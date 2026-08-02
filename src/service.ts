@@ -142,55 +142,67 @@ export class RoomService {
   async recoverRoom(roomId: string): Promise<Room> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     return this.lock(id, async () => {
-      let room = await this.store.load(id);
-      if (room.state === 'closed') return room;
-      const packetPending = this.isPacketPending(room);
-      let packet = this.packets.get(id);
-      if (packet) {
-        if (!packetPending && packet.cid !== room.identity_cid) {
-          throw new RoomServiceError(
-            `restored room packet CID mismatch for "${id}": expected "${room.identity_cid}", found "${packet.cid}"`,
-          );
-        }
-      } else if (packetPending) {
-        if (this.packets.restore) {
-          try {
-            packet = await this.packets.restore(id);
-          } catch { /* no live packet was durably established; provision below */ }
-        }
-        if (!packet) {
-          try {
-            packet = await this.packets.create(id, room.identity_name, `ours-cowork mission room ${id}`);
-          } catch (createFailure) {
-            throw new RoomServiceError(`failed to recover room packet "${id}"`, {
-              cause: createFailure,
-            });
-          }
-        }
-      } else {
-        if (!this.packets.restore) {
-          throw new RoomServiceError(`room packet "${id}" with established CID must be restored, not created`);
-        }
-        try {
-          packet = await this.packets.restore(id, room.identity_cid);
-        } catch (error) {
-          throw new RoomServiceError(
-            `failed to restore established room packet "${id}": ${error instanceof Error ? error.message : String(error)}`,
-            { cause: error },
-          );
-        }
-        if (packet.cid !== room.identity_cid) {
-          throw new RoomServiceError(
-            `restored room packet CID mismatch for "${id}": expected "${room.identity_cid}", found "${packet.cid}"`,
-          );
-        }
-      }
-      if (packetPending) {
-        const { status: _packetPending, ...established } = room;
-        room = await this.store.save(RoomSchema.parse({ ...established, identity_cid: packet.cid }));
-      }
-      return this.reconcileUnlocked(room, packet);
+      const room = await this.recoverPacketUnlocked(id, await this.store.load(id));
+      if (room.state === 'closed' || room.state === 'closing') return room;
+      return this.reconcileUnlocked(room, this.packet(id));
     });
+  }
+
+  /** Restore/provision only the durable packet boundary; daemon reconciliation is a later phase. */
+  async recoverPacket(roomId: string): Promise<Room> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    return this.lock(id, async () => this.recoverPacketUnlocked(id, await this.store.load(id)));
+  }
+
+  private async recoverPacketUnlocked(id: string, initial: Room): Promise<Room> {
+    let room = initial;
+    if (room.state === 'closed') return room;
+    const packetPending = this.isPacketPending(room);
+    let packet = this.packets.get(id);
+    if (packet) {
+      if (!packetPending && packet.cid !== room.identity_cid) {
+        throw new RoomServiceError(
+          `restored room packet CID mismatch for "${id}": expected "${room.identity_cid}", found "${packet.cid}"`,
+        );
+      }
+    } else if (packetPending) {
+      if (this.packets.restore) {
+        try {
+          packet = await this.packets.restore(id);
+        } catch { /* no live packet was durably established; provision below */ }
+      }
+      if (!packet) {
+        try {
+          packet = await this.packets.create(id, room.identity_name, `ours-cowork mission room ${id}`);
+        } catch (createFailure) {
+          throw new RoomServiceError(`failed to recover room packet "${id}"`, {
+            cause: createFailure,
+          });
+        }
+      }
+    } else {
+      if (!this.packets.restore) {
+        throw new RoomServiceError(`room packet "${id}" with established CID must be restored, not created`);
+      }
+      try {
+        packet = await this.packets.restore(id, room.identity_cid);
+      } catch (error) {
+        throw new RoomServiceError(
+          `failed to restore established room packet "${id}": ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
+      }
+      if (packet.cid !== room.identity_cid) {
+        throw new RoomServiceError(
+          `restored room packet CID mismatch for "${id}": expected "${room.identity_cid}", found "${packet.cid}"`,
+        );
+      }
+    }
+    if (packetPending) {
+      const { status: _packetPending, ...established } = room;
+      room = await this.store.save(RoomSchema.parse({ ...established, identity_cid: packet.cid }));
+    }
+    return room;
   }
 
   async updateRoom(roomId: string, input: unknown): Promise<Room> {
@@ -402,6 +414,22 @@ export class RoomService {
   async reconcileRoom(roomId: string): Promise<Room> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     return this.lock(id, async () => this.reconcileUnlocked(await this.store.load(id), this.packet(id)));
+  }
+
+  notifyRoom(roomId: string): Promise<void> {
+    return this.intake.notify(roomId);
+  }
+
+  resumePending(roomId: string): Promise<void> {
+    return this.intake.resumePending(roomId);
+  }
+
+  beginShutdown(): void {
+    this.intake.beginShutdown();
+  }
+
+  drain(): Promise<void> {
+    return this.intake.drain();
   }
 
   async listRooms(): Promise<Room[]> {

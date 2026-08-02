@@ -48,6 +48,7 @@ export class IntakePump {
   private readonly nowValue: () => string;
   private readonly nextMessageId: () => string;
   private readonly notifications = new Map<string, NotificationState>();
+  private acceptingNotifications = true;
 
   constructor(store: IntakeStore, packets: IntakePacketRegistry, options: IntakePumpOptions = {}) {
     this.store = store;
@@ -64,6 +65,8 @@ export class IntakePump {
    */
   notify(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
+    // The unread item remains in packet state and is resumed on next boot.
+    if (!this.acceptingNotifications) return Promise.resolve();
     const existing = this.notifications.get(id);
     if (existing) {
       existing.dirty = true;
@@ -86,6 +89,16 @@ export class IntakePump {
   async resumePending(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     await this.lock(id, () => this.processAndRelayUnlocked(id, this.packet(id)));
+  }
+
+  beginShutdown(): void {
+    this.acceptingNotifications = false;
+  }
+
+  async drain(): Promise<void> {
+    while (this.notifications.size > 0) {
+      await Promise.allSettled([...this.notifications.values()].map((state) => state.work));
+    }
   }
 
   private async runNotificationWorker(roomId: string, state: NotificationState): Promise<void> {

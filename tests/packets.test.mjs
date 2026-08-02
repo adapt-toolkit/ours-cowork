@@ -474,11 +474,32 @@ test('PacketRegistry public lifecycle surface is standalone', () => {
   assert.equal(typeof PacketRegistry, 'function');
   const source = readFileSync(new URL('../src/packets.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /ours-mcp|@ours\.network\/mcp/);
-  for (const entry of ['daemon.ts', 'cli.ts']) {
-    const placeholder = readFileSync(new URL(`../src/${entry}`, import.meta.url), 'utf8');
-    assert.match(placeholder, /Build-only placeholder/);
-    assert.doesNotMatch(placeholder, /ours-mcp|@ours\.network\/mcp/);
-  }
+  const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+  assert.match(daemon, /class CoworkDaemon/);
+  assert.match(daemon, /runDaemon/);
+  assert.doesNotMatch(daemon, /ours-mcp|@ours\.network\/mcp/);
+  const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+  assert.match(cli, /Build-only placeholder/);
+  assert.doesNotMatch(cli, /ours-mcp|@ours\.network\/mcp/);
+});
+
+test('daemon unhosting removes runtime packets without purging restart state', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cowork-unhost-'));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const liveDir = join(root, 'rooms', roomId, 'live');
+  fs.mkdirSync(liveDir, { recursive: true });
+  fs.writeFileSync(join(liveDir, 'identity.key'), 'secret');
+  fs.writeFileSync(join(liveDir, 'state_data.bin'), 'state');
+  const removed = [];
+  const host = { removePacket(cid) { removed.push(cid); } };
+  const registry = new PacketRegistry(host, root);
+  registry.packets.set(roomId, { cid: 'cid-room', name: `cowork-room-${roomId}` });
+  await registry.unhostAll();
+  assert.deepEqual(removed, ['cid-room']);
+  assert.equal(registry.size, 0);
+  assert.equal(fs.readFileSync(join(liveDir, 'identity.key'), 'utf8'), 'secret');
+  assert.equal(fs.readFileSync(join(liveDir, 'state_data.bin'), 'utf8'), 'state');
+  rmSync(root, { recursive: true, force: true });
 });
 
 test('a submitted timeout terminalizes the packet without enqueueing or pairing a later result', async () => {

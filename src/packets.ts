@@ -108,6 +108,7 @@ export interface PacketRegistryOptions {
   log?: (...parts: unknown[]) => void;
   seed?: () => string;
   beforeExpose?: (packet: RoomPacket) => void | Promise<void>;
+  onNotify?: (roomId: string, event: string) => void;
 }
 
 export class PacketRegistry {
@@ -119,6 +120,7 @@ export class PacketRegistry {
   private readonly log: (...parts: unknown[]) => void;
   private readonly seed: () => string;
   private readonly beforeExpose: (packet: RoomPacket) => void | Promise<void>;
+  private readonly onNotify: (roomId: string, event: string) => void;
 
   constructor(
     host: AdaptHost,
@@ -132,6 +134,7 @@ export class PacketRegistry {
     this.log = options.log ?? (() => {});
     this.seed = options.seed ?? (() => randomBytes(24).toString('hex'));
     this.beforeExpose = options.beforeExpose ?? (() => {});
+    this.onNotify = options.onNotify ?? (() => {});
   }
 
   get size(): number {
@@ -157,7 +160,12 @@ export class PacketRegistry {
     let native: Packet | undefined;
     try {
       native = await this.host.createPacket(this.packetName(roomId), this.seed());
-      const room = new HostedRoomPacket(native, () => this.saveState(native!, liveDir), this.log);
+      const room = new HostedRoomPacket(
+        native,
+        () => this.saveState(native!, liveDir),
+        this.log,
+        (event) => this.onNotify(roomId, event),
+      );
       atomicWriteFileSync(this.identityPath(roomId), Buffer.from(exportSigningSecret(native), 'utf8'), this.persistence);
       this.saveState(native, liveDir);
       this.packets.set(roomId, room);
@@ -201,7 +209,12 @@ export class PacketRegistry {
         `restored room packet CID mismatch for "${roomId}": expected "${expectedCid}", found "${native.cid}"`,
       );
     }
-    const room = new HostedRoomPacket(native, () => this.saveState(native, liveDir), this.log);
+    const room = new HostedRoomPacket(
+      native,
+      () => this.saveState(native, liveDir),
+      this.log,
+      (event) => this.onNotify(roomId, event),
+    );
     try {
       await withScopeAsync(async (lifetime) => {
         const state = native.pw.packet.ParseValue(new Uint8Array(stateBytes)).Attach(lifetime);
@@ -243,6 +256,20 @@ export class PacketRegistry {
       );
     }
     return residue;
+  }
+
+  /** Unhost runtime packets while retaining every byte required for restart. */
+  async unhostAll(): Promise<void> {
+    const errors: unknown[] = [];
+    for (const [roomId, room] of [...this.packets]) {
+      try {
+        this.host.removePacket(room.cid, new Error('cowork daemon is shutting down'));
+        this.packets.delete(roomId);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) throw new AggregateError(errors, 'failed to unhost room packets');
   }
 
   private saveState(packet: Packet, liveDir: string): void {
@@ -301,11 +328,12 @@ export class HostedRoomPacket implements RoomPacket {
     packet: Packet,
     saveState: () => void,
     log: (...parts: unknown[]) => void,
+    onNotify: (event: string) => void = () => {},
   ) {
     this.packet = packet;
     this.name = packet.name;
     this.cid = packet.cid;
-    wireHandlers(packet, { onSaveState: saveState, onNotify: () => {} }, log);
+    wireHandlers(packet, { onSaveState: saveState, onNotify: (event) => onNotify(event) }, log);
   }
 
   async setIdentity(identityName: string, bio: string): Promise<void> {

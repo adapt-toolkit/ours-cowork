@@ -289,11 +289,6 @@ export class CoworkStore {
       this.ensurePrivateDirectory(roomDir, false, `room "${validRoomId}" directory`);
       const archivePath = this.archivePath(validRoomId);
       const metadataPath = this.metadataPath(validRoomId);
-      const expected = new Set(['archive.jsonl', 'room.json']);
-      const unexpected = this.fs.readdirSync(roomDir).filter((name) => !expected.has(name));
-      if (unexpected.length > 0) {
-        throw new CoworkStorageError(`room "${validRoomId}" contains live or unexpected residue: ${unexpected.join(', ')}`);
-      }
       const archivePresent = this.lstatIfPresent(archivePath) !== undefined;
       const metadataPresent = this.lstatIfPresent(metadataPath) !== undefined;
       if (metadataPresent) {
@@ -301,12 +296,18 @@ export class CoworkStore {
         if (room.state !== 'closed') {
           throw new CoworkStorageError(`room "${validRoomId}" must be closed before deletion`);
         }
+        this.removeProvisioningArtifacts(roomDir);
       } else if (archivePresent) {
         // The only valid resumable order removes archive.jsonl first. Missing
         // metadata while an archive remains is therefore not a deletion stage.
         throw new CoworkStorageError(
           `room "${validRoomId}" has archive residue without deletion metadata`,
         );
+      }
+      const expected = new Set(['archive.jsonl', 'room.json']);
+      const unexpected = this.fs.readdirSync(roomDir).filter((name) => !expected.has(name));
+      if (unexpected.length > 0) {
+        throw new CoworkStorageError(`room "${validRoomId}" contains live or unexpected residue: ${unexpected.join(', ')}`);
       }
       if (archivePresent) {
         this.assertRegularFile(archivePath, 'room archive');
@@ -322,6 +323,30 @@ export class CoworkStore {
       this.fsyncDirectory(this.roomsDirectory());
       this.nextSequences.delete(validRoomId);
     });
+  }
+
+  private removeProvisioningArtifacts(roomDir: string): void {
+    const journalPath = join(roomDir, '.cowork-provisioning-stage');
+    const targets = [join(roomDir, 'live'), join(roomDir, 'provisioning-residue')];
+    if (this.lstatIfPresent(journalPath)) {
+      this.assertRegularFile(journalPath, 'provisioning staging journal');
+      const stagingName = this.fs.readFileSync(journalPath, 'utf8').trim();
+      if (!/^live\.staging-[0-9a-f]{32}$/.test(stagingName)) {
+        throw new CoworkStorageError('invalid provisioning staging journal');
+      }
+      targets.push(join(roomDir, stagingName));
+    }
+    for (const target of targets) {
+      const stat = this.lstatIfPresent(target);
+      if (!stat) continue;
+      if (stat.isSymbolicLink() || !stat.isDirectory()) this.fs.unlinkSync(target);
+      else this.fs.rmSync(target, { recursive: true, force: true });
+      this.fsyncDirectory(roomDir);
+    }
+    if (this.lstatIfPresent(journalPath)) {
+      this.fs.unlinkSync(journalPath);
+      this.fsyncDirectory(roomDir);
+    }
   }
 
   private loadUnlocked(roomId: string): Room {

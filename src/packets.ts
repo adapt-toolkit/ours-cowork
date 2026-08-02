@@ -164,7 +164,6 @@ export class PacketRegistry {
       }
     }
     this.prepareProvisioningDirectory(roomId);
-    this.provisioningCheckpoint('mkdir');
 
     let native: Packet | undefined;
     try {
@@ -247,6 +246,11 @@ export class PacketRegistry {
         await room.setIdentity(identityName, bio);
         this.provisioningCheckpoint('identity_applied');
       }
+      atomicWriteFileSync(
+        this.ownershipPath(roomId),
+        Buffer.from(`${roomId}\n`, 'utf8'),
+        this.persistence,
+      );
       await this.beforeExpose(room);
       this.host.exposePacket(native.cid);
       this.packets.set(roomId, room);
@@ -326,6 +330,8 @@ export class PacketRegistry {
   private identityPath(roomId: string): string { return join(this.liveDir(roomId), 'identity.key'); }
   private statePath(roomId: string): string { return join(this.liveDir(roomId), 'state_data.bin'); }
   private ownershipPath(roomId: string): string { return join(this.liveDir(roomId), '.cowork-provisioning-v1'); }
+  private stagingJournalPath(roomId: string): string { return join(this.roomDir(roomId), '.cowork-provisioning-stage'); }
+  private residuePath(roomId: string): string { return join(this.roomDir(roomId), 'provisioning-residue'); }
 
   private hasRestorableState(roomId: string): boolean {
     try {
@@ -354,17 +360,62 @@ export class PacketRegistry {
         this.fsyncDirectory(roomDir);
       } else {
         this.assertSafeRoomDirectory(roomId);
-        let suffix = 0;
-        let residue = join(roomDir, 'provisioning-residue');
-        while (this.fs.existsSync(residue)) residue = join(roomDir, `provisioning-residue-${++suffix}`);
+        const residue = this.residuePath(roomId);
+        if (this.fs.existsSync(residue)) {
+          throw new PacketPersistenceError(
+            `room "${roomId}" has unknown live state and an existing provisioning residue; inspect both before retrying`,
+          );
+        }
         this.fs.renameSync(liveDir, residue);
         this.fs.chmodSync(residue, 0o700);
         this.fsyncDirectory(roomDir);
       }
     }
-    this.fs.mkdirSync(liveDir, { recursive: false, mode: 0o700 });
-    this.fs.chmodSync(liveDir, 0o700);
-    atomicWriteFileSync(this.ownershipPath(roomId), Buffer.from(`${roomId}\n`, 'utf8'), this.persistence);
+    this.cleanupOwnedStaging(roomId);
+    const stagingName = `live.staging-${randomBytes(16).toString('hex')}`;
+    atomicWriteFileSync(
+      this.stagingJournalPath(roomId),
+      Buffer.from(`${stagingName}\n`, 'utf8'),
+      this.persistence,
+    );
+    const stagingDir = join(roomDir, stagingName);
+    if (this.fs.existsSync(stagingDir)) {
+      throw new PacketPersistenceError(`provisioning staging collision for room "${roomId}"`);
+    }
+    this.fs.mkdirSync(stagingDir, { recursive: false, mode: 0o700 });
+    this.fs.chmodSync(stagingDir, 0o700);
+    atomicWriteFileSync(
+      join(stagingDir, '.cowork-provisioning-v1'),
+      Buffer.from(`${roomId}\n`, 'utf8'),
+      this.persistence,
+    );
+    this.provisioningCheckpoint('mkdir');
+    this.fs.renameSync(stagingDir, liveDir);
+    this.fsyncDirectory(roomDir);
+    this.fs.unlinkSync(this.stagingJournalPath(roomId));
+    this.fsyncDirectory(roomDir);
+  }
+
+  private cleanupOwnedStaging(roomId: string): void {
+    const journal = this.stagingJournalPath(roomId);
+    let stagingName: string;
+    try { stagingName = this.fs.readFileSync(journal, 'utf8').trim(); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    if (!/^live\.staging-[0-9a-f]{32}$/.test(stagingName)) {
+      throw new PacketPersistenceError(`invalid provisioning staging journal for room "${roomId}"`);
+    }
+    const stagingDir = join(this.roomDir(roomId), stagingName);
+    if (this.fs.existsSync(stagingDir)) {
+      const stat = this.fs.lstatSync(stagingDir);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new PacketPersistenceError(`unsafe provisioning staging path for room "${roomId}"`);
+      }
+      this.fs.rmSync(stagingDir, { recursive: true, force: true });
+      this.fsyncDirectory(this.roomDir(roomId));
+    }
   }
 
   private assertSafeRoomDirectory(roomId: string): void {

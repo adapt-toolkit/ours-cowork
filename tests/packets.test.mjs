@@ -228,16 +228,22 @@ async function runPacketDriver() {
     for (const stage of ['mkdir', 'identity', 'state', 'identity_applied']) {
       const roomId = `crash-${stage.replace('_', '-')}`;
       fs.mkdirSync(join(stateDir, 'rooms', roomId), { recursive: true, mode: 0o700 });
-      let injected = false;
-      const interrupted = new PacketRegistry(host, stateDir, {
-        provisioningCheckpoint(observed) {
-          if (!injected && observed === stage) {
-            injected = true;
-            throw new Error(`crash at ${stage}`);
-          }
-        },
-      });
-      await assert.rejects(interrupted.create(roomId, `Exact ${stage}`, `Exact bio ${stage}`), new RegExp(stage));
+      const interruptions = stage === 'mkdir' ? 3 : 1;
+      for (let attempt = 0; attempt < interruptions; attempt += 1) {
+        let injected = false;
+        const interrupted = new PacketRegistry(host, stateDir, {
+          provisioningCheckpoint(observed) {
+            if (!injected && observed === stage) {
+              injected = true;
+              throw new Error(`crash at ${stage}`);
+            }
+          },
+        });
+        await assert.rejects(interrupted.create(roomId, `Exact ${stage}`, `Exact bio ${stage}`), new RegExp(stage));
+        const debris = fs.readdirSync(join(stateDir, 'rooms', roomId));
+        assert(debris.filter((name) => name.startsWith('live.staging-')).length <= 1);
+        assert(debris.filter((name) => name.startsWith('provisioning-residue')).length <= 1);
+      }
       const resumed = new PacketRegistry(host, stateDir);
       const packet = await resumed.create(roomId, `Exact ${stage}`, `Exact bio ${stage}`);
       assert(packet.cid, `${stage} restart must establish one packet CID`);
@@ -351,13 +357,18 @@ async function runPacketDriver() {
     );
 
     await assert.rejects(
-      gamma.packet.mutatingTx('::a2a_messaging::send_file', {
-        contact: attacker.cid,
-        filename: 'blocked.txt',
-        mime: 'text/plain',
-        data: gamma.packet.newBinary(Buffer.from('blocked')),
-      }),
-      /Room packets do not accept files/,
+      gamma.packet.mutatingTx(
+        '::a2a_messaging::send_file',
+        {
+          contact: attacker.cid,
+          filename: 'blocked.txt',
+          mime: 'text/plain',
+          data: gamma.packet.newBinary(Buffer.from('blocked')),
+        },
+        undefined,
+        250,
+      ),
+      /timed out waiting for transaction result/,
     );
     await attacker.mutatingTx('::a2a_messaging::send_file', {
       contact: gamma.cid,
@@ -400,8 +411,13 @@ async function runPacketDriver() {
 
     failStateWrite = true;
     await assert.rejects(
-      gamma.send(peer.cid, 'must-not-escape'),
-      (error) => error instanceof PacketPersistenceError && error.cause?.code === 'ENOSPC',
+      gamma.packet.mutatingTx(
+        '::a2a_messaging::send_message',
+        { contact: peer.cid, text: 'must-not-escape' },
+        undefined,
+        250,
+      ),
+      /timed out waiting for transaction result/,
     );
     await sleep(500);
     assert.equal(renderRawInbox(peer).some((message) => message.text === 'must-not-escape'), false,
@@ -586,6 +602,23 @@ test('packet persistence failures are typed and leave the prior live file untouc
   rmSync(root, { recursive: true, force: true });
 });
 
+test('unknown live state uses one fixed quarantine and never suffixes or overwrites an existing residue', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'ours-cowork-residue-bound-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const roomId = 'bounded-room';
+  const roomDir = join(root, 'rooms', roomId);
+  fs.mkdirSync(join(roomDir, 'live'), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(join(roomDir, 'provisioning-residue'), { mode: 0o700 });
+  fs.writeFileSync(join(roomDir, 'live', 'unknown-live'), 'live');
+  fs.writeFileSync(join(roomDir, 'provisioning-residue', 'unknown-residue'), 'residue');
+  const registry = new PacketRegistry({ createPacket: () => assert.fail('must fail before native create') }, root);
+  await assert.rejects(registry.create(roomId), /unknown live state.*existing provisioning residue/i);
+  assert.equal(fs.readFileSync(join(roomDir, 'live', 'unknown-live'), 'utf8'), 'live');
+  assert.equal(fs.readFileSync(join(roomDir, 'provisioning-residue', 'unknown-residue'), 'utf8'), 'residue');
+  assert.deepEqual(fs.readdirSync(roomDir).sort(), ['live', 'provisioning-residue']);
+  assert.doesNotMatch(readFileSync(new URL('../src/packets.ts', import.meta.url), 'utf8'), /provisioning-residue-\$\{/);
+});
+
 test('PacketRegistry public lifecycle surface is standalone', () => {
   assert.equal(typeof PacketRegistry, 'function');
   const externalDaemonPattern = new RegExp(`${['ours', 'mcp'].join('-')}|@ours\\.network\\/${'mcp'}`);
@@ -659,32 +692,16 @@ test('AdaptHost shutdown always attempts wrapper stop and aggregates packet and 
   assert.equal(host.wrapper, undefined);
 });
 
-test('a submitted timeout terminalizes the packet without enqueueing or pairing a later result', async () => {
-  const { packet, pw, submitted, terminal } = fakePacket('timeout');
-  const first = packet.mutatingTx('first', {}, undefined, 10);
-  const second = packet.mutatingTx('second', {}, undefined, 10);
-  const outcomes = await settledWithin([first, second]);
-  assert.deepEqual(outcomes.map((outcome) => outcome.status), ['rejected', 'rejected']);
-  assert.equal(submitted.length, 1, 'queued mutation must never submit after terminal timeout');
-  assert.equal(terminal.length, 1);
-
-  // A detached return arriving after terminalization is consumed/destroyed and
-  // cannot settle the queued call or make a future mutation legal.
-  const late = fakeReturnData('return_data', { call: 'late-first' });
-  pw.on_return_data(late);
-  assert.equal(late.destroyed, true);
-  await assert.rejects(packet.mutatingTx('third', {}), /timed out|closed|terminal/i);
-  assert.equal(submitted.length, 1);
-});
-
-test('transaction failure rejects one local mutation without terminalizing healthy packet state', async () => {
+test('unrelated transaction failure cannot consume an overlapping local result or release its queued call', async () => {
   const { packet, pw, submitted, terminal } = fakePacket('ambiguous');
   const first = packet.mutatingTx('local-first', {});
   const second = packet.mutatingTx('local-second', {});
   await new Promise((done) => setImmediate(done));
   assert.equal(submitted.length, 1);
-  pw.on_transaction_failure('local refusal');
-  await assert.rejects(first, /local refusal/);
+  pw.on_transaction_failure('unrelated inbound refusal');
+  assert.equal(submitted.length, 1);
+  pw.on_return_data(fakeReturnData('return_data', { call: 'late-first' }));
+  assert.equal((await first).Visualize(), '[object Object]');
   await new Promise((done) => setImmediate(done));
   assert.equal(submitted.length, 2);
   pw.on_return_data(fakeReturnData('return_data', { call: 'second' }));
@@ -697,6 +714,41 @@ test('transaction failure rejects one local mutation without terminalizing healt
   pw.on_return_data(fakeReturnData('return_data', { call: 'future' }));
   await future;
   assert.equal(terminal.length, 0);
+});
+
+test('failed local callback times out through a tombstone, swallows its late result, and lets the next call proceed', async () => {
+  const { packet, pw, submitted, terminal } = fakePacket('failed-local');
+  const first = packet.mutatingTx('local-first', {}, undefined, 10);
+  const second = packet.mutatingTx('local-second', {}, undefined, 100);
+  await new Promise((done) => setImmediate(done));
+  pw.on_transaction_failure('genuine local failure');
+  await assert.rejects(first, /timed out/);
+  assert.equal(submitted.length, 1, 'expired call must hold the submission barrier');
+  pw.on_return_data(fakeReturnData('return_data', { call: 'late-first' }));
+  await new Promise((done) => setImmediate(done));
+  assert.equal(submitted.length, 2, 'late result consumes only the expired tombstone');
+  pw.on_return_data(fakeReturnData('return_data', { call: 'second' }));
+  await second;
+  assert.equal(terminal.length, 0);
+});
+
+test('expired tombstone releases after a bounded drain and teardown never rejects an expired call twice', async () => {
+  const { packet, pw, submitted, terminal } = fakePacket('bounded-expiry');
+  let firstRejects = 0;
+  const first = packet.mutatingTx('first', {}, undefined, 10).catch((error) => {
+    firstRejects += 1;
+    throw error;
+  });
+  const second = packet.mutatingTx('second', {}, undefined, 200);
+  await assert.rejects(first, /timed out/);
+  await sleep(80);
+  assert.equal(submitted.length, 2, 'bounded tombstone drain must release the next submission');
+  packet.close(new Error('explicit teardown'));
+  await assert.rejects(second, /explicit teardown/);
+  assert.equal(firstRejects, 1);
+  assert.equal(terminal.length, 1);
+  pw.on_return_data(fakeReturnData('return_data', { call: 'late-after-close' }));
+  assert.equal(firstRejects, 1);
 });
 
 test('Packet.close rejects active and queued work before another envelope is submitted', async () => {

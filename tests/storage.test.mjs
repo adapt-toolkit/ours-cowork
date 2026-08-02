@@ -563,7 +563,7 @@ test('delete removes archive then metadata without creating an on-disk lock', as
   assert.equal(fs.readdirSync(join(stateDir, 'rooms')).some((name) => name.includes('lock')), false);
 });
 
-test('delete resumes every expected partial stage but rejects live residue', async (t) => {
+test('delete resumes every expected partial stage and removes explicitly authorized provisioning artifacts', async (t) => {
   for (const stage of ['archive-gone', 'files-gone', 'directory-gone']) {
     await t.test(stage, async (t) => {
       const { stateDir, store, cleanup } = temporaryStore();
@@ -601,12 +601,28 @@ test('delete resumes every expected partial stage but rejects live residue', asy
     assert.equal(fs.existsSync(join(stateDir, 'rooms', ROOM_ID)), false);
   });
 
-  await t.test('live residue', async (t) => {
+  await t.test('known provisioning artifacts', async (t) => {
     const { stateDir, store, cleanup } = temporaryStore();
     t.after(cleanup);
     await store.create(room({ state: 'closed', closed_at: AT }));
-    fs.mkdirSync(join(stateDir, 'rooms', ROOM_ID, 'live'), { mode: 0o700 });
-    await assert.rejects(store.delete(ROOM_ID), /live or unexpected residue/i);
-    assert.equal(fs.existsSync(join(stateDir, 'rooms', ROOM_ID, 'archive.jsonl')), true);
+    const roomDir = join(stateDir, 'rooms', ROOM_ID);
+    const stagingName = `live.staging-${'ab'.repeat(16)}`;
+    for (const name of ['live', 'provisioning-residue', stagingName]) {
+      fs.mkdirSync(join(roomDir, name), { mode: 0o700 });
+      fs.writeFileSync(join(roomDir, name, 'retained'), name);
+    }
+    fs.writeFileSync(join(roomDir, '.cowork-provisioning-stage'), `${stagingName}\n`, { mode: 0o600 });
+    await store.delete(ROOM_ID);
+    assert.equal(fs.existsSync(roomDir), false);
+  });
+
+  await t.test('untracked staging residue', async (t) => {
+    const { stateDir, store, cleanup } = temporaryStore();
+    t.after(cleanup);
+    await store.create(room({ state: 'closed', closed_at: AT }));
+    const unknown = join(stateDir, 'rooms', ROOM_ID, `live.staging-${'cd'.repeat(16)}`);
+    fs.mkdirSync(unknown, { mode: 0o700 });
+    await assert.rejects(store.delete(ROOM_ID), /unexpected residue/i);
+    assert.equal(fs.existsSync(unknown), true);
   });
 });

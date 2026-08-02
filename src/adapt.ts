@@ -75,7 +75,12 @@ type Pending = {
   timer: ReturnType<typeof setTimeout>;
   payload?: AdaptValue;
   callbackError?: Error;
+  settled?: boolean;
+  expired?: boolean;
+  lateTimer?: ReturnType<typeof setTimeout>;
 };
+
+const LATE_RESULT_DRAIN_MS = 50;
 
 export type PacketEnvelopeFactory = (name: string, targ: unknown) => AdaptValue;
 
@@ -84,6 +89,8 @@ export type NotifyHandler = (event: string, payload: AdaptValue) => void;
 export class Packet {
   readonly pending: Pending[] = [];
   private lock: Promise<void> = Promise.resolve();
+  private expiredDrain?: Promise<void>;
+  private releaseExpiredDrain?: () => void;
   private closedError?: Error;
   private terminalNotified = false;
   private readonly onTerminal: (error: Error) => void;
@@ -144,6 +151,8 @@ export class Packet {
     await previous;
     try {
       this.assertOpen();
+      if (this.expiredDrain) await this.expiredDrain;
+      this.assertOpen();
       return await fn();
     } finally {
       release();
@@ -153,15 +162,15 @@ export class Packet {
   private enqueue(envelope: AdaptValue, timeoutMs: number): Promise<AdaptValue> {
     return new Promise<AdaptValue>((resolveResult, rejectResult) => {
       const timer = setTimeout(() => {
-        if (!this.pending.some((pending) => pending.timer === timer)) return;
-        // Once submitted, a timeout cannot safely release the FIFO: the SDK does
-        // not tag callbacks with a local call id, so a late result could otherwise
-        // settle the next mutation and a late SEND could escape. Terminalize the
-        // packet; AdaptHost's terminal hook removes the native packet before any
-        // queued/future mutation can submit.
-        this.close(new Error(`timed out waiting for transaction result on packet "${this.name}"`));
+        const pending = this.pending.find((candidate) => candidate.timer === timer);
+        if (!pending || pending.settled) return;
+        pending.settled = true;
+        pending.expired = true;
+        pending.reject(new Error(`timed out waiting for transaction result on packet "${this.name}"`));
+        this.expiredDrain = new Promise<void>((resolveDrain) => { this.releaseExpiredDrain = resolveDrain; });
+        pending.lateTimer = setTimeout(() => this.releaseExpired(pending), LATE_RESULT_DRAIN_MS);
       }, timeoutMs);
-      const pending = { resolve: resolveResult, reject: rejectResult, timer };
+      const pending: Pending = { resolve: resolveResult, reject: rejectResult, timer };
       this.pending.push(pending);
       try {
         this.pw.add_client_message(envelope);
@@ -211,15 +220,32 @@ export class Packet {
     const pending = this.pending.splice(0);
     for (const call of pending) {
       clearTimeout(call.timer);
+      if (call.lateTimer) clearTimeout(call.lateTimer);
       call.payload?.Destroy();
-      call.reject(error);
+      if (!call.settled) {
+        call.settled = true;
+        call.reject(error);
+      }
     }
+    this.releaseExpiredDrain?.();
+    this.releaseExpiredDrain = undefined;
+    this.expiredDrain = undefined;
     if (!this.terminalNotified) {
       this.terminalNotified = true;
       for (const listener of this.terminalListeners) listener(error);
       this.terminalListeners.clear();
       this.onTerminal(error);
     }
+  }
+
+  releaseExpired(pending: Pending): void {
+    const index = this.pending.indexOf(pending);
+    if (index >= 0) this.pending.splice(index, 1);
+    if (pending.lateTimer) clearTimeout(pending.lateTimer);
+    pending.payload?.Destroy();
+    this.releaseExpiredDrain?.();
+    this.releaseExpiredDrain = undefined;
+    this.expiredDrain = undefined;
   }
 }
 
@@ -230,9 +256,10 @@ export function wireHandlers(
 ): void {
   const settleAfterActionLoop = (pending: Pending): void => {
     queueMicrotask(() => {
-      if (packet.pending[0] !== pending || !pending.payload) return;
+      if (packet.pending[0] !== pending || !pending.payload || pending.callbackError) return;
       packet.pending.shift();
       clearTimeout(pending.timer);
+      pending.settled = true;
       pending.resolve(pending.payload);
     });
   };
@@ -260,6 +287,10 @@ export function wireHandlers(
       }
       const pending = packet.pending[0];
       if (!pending) return;
+      if (pending.expired) {
+        packet.releaseExpired(pending);
+        return;
+      }
       if (pending.payload) pending.payload.Destroy();
       pending.payload = data.Reduce('payload').Detach();
       // Result-data commonly precedes save_state. The SDK invokes every RET hook
@@ -272,20 +303,11 @@ export function wireHandlers(
   };
 
   packet.pw.on_transaction_failure = (message: string) => {
-    const pending = packet.pending[0];
-    if (!pending) {
-      // The SDK reports an inbound abort through the same callback as a failed
-      // client transaction. An inbound refusal is healthy packet behavior: it
-      // must not tear down the native packet or its registry entry.
-      log(`[${packet.name}] inbound transaction rejected:`, message);
-      return;
-    }
-    packet.pending.shift();
-    clearTimeout(pending.timer);
-    pending.payload?.Destroy();
-    pending.reject(pending.callbackError ?? new Error(
-      `packet "${packet.name}" transaction failure: ${message}`,
-    ));
+    // SDK 0.10.12 provides neither origin nor a client-call correlation key.
+    // This may describe unrelated inbound traffic while a local call is
+    // pending, so consuming the local FIFO here would mispair later results.
+    // The pending call remains protected by its bounded timeout/tombstone.
+    log(`[${packet.name}] transaction rejected (origin uncorrelated):`, message);
   };
 }
 

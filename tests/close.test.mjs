@@ -613,3 +613,17 @@ test('PacketRegistry destroy is idempotent, retries purge, and never follows a l
   assert.deepEqual(await registry.destroy(ROOM_ID), []);
   assert.deepEqual(removed, ['cid-room']);
 });
+
+test('normal packet close retains the fixed uncertain provisioning residue', async (t) => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'ours-cowork-close-residue-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const roomDir = join(stateDir, 'rooms', ROOM_ID);
+  fs.mkdirSync(join(roomDir, 'live'), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(join(roomDir, 'provisioning-residue'), { mode: 0o700 });
+  fs.writeFileSync(join(roomDir, 'provisioning-residue', 'unknown'), 'retain');
+  const registry = new PacketRegistry({ removePacket() {} }, stateDir);
+  registry.packets.set(ROOM_ID, { name: 'room', cid: 'cid-room' });
+  assert.deepEqual(await registry.destroy(ROOM_ID), []);
+  assert.equal(fs.existsSync(join(roomDir, 'live')), false);
+  assert.equal(fs.readFileSync(join(roomDir, 'provisioning-residue', 'unknown'), 'utf8'), 'retain');
+});

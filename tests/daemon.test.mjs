@@ -101,6 +101,31 @@ test('an authenticated worker shutdown request enters the supervisor bounded shu
   assert.deepEqual(await supervisor.done, { code: 0, signal: null });
 });
 
+test('an authenticated worker shutdown request arms the exit watchdog', async () => {
+  const capability = 'de'.repeat(32);
+  const signals = new EventEmitter();
+  const sent = [];
+  const killed = [];
+  const child = Object.assign(new EventEmitter(), {
+    connected: true, exitCode: null,
+    send(message) { sent.push(message); },
+    kill(signal) { killed.push(signal); },
+  });
+  const supervisor = new DaemonSupervisor({ child, signals, shutdownTimeoutMs: 20, capability });
+  supervisor.start();
+  child.emit('message', { type: 'init_ack', capability });
+  child.emit('message', { type: 'shutdown_request', capability });
+  await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+  assert.deepEqual(sent, [
+    { type: 'init', capability },
+    { type: 'shutdown', signal: 'SIGTERM', capability },
+  ]);
+  assert.deepEqual(killed, ['SIGKILL']);
+  child.exitCode = null;
+  child.emit('exit', null, 'SIGKILL');
+  assert.deepEqual(await supervisor.done, { code: null, signal: 'SIGKILL' });
+});
+
 test('supervisor strips inherited preload and execution modes from its worker', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-exec-argv-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

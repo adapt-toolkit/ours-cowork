@@ -292,8 +292,9 @@ test('status, stop, and restart ignore a purpose-built argv/PPID/PID/lock/socket
   }
 });
 
-test('a fake accepted shutdown that keeps the same control session cannot report stopped', { timeout: 20_000 }, async () => {
+test('a silent but accepting control endpoint cannot prove its session stopped', { timeout: 20_000 }, async () => {
   const session = 'ab'.repeat(16);
+  let requests = 0;
   await withRawRpc((socket) => {
     let bytes = '';
     socket.setEncoding('utf8');
@@ -302,18 +303,51 @@ test('a fake accepted shutdown that keeps the same control session cannot report
       const newline = bytes.indexOf('\n');
       if (newline < 0) return;
       const request = JSON.parse(bytes.slice(0, newline));
+      requests += 1;
       const result = request.method === 'daemon.status'
-        ? { version: 1, protocol: 'cowork-supervisor-control', running: true, session }
+        ? requests === 1
+          ? { version: 1, protocol: 'cowork-supervisor-control', running: true, session }
+          : undefined
         : request.method === 'daemon.shutdown'
           ? { accepted: true, session }
           : undefined;
+      if (result === undefined) return;
       socket.end(`${JSON.stringify({ version: 1, id: request.id, result })}\n`);
     });
   }, async (env) => {
+    const before = Date.now();
     const result = await runCli(['stop', '--json'], { env });
+    const elapsed = Date.now() - before;
     assert.equal(result.code, 4);
     assert.equal(result.stderr, '');
     assert.equal(JSON.parse(result.stdout).error.code, 'invalid_state');
+    assert(elapsed >= 11_000, `silent live endpoint was treated as stopped after ${elapsed}ms`);
+    assert(requests > 2, 'stop did not continue polling the accepting endpoint');
+  });
+});
+
+test('replacement of the authenticated control session proves the original session stopped', async () => {
+  const original = 'ab'.repeat(16);
+  const replacement = 'cd'.repeat(16);
+  let shutdownAccepted = false;
+  await withRpc((request) => {
+    if (request.method === 'daemon.status') {
+      return { result: {
+        version: 1,
+        protocol: 'cowork-supervisor-control',
+        running: true,
+        session: shutdownAccepted ? replacement : original,
+      } };
+    }
+    if (request.method === 'daemon.shutdown') {
+      shutdownAccepted = true;
+      return { result: { accepted: true, session: original } };
+    }
+    return { error: { code: 'method_not_found', message: 'unsupported' } };
+  }, async (rpc) => {
+    const result = await runCli(['stop', '--json'], { env: rpc.env });
+    assert.equal(result.code, 0, `${result.stdout} ${result.stderr}`);
+    assert.deepEqual(JSON.parse(result.stdout).result, { stopped: true });
   });
 });
 

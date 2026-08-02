@@ -43,7 +43,7 @@ interface DaemonControlStatus {
 type ControlProbe =
   | { kind: 'running'; status: DaemonControlStatus }
   | { kind: 'absent' }
-  | { kind: 'foreign' };
+  | { kind: 'occupied' };
 
 class CliError extends Error {
   readonly exitCode: number;
@@ -54,6 +54,16 @@ class CliError extends Error {
     this.name = 'CliError';
     this.exitCode = exitCode;
     this.code = code;
+  }
+}
+
+class RpcTransportError extends CliError {
+  readonly connected: boolean;
+
+  constructor(connected: boolean, message: string, options?: ErrorOptions) {
+    super(EXIT.daemonUnavailable, 'daemon_unavailable', message, options);
+    this.name = 'RpcTransportError';
+    this.connected = connected;
   }
 }
 
@@ -292,6 +302,7 @@ function rpcCall(
     let bytes = '';
     let size = 0;
     let settled = false;
+    let connected = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const finishError = (error: CliError): void => {
       if (settled) return;
@@ -301,9 +312,12 @@ function rpcCall(
       socket.destroy();
       rejectCall(error);
     };
-    timer = setTimeout(() => finishError(new CliError(EXIT.daemonUnavailable, 'daemon_unavailable', 'daemon did not answer the management socket')), timeoutMs);
+    timer = setTimeout(() => finishError(new RpcTransportError(connected, 'daemon did not answer the management socket')), timeoutMs);
     socket.setEncoding('utf8');
-    socket.once('connect', () => socket.write(request));
+    socket.once('connect', () => {
+      connected = true;
+      socket.write(request);
+    });
     socket.on('data', (chunk: string) => {
       if (settled) return;
       size += Buffer.byteLength(chunk, 'utf8');
@@ -340,12 +354,9 @@ function rpcCall(
     socket.once('error', (error: NodeJS.ErrnoException) => {
       if (settled) return;
       const unauthorized = error.code === 'EACCES' || error.code === 'EPERM';
-      finishError(new CliError(
-        unauthorized ? EXIT.unauthorized : EXIT.daemonUnavailable,
-        unauthorized ? 'unauthorized' : 'daemon_unavailable',
-        unauthorized ? 'management socket access denied' : 'cowork daemon is unavailable',
-        { cause: error },
-      ));
+      finishError(unauthorized
+        ? new CliError(EXIT.unauthorized, 'unauthorized', 'management socket access denied', { cause: error })
+        : new RpcTransportError(connected, 'cowork daemon is unavailable', { cause: error }));
     });
   });
 }
@@ -373,11 +384,11 @@ function isDaemonControlStatus(value: unknown): value is DaemonControlStatus {
 async function probeDaemon(config: CoworkConfig, timeoutMs = RPC_TIMEOUT_MS): Promise<ControlProbe> {
   try {
     const result = await rpcCall(join(config.stateDir, 'management.sock'), 'daemon.status', {}, timeoutMs);
-    return isDaemonControlStatus(result) ? { kind: 'running', status: result } : { kind: 'foreign' };
+    return isDaemonControlStatus(result) ? { kind: 'running', status: result } : { kind: 'occupied' };
   } catch (error) {
-    if (error instanceof CliError && error.code === 'daemon_unavailable') return { kind: 'absent' };
+    if (error instanceof RpcTransportError) return error.connected ? { kind: 'occupied' } : { kind: 'absent' };
     if (error instanceof CliError && error.code === 'unauthorized') throw error;
-    return { kind: 'foreign' };
+    return { kind: 'occupied' };
   }
 }
 
@@ -414,7 +425,7 @@ async function startDaemon(config: CoworkConfig): Promise<{ started: boolean; al
   const socketPath = join(config.stateDir, 'management.sock');
   const existing = await probeDaemon(config);
   if (existing.kind === 'running') return { started: false, alreadyRunning: true };
-  if (existing.kind === 'foreign' || await socketOpen(socketPath)) {
+  if (existing.kind === 'occupied' || await socketOpen(socketPath)) {
     throw new CliError(EXIT.invalidState, 'invalid_state', 'management socket is occupied by an endpoint without cowork supervisor control');
   }
   ensureRuntimeState(config);
@@ -440,20 +451,21 @@ async function startDaemon(config: CoworkConfig): Promise<{ started: boolean; al
 }
 
 async function stopDaemon(config: CoworkConfig): Promise<{ stopped: boolean }> {
+  const socketPath = join(config.stateDir, 'management.sock');
   const initial = await probeDaemon(config);
   if (initial.kind === 'absent') {
-    if (await socketOpen(join(config.stateDir, 'management.sock'))) {
+    if (await socketOpen(socketPath)) {
       throw new CliError(EXIT.invalidState, 'invalid_state', 'management socket is occupied by a non-cowork endpoint');
     }
     return { stopped: false };
   }
-  if (initial.kind === 'foreign') {
+  if (initial.kind === 'occupied') {
     throw new CliError(EXIT.invalidState, 'invalid_state', 'management endpoint did not prove cowork supervisor control');
   }
   let response: unknown;
   try {
     response = await rpcCall(
-      join(config.stateDir, 'management.sock'),
+      socketPath,
       'daemon.shutdown',
       { session: initial.status.session },
     );
@@ -469,8 +481,11 @@ async function stopDaemon(config: CoworkConfig): Promise<{ stopped: boolean }> {
   const deadline = Date.now() + STOP_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const observed = await probeDaemon(config, Math.min(500, Math.max(1, deadline - Date.now())));
+    if (observed.kind === 'running' && observed.status.session !== initial.status.session) {
+      return { stopped: true };
+    }
     if (observed.kind === 'absent'
-      || (observed.kind === 'running' && observed.status.session !== initial.status.session)) {
+      && !await socketOpen(socketPath, Math.min(500, Math.max(1, deadline - Date.now())))) {
       return { stopped: true };
     }
     await sleep(100);

@@ -140,6 +140,16 @@ test('room and invite schemas are strict, versioned, and enforce invite threshol
   const confirmed = { ...pending, state: 'live', recovery_confirmed: true };
   assert.equal(RoomSchema.parse(room({ invites: [confirmedSource, confirmed] })).invites[1].recovery_of, 'invite-1');
   assert.throws(() => RoomSchema.parse(room({ invites: [source, confirmed] })));
+
+  const confirmedRevoked = { ...pending, state: 'revoked', recovery_confirmed: true };
+  assert.equal(RoomSchema.parse(room({ invites: [confirmedSource, confirmedRevoked] })).invites[1].state, 'revoked');
+  assert.throws(
+    () => RoomSchema.parse(room({ invites: [source, confirmedRevoked] })),
+    /recovery lineage/i,
+  );
+  const discarded = { ...pending, state: 'revoked', recovery_confirmed: false };
+  assert.equal(RoomSchema.parse(room({ invites: [source, discarded] })).invites[1].recovery_confirmed, false);
+  assert.equal(RoomSchema.parse(room({ invites: [confirmedSource, discarded] })).invites[1].recovery_confirmed, false);
 });
 
 test('only the exact packet-pending room sentinel may have an empty identity CID', () => {

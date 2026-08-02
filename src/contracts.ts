@@ -178,7 +178,9 @@ export const RoomSchema = z.object({
       : invite.state === 'live' || invite.state === 'consumed' || invite.state === 'replacement_required'
         ? source?.state === 'revoked'
         : invite.state === 'revoked'
-          ? source?.state === 'replacement_required' || source?.state === 'revoked'
+          ? invite.recovery_confirmed === true
+            ? source?.state === 'revoked'
+            : source?.state === 'replacement_required' || source?.state === 'revoked'
           : false;
     if (!source || source.invite_id === invite.invite_id || !validSourceState) {
       context.addIssue({

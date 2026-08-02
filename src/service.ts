@@ -6,6 +6,7 @@ import {
   CreateRoomInputSchema,
   InviteModeSchema,
   LowerCrockfordUlidSchema,
+  PostMessageInputSchema,
   RoleSchema,
   RoomInviteSchema,
   RoomSchema,
@@ -17,6 +18,7 @@ import {
 } from './contracts.ts';
 import type { RoomPacket } from './packets.ts';
 import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
+import { IntakePump } from './intake.ts';
 
 const CROCKFORD = '0123456789abcdefghjkmnpqrstvwxyz';
 const ROOM_ROLE = 'room';
@@ -77,6 +79,7 @@ export class RoomService {
   private readonly nowValue: () => string;
   private readonly nextRoomId: () => string;
   private readonly nextMessageId: () => string;
+  private readonly intake: IntakePump;
 
   constructor(store: Store, packets: RoomPacketRegistry, options: RoomServiceOptions = {}) {
     this.store = store;
@@ -84,6 +87,10 @@ export class RoomService {
     this.nowValue = options.now ?? (() => new Date().toISOString());
     this.nextRoomId = options.roomId ?? generateUlid;
     this.nextMessageId = options.messageId ?? generateUlid;
+    this.intake = new IntakePump(store, packets, {
+      now: this.nowValue,
+      messageId: this.nextMessageId,
+    });
   }
 
   async createRoom(input: unknown): Promise<Room> {
@@ -400,6 +407,47 @@ export class RoomService {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const page = HistoryOptionsSchema.parse(options) as ArchiveReadOptions;
     return this.store.read(id, page);
+  }
+
+  async postMessage(roomId: string, input: unknown): Promise<MessageRecord> {
+    // Parse the caller-controlled object in full before consulting or assigning
+    // any host-owned authorship fields. Strict parsing rejects every author-like
+    // field, including spellings the service does not otherwise recognize.
+    const request = PostMessageInputSchema.parse(input);
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      if (room.state !== 'active') {
+        throw new RoomServiceError(`cannot post a room message while room "${id}" is not active`);
+      }
+      const appended = await this.store.append(id, {
+        version: 1,
+        kind: 'message',
+        room_id: id,
+        at: this.now(),
+        message_id: LowerCrockfordUlidSchema.parse(this.nextMessageId()),
+        author: {
+          identity: room.identity_cid,
+          display_name: room.identity_name,
+          role: ROOM_ROLE,
+        },
+        category: 'chat',
+        text: request.text,
+      });
+      if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong room message kind');
+      for (const seat of room.seats) {
+        await this.store.append(id, {
+          version: 1,
+          kind: 'relay_intent',
+          room_id: id,
+          at: this.now(),
+          message_id: appended.message_id,
+          recipient_identity: seat.identity,
+        });
+      }
+      await this.intake.resumePending(id);
+      return appended;
+    });
   }
 
   private async reconcileUnlocked(room: Room, packet: RoomPacket): Promise<Room> {

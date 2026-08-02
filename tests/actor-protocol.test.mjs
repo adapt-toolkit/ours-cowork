@@ -11,6 +11,7 @@ const ROOT = resolve(dirname(THIS_FILE), '..');
 const UNIT_DIR = resolve(ROOT, 'mufl_code');
 const FIXTURE_UNIT_DIR = resolve(ROOT, 'tests/fixtures');
 const SUCCESS_SENTINEL = 'COWORK_PACKET_DRIVER_SUCCESS';
+const FAILURE_SENTINEL = 'COWORK_PACKET_DRIVER_FAILURE';
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 async function unusedPort() {
@@ -75,8 +76,52 @@ function renderMessages(value) {
 }
 
 if (process.argv.includes('--packet-driver')) {
-let driverPassed = false;
 test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180_000 }, async (t) => {
+  const packets = [];
+  const cleanupErrors = [];
+  let broker;
+  let brokerExited;
+  let wrapper;
+  let driverFailure;
+  let driverCompleted = false;
+
+  t.after(async () => {
+    for (const packet of packets) {
+      if (packet.deliberatelyRemoved) continue;
+      try {
+        wrapper.remove_packet(packet.cid);
+      } catch (error) {
+        cleanupErrors.push(new Error(`failed to remove ${packet.name} (${packet.cid}): ${error.message}`));
+      }
+    }
+
+    if (broker) {
+      broker.kill('SIGKILL');
+      const brokerTimeout = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('local broker did not exit after SIGKILL')), 5_000).unref();
+      });
+      try {
+        await Promise.race([brokerExited, brokerTimeout]);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+
+    if (driverCompleted && cleanupErrors.length === 0) {
+      process.stdout.write(`${SUCCESS_SENTINEL}\n`);
+    } else {
+      process.stdout.write(`${FAILURE_SENTINEL} ${JSON.stringify({
+        driver: driverFailure?.stack ?? 'driver did not complete',
+        cleanup: cleanupErrors.map((error) => error.stack ?? error.message),
+      })}\n`);
+    }
+
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(cleanupErrors, 'packet driver cleanup failed');
+    }
+  });
+
+  try {
   const unitFile = readdirSync(UNIT_DIR).find((name) => name.endsWith('.muflo'));
   assert.ok(unitFile, 'compiled cowork actor missing; run scripts/compile-mufl.sh');
   const fixtureUnitFile = readdirSync(FIXTURE_UNIT_DIR).find((name) => name.endsWith('.muflo'));
@@ -91,22 +136,15 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   const port = await unusedPort();
   const brokerBin = resolve(ROOT, 'node_modules/.bin/adapt-broker');
   const brokerErrors = [];
-  const broker = spawn(process.execPath, [brokerBin, '--host', '127.0.0.1', '--port', String(port), '--test_mode'], {
+  broker = spawn(process.execPath, [brokerBin, '--host', '127.0.0.1', '--port', String(port), '--test_mode'], {
     cwd: ROOT,
     stdio: ['ignore', 'ignore', 'pipe'],
   });
-  broker.stderr.on('data', (chunk) => brokerErrors.push(chunk.toString()));
-  const packets = [];
-  let wrapper;
-  t.after(async () => {
-    for (const packet of packets) {
-      try { wrapper?.remove_packet(packet.cid); } catch { /* already removed */ }
-    }
-    const brokerExited = new Promise((done) => broker.once('exit', done));
-    broker.kill('SIGKILL');
-    await brokerExited;
-    if (driverPassed) process.stdout.write(`${SUCCESS_SENTINEL}\n`);
+  brokerExited = new Promise((done) => {
+    broker.once('error', (error) => done({ error }));
+    broker.once('exit', (code, signal) => done({ code, signal }));
   });
+  broker.stderr.on('data', (chunk) => brokerErrors.push(chunk.toString()));
   try {
     await waitForPort(port);
   } catch (error) {
@@ -219,6 +257,9 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   await sleep(1_000);
 
   const oneTimeRoom = await createPacket('one-time-room', `cowork-one-${Date.now()}`);
+  if (process.argv.includes('--deliberate-driver-failure')) {
+    assert.fail('deliberate packet driver assertion failure');
+  }
   const alice = await createPacket('alice', `cowork-alice-${Date.now()}`);
   const replay = await createPacket('replay', `cowork-replay-${Date.now()}`);
   await Promise.all([namePacket(oneTimeRoom, 'One-time room'), namePacket(alice, 'Alice'), namePacket(replay, 'Replay')]);
@@ -390,6 +431,7 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   const signingSecret = Buffer.from(readonly(room, '::actor::export_signing_secret').Serialize()).toString('hex');
   const originalCid = room.cid;
   wrapper.remove_packet(originalCid);
+  room.deliberatelyRemoved = true;
   const restored = await createPacket('restored-public-room', `cowork-restored-${Date.now()}`, signingSecret);
   assert.equal(restored.cid, originalCid);
   const parsedState = restored.pw.packet.ParseValue(new Uint8Array(stateBytes));
@@ -404,37 +446,93 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   await waitFor(() => inbox(restored).some((message) => message.text === 'after-import-sequence'), 'post-import message sequence');
   const afterImport = inbox(restored).find((message) => message.text === 'after-import-sequence');
   assert.equal(afterImport.msg_id, maxExportedMessageId + 1);
-  driverPassed = true;
+  driverCompleted = true;
+  } catch (error) {
+    driverFailure = error;
+    throw error;
+  }
 });
 } else {
-  test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180_000 }, async () => {
-    const child = spawn(process.execPath, [THIS_FILE, '--packet-driver'], {
+  async function runPacketDriver(t, { extraArgs = [], timeoutMs }) {
+    const child = spawn(process.execPath, [THIS_FILE, '--packet-driver', ...extraArgs], {
       cwd: ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const output = [];
-    let sawSuccess = false;
-    child.stdout.on('data', (chunk) => {
-      const text = chunk.toString();
-      output.push(text);
-      if (!sawSuccess && output.join('').includes(SUCCESS_SENTINEL)) {
-        sawSuccess = true;
-        child.kill('SIGKILL');
-      }
-    });
-    child.stderr.on('data', (chunk) => output.push(chunk.toString()));
-    const result = await new Promise((done, reject) => {
-      child.once('error', reject);
+    let output = '';
+    let settleOutcome;
+    let killRequested = false;
+    const outcomePromise = new Promise((done) => { settleOutcome = done; });
+    const exitedPromise = new Promise((done) => {
+      child.once('error', (error) => done({ code: null, signal: null, error }));
       child.once('exit', (code, signal) => done({ code, signal }));
     });
+
+    function capture(chunk) {
+      output += chunk.toString();
+      if (output.includes(FAILURE_SENTINEL)) {
+        settleOutcome({ kind: 'failure' });
+      } else if (output.includes(SUCCESS_SENTINEL)) {
+        settleOutcome({ kind: 'success' });
+      }
+    }
+
+    child.stdout.on('data', capture);
+    child.stderr.on('data', capture);
+
+    async function killAndReap() {
+      if (!killRequested) {
+        killRequested = true;
+        child.kill('SIGKILL');
+      }
+      return exitedPromise;
+    }
+
+    // This is intentionally redundant with the normal-path reap below: every
+    // assertion/exception path owned by node:test still kills and awaits the
+    // native wrapper child.
+    t.after(async () => { await killAndReap(); });
+
+    let watchdog;
+    const timeoutPromise = new Promise((done) => {
+      watchdog = setTimeout(() => done({ kind: 'timeout' }), timeoutMs);
+    });
+    const outcome = await Promise.race([
+      outcomePromise,
+      exitedPromise.then((result) => ({ kind: 'exit', result })),
+      timeoutPromise,
+    ]);
+    clearTimeout(watchdog);
+    const result = await killAndReap();
+    return { outcome, result, output };
+  }
+
+  function diagnostics(run) {
+    const exit = run.result.error?.message ?? run.result.signal ?? run.result.code;
+    return `packet driver ${run.outcome.kind} (${exit})\n${run.output.slice(-12_000)}`;
+  }
+
+  test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180_000 }, async (t) => {
+    const run = await runPacketDriver(t, { timeoutMs: 120_000 });
     assert.equal(
-      sawSuccess,
-      true,
-      `packet driver exited before its success sentinel (${result.signal ?? result.code})\n${output.join('').slice(-12_000)}`,
+      run.outcome.kind,
+      'success',
+      diagnostics(run),
     );
-    assert.ok(
-      result.signal === 'SIGKILL',
-      `packet driver ended unexpectedly (${result.signal ?? result.code})\n${output.join('').slice(-12_000)}`,
+    assert.equal(
+      run.result.signal,
+      'SIGKILL',
+      diagnostics(run),
     );
+  });
+
+  test('packet driver assertion failures report and terminate promptly', { timeout: 30_000 }, async (t) => {
+    const startedAt = Date.now();
+    const run = await runPacketDriver(t, {
+      extraArgs: ['--deliberate-driver-failure'],
+      timeoutMs: 20_000,
+    });
+    assert.equal(run.outcome.kind, 'failure', diagnostics(run));
+    assert.match(run.output, /deliberate packet driver assertion failure/, diagnostics(run));
+    assert.ok(Date.now() - startedAt < 20_000, diagnostics(run));
   });
 }

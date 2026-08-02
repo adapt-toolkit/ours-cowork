@@ -63,6 +63,11 @@ test('dispatcher strictly validates the versioned envelope and shares one route 
   const missing = await dispatcher.dispatch({ version: 1, id: 1, method: 'missing', params: {} });
   assert.equal(missing.error.code, 'method_not_found');
   assert.equal(calls.length, 1);
+  for (const method of ['toString', 'constructor', '__proto__']) {
+    const response = await dispatcher.dispatch({ version: 1, id: method, method, params: {} });
+    assert.equal(response.error.code, 'method_not_found');
+    assert.equal(response.error.message, 'method not found');
+  }
 });
 
 test('the exhaustive service route table marks every route auth:true', () => {
@@ -174,4 +179,77 @@ test('stop rejects new dispatcher work, awaits in-flight work, and is idempotent
   assert.deepEqual(await pending, { version: 1, id: 1, result: 'done' });
   await drain;
   assert.equal(drained, true);
+});
+
+test('shutdown bounds an authenticated partial HTTP body and destroys the slow connection', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-slowloris-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const token = 'ef'.repeat(32);
+  const dispatcher = new RpcDispatcher({ ping: { auth: true, run: async () => null } });
+  const server = new TransportServer({
+    socketPath: join(dir, 'management.sock'), rest: { enabled: true, port: 0 }, token, dispatcher,
+  });
+  await server.start();
+  const socket = net.createConnection(server.restAddress.port, '127.0.0.1');
+  await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
+  socket.write(`POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer ${token}\r\nContent-Length: 1000\r\n\r\n{`);
+  const outcome = await Promise.race([
+    server.stop().then(() => 'stopped'),
+    new Promise((resolve) => setTimeout(() => resolve('timeout'), 1_500)),
+  ]);
+  assert.equal(outcome, 'stopped');
+  await Promise.race([
+    new Promise((resolve) => socket.once('close', resolve)),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('slow HTTP socket remained open')), 500)),
+  ]);
+});
+
+test('shutdown closes an idle authenticated HTTP keep-alive connection', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-keepalive-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const token = 'a1'.repeat(32);
+  const dispatcher = new RpcDispatcher({ ping: { auth: true, run: async () => ({ pong: true }) } });
+  const server = new TransportServer({
+    socketPath: join(dir, 'management.sock'), rest: { enabled: true, port: 0 }, token, dispatcher,
+  });
+  await server.start();
+  const socket = net.createConnection(server.restAddress.port, '127.0.0.1');
+  socket.setEncoding('utf8');
+  await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
+  const body = JSON.stringify({ version: 1, id: 1, method: 'ping', params: {} });
+  socket.write(`POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\nAuthorization: Bearer ${token}\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('keep-alive response timed out')), 1_000);
+    socket.on('data', (chunk) => {
+      if (!chunk.includes('200 OK')) return;
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+  const closed = new Promise((resolve) => socket.once('close', resolve));
+  await server.stop();
+  await Promise.race([
+    closed,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('idle keep-alive remained open')), 500)),
+  ]);
+});
+
+test('shutdown preserves a replacement Unix socket at the same path', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-socket-owner-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'management.sock');
+  const dispatcher = new RpcDispatcher({ ping: { auth: true, run: async () => null } });
+  const transport = new TransportServer({ socketPath: path, rest: { enabled: false, port: 1 }, dispatcher });
+  await transport.start();
+  const moved = `${path}.old`;
+  const { renameSync } = await import('node:fs');
+  renameSync(path, moved);
+  const replacement = net.createServer();
+  await new Promise((resolve, reject) => {
+    replacement.once('error', reject);
+    replacement.listen(path, resolve);
+  });
+  await transport.stop();
+  assert(lstatSync(path).isSocket());
+  await new Promise((resolve) => replacement.close(resolve));
 });

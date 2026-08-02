@@ -1,4 +1,4 @@
-import { timingSafeEqual as nodeTimingSafeEqual } from 'node:crypto';
+import { randomBytes, timingSafeEqual as nodeTimingSafeEqual } from 'node:crypto';
 import * as http from 'node:http';
 import * as net from 'node:net';
 import * as nodeFs from 'node:fs';
@@ -6,6 +6,11 @@ import * as nodeFs from 'node:fs';
 import { z } from 'zod';
 
 export const MAX_REQUEST_BYTES = 1024 * 1024;
+export const HTTP_HEADERS_TIMEOUT_MS = 5_000;
+export const HTTP_REQUEST_TIMEOUT_MS = 10_000;
+export const HTTP_BODY_IDLE_TIMEOUT_MS = 5_000;
+export const HTTP_KEEP_ALIVE_TIMEOUT_MS = 5_000;
+const SHUTDOWN_GRACE_MS = 250;
 
 const RpcIdSchema = z.union([
   z.string().min(1).max(256),
@@ -38,7 +43,9 @@ export class RpcDispatcher {
   private accepting = true;
 
   constructor(routes: AuthenticatedRouteTable) {
-    this.routes = Object.freeze({ ...routes });
+    const owned = Object.create(null) as Record<string, AuthenticatedRoute>;
+    for (const [method, route] of Object.entries(routes)) owned[method] = route;
+    this.routes = Object.freeze(owned);
     for (const [method, route] of Object.entries(this.routes)) {
       if (!method || route.auth !== true || typeof route.run !== 'function') {
         throw new TypeError(`RPC route "${method}" is not an authenticated route`);
@@ -56,7 +63,7 @@ export class RpcDispatcher {
     }
     const request = parsed.data;
     if (!this.accepting) return Promise.resolve(errorResponse(request.id, 'shutting_down', 'daemon is shutting down'));
-    const route = this.routes[request.method];
+    const route = Object.hasOwn(this.routes, request.method) ? this.routes[request.method] : undefined;
     if (!route) return Promise.resolve(errorResponse(request.id, 'method_not_found', 'method not found'));
     const operation = Promise.resolve().then(() => route.run(request.params)).then(
       (result): RpcResponse => ({ version: 1, id: request.id, result }),
@@ -164,11 +171,13 @@ export class TransportServer {
   private readonly fs: typeof nodeFs;
   private readonly compare: (left: Uint8Array, right: Uint8Array) => boolean;
   private readonly sockets = new Set<net.Socket>();
+  private readonly httpSockets = new Set<net.Socket>();
   private readonly requests = new Set<Promise<void>>();
   private unixServer?: net.Server;
   private httpServer?: http.Server;
   private startWork?: Promise<void>;
   private stopWork?: Promise<void>;
+  private ownedSocket?: { dev: number; ino: number; uid: number };
 
   constructor(options: TransportServerOptions) {
     this.options = options;
@@ -197,8 +206,17 @@ export class TransportServer {
     try {
       await listen(unix, this.options.socketPath);
       this.fs.chmodSync(this.options.socketPath, 0o600);
+      this.ownedSocket = this.captureOwnedSocket();
       if (this.options.rest.enabled) {
         const rest = http.createServer((request, response) => this.track(this.handleRest(request, response)));
+        rest.headersTimeout = HTTP_HEADERS_TIMEOUT_MS;
+        rest.requestTimeout = HTTP_REQUEST_TIMEOUT_MS;
+        rest.keepAliveTimeout = HTTP_KEEP_ALIVE_TIMEOUT_MS;
+        rest.on('connection', (socket) => {
+          this.httpSockets.add(socket);
+          socket.setTimeout(HTTP_KEEP_ALIVE_TIMEOUT_MS, () => socket.destroy());
+          socket.on('close', () => this.httpSockets.delete(socket));
+        });
         this.httpServer = rest;
         await listen(rest, this.options.rest.port, '127.0.0.1');
       }
@@ -216,12 +234,20 @@ export class TransportServer {
 
   private async stopUnlocked(): Promise<void> {
     this.options.dispatcher.beginShutdown();
+    const httpServer = this.httpServer;
     const closing = this.closeServers();
     for (const socket of this.sockets) socket.end();
+    await Promise.race([
+      Promise.allSettled([...this.requests]),
+      new Promise<void>((resolveGrace) => setTimeout(resolveGrace, SHUTDOWN_GRACE_MS)),
+    ]);
+    httpServer?.closeAllConnections?.();
+    for (const socket of this.httpSockets) socket.destroy();
     await Promise.allSettled([...this.requests]);
     await this.options.dispatcher.drain();
     for (const socket of this.sockets) socket.destroy();
     this.sockets.clear();
+    this.httpSockets.clear();
     await closing;
     this.removeOwnedSocket();
   }
@@ -338,21 +364,67 @@ export class TransportServer {
   }
 
   private removeOwnedSocket(): void {
+    const owned = this.ownedSocket;
+    if (!owned) return;
     try {
       const stat = this.fs.lstatSync(this.options.socketPath);
-      if (stat.isSocket()) this.fs.unlinkSync(this.options.socketPath);
+      if (!stat.isSocket() || stat.isSymbolicLink() || stat.dev !== owned.dev || stat.ino !== owned.ino
+        || stat.uid !== owned.uid || (stat.mode & 0o777) !== 0o600) return;
+      this.fs.unlinkSync(this.options.socketPath);
+      this.ownedSocket = undefined;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
 
+  private captureOwnedSocket(): { dev: number; ino: number; uid: number } {
+    const stat = this.fs.lstatSync(this.options.socketPath);
+    const uid = typeof process.getuid === 'function' ? process.getuid() : stat.uid;
+    if (!stat.isSocket() || stat.isSymbolicLink() || stat.uid !== uid || (stat.mode & 0o777) !== 0o600) {
+      throw new Error('management socket is not an owned 0600 Unix socket');
+    }
+    return { dev: stat.dev, ino: stat.ino, uid: stat.uid };
+  }
+
   private async closeServers(): Promise<void> {
+    const protectedPath = this.protectReplacementSocket();
     await Promise.allSettled([
       closeServer(this.httpServer),
       closeServer(this.unixServer),
     ]);
+    if (protectedPath) this.restoreReplacementSocket(protectedPath);
     this.httpServer = undefined;
     this.unixServer = undefined;
+  }
+
+  private protectReplacementSocket(): { path: string; dev: number; ino: number } | undefined {
+    const owned = this.ownedSocket;
+    if (!owned) return undefined;
+    let current: nodeFs.Stats;
+    try { current = this.fs.lstatSync(this.options.socketPath); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+    if (current.dev === owned.dev && current.ino === owned.ino) return undefined;
+    if (!current.isSocket() || current.isSymbolicLink()) return undefined;
+    const protectedPath = `${this.options.socketPath}.replacement-${process.pid}-${randomBytes(6).toString('hex')}`;
+    this.fs.renameSync(this.options.socketPath, protectedPath);
+    return { path: protectedPath, dev: current.dev, ino: current.ino };
+  }
+
+  private restoreReplacementSocket(protectedSocket: { path: string; dev: number; ino: number }): void {
+    const protectedStat = this.fs.lstatSync(protectedSocket.path);
+    if (protectedStat.dev !== protectedSocket.dev || protectedStat.ino !== protectedSocket.ino
+      || !protectedStat.isSocket() || protectedStat.isSymbolicLink()) {
+      throw new Error('replacement management socket changed while protected');
+    }
+    try {
+      this.fs.lstatSync(this.options.socketPath);
+      throw new Error('management socket path was reoccupied during shutdown');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    this.fs.renameSync(protectedSocket.path, this.options.socketPath);
   }
 }
 
@@ -383,11 +455,28 @@ function readBody(request: http.IncomingMessage, limit: number): Promise<{ ok: t
     const chunks: Buffer[] = [];
     let size = 0;
     let settled = false;
+    let idle = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      request.destroy(new Error('request body timed out'));
+      rejectBody(new Error('request body timed out'));
+    }, HTTP_BODY_IDLE_TIMEOUT_MS);
+    const resetIdle = (): void => {
+      clearTimeout(idle);
+      idle = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        request.destroy(new Error('request body timed out'));
+        rejectBody(new Error('request body timed out'));
+      }, HTTP_BODY_IDLE_TIMEOUT_MS);
+    };
     request.on('data', (chunk: Buffer) => {
       if (settled) return;
+      resetIdle();
       size += chunk.length;
       if (size > limit) {
         settled = true;
+        clearTimeout(idle);
         request.resume();
         resolveBody({ ok: false });
         return;
@@ -395,12 +484,26 @@ function readBody(request: http.IncomingMessage, limit: number): Promise<{ ok: t
       chunks.push(chunk);
     });
     request.on('end', () => {
-      if (!settled) resolveBody({ ok: true, bytes: Buffer.concat(chunks, size) });
+      if (!settled) {
+        settled = true;
+        clearTimeout(idle);
+        resolveBody({ ok: true, bytes: Buffer.concat(chunks, size) });
+      }
     });
     request.on('aborted', () => {
-      if (!settled) rejectBody(new Error('request body aborted'));
+      if (!settled) {
+        settled = true;
+        clearTimeout(idle);
+        rejectBody(new Error('request body aborted'));
+      }
     });
-    request.on('error', rejectBody);
+    request.on('error', (error) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(idle);
+        rejectBody(error);
+      }
+    });
   });
 }
 

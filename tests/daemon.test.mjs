@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import * as realFs from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -65,6 +67,38 @@ test('runtime state and token reject insecure modes and symlinks; token creation
       { random: () => { throw new Error('entropy unavailable'); } },
     ), /generate management token/);
     assert.equal(existsSync(join(failedDir, 'management-token')), false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('state setup rejects a hostile writable ancestor and config validates the opened fd after a swap', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-path-race-'));
+  try {
+    const hostile = join(dir, 'hostile');
+    realFs.mkdirSync(hostile, { mode: 0o777 });
+    chmodSync(hostile, 0o777);
+    assert.throws(() => ensureRuntimeState({
+      version: 1, brokerUrl: 'ws://broker', stateDir: join(hostile, 'state'), rest: { enabled: false, port: 3010 },
+    }), /unsafe writable ancestor/i);
+
+    const configPath = join(dir, 'config.json');
+    const config = { version: 1, brokerUrl: 'ws://broker', stateDir: join(dir, 'state'), rest: { enabled: false, port: 3010 } };
+    writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
+    const replacement = join(dir, 'replacement.json');
+    writeFileSync(replacement, JSON.stringify(config), { mode: 0o644 });
+    let swapped = false;
+    const fs = new Proxy(realFs, {
+      get(target, property) {
+        if (property === 'openSync') return (path, ...args) => {
+          if (!swapped && path === configPath) {
+            swapped = true;
+            renameSync(replacement, configPath);
+          }
+          return target.openSync(path, ...args);
+        };
+        return target[property];
+      },
+    });
+    assert.throws(() => loadConfig({ OURS_COWORK_CONFIG: configPath }, { fs }), /config|0600|mode/i);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -174,7 +208,9 @@ test('partial boot failure rolls back transports, PID, packets, host, and lock',
     host: new FakeHost(events),
     store: { async list() { return [{ room_id: '01jz6y7n8p9q0r1s2t3v4w5x6y', state: 'active' }]; } },
     registry: new FakeRegistry(events),
-    service: { ...new FakeService(events, []), recoverPacket: async () => { throw new Error('restore crash'); } },
+    service: Object.assign(new FakeService(events, []), {
+      recoverPacket: async () => { throw new Error('restore crash'); },
+    }),
     transports: { async start() { events.push('transports.start'); }, async stop() { events.push('transports.stop'); } },
     writePid: () => events.push('pid.write'), removePid: () => events.push('pid.remove'),
   });
@@ -209,4 +245,129 @@ test('SIGINT and SIGTERM share one idempotent shutdown and remove listeners', as
   assert.equal(events.filter((event) => event === 'host.close').length, 1);
   assert.equal(signals.listeners.size, 0);
   rmSync(dir, { recursive: true, force: true });
+});
+
+test('shutdown during delayed wrapper boot cancels every later boot phase before releasing ownership', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-boot-cancel-'));
+  const events = [];
+  let releaseBoot;
+  const host = {
+    boot() { events.push('wrapper.begin'); return new Promise((resolve) => { releaseBoot = () => { events.push('wrapper.end'); resolve(); }; }); },
+    async shutdown() { events.push('host.shutdown'); },
+    close() { assert.fail('legacy close must not be used when shutdown exists'); },
+  };
+  const daemon = new CoworkDaemon({
+    config: { version: 1, brokerUrl: 'ws://broker', stateDir: dir, rest: { enabled: false, port: 3010 } },
+    prepare: () => ({ socketPath: join(dir, 'management.sock') }),
+    lock: () => ({ release: () => events.push('lock.release') }), host,
+    store: { async list() { events.push('rooms.list'); return []; } },
+    registry: new FakeRegistry(events), service: new FakeService(events, []),
+    transports: { async start() { events.push('transports.start'); }, async stop() { events.push('transports.stop'); } },
+    writePid: () => events.push('pid.write'), removePid: () => events.push('pid.remove'),
+  });
+  const boot = daemon.boot();
+  await Promise.resolve();
+  const stopped = daemon.shutdown();
+  releaseBoot();
+  await assert.rejects(boot, /cancel|shutdown/i);
+  await stopped;
+  assert.deepEqual(events, [
+    'wrapper.begin', 'wrapper.end', 'service.reject', 'service.drain', 'pid.remove',
+    'packets.remove', 'host.shutdown', 'lock.release',
+  ]);
+  assert(!events.includes('rooms.list'));
+  assert(!events.includes('transports.start'));
+  assert(!events.includes('pid.write'));
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('rejected host boot and transport start still invoke their idempotent cleanup boundaries', async () => {
+  const room = { room_id: '01jz6y7n8p9q0r1s2t3v4w5x6y', state: 'active' };
+  for (const failAt of ['host', 'transport']) {
+    const dir = mkdtempSync(join(tmpdir(), `cowork-attempt-${failAt}-`));
+    const events = [];
+    const host = {
+      async boot() { events.push('host.boot'); if (failAt === 'host') throw new Error('primary boot failure'); },
+      async shutdown() { events.push('host.shutdown'); }, close() {},
+    };
+    const transports = {
+      async start() { events.push('transport.start'); if (failAt === 'transport') throw new Error('primary transport failure'); },
+      async stop() { events.push('transport.stop'); },
+    };
+    const daemon = new CoworkDaemon({
+      config: { version: 1, brokerUrl: 'ws://broker', stateDir: dir, rest: { enabled: false, port: 3010 } },
+      prepare: () => ({ socketPath: join(dir, 'management.sock') }), lock: () => ({ release() { events.push('lock.release'); } }),
+      host, store: { async list() { return failAt === 'transport' ? [room] : []; } }, registry: new FakeRegistry(events),
+      service: new FakeService(events, []), transports,
+      writePid() {}, removePid() { events.push('pid.remove'); },
+    });
+    await assert.rejects(daemon.boot(), failAt === 'host' ? /primary boot/ : /primary transport/);
+    assert(events.includes('host.shutdown'));
+    if (failAt === 'transport') assert(events.includes('transport.stop'));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('boot failure preserves the primary error and aggregates cleanup failures without resurrection', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-error-aggregate-'));
+  const primary = new Error('primary host boot failure');
+  const cleanup = new Error('host cleanup failure');
+  const events = [];
+  const daemon = new CoworkDaemon({
+    config: { version: 1, brokerUrl: 'ws://broker', stateDir: dir, rest: { enabled: false, port: 3010 } },
+    prepare: () => ({ socketPath: join(dir, 'management.sock') }),
+    lock: () => ({ release() { events.push('lock.release'); } }),
+    host: { async boot() { throw primary; }, async shutdown() { throw cleanup; }, close() {} },
+    store: { async list() { return []; } }, registry: new FakeRegistry(events), service: new FakeService(events, []),
+    transports: { async start() {}, async stop() {} }, writePid() {}, removePid() { events.push('pid.remove'); },
+  });
+  await assert.rejects(daemon.boot(), (error) => {
+    assert(error instanceof AggregateError);
+    assert.equal(error.cause, primary);
+    assert.equal(error.errors[0], primary);
+    assert(error.errors.some((entry) => entry instanceof AggregateError && entry.errors.includes(cleanup)));
+    return true;
+  });
+  await assert.rejects(daemon.shutdown(), (error) => error instanceof AggregateError && error.errors.includes(cleanup));
+  assert.deepEqual(events.slice(-3), ['pid.remove', 'packets.remove', 'lock.release']);
+  assert(!events.includes('transports.start'));
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('real executable owns SIGINT/SIGTERM after SDK boot and exits without runtime endpoints', async (t) => {
+  for (const shutdownSignal of ['SIGINT', 'SIGTERM']) {
+    const dir = mkdtempSync(join(tmpdir(), `cowork-real-${shutdownSignal.toLowerCase()}-`));
+    const child = spawn(process.execPath, [new URL('../src/daemon.ts', import.meta.url).pathname], {
+      env: {
+        ...process.env,
+        OURS_COWORK_STATE_DIR: dir,
+        OURS_COWORK_BROKER_URL: 'ws://127.0.0.1:1',
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); rmSync(dir, { recursive: true, force: true }); });
+    const pidPath = join(dir, 'daemon.pid');
+    const socketPath = join(dir, 'management.sock');
+    const deadline = Date.now() + 10_000;
+    while ((!existsSync(pidPath) || !existsSync(socketPath)) && Date.now() < deadline) {
+      if (child.exitCode !== null) assert.fail(`daemon exited during boot (${child.exitCode}): ${stderr}`);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert(existsSync(pidPath), `daemon did not write PID: ${stderr}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(child.exitCode, null, `daemon exited before ${shutdownSignal}: ${stderr}`);
+    const exitWork = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
+    child.kill(shutdownSignal);
+    const exited = await Promise.race([
+      exitWork,
+      new Promise((resolve) => setTimeout(() => resolve('timeout'), 3_000)),
+    ]);
+    assert.notEqual(exited, 'timeout', `daemon retained SDK reconnect resources after ${shutdownSignal}: ${stderr}`);
+    assert.deepEqual(exited, { code: 0, signal: null }, stderr);
+    assert.equal(existsSync(socketPath), false);
+    assert.equal(existsSync(pidPath), false);
+  }
 });

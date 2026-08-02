@@ -111,12 +111,10 @@ export function ensureRuntimeState(config: CoworkConfig, io: ConfigIo = {}): Run
   const parsed = CoworkConfigSchema.parse(config);
   const fs = io.fs ?? nodeFs;
   const stateDir = resolve(parsed.stateDir);
-  assertNoSymlinkComponents(fs, stateDir, 'state directory');
+  assertSecureAncestors(fs, stateDir, 'state directory');
   const existing = lstatIfPresent(fs, stateDir);
   if (!existing) {
-    fs.mkdirSync(stateDir, { recursive: true, mode: DIRECTORY_MODE });
-    fs.chmodSync(stateDir, DIRECTORY_MODE);
-    fsyncDirectory(fs, dirname(stateDir));
+    createSecureDirectoryTree(fs, stateDir, 'state directory');
   }
   assertSecureDirectory(fs, stateDir, 'state directory');
 
@@ -124,7 +122,7 @@ export function ensureRuntimeState(config: CoworkConfig, io: ConfigIo = {}): Run
   const rooms = lstatIfPresent(fs, roomsPath);
   if (!rooms) {
     fs.mkdirSync(roomsPath, { mode: DIRECTORY_MODE });
-    fs.chmodSync(roomsPath, DIRECTORY_MODE);
+    secureOpenedDirectory(fs, roomsPath, 'rooms directory');
     fsyncDirectory(fs, stateDir);
   }
   assertSecureDirectory(fs, roomsPath, 'rooms directory');
@@ -190,15 +188,67 @@ function loadOrCreateToken(
   }
 }
 
-function assertNoSymlinkComponents(fs: typeof nodeFs, path: string, label: string): void {
+function assertSecureAncestors(fs: typeof nodeFs, path: string, label: string): void {
   const absolute = isAbsolute(path) ? path : resolve(path);
   const root = parse(absolute).root;
   let cursor = root;
-  for (const component of absolute.slice(root.length).split('/').filter(Boolean)) {
+  const components = absolute.slice(root.length).split('/').filter(Boolean);
+  for (const [index, component] of components.entries()) {
     cursor = join(cursor, component);
     const stat = lstatIfPresent(fs, cursor);
     if (stat?.isSymbolicLink()) throw new CoworkConfigError(`${label} must not traverse a symbolic link (symlink): ${cursor}`);
     if (!stat) break;
+    if (!stat.isDirectory()) {
+      if (index === components.length - 1) return;
+      throw new CoworkConfigError(`${label} ancestor is not a directory: ${cursor}`);
+    }
+    if (index < components.length - 1) assertTrustedAncestor(stat, cursor, label);
+  }
+}
+
+function assertTrustedAncestor(stat: nodeFs.Stats, path: string, label: string): void {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : stat.uid;
+  const trustedStickyDirectory = (stat.mode & 0o1000) !== 0;
+  if (stat.uid !== uid && !trustedStickyDirectory) {
+    throw new CoworkConfigError(`${label} has a non-owned ancestor: ${path}`);
+  }
+  const writableByOthers = (stat.mode & 0o022) !== 0;
+  if (writableByOthers && !trustedStickyDirectory) {
+    throw new CoworkConfigError(`${label} has an unsafe writable ancestor: ${path}`);
+  }
+}
+
+function createSecureDirectoryTree(fs: typeof nodeFs, path: string, label: string): void {
+  const missing: string[] = [];
+  let cursor = path;
+  while (!lstatIfPresent(fs, cursor)) {
+    missing.push(cursor);
+    const parent = dirname(cursor);
+    if (parent === cursor) throw new CoworkConfigError(`cannot locate an existing ancestor for ${label}`);
+    cursor = parent;
+  }
+  assertSecureAncestors(fs, path, label);
+  for (const directory of missing.reverse()) {
+    fs.mkdirSync(directory, { mode: DIRECTORY_MODE });
+    secureOpenedDirectory(fs, directory, label);
+    fsyncDirectory(fs, dirname(directory));
+  }
+}
+
+function secureOpenedDirectory(fs: typeof nodeFs, path: string, label: string): void {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(path, nodeFs.constants.O_RDONLY | NO_FOLLOW);
+    const opened = fs.fstatSync(fd);
+    const current = fs.lstatSync(path);
+    if (!opened.isDirectory() || current.isSymbolicLink()
+      || opened.dev !== current.dev || opened.ino !== current.ino) {
+      throw new CoworkConfigError(`${label} changed while opening`);
+    }
+    fs.fchmodSync(fd, DIRECTORY_MODE);
+    fs.fsyncSync(fd);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
   }
 }
 
@@ -232,7 +282,9 @@ function readSecureFile(fs: typeof nodeFs, path: string, label: string): Buffer 
     fd = fs.openSync(path, nodeFs.constants.O_RDONLY | NO_FOLLOW);
     const opened = fs.fstatSync(fd);
     const current = fs.lstatSync(path);
-    if (!opened.isFile() || opened.nlink !== 1 || current.dev !== opened.dev || current.ino !== opened.ino) {
+    if (!opened.isFile() || opened.nlink !== 1 || (opened.mode & 0o777) !== FILE_MODE
+      || (typeof process.getuid === 'function' && opened.uid !== process.getuid())
+      || current.isSymbolicLink() || current.dev !== opened.dev || current.ino !== opened.ino) {
       throw new CoworkConfigError(`${label} changed while opening`);
     }
     return fs.readFileSync(fd);

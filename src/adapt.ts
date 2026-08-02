@@ -268,6 +268,12 @@ function asError(error: unknown): Error {
 
 export interface AdaptHostOptions {
   unit?: Unit;
+  /** SDK 0.10.12 has no public wrapper stop; embedders may supply one when available. */
+  shutdownWrapper?: (wrapper: AdaptWrapper) => void | Promise<void>;
+}
+
+export interface AdaptHostShutdownResult {
+  requiresProcessExit: boolean;
 }
 
 export interface CreatePacketOptions {
@@ -281,6 +287,7 @@ export class AdaptHost {
   private readonly brokerUrl: string;
   private readonly log: Logger;
   readonly unit: Unit;
+  private readonly shutdownWrapper?: (wrapper: AdaptWrapper) => void | Promise<void>;
 
   constructor(
     brokerUrl: string,
@@ -290,6 +297,7 @@ export class AdaptHost {
     this.brokerUrl = brokerUrl;
     this.log = log;
     this.unit = options.unit ?? locateUnit();
+    this.shutdownWrapper = options.shutdownWrapper;
   }
 
   get packetCount(): number {
@@ -403,7 +411,34 @@ export class AdaptHost {
         errors.push(asError(error));
       }
     }
+    this.wrapper = undefined;
     if (errors.length) throw new AggregateError(errors, 'failed to remove all hosted packets');
+  }
+
+  /**
+   * Release every public SDK resource. SDK 0.10.12 exposes packet disposal but
+   * not its private broker client's stop(), so a real native wrapper reports
+   * that the owning process must exit after graceful daemon cleanup.
+   */
+  async shutdown(): Promise<AdaptHostShutdownResult> {
+    const wrapper = this.wrapper;
+    this.close();
+    if (!wrapper) return { requiresProcessExit: false };
+    if (this.shutdownWrapper) {
+      await this.shutdownWrapper(wrapper);
+      return { requiresProcessExit: false };
+    }
+    const futureWrapper = wrapper as AdaptWrapper & {
+      stop?: () => void | Promise<void>;
+      shutdown?: () => void | Promise<void>;
+      dispose?: () => void | Promise<void>;
+    };
+    const publicStop = futureWrapper.shutdown ?? futureWrapper.stop ?? futureWrapper.dispose;
+    if (typeof publicStop === 'function') {
+      await publicStop.call(wrapper);
+      return { requiresProcessExit: false };
+    }
+    return { requiresProcessExit: true };
   }
 }
 

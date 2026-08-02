@@ -502,6 +502,25 @@ test('daemon unhosting removes runtime packets without purging restart state', a
   rmSync(root, { recursive: true, force: true });
 });
 
+test('AdaptHost shutdown uses an explicit wrapper stop adapter and otherwise requires process exit', async () => {
+  const unit = { dir: '/unused', hash: 'fake', contents: new Uint8Array() };
+  const calls = [];
+  const adapted = new AdaptHost('ws://broker', () => {}, {
+    unit,
+    shutdownWrapper: async (wrapper) => calls.push(wrapper),
+  });
+  const wrapper = { packet_manager: {} };
+  adapted.wrapper = wrapper;
+  assert.deepEqual(await adapted.shutdown(), { requiresProcessExit: false });
+  assert.deepEqual(calls, [wrapper]);
+  assert.equal(adapted.wrapper, undefined);
+
+  const nativeBoundary = new AdaptHost('ws://broker', () => {}, { unit });
+  nativeBoundary.wrapper = { packet_manager: {} };
+  assert.deepEqual(await nativeBoundary.shutdown(), { requiresProcessExit: true });
+  assert.equal(nativeBoundary.wrapper, undefined);
+});
+
 test('a submitted timeout terminalizes the packet without enqueueing or pairing a later result', async () => {
   const { packet, pw, submitted, terminal } = fakePacket('timeout');
   const first = packet.mutatingTx('first', {}, undefined, 10);

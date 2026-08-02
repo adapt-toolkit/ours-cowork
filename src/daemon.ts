@@ -23,6 +23,13 @@ export interface DaemonLock {
   release(): void;
 }
 
+export class DaemonBootCancelledError extends Error {
+  constructor() {
+    super('cowork daemon boot cancelled by shutdown');
+    this.name = 'DaemonBootCancelledError';
+  }
+}
+
 export interface LockOptions {
   fs?: typeof nodeFs;
   pid?: number;
@@ -32,6 +39,7 @@ export interface LockOptions {
 export interface DaemonHost {
   boot(): Promise<void>;
   close(): void;
+  shutdown?(): Promise<unknown>;
 }
 
 export interface DaemonStore {
@@ -75,6 +83,8 @@ export interface CoworkDaemonOptions {
   removePid?: (stateDir: string) => void;
   signals?: SignalTarget;
   log?: (...parts: unknown[]) => void;
+  onSignalComplete?: (error?: unknown) => void;
+  exclusiveSignals?: boolean;
 }
 
 export class CoworkDaemon {
@@ -88,16 +98,28 @@ export class CoworkDaemon {
   private bootWork?: Promise<void>;
   private shutdownWork?: Promise<void>;
   private hostBooted = false;
+  private hostStartAttempted = false;
   private transportsStarted = false;
+  private transportStartAttempted = false;
   private pidWritten = false;
   private ready = false;
   private stopping = false;
   private cleanupComplete = false;
+  private cleanupWork?: Promise<void>;
+  private cancelled = false;
+  private signalsInstalled = false;
   private readonly queuedNotifications = new Set<string>();
   private readonly notificationWork = new Set<Promise<void>>();
 
   private readonly onSignal = (): void => {
-    void this.shutdown().catch((error) => this.options.log?.('daemon signal shutdown failed:', error));
+    this.options.log?.('daemon signal received');
+    void this.shutdown().then(
+      () => this.options.onSignalComplete?.(),
+      (error) => {
+        this.options.log?.('daemon signal shutdown failed:', error);
+        this.options.onSignalComplete?.(error);
+      },
+    );
   };
 
   constructor(options: CoworkDaemonOptions) {
@@ -114,6 +136,7 @@ export class CoworkDaemon {
     const config = this.options.config;
     const runtime = (this.options.prepare ?? ensureRuntimeState)(config);
     this.lockHandle = (this.options.lock ?? ((stateDir) => acquireDaemonLock(stateDir)))(config.stateDir);
+    this.installSignals();
     try {
       this.host = this.options.host ?? new AdaptHost(config.brokerUrl, this.options.log);
       this.store = this.options.store ?? new CoworkStore(config.stateDir);
@@ -138,25 +161,35 @@ export class CoworkDaemon {
       );
       serviceRef = this.service;
 
+      this.hostStartAttempted = true;
       await this.host.boot();
       this.hostBooted = true;
+      this.claimSignalOwnership();
+      this.checkpoint();
 
       const rooms = await this.store.list();
+      this.checkpoint();
       const recoverable = rooms.filter((room) => room.state !== 'closed');
       // All packet CIDs are restored (or the exact packet-pending sentinel is
       // completed) before any metadata reconciliation can create intents.
-      for (const room of recoverable) await this.service.recoverPacket(room.room_id);
+      for (const room of recoverable) {
+        await this.service.recoverPacket(room.room_id);
+        this.checkpoint();
+      }
       for (const room of recoverable.filter((candidate) => candidate.state !== 'closing')) {
         await this.service.reconcileRoom(room.room_id);
+        this.checkpoint();
       }
       // Closing is forward-only and precedes every inbox/send recovery.
       for (const room of recoverable.filter((candidate) => candidate.state === 'closing')) {
         await this.service.closeRoom(room.room_id);
+        this.checkpoint();
       }
       // Task 6 resumePending itself performs inbox snapshot -> complete all
       // intents -> atomic consume -> pending sends, in that exact order.
       for (const room of recoverable.filter((candidate) => candidate.state !== 'closing')) {
         await this.service.resumePending(room.room_id);
+        this.checkpoint();
       }
 
       const realService = this.service as RoomService;
@@ -168,69 +201,81 @@ export class CoworkDaemon {
         dispatcher,
         log: this.options.log,
       });
+      this.transportStartAttempted = true;
       await this.transports.start();
       this.transportsStarted = true;
+      this.checkpoint();
 
+      this.ready = true;
+      await this.flushQueuedNotifications();
+      this.checkpoint();
       (this.options.writePid ?? writeDaemonPid)(config.stateDir);
       this.pidWritten = true;
-      this.ready = true;
-      this.installSignals();
-      await this.flushQueuedNotifications();
     } catch (error) {
-      await this.rollbackBoot();
+      this.cancelled = true;
+      let cleanupError: unknown;
+      try { await this.cleanupOwned(); } catch (cleanup) { cleanupError = cleanup; }
+      if (cleanupError !== undefined) {
+        throw new AggregateError([error, cleanupError], 'cowork daemon boot and cleanup failed', { cause: error });
+      }
       throw error;
     }
   }
 
   shutdown(): Promise<void> {
-    this.shutdownWork ??= this.shutdownUnlocked();
+    this.cancelled = true;
+    this.shutdownWork ??= this.shutdownCoordinated();
     return this.shutdownWork;
   }
 
-  private async shutdownUnlocked(): Promise<void> {
-    if (this.cleanupComplete) return;
+  private async shutdownCoordinated(): Promise<void> {
+    if (this.bootWork) await Promise.allSettled([this.bootWork]);
+    await this.cleanupOwned();
+  }
+
+  private cleanupOwned(): Promise<void> {
+    this.cleanupWork ??= this.cleanupUnlocked();
+    return this.cleanupWork;
+  }
+
+  private async cleanupUnlocked(): Promise<void> {
     this.stopping = true;
     this.ready = false;
     this.removeSignals();
     const errors: unknown[] = [];
     try { this.service?.beginShutdown(); } catch (error) { errors.push(error); }
-    if (this.transportsStarted || this.transports) {
+    if (this.transportStartAttempted || this.transportsStarted || this.transports) {
       try { await this.transports?.stop(); } catch (error) { errors.push(error); }
       this.transportsStarted = false;
+      this.transportStartAttempted = false;
     }
     try {
       await Promise.allSettled([...this.notificationWork]);
       await this.service?.drain();
     } catch (error) { errors.push(error); }
     try {
-      if (this.pidWritten || this.hostBooted) (this.options.removePid ?? removeDaemonPid)(this.options.config.stateDir);
+      if (this.lockHandle || this.pidWritten || this.hostStartAttempted) {
+        (this.options.removePid ?? removeDaemonPid)(this.options.config.stateDir);
+      }
       this.pidWritten = false;
     } catch (error) { errors.push(error); }
     try { await this.registry?.unhostAll(); } catch (error) { errors.push(error); }
-    try { if (this.hostBooted) this.host?.close(); } catch (error) { errors.push(error); }
+    if (this.hostStartAttempted || this.hostBooted) {
+      try {
+        if (this.host?.shutdown) await this.host.shutdown();
+        else this.host?.close();
+      } catch (error) { errors.push(error); }
+    }
     this.hostBooted = false;
+    this.hostStartAttempted = false;
     try { this.lockHandle?.release(); } catch (error) { errors.push(error); }
     this.lockHandle = undefined;
     this.cleanupComplete = true;
     if (errors.length > 0) throw new AggregateError(errors, 'cowork daemon shutdown encountered errors');
   }
 
-  private async rollbackBoot(): Promise<void> {
-    this.stopping = true;
-    const errors: unknown[] = [];
-    if (this.transportsStarted) {
-      try { await this.transports?.stop(); } catch (error) { errors.push(error); }
-      this.transportsStarted = false;
-    }
-    try { (this.options.removePid ?? removeDaemonPid)(this.options.config.stateDir); } catch (error) { errors.push(error); }
-    this.pidWritten = false;
-    try { await this.registry?.unhostAll(); } catch (error) { errors.push(error); }
-    try { if (this.hostBooted) this.host?.close(); } catch (error) { errors.push(error); }
-    this.hostBooted = false;
-    try { this.lockHandle?.release(); } catch (error) { errors.push(error); }
-    this.lockHandle = undefined;
-    this.cleanupComplete = true;
-    if (errors.length > 0) this.options.log?.('partial boot rollback errors:', new AggregateError(errors));
+  private checkpoint(): void {
+    if (this.cancelled) throw new DaemonBootCancelledError();
   }
 
   private handleNotification(roomId: string, service = this.service): void {
@@ -260,15 +305,33 @@ export class CoworkDaemon {
   }
 
   private installSignals(): void {
+    if (this.signalsInstalled) return;
     const signals = this.options.signals ?? process;
+    if (this.options.exclusiveSignals && signals === process) {
+      process.removeAllListeners('SIGINT');
+      process.removeAllListeners('SIGTERM');
+    }
     signals.on('SIGINT', this.onSignal);
     signals.on('SIGTERM', this.onSignal);
+    this.signalsInstalled = true;
+  }
+
+  private claimSignalOwnership(): void {
+    if (!this.options.exclusiveSignals) return;
+    const signals = this.options.signals ?? process;
+    if (signals !== process) return;
+    process.removeAllListeners('SIGINT');
+    process.removeAllListeners('SIGTERM');
+    this.signalsInstalled = false;
+    this.installSignals();
   }
 
   private removeSignals(): void {
+    if (!this.signalsInstalled) return;
     const signals = this.options.signals ?? process;
     signals.off('SIGINT', this.onSignal);
     signals.off('SIGTERM', this.onSignal);
+    this.signalsInstalled = false;
   }
 }
 
@@ -437,14 +500,26 @@ function lstatIfPresent(fs: typeof nodeFs, path: string): nodeFs.Stats | undefin
 }
 
 export async function runDaemon(): Promise<void> {
-  const daemon = new CoworkDaemon({ config: loadConfig(), log: (...parts) => console.error(...parts) });
+  const daemon = new CoworkDaemon({
+    config: loadConfig(),
+    log: (...parts) => console.error(...parts),
+    // SDK 0.10.12 has no public wrapper/broker stop. Process ownership is the
+    // supported final boundary after every durable daemon resource is closed.
+    onSignalComplete: (error) => {
+      if (error !== undefined) console.error(error);
+      console.error(`cowork daemon shutdown complete (${error === undefined ? 'clean' : 'failed'})`);
+      setImmediate(() => process.exit(error === undefined ? 0 : 1));
+    },
+    exclusiveSignals: true,
+  });
   await daemon.boot();
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : undefined;
 if (invokedPath === fileURLToPath(import.meta.url)) {
   void runDaemon().catch((error) => {
+    if (error instanceof DaemonBootCancelledError) return;
     console.error(error instanceof Error ? error.stack ?? error.message : String(error));
-    process.exitCode = 1;
+    process.exit(1);
   });
 }

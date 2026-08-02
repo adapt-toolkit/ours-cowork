@@ -3,6 +3,7 @@
 
 import * as nodeFs from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { AdaptHost } from './adapt.ts';
 import {
@@ -16,6 +17,7 @@ import { PacketRegistry } from './packets.ts';
 import { RoomService } from './service.ts';
 import { CoworkStore } from './storage.ts';
 import { createServiceRoutes, RpcDispatcher, TransportServer } from './transports.ts';
+import { createStaticWebHandler, loadWebAssets } from './web.ts';
 
 const FILE_MODE = 0o600;
 const NO_FOLLOW = nodeFs.constants.O_NOFOLLOW ?? 0;
@@ -235,15 +237,21 @@ export class CoworkDaemon {
       }
 
       const realService = this.service as RoomService;
-      const routes = this.options.control
-        ? { ...createServiceRoutes(realService), ...createDaemonControlRoutes(this.options.control) }
-        : createServiceRoutes(realService);
-      const dispatcher = new RpcDispatcher(routes);
+      const serviceRoutes = createServiceRoutes(realService);
+      const unixRoutes = this.options.control
+        ? { ...serviceRoutes, ...createDaemonControlRoutes(this.options.control) }
+        : serviceRoutes;
+      const unixDispatcher = new RpcDispatcher(unixRoutes);
+      const restDispatcher = new RpcDispatcher(serviceRoutes);
+      const staticHandler = createStaticWebHandler(loadWebAssets(
+        fileURLToPath(new URL('./web/', import.meta.url)),
+      ));
       this.transports = this.options.transports ?? new TransportServer({
         socketPath: runtime.socketPath,
         rest: config.rest,
-        token: (runtime as Partial<RuntimeState>).token,
-        dispatcher,
+        unixDispatcher,
+        restDispatcher,
+        staticHandler,
         log: this.options.log,
       });
       this.transportStartAttempted = true;

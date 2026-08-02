@@ -1,10 +1,12 @@
-import { randomBytes, timingSafeEqual as nodeTimingSafeEqual } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import * as http from 'node:http';
 import * as net from 'node:net';
 import * as nodeFs from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 import { z } from 'zod';
+
+import { createStaticWebHandler, type StaticWebHandler } from './web.ts';
 
 export const MAX_REQUEST_BYTES = 1024 * 1024;
 export const HTTP_HEADERS_TIMEOUT_MS = 5_000;
@@ -168,17 +170,17 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
 export interface TransportServerOptions {
   socketPath: string;
   rest: { enabled: boolean; port: number };
-  dispatcher: RpcDispatcher;
-  token?: string;
+  unixDispatcher: RpcDispatcher;
+  restDispatcher: RpcDispatcher;
+  staticHandler?: StaticWebHandler;
   fs?: typeof nodeFs;
-  timingSafeEqual?: (left: Uint8Array, right: Uint8Array) => boolean;
   log?: (...parts: unknown[]) => void;
 }
 
 export class TransportServer {
   private readonly options: TransportServerOptions;
   private readonly fs: typeof nodeFs;
-  private readonly compare: (left: Uint8Array, right: Uint8Array) => boolean;
+  private readonly staticHandler: StaticWebHandler;
   private readonly sockets = new Set<net.Socket>();
   private readonly httpSockets = new Set<net.Socket>();
   private readonly httpPhases = new Map<net.Socket, HttpSocketPhase>();
@@ -195,10 +197,7 @@ export class TransportServer {
   constructor(options: TransportServerOptions) {
     this.options = options;
     this.fs = options.fs ?? nodeFs;
-    this.compare = options.timingSafeEqual ?? nodeTimingSafeEqual;
-    if (options.rest.enabled && !/^[0-9a-f]{64}$/.test(options.token ?? '')) {
-      throw new Error('REST requires a valid 64-hex management token');
-    }
+    this.staticHandler = options.staticHandler ?? createStaticWebHandler(new Map());
   }
 
   get restAddress(): net.AddressInfo {
@@ -266,7 +265,9 @@ export class TransportServer {
   }
 
   private async stopUnlocked(): Promise<void> {
-    this.options.dispatcher.beginShutdown();
+    for (const dispatcher of new Set([this.options.unixDispatcher, this.options.restDispatcher])) {
+      dispatcher.beginShutdown();
+    }
     const httpServer = this.httpServer;
     const quarantined = this.quarantinePublicPath();
     const closing = this.closeServers();
@@ -280,7 +281,9 @@ export class TransportServer {
     await this.drainRequests();
     httpServer?.closeAllConnections?.();
     for (const socket of this.httpSockets) socket.destroy();
-    await this.options.dispatcher.drain();
+    for (const dispatcher of new Set([this.options.unixDispatcher, this.options.restDispatcher])) {
+      await dispatcher.drain();
+    }
     for (const socket of this.sockets) socket.destroy();
     this.sockets.clear();
     this.httpSockets.clear();
@@ -315,7 +318,7 @@ export class TransportServer {
           socket.end(`${JSON.stringify(errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'))}\n`);
           return;
         }
-        const operation = this.dispatchBytes(line).then((response) => {
+        const operation = this.dispatchBytes(this.options.unixDispatcher, line).then((response) => {
           if (!socket.destroyed) socket.write(`${JSON.stringify(response)}\n`);
         });
         this.track(operation);
@@ -336,15 +339,31 @@ export class TransportServer {
       socket.setTimeout(0);
     };
     try {
-      if (!this.authorized(request.headers.authorization)) {
+      if (request.url !== '/rpc') {
+        if (request.method === 'GET') {
+          activateResponse();
+          if (await this.staticHandler(request, response)) return;
+        }
         activateResponse();
-        sendJson(response, 401, errorResponse(null, 'unauthorized', 'unauthorized'));
+        sendJson(response, 404, errorResponse(null, 'not_found', 'not found'));
         request.resume();
         return await responseFinished(response);
       }
-      if (request.method !== 'POST' || request.url !== '/rpc') {
+      if (request.method !== 'POST') {
         activateResponse();
         sendJson(response, 404, errorResponse(null, 'not_found', 'not found'));
+        request.resume();
+        return await responseFinished(response);
+      }
+      if (!isJsonMediaType(request.headers['content-type'])) {
+        activateResponse();
+        sendJson(response, 415, errorResponse(null, 'unsupported_media_type', 'application/json required'));
+        request.resume();
+        return await responseFinished(response);
+      }
+      if (!this.safeRestOrigin(request)) {
+        activateResponse();
+        sendJson(response, 403, errorResponse(null, 'forbidden', 'forbidden request origin'));
         request.resume();
         return await responseFinished(response);
       }
@@ -362,7 +381,7 @@ export class TransportServer {
         return await responseFinished(response);
       }
       activateResponse();
-      const rpc = await this.dispatchBytes(body.bytes);
+      const rpc = await this.dispatchBytes(this.options.restDispatcher, body.bytes);
       const status = 'error' in rpc
         ? rpc.error.code === 'method_not_found' ? 404
           : rpc.error.code === 'internal' ? 500 : 400
@@ -382,23 +401,20 @@ export class TransportServer {
     }
   }
 
-  private authorized(header: string | undefined): boolean {
-    const expectedText = this.options.token;
-    if (!expectedText || typeof header !== 'string' || !header.startsWith('Bearer ')) return false;
-    const suppliedText = header.slice('Bearer '.length);
-    if (!/^[0-9a-f]{64}$/.test(suppliedText) || suppliedText.length !== expectedText.length) return false;
-    const supplied = Buffer.from(suppliedText, 'hex');
-    const expected = Buffer.from(expectedText, 'hex');
-    if (supplied.length !== expected.length) return false;
-    try { return this.compare(supplied, expected); } catch { return false; }
+  private safeRestOrigin(request: http.IncomingMessage): boolean {
+    const authority = `127.0.0.1:${this.restAddress.port}`;
+    if (request.headers.host !== authority) return false;
+    const origin = request.headers.origin;
+    if (origin !== undefined && origin !== `http://${authority}`) return false;
+    return request.headers['sec-fetch-site']?.toLowerCase() !== 'cross-site';
   }
 
-  private async dispatchBytes(bytes: Uint8Array): Promise<RpcResponse> {
+  private async dispatchBytes(dispatcher: RpcDispatcher, bytes: Uint8Array): Promise<RpcResponse> {
     let input: unknown;
     try { input = JSON.parse(Buffer.from(bytes).toString('utf8')); } catch {
       return errorResponse(null, 'invalid_json', 'invalid JSON');
     }
-    return this.options.dispatcher.dispatch(input);
+    return dispatcher.dispatch(input);
   }
 
   private track(work: Promise<void>): void {
@@ -616,6 +632,13 @@ function classifyServiceError(error: unknown): string {
   if (name === 'CoworkStorageError' && /does not exist|missing/i.test(String(error))) return 'not_found';
   if (name === 'RoomServiceError') return 'invalid_state';
   return 'internal';
+}
+
+function isJsonMediaType(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const mediaType = value.split(';', 1)[0]?.trim().toLowerCase();
+  return mediaType === 'application/json'
+    || (mediaType?.startsWith('application/') === true && mediaType.endsWith('+json'));
 }
 
 function sendJson(response: http.ServerResponse, status: number, value: RpcResponse): void {

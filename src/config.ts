@@ -1,4 +1,3 @@
-import { randomBytes } from 'node:crypto';
 import * as nodeFs from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
@@ -28,8 +27,6 @@ export interface RuntimeState {
   socketPath: string;
   pidPath: string;
   lockPath: string;
-  tokenPath: string;
-  token?: string;
 }
 
 export interface ConfigEnvironment {
@@ -42,7 +39,6 @@ export interface ConfigEnvironment {
 export interface ConfigIo {
   fs?: typeof nodeFs;
   home?: string;
-  random?: (size: number) => Buffer;
 }
 
 export class CoworkConfigError extends Error {
@@ -57,7 +53,7 @@ export function defaultConfig(home = homedir()): CoworkConfig {
     version: 1,
     brokerUrl: 'wss://broker1.ours.network',
     stateDir: resolve(home, '.ours-cowork'),
-    rest: { enabled: false, port: 3052 },
+    rest: { enabled: true, port: 3052 },
   };
 }
 
@@ -127,14 +123,11 @@ export function ensureRuntimeState(config: CoworkConfig, io: ConfigIo = {}): Run
   }
   assertSecureDirectory(fs, roomsPath, 'rooms directory');
 
-  const runtime: RuntimeState = {
+  return {
     socketPath: join(stateDir, 'management.sock'),
     pidPath: join(stateDir, 'daemon.pid'),
     lockPath: join(stateDir, 'daemon.lock'),
-    tokenPath: join(stateDir, 'management-token'),
   };
-  if (parsed.rest.enabled) runtime.token = loadOrCreateToken(fs, runtime.tokenPath, io.random ?? randomBytes);
-  return runtime;
 }
 
 function parsePort(value: string): number {
@@ -144,48 +137,6 @@ function parsePort(value: string): number {
   const port = Number(value);
   if (port > 65_535) throw new CoworkConfigError('OURS_COWORK_REST_PORT must be from 1 to 65535');
   return port;
-}
-
-function loadOrCreateToken(
-  fs: typeof nodeFs,
-  path: string,
-  random: (size: number) => Buffer,
-): string {
-  if (lstatIfPresent(fs, path)) {
-    assertSecureFile(fs, path, 'management token');
-    const token = readSecureFile(fs, path, 'management token').toString('utf8');
-    if (!/^[0-9a-f]{64}$/.test(token)) {
-      throw new CoworkConfigError('management token must contain exactly 64 lowercase hexadecimal characters');
-    }
-    return token;
-  }
-
-  let token: string;
-  try {
-    const bytes = random(32);
-    if (!Buffer.isBuffer(bytes) || bytes.length !== 32) throw new Error('random source returned the wrong byte count');
-    token = bytes.toString('hex');
-  } catch (error) {
-    throw new CoworkConfigError('failed to generate management token', { cause: error });
-  }
-  let fd: number | undefined;
-  let created = false;
-  try {
-    fd = fs.openSync(path, nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL | nodeFs.constants.O_WRONLY | NO_FOLLOW, FILE_MODE);
-    created = true;
-    fs.fchmodSync(fd, FILE_MODE);
-    writeAll(fs, fd, Buffer.from(token, 'ascii'));
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = undefined;
-    assertSecureFile(fs, path, 'management token');
-    fsyncDirectory(fs, dirname(path));
-    return token;
-  } catch (error) {
-    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* creation failure wins */ }
-    if (created) try { fs.unlinkSync(path); } catch { /* creation failure wins */ }
-    throw new CoworkConfigError('failed to create management token', { cause: error });
-  }
 }
 
 function assertSecureAncestors(fs: typeof nodeFs, path: string, label: string): void {
@@ -302,15 +253,6 @@ function fsyncDirectory(fs: typeof nodeFs, path: string): void {
     fs.fsyncSync(fd);
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
-  }
-}
-
-function writeAll(fs: typeof nodeFs, fd: number, bytes: Uint8Array): void {
-  let offset = 0;
-  while (offset < bytes.length) {
-    const written = fs.writeSync(fd, bytes, offset, bytes.length - offset, null);
-    if (written <= 0) throw new Error('write made no progress');
-    offset += written;
   }
 }
 

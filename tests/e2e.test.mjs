@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -225,10 +225,16 @@ if (process.argv.includes('--e2e-driver')) {
       const unitFile = readdirSync(UNIT_DIR).find((name) => name.endsWith('.muflo'));
       assert(unitFile, 'compile the cowork packet before running E2E');
       const port = await unusedPort();
+      const configPath = join(stateDir, 'config.json');
+      writeFileSync(configPath, JSON.stringify({
+        version: 1,
+        brokerUrl: `ws://127.0.0.1:${port}`,
+        stateDir,
+        rest: { enabled: false, port: 3052 },
+      }), { mode: 0o600 });
       env = {
         ...process.env,
-        OURS_COWORK_STATE_DIR: stateDir,
-        OURS_COWORK_BROKER_URL: `ws://127.0.0.1:${port}`,
+        OURS_COWORK_CONFIG: configPath,
       };
 
       broker = spawn(process.execPath, [join(ROOT, 'node_modules/.bin/adapt-broker'), '--host', '127.0.0.1', '--port', String(port), '--test_mode'], {

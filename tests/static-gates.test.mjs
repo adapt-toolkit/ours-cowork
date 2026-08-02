@@ -9,7 +9,6 @@ const SOURCE_EXTENSIONS = new Set([
   '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.json', '.sh',
   '.mu', '.mm', '.mufl', '.muflo', '.yml', '.yaml',
 ]);
-const DOCUMENT_EXTENSIONS = new Set(['.md']);
 const SKIPPED_SOURCE_TREES = new Set([
   '.git', '.superpowers', 'node_modules', 'dist', 'docs', join('mufl_code', 'core'),
 ]);
@@ -165,7 +164,7 @@ test('recursive owned-source discovery covers configs/scripts/tests/fixtures/MUF
 });
 
 test('README and every operator document preserve the exact wording boundary', () => {
-  const documentationFiles = [join(ROOT, 'README.md'), ...filesBelow(join(ROOT, 'docs'), DOCUMENT_EXTENSIONS)];
+  const documentationFiles = [join(ROOT, 'README.md'), ...DOC_NAMES.map((path) => join(ROOT, path))];
   assert.deepEqual(documentationFiles.flatMap((path) => documentationViolations(
     normalized(path), readFileSync(path, 'utf8'), normalized(path) === 'docs/10-limitations.md',
   )), []);
@@ -183,6 +182,7 @@ test('npm dry-run pack list is the exact standalone release artifact', () => {
   const packs = JSON.parse(output);
   assert.equal(packs.length, 1);
   const paths = packs[0].files.map((file) => file.path).sort();
+  assert.equal(paths.some((path) => path.startsWith('docs/superpowers/')), false);
   const packetPaths = paths.filter((path) => /^dist\/mufl_code\/[0-9A-F]{64}\.muflo$/.test(path));
   assert.equal(packetPaths.length, 1);
   const expected = ['LICENSE', 'README.md', 'dist/cli.js', 'dist/daemon.js', 'package.json', ...DOC_NAMES, packetPaths[0]].sort();

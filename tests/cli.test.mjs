@@ -392,9 +392,15 @@ test('replacement of the authenticated control session proves the original sessi
 test('real daemon start, status, and stop use the management control session', { timeout: 30_000 }, async (t) => {
   const stateDir = await mkdtemp(join(tmpdir(), 'cowork-cli-real-control-'));
   await chmod(stateDir, 0o700);
+  const configPath = join(stateDir, 'config.json');
+  await writeFile(configPath, JSON.stringify({
+    version: 1,
+    brokerUrl: 'ws://127.0.0.1:1',
+    stateDir,
+    rest: { enabled: false, port: 3052 },
+  }), { mode: 0o600 });
   const env = {
-    OURS_COWORK_STATE_DIR: stateDir,
-    OURS_COWORK_BROKER_URL: 'ws://127.0.0.1:1',
+    OURS_COWORK_CONFIG: configPath,
   };
   t.after(async () => {
     const pidPath = join(stateDir, 'daemon.pid');

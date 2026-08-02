@@ -366,18 +366,16 @@ test('ambient worker environment or mismatched live IPC fails before runtime sta
   }
 });
 
-test('runtime state and token reject insecure modes and symlinks; token creation failure is fatal', () => {
+test('runtime state creates no token and rejects insecure modes and symlinks', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-perms-'));
   try {
     const stateDir = join(dir, 'state');
     const config = { version: 1, brokerUrl: 'ws://broker', stateDir, rest: { enabled: true, port: 3010 } };
     const runtime = ensureRuntimeState(config);
-    assert.match(runtime.token, /^[0-9a-f]{64}$/);
+    assert.equal('token' in runtime, false);
+    assert.equal('tokenPath' in runtime, false);
     assert.equal(lstatSync(stateDir).mode & 0o777, 0o700);
-    assert.equal(lstatSync(join(stateDir, 'management-token')).mode & 0o777, 0o600);
-    chmodSync(join(stateDir, 'management-token'), 0o644);
-    assert.throws(() => ensureRuntimeState(config), /management token.*mode/i);
-    rmSync(join(stateDir, 'management-token'));
+    assert.equal(existsSync(join(stateDir, 'management-token')), false);
     chmodSync(stateDir, 0o755);
     assert.throws(() => ensureRuntimeState(config), /state directory.*mode/i);
 
@@ -386,13 +384,6 @@ test('runtime state and token reject insecure modes and symlinks; token creation
     writeFileSync(real, 'not-dir');
     symlinkSync(real, link);
     assert.throws(() => ensureRuntimeState({ ...config, stateDir: link, rest: { enabled: false, port: 3010 } }), /symbolic link|symlink/i);
-
-    const failedDir = join(dir, 'random-failure');
-    assert.throws(() => ensureRuntimeState(
-      { ...config, stateDir: failedDir },
-      { random: () => { throw new Error('entropy unavailable'); } },
-    ), /generate management token/);
-    assert.equal(existsSync(join(failedDir, 'management-token')), false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -722,11 +713,17 @@ test('boot failure preserves the primary error and aggregates cleanup failures w
 test('real executable owns SIGINT/SIGTERM after SDK boot and exits without runtime endpoints', async (t) => {
   for (const shutdownSignal of ['SIGINT', 'SIGTERM']) {
     const dir = mkdtempSync(join(tmpdir(), `cowork-real-${shutdownSignal.toLowerCase()}-`));
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({
+      version: 1,
+      brokerUrl: 'ws://127.0.0.1:1',
+      stateDir: dir,
+      rest: { enabled: false, port: 3052 },
+    }), { mode: 0o600 });
     const child = spawn(process.execPath, [new URL('../src/daemon.ts', import.meta.url).pathname], {
       env: {
         ...process.env,
-        OURS_COWORK_STATE_DIR: dir,
-        OURS_COWORK_BROKER_URL: 'ws://127.0.0.1:1',
+        OURS_COWORK_CONFIG: configPath,
       },
       stdio: ['ignore', 'ignore', 'pipe'],
     });
@@ -763,6 +760,13 @@ test('real SDK-free supervisor handles signals from pre-lock through ready', asy
   for (const [index, stage] of stages.entries()) {
     const signal = index % 2 === 0 ? 'SIGINT' : 'SIGTERM';
     const dir = mkdtempSync(join(tmpdir(), `cowork-stage-${stage}-`));
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({
+      version: 1,
+      brokerUrl: 'ws://127.0.0.1:1',
+      stateDir: dir,
+      rest: { enabled: false, port: 3052 },
+    }), { mode: 0o600 });
     const program = [
       `import { runSupervisor } from ${JSON.stringify(daemonUrl)};`,
       `const target = ${JSON.stringify(stage)};`,
@@ -775,8 +779,7 @@ test('real SDK-free supervisor handles signals from pre-lock through ready', asy
     const child = spawn(process.execPath, ['--input-type=module', '--eval', program], {
       env: {
         ...process.env,
-        OURS_COWORK_STATE_DIR: dir,
-        OURS_COWORK_BROKER_URL: 'ws://127.0.0.1:1',
+        OURS_COWORK_CONFIG: configPath,
       },
       stdio: ['ignore', 'ignore', 'pipe'],
     });

@@ -14,19 +14,25 @@ import {
   TransportServer,
 } from '../src/transports.ts';
 
-function request(port, { body = '', authorization, chunks } = {}) {
+function request(port, {
+  body = '', chunks, headers = { 'content-type': 'application/json' }, method = 'POST', path = '/rpc', host,
+} = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({
-      host: '127.0.0.1', port, path: '/rpc', method: 'POST',
-      headers: authorization ? { authorization } : {},
+      host: '127.0.0.1', port, path, method, headers: { ...headers, ...(host === undefined ? {} : { host }) },
     }, (res) => {
       const data = [];
       res.on('data', (chunk) => data.push(chunk));
-      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(data).toString('utf8') }));
+      res.on('end', () => {
+        const responseBody = Buffer.concat(data).toString('utf8');
+        let json;
+        try { json = JSON.parse(responseBody); } catch {}
+        resolve({ status: res.statusCode, statusCode: res.statusCode, headers: res.headers, body: responseBody, json });
+      });
     });
     req.on('error', reject);
     if (chunks) for (const chunk of chunks) req.write(chunk);
-    else req.write(body);
+    else if (method !== 'GET') req.write(body);
     req.end();
   });
 }
@@ -41,6 +47,14 @@ function unixRequest(path, value) {
     socket.on('end', () => resolve(data));
     socket.on('error', reject);
   });
+}
+
+function dispatchers(dispatcher) {
+  return { unixDispatcher: dispatcher, restDispatcher: dispatcher };
+}
+
+function nullDispatchers() {
+  return dispatchers(new RpcDispatcher({ ping: { auth: true, run: async () => null } }));
 }
 
 test('dispatcher strictly validates the versioned envelope and shares one route table', async () => {
@@ -82,66 +96,95 @@ test('the exhaustive service route table marks every route auth:true', () => {
   assert(Object.values(routes).every((route) => route.auth === true));
 });
 
-test('Unix and REST use the same dispatcher; socket is 0600 and REST is loopback-only', async (t) => {
+test('REST is unauthenticated, loopback-only, emits no CORS, and excludes daemon control routes', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-transport-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const socketPath = join(dir, 'management.sock');
-  const token = 'ab'.repeat(32);
-  const dispatcher = new RpcDispatcher({
+  const roomRoutes = {
     'room.echo': { auth: true, run: async (params) => params },
+  };
+  const controlRoutes = {
+    'daemon.status': { auth: true, run: async () => ({ running: true }) },
+    'daemon.shutdown': { auth: true, run: async () => ({ accepted: true }) },
+  };
+  const server = new TransportServer({
+    socketPath,
+    rest: { enabled: true, port: 0 },
+    unixDispatcher: new RpcDispatcher({ ...roomRoutes, ...controlRoutes }),
+    restDispatcher: new RpcDispatcher(roomRoutes),
   });
-  const server = new TransportServer({ socketPath, rest: { enabled: true, port: 0 }, token, dispatcher });
   await server.start();
   t.after(() => server.stop());
   assert.equal(lstatSync(socketPath).mode & 0o777, 0o600);
   assert.equal(server.restAddress.address, '127.0.0.1');
 
-  const wire = JSON.stringify({ version: 1, id: 'same', method: 'room.echo', params: { value: 7 } });
+  const envelope = { version: 1, id: 'same', method: 'room.echo', params: { value: 7 } };
+  const wire = JSON.stringify(envelope);
   const unix = JSON.parse(await unixRequest(socketPath, `${wire}\n`));
-  const rest = await request(server.restAddress.port, { body: wire, authorization: `Bearer ${token}` });
-  assert.equal(rest.status, 200);
-  assert.deepEqual(JSON.parse(rest.body), unix);
+  const rest = await request(server.restAddress.port, { body: wire });
+  assert.equal(rest.statusCode, 200);
+  assert.deepEqual(rest.json.result, envelope.params);
+  assert.deepEqual(rest.json, unix);
+  assert.equal(rest.headers['access-control-allow-origin'], undefined);
+
+  for (const method of ['daemon.status', 'daemon.shutdown']) {
+    const controlEnvelope = { version: 1, id: method, method, params: {} };
+    const overHttp = await request(server.restAddress.port, { body: JSON.stringify(controlEnvelope) });
+    assert.equal(overHttp.statusCode, 404);
+    assert.equal(overHttp.json.error.code, 'method_not_found');
+    const overUnix = JSON.parse(await unixRequest(socketPath, `${JSON.stringify(controlEnvelope)}\n`));
+    assert.deepEqual(overUnix.result, method === 'daemon.status' ? { running: true } : { accepted: true });
+  }
 });
 
-test('REST authorization is uniform, validates length before timingSafeEqual, and fails closed', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'cowork-auth-'));
+test('REST RPC requires POST, JSON, the exact bound Host, a same origin, and non-cross-site fetch metadata', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-origin-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const comparisons = [];
-  const dispatcher = new RpcDispatcher({
-    ping: { auth: true, run: async () => ({ pong: true }) },
-  });
-  const token = '01'.repeat(32);
+  let calls = 0;
+  const dispatcher = new RpcDispatcher({ ping: { auth: true, run: async () => { calls += 1; return { pong: true }; } } });
   const server = new TransportServer({
-    socketPath: join(dir, 'management.sock'), rest: { enabled: true, port: 0 }, token, dispatcher,
-    timingSafeEqual: (left, right) => { comparisons.push([left.length, right.length]); return left.equals(right); },
+    socketPath: join(dir, 'management.sock'), rest: { enabled: true, port: 0 },
+    unixDispatcher: dispatcher, restDispatcher: dispatcher,
   });
   await server.start();
   t.after(() => server.stop());
   const port = server.restAddress.port;
   const body = JSON.stringify({ version: 1, id: 1, method: 'ping', params: {} });
-  const attempts = [undefined, 'Basic abc', 'Bearer xyz', `Bearer ${'02'.repeat(32)}`];
-  const observed = [];
-  for (const authorization of attempts) observed.push(await request(port, { body, authorization }));
-  assert.deepEqual(observed.map(({ status, body: value }) => [status, value]), [
-    [401, observed[0].body], [401, observed[0].body], [401, observed[0].body], [401, observed[0].body],
-  ]);
-  assert.deepEqual(comparisons, [[32, 32]]);
+  const authority = `127.0.0.1:${port}`;
+
+  const accepted = await request(port, {
+    body,
+    headers: { 'content-type': 'application/json; charset=utf-8', origin: `http://${authority}`, 'sec-fetch-site': 'same-origin' },
+  });
+  assert.equal(accepted.statusCode, 200);
+  assert.deepEqual(accepted.json.result, { pong: true });
+  assert.equal(accepted.headers['access-control-allow-origin'], undefined);
+
+  for (const options of [
+    { method: 'GET' },
+    { headers: { 'content-type': 'text/plain' } },
+    { host: `localhost:${port}` },
+    { headers: { 'content-type': 'application/json', origin: `http://localhost:${port}` } },
+    { headers: { 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' } },
+  ]) {
+    const rejected = await request(port, { body, ...options });
+    assert.notEqual(rejected.statusCode, 200);
+    assert.equal(rejected.headers['access-control-allow-origin'], undefined);
+  }
+  assert.equal(calls, 1);
 });
 
 test('REST and Unix reject oversized streaming/chunked bodies before dispatch', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-cap-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   let calls = 0;
-  const token = 'cd'.repeat(32);
   const dispatcher = new RpcDispatcher({ ping: { auth: true, run: async () => { calls += 1; } } });
   const socketPath = join(dir, 'management.sock');
-  const server = new TransportServer({ socketPath, rest: { enabled: true, port: 0 }, token, dispatcher });
+  const server = new TransportServer({ socketPath, rest: { enabled: true, port: 0 }, ...dispatchers(dispatcher) });
   await server.start();
   t.after(() => server.stop());
   const chunks = [Buffer.alloc(MAX_REQUEST_BYTES, 0x20), Buffer.from('xx')];
-  const rest = await request(server.restAddress.port, {
-    authorization: `Bearer ${token}`, chunks,
-  });
+  const rest = await request(server.restAddress.port, { chunks });
   assert.equal(rest.status, 413);
   const unix = JSON.parse(await unixRequest(socketPath, `${' '.repeat(MAX_REQUEST_BYTES + 1)}\n`));
   assert.equal(unix.error.code, 'request_too_large');
@@ -152,12 +195,16 @@ test('malformed JSON is a protocol error and a live Unix socket is never unlinke
   const dir = mkdtempSync(join(tmpdir(), 'cowork-stale-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const dispatcher = new RpcDispatcher({ ping: { auth: true, run: async () => null } });
-  const first = new TransportServer({ socketPath: join(dir, 'management.sock'), rest: { enabled: false, port: 1 }, dispatcher });
+  const first = new TransportServer({
+    socketPath: join(dir, 'management.sock'), rest: { enabled: false, port: 1 }, ...dispatchers(dispatcher),
+  });
   await first.start();
   t.after(() => first.stop());
   const malformed = JSON.parse(await unixRequest(join(dir, 'management.sock'), '{nope}\n'));
   assert.equal(malformed.error.code, 'invalid_json');
-  const second = new TransportServer({ socketPath: join(dir, 'management.sock'), rest: { enabled: false, port: 1 }, dispatcher });
+  const second = new TransportServer({
+    socketPath: join(dir, 'management.sock'), rest: { enabled: false, port: 1 }, ...dispatchers(dispatcher),
+  });
   await assert.rejects(second.start(), /already in use|live/i);
   assert(lstatSync(join(dir, 'management.sock')).isSocket());
 });
@@ -182,18 +229,17 @@ test('stop rejects new dispatcher work, awaits in-flight work, and is idempotent
   assert.equal(drained, true);
 });
 
-test('shutdown bounds an authenticated partial HTTP body and destroys the slow connection', async (t) => {
+test('shutdown bounds a partial HTTP body and destroys the slow connection', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-slowloris-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const token = 'ef'.repeat(32);
   const dispatcher = new RpcDispatcher({ ping: { auth: true, run: async () => null } });
   const server = new TransportServer({
-    socketPath: join(dir, 'management.sock'), rest: { enabled: true, port: 0 }, token, dispatcher,
+    socketPath: join(dir, 'management.sock'), rest: { enabled: true, port: 0 }, ...dispatchers(dispatcher),
   });
   await server.start();
   const socket = net.createConnection(server.restAddress.port, '127.0.0.1');
   await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
-  socket.write(`POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer ${token}\r\nContent-Length: 1000\r\n\r\n{`);
+  socket.write(`POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:${server.restAddress.port}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{`);
   const outcome = await Promise.race([
     server.stop().then(() => 'stopped'),
     new Promise((resolve) => setTimeout(() => resolve('timeout'), 1_500)),
@@ -205,20 +251,19 @@ test('shutdown bounds an authenticated partial HTTP body and destroys the slow c
   ]);
 });
 
-test('shutdown closes an idle authenticated HTTP keep-alive connection', async (t) => {
+test('shutdown closes an idle HTTP keep-alive connection', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-keepalive-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const token = 'a1'.repeat(32);
   const dispatcher = new RpcDispatcher({ ping: { auth: true, run: async () => ({ pong: true }) } });
   const server = new TransportServer({
-    socketPath: join(dir, 'management.sock'), rest: { enabled: true, port: 0 }, token, dispatcher,
+    socketPath: join(dir, 'management.sock'), rest: { enabled: true, port: 0 }, ...dispatchers(dispatcher),
   });
   await server.start();
   const socket = net.createConnection(server.restAddress.port, '127.0.0.1');
   socket.setEncoding('utf8');
   await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
   const body = JSON.stringify({ version: 1, id: 1, method: 'ping', params: {} });
-  socket.write(`POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\nAuthorization: Bearer ${token}\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+  socket.write(`POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:${server.restAddress.port}\r\nConnection: keep-alive\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('keep-alive response timed out')), 1_000);
     socket.on('data', (chunk) => {
@@ -238,7 +283,6 @@ test('shutdown closes an idle authenticated HTTP keep-alive connection', async (
 test('shutdown lets an already-dispatched HTTP operation finish without a response cutoff', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-http-dispatch-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const token = 'b2'.repeat(32);
   let markStarted;
   const started = new Promise((resolve) => { markStarted = resolve; });
   const dispatcher = new RpcDispatcher({
@@ -249,11 +293,11 @@ test('shutdown lets an already-dispatched HTTP operation finish without a respon
     } },
   });
   const server = new TransportServer({
-    socketPath: join(dir, 'management.sock'), rest: { enabled: true, port: 0 }, token, dispatcher,
+    socketPath: join(dir, 'management.sock'), rest: { enabled: true, port: 0 }, ...dispatchers(dispatcher),
   });
   await server.start();
   const body = JSON.stringify({ version: 1, id: 1, method: 'slow', params: {} });
-  const response = request(server.restAddress.port, { body, authorization: `Bearer ${token}` });
+  const response = request(server.restAddress.port, { body });
   await started;
   const stopping = server.stop();
   const result = await response;
@@ -262,12 +306,46 @@ test('shutdown lets an already-dispatched HTTP operation finish without a respon
   await stopping;
 });
 
+test('shutdown drains an in-flight static response before closing its connection', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-http-static-drain-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  let release;
+  let markStarted;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const dispatcher = new RpcDispatcher({ ping: { auth: true, run: async () => null } });
+  const server = new TransportServer({
+    socketPath: join(dir, 'management.sock'), rest: { enabled: true, port: 0 }, ...dispatchers(dispatcher),
+    staticHandler: async (_incoming, response) => {
+      markStarted();
+      await gate;
+      response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      response.end('complete');
+      return true;
+    },
+  });
+  await server.start();
+  const pending = request(server.restAddress.port, { method: 'GET', path: '/' });
+  await started;
+  let stopped = false;
+  const stopping = server.stop().then(() => { stopped = true; });
+  await Promise.resolve();
+  assert.equal(stopped, false);
+  release();
+  const response = await pending;
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body, 'complete');
+  await stopping;
+});
+
 test('shutdown preserves a replacement Unix socket at the same path', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-socket-owner-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const path = join(dir, 'management.sock');
   const dispatcher = new RpcDispatcher({ ping: { auth: true, run: async () => null } });
-  const transport = new TransportServer({ socketPath: path, rest: { enabled: false, port: 1 }, dispatcher });
+  const transport = new TransportServer({
+    socketPath: path, rest: { enabled: false, port: 1 }, ...dispatchers(dispatcher),
+  });
   await transport.start();
   const moved = `${path}.old`;
   const { renameSync } = await import('node:fs');
@@ -289,7 +367,7 @@ for (const kind of ['regular file', 'symlink']) {
     const path = join(dir, 'management.sock');
     const transport = new TransportServer({
       socketPath: path, rest: { enabled: false, port: 1 },
-      dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+      ...nullDispatchers(),
     });
     await transport.start();
     realFs.renameSync(path, `${path}.old`);
@@ -321,7 +399,7 @@ test('shutdown never overwrites a Unix path reoccupied while a replacement is pr
   });
   const transport = new TransportServer({
     socketPath: path, rest: { enabled: false, port: 1 }, fs,
-    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+    ...nullDispatchers(),
   });
   await transport.start();
   realFs.renameSync(path, `${path}.old`);
@@ -373,7 +451,7 @@ for (const kind of ['regular file', 'symlink', 'socket']) {
     });
     const transport = new TransportServer({
       socketPath: path, rest: { enabled: false, port: 1 }, fs,
-      dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+      ...nullDispatchers(),
     });
     t.after(() => transport.stop());
     await assert.rejects(transport.start(), /exist|occupied|publish/i);
@@ -404,7 +482,7 @@ test('startup removes only inode-verified owned stale private sockets within its
   symlinkSync('preserve-target', preservedLink);
   const transport = new TransportServer({
     socketPath: path, rest: { enabled: false, port: 1 },
-    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+    ...nullDispatchers(),
   });
   t.after(() => transport.stop());
   await transport.start();
@@ -432,7 +510,7 @@ test('publication retains its exact owned socket at a non-scannable residue with
   });
   const transport = new TransportServer({
     socketPath: path, rest: { enabled: false, port: 1 }, fs,
-    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+    ...nullDispatchers(),
   });
   await transport.start();
   t.after(() => transport.stop());
@@ -474,7 +552,7 @@ test('stale cleanup retains the exact inert socket residue without unlinking qua
   });
   const transport = new TransportServer({
     socketPath: path, rest: { enabled: false, port: 1 }, fs,
-    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+    ...nullDispatchers(),
   });
   await transport.start();
   t.after(() => transport.stop());
@@ -528,7 +606,7 @@ test('publication preserves a private-alias replacement swapped at the final des
   });
   const transport = new TransportServer({
     socketPath: path, rest: { enabled: false, port: 1 }, fs,
-    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+    ...nullDispatchers(),
   });
   t.after(() => transport.stop());
   await assert.rejects(transport.start(), /private|publish|changed|replacement|residue/i);
@@ -549,7 +627,7 @@ test('stale-prefix cleanup preserves a live same-UID private socket', async (t) 
   t.after(async () => { await new Promise((resolve) => live.close(resolve)); });
   const transport = new TransportServer({
     socketPath: path, rest: { enabled: false, port: 1 },
-    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+    ...nullDispatchers(),
   });
   await transport.start();
   t.after(() => transport.stop());
@@ -606,7 +684,7 @@ test('stale-prefix cleanup preserves a replacement swapped at its final destruct
   });
   const transport = new TransportServer({
     socketPath: path, rest: { enabled: false, port: 1 }, fs,
-    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+    ...nullDispatchers(),
   });
   t.after(() => transport.stop());
   await assert.rejects(transport.start(), /stale|changed|replacement|residue/i);
@@ -637,7 +715,7 @@ for (const kind of ['regular file', 'symlink', 'socket']) {
     });
     const transport = new TransportServer({
       socketPath: path, rest: { enabled: false, port: 1 }, fs,
-      dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+      ...nullDispatchers(),
     });
     await transport.start();
     let replacementServer;

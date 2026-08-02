@@ -11,7 +11,7 @@
     "dist",
     "LICENSE",
     "README.md",
-    "docs"
+    "docs/*.md"
   ],
   "engines": {
     "node": ">=20"

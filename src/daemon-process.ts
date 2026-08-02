@@ -1,6 +1,8 @@
 // Executable-only process ownership for the public daemon bundle. Importable
 // supervisor/runtime APIs never terminate the host process.
 
+import { randomBytes } from 'node:crypto';
+
 import { runSupervisor } from './daemon.ts';
 
 const WORKER_HANDSHAKE_TIMEOUT_MS = 5_000;
@@ -129,6 +131,14 @@ async function runWorker(): Promise<number> {
     writePid: (stateDir) => runtime.writeDaemonPid(stateDir, undefined, supervisorPid),
     removePid: (stateDir) => runtime.removeDaemonPid(stateDir, undefined, supervisorPid),
     onStage: (stage) => { void sendIpc({ type: 'stage', stage, capability }); },
+    control: {
+      // Created only after the supervisor capability handshake completed.
+      session: randomBytes(16).toString('hex'),
+      async requestSupervisorShutdown() {
+        if (!capability || disconnected || process.connected === false) return false;
+        return sendIpc({ type: 'shutdown_request', capability });
+      },
+    },
   });
   try {
     await daemon.boot();

@@ -33,6 +33,18 @@ interface RpcResponse {
   error?: { code: string; message: string };
 }
 
+interface DaemonControlStatus {
+  version: 1;
+  protocol: 'cowork-supervisor-control';
+  running: true;
+  session: string;
+}
+
+type ControlProbe =
+  | { kind: 'running'; status: DaemonControlStatus }
+  | { kind: 'absent' }
+  | { kind: 'foreign' };
+
 class CliError extends Error {
   readonly exitCode: number;
   readonly code: string;
@@ -267,7 +279,12 @@ function roomRequest(command: string | undefined, args: string[]): { method: str
   }
 }
 
-function rpcCall(socketPath: string, method: string, params: Record<string, unknown>): Promise<unknown> {
+function rpcCall(
+  socketPath: string,
+  method: string,
+  params: Record<string, unknown>,
+  timeoutMs = RPC_TIMEOUT_MS,
+): Promise<unknown> {
   const id = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const request = `${JSON.stringify({ version: 1, id, method, params })}\n`;
   return new Promise((resolveCall, rejectCall) => {
@@ -284,7 +301,7 @@ function rpcCall(socketPath: string, method: string, params: Record<string, unkn
       socket.destroy();
       rejectCall(error);
     };
-    timer = setTimeout(() => finishError(new CliError(EXIT.daemonUnavailable, 'daemon_unavailable', 'daemon did not answer the management socket')), RPC_TIMEOUT_MS);
+    timer = setTimeout(() => finishError(new CliError(EXIT.daemonUnavailable, 'daemon_unavailable', 'daemon did not answer the management socket')), timeoutMs);
     socket.setEncoding('utf8');
     socket.once('connect', () => socket.write(request));
     socket.on('data', (chunk: string) => {
@@ -342,104 +359,26 @@ function rpcError(error: { code: string; message: string }): CliError {
   return new CliError(exitCode, error.code, error.message);
 }
 
-function readPid(path: string): number | null {
-  let fd: number | undefined;
+function isDaemonControlStatus(value: unknown): value is DaemonControlStatus {
+  if (value === null || typeof value !== 'object') return false;
+  const status = value as Record<string, unknown>;
+  return Object.keys(status).length === 4
+    && status.version === 1
+    && status.protocol === 'cowork-supervisor-control'
+    && status.running === true
+    && typeof status.session === 'string'
+    && /^[0-9a-f]{32}$/.test(status.session);
+}
+
+async function probeDaemon(config: CoworkConfig, timeoutMs = RPC_TIMEOUT_MS): Promise<ControlProbe> {
   try {
-    const stat = fs.lstatSync(path);
-    if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600) {
-      throw new CliError(EXIT.internal, 'internal', 'daemon PID file is not a secure 0600 regular file');
-    }
-    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
-      throw new CliError(EXIT.unauthorized, 'unauthorized', 'daemon PID file is not owned by the current user');
-    }
-    fd = fs.openSync(path, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
-    const opened = fs.fstatSync(fd);
-    const current = fs.lstatSync(path);
-    if (opened.dev !== stat.dev || opened.ino !== stat.ino
-      || current.dev !== opened.dev || current.ino !== opened.ino) {
-      throw new CliError(EXIT.internal, 'internal', 'daemon PID file changed while opening');
-    }
-    const text = fs.readFileSync(fd, 'utf8');
-    if (!/^[1-9][0-9]*\n$/.test(text)) throw new CliError(EXIT.internal, 'internal', 'daemon PID file is malformed');
-    const pid = Number(text.trim());
-    if (!Number.isSafeInteger(pid)) throw new CliError(EXIT.internal, 'internal', 'daemon PID file is malformed');
-    return pid;
+    const result = await rpcCall(join(config.stateDir, 'management.sock'), 'daemon.status', {}, timeoutMs);
+    return isDaemonControlStatus(result) ? { kind: 'running', status: result } : { kind: 'foreign' };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw error;
-  } finally {
-    if (fd !== undefined) fs.closeSync(fd);
+    if (error instanceof CliError && error.code === 'daemon_unavailable') return { kind: 'absent' };
+    if (error instanceof CliError && error.code === 'unauthorized') throw error;
+    return { kind: 'foreign' };
   }
-}
-
-function isAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
-}
-
-interface ProcessIdentity {
-  ppid: number;
-  argv: string[];
-}
-
-function processIdentity(pid: number): ProcessIdentity | null {
-  if (process.platform === 'linux') {
-    try {
-      const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
-      const ppidText = /^PPid:\s+([0-9]+)$/m.exec(status)?.[1];
-      if (!ppidText) return null;
-      const argv = fs.readFileSync(`/proc/${pid}/cmdline`).toString('utf8').split('\0').filter(Boolean);
-      if (argv.length === 0) return null;
-      return { ppid: Number(ppidText), argv };
-    } catch { return null; }
-  }
-  if (process.platform === 'darwin') {
-    const result = spawnSync('ps', ['-ww', '-p', String(pid), '-o', 'ppid=', '-o', 'command='], { encoding: 'utf8' });
-    if (result.status !== 0) return null;
-    const match = /^\s*([0-9]+)\s+(.+)$/.exec(result.stdout.trim());
-    if (!match) return null;
-    // Darwin does not expose procfs argv. Keep this parser deliberately
-    // conservative: ambiguous quoting means "not owned" and is never signaled.
-    const argv = match[2]!.match(/(?:[^\s"']+|"(?:\\.|[^"])*"|'[^']*')+/g)
-      ?.map((part) => part.replace(/^(?:"([\s\S]*)"|'([\s\S]*)')$/, '$1$2')) ?? [];
-    return argv.length > 0 ? { ppid: Number(match[1]), argv } : null;
-  }
-  return null;
-}
-
-function sameExecutablePath(candidate: string, expected: string): boolean {
-  try { return fs.realpathSync(candidate) === fs.realpathSync(expected); }
-  catch { return false; }
-}
-
-function argvRuns(argv: string[], script: string, requiredArgument?: string): boolean {
-  const index = argv.findIndex((argument) => sameExecutablePath(argument, script));
-  return index >= 0 && (requiredArgument === undefined || argv.slice(index + 1).includes(requiredArgument));
-}
-
-/**
- * Prove the Task 8 supervisor/worker ownership chain before trusting a PID.
- * The secure PID names the CLI supervisor, the secure lock names its daemon.js
- * worker, and that live worker must still have the supervisor as its parent.
- */
-function ownedSupervisorPid(config: CoworkConfig): number | null {
-  const supervisorPid = readPid(join(config.stateDir, 'daemon.pid'));
-  if (supervisorPid === null || !isAlive(supervisorPid)) return null;
-  let workerPid: number | null;
-  try { workerPid = readPid(join(config.stateDir, 'daemon.lock')); }
-  catch { return null; }
-  if (workerPid === null || !isAlive(workerPid)) return null;
-  const supervisor = processIdentity(supervisorPid);
-  const worker = processIdentity(workerPid);
-  if (!supervisor || !worker || worker.ppid !== supervisorPid) return null;
-  const daemonScript = fileURLToPath(new URL('./daemon.js', import.meta.url));
-  if (!argvRuns(supervisor.argv, SELF, 'serve') || !argvRuns(worker.argv, daemonScript)) return null;
-  return supervisorPid;
-}
-
-function ambiguousLivePid(config: CoworkConfig): number | null {
-  const pid = readPid(join(config.stateDir, 'daemon.pid'));
-  return pid !== null && isAlive(pid) ? pid : null;
 }
 
 function socketOpen(path: string, timeoutMs = 500): Promise<boolean> {
@@ -461,26 +400,24 @@ function socketOpen(path: string, timeoutMs = 500): Promise<boolean> {
 
 const sleep = (milliseconds: number): Promise<void> => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
 
-async function waitForOwnedDaemon(config: CoworkConfig, socketPath: string, timeoutMs: number): Promise<number | null> {
+async function waitForOwnedDaemon(config: CoworkConfig, timeoutMs: number): Promise<DaemonControlStatus | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const pid = ownedSupervisorPid(config);
-    if (pid !== null && await socketOpen(socketPath) && ownedSupervisorPid(config) === pid) return pid;
+    const probe = await probeDaemon(config, Math.min(500, Math.max(1, deadline - Date.now())));
+    if (probe.kind === 'running') return probe.status;
     await sleep(200);
   }
   return null;
 }
 
-async function startDaemon(config: CoworkConfig): Promise<{ pid: number; alreadyRunning: boolean }> {
-  const runtime = ensureRuntimeState(config);
-  const existing = ownedSupervisorPid(config);
-  if (existing !== null && await socketOpen(runtime.socketPath) && ownedSupervisorPid(config) === existing) {
-    return { pid: existing, alreadyRunning: true };
+async function startDaemon(config: CoworkConfig): Promise<{ started: boolean; alreadyRunning: boolean }> {
+  const socketPath = join(config.stateDir, 'management.sock');
+  const existing = await probeDaemon(config);
+  if (existing.kind === 'running') return { started: false, alreadyRunning: true };
+  if (existing.kind === 'foreign' || await socketOpen(socketPath)) {
+    throw new CliError(EXIT.invalidState, 'invalid_state', 'management socket is occupied by an endpoint without cowork supervisor control');
   }
-  const ambiguous = ambiguousLivePid(config);
-  if (ambiguous !== null) {
-    throw new CliError(EXIT.invalidState, 'invalid_state', `live PID ${ambiguous} is not provably the cowork supervisor; refusing to start or signal it`);
-  }
+  ensureRuntimeState(config);
   const logPath = join(config.stateDir, 'daemon.log');
   const logFd = fs.openSync(logPath, 'a', 0o600);
   let child;
@@ -495,29 +432,50 @@ async function startDaemon(config: CoworkConfig): Promise<{ pid: number; already
   }
   child.unref();
   if (!child.pid) throw new CliError(EXIT.internal, 'internal', 'failed to spawn cowork daemon');
-  const readyPid = await waitForOwnedDaemon(config, runtime.socketPath, START_TIMEOUT_MS);
-  if (readyPid === null) {
+  const ready = await waitForOwnedDaemon(config, START_TIMEOUT_MS);
+  if (ready === null) {
     throw new CliError(EXIT.internal, 'internal', `daemon did not become ready; inspect ${logPath}`);
   }
-  return { pid: readyPid, alreadyRunning: false };
+  return { started: true, alreadyRunning: false };
 }
 
-async function stopDaemon(config: CoworkConfig): Promise<{ stopped: boolean; pid?: number }> {
-  const pid = ownedSupervisorPid(config);
-  if (pid === null) return { stopped: false };
-  if (ownedSupervisorPid(config) !== pid) {
-    throw new CliError(EXIT.invalidState, 'invalid_state', 'cowork supervisor identity changed before signaling; refusing to signal it');
+async function stopDaemon(config: CoworkConfig): Promise<{ stopped: boolean }> {
+  const initial = await probeDaemon(config);
+  if (initial.kind === 'absent') {
+    if (await socketOpen(join(config.stateDir, 'management.sock'))) {
+      throw new CliError(EXIT.invalidState, 'invalid_state', 'management socket is occupied by a non-cowork endpoint');
+    }
+    return { stopped: false };
   }
-  try { process.kill(pid, 'SIGTERM'); }
-  catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'EPERM') throw new CliError(EXIT.unauthorized, 'unauthorized', `permission denied signaling daemon PID ${pid}`);
-    if (code !== 'ESRCH') throw new CliError(EXIT.internal, 'internal', `failed to signal daemon PID ${pid}`);
+  if (initial.kind === 'foreign') {
+    throw new CliError(EXIT.invalidState, 'invalid_state', 'management endpoint did not prove cowork supervisor control');
+  }
+  let response: unknown;
+  try {
+    response = await rpcCall(
+      join(config.stateDir, 'management.sock'),
+      'daemon.shutdown',
+      { session: initial.status.session },
+    );
+  } catch (error) {
+    throw new CliError(EXIT.invalidState, 'invalid_state', 'cowork daemon did not accept self-shutdown', { cause: error });
+  }
+  if (response === null || typeof response !== 'object'
+    || Object.keys(response).length !== 2
+    || (response as Record<string, unknown>).accepted !== true
+    || (response as Record<string, unknown>).session !== initial.status.session) {
+    throw new CliError(EXIT.invalidState, 'invalid_state', 'cowork daemon returned an invalid self-shutdown receipt');
   }
   const deadline = Date.now() + STOP_TIMEOUT_MS;
-  while (Date.now() < deadline && isAlive(pid)) await sleep(100);
-  if (isAlive(pid)) throw new CliError(EXIT.invalidState, 'invalid_state', `daemon PID ${pid} did not stop within ${STOP_TIMEOUT_MS / 1000} seconds`);
-  return { stopped: true, pid };
+  while (Date.now() < deadline) {
+    const observed = await probeDaemon(config, Math.min(500, Math.max(1, deadline - Date.now())));
+    if (observed.kind === 'absent'
+      || (observed.kind === 'running' && observed.status.session !== initial.status.session)) {
+      return { stopped: true };
+    }
+    await sleep(100);
+  }
+  throw new CliError(EXIT.invalidState, 'invalid_state', 'cowork control session remained live after bounded self-shutdown');
 }
 
 function serviceEnvironment(config: CoworkConfig): Record<string, string> {
@@ -526,6 +484,15 @@ function serviceEnvironment(config: CoworkConfig): Record<string, string> {
     OURS_COWORK_STATE_DIR: config.stateDir,
     ...(config.rest.enabled ? { OURS_COWORK_REST_PORT: String(config.rest.port) } : {}),
   };
+}
+
+function validateServiceConfiguration(config: CoworkConfig): void {
+  const values = { cowork_cli: SELF, ...serviceEnvironment(config) };
+  for (const [label, value] of Object.entries(values)) {
+    if (/[\x00-\x1f\x7f-\x9f]/.test(value)) {
+      throw new CliError(EXIT.invalidState, 'invalid_state', `${label} contains a control character unsafe for a service definition`);
+    }
+  }
 }
 
 /** Quote a general systemd value and suppress unit/environment expansion. */
@@ -567,6 +534,7 @@ function runTool(command: string, args: string[]): boolean {
 }
 
 function installSystemd(config: CoworkConfig): string {
+  validateServiceConfiguration(config);
   const path = systemdUnitPath();
   fs.mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const environment = Object.entries(serviceEnvironment(config))
@@ -610,6 +578,7 @@ function uninstallSystemd(): string {
 }
 
 function installLaunchd(config: CoworkConfig): string {
+  validateServiceConfiguration(config);
   const path = launchdPlistPath();
   const logPath = join(config.stateDir, 'daemon.log');
   fs.mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -711,31 +680,31 @@ async function execute(args: string[], output: Output): Promise<void> {
     case 'start': {
       const result = await startDaemon(config);
       output.success(result, result.alreadyRunning
-        ? `ours-cowork is already running (pid ${result.pid})`
-        : `ours-cowork started (pid ${result.pid})`);
+        ? 'ours-cowork is already running'
+        : 'ours-cowork started');
       return;
     }
     case 'stop': {
       const result = await stopDaemon(config);
-      output.success(result, result.stopped ? `ours-cowork stopped (pid ${result.pid})` : 'ours-cowork is not running');
+      output.success(result, result.stopped ? 'ours-cowork stopped' : 'ours-cowork is not running');
       return;
     }
     case 'restart': {
       await stopDaemon(config);
       const result = await startDaemon(config);
-      output.success(result, `ours-cowork restarted (pid ${result.pid})`);
+      output.success(result, 'ours-cowork restarted');
       return;
     }
     case 'status': {
-      const runtime = { socketPath: join(config.stateDir, 'management.sock') };
-      const pid = ownedSupervisorPid(config);
-      if (pid === null || !await socketOpen(runtime.socketPath) || ownedSupervisorPid(config) !== pid) {
+      const probe = await probeDaemon(config);
+      if (probe.kind !== 'running') {
         throw new CliError(EXIT.daemonUnavailable, 'daemon_unavailable', 'ours-cowork is stopped');
       }
-      output.success({ running: true, pid, broker_url: config.brokerUrl, state_dir: config.stateDir }, `ours-cowork is running (pid ${pid})`);
+      output.success({ running: true }, 'ours-cowork is running');
       return;
     }
     case 'install-service': {
+      validateServiceConfiguration(config);
       await stopDaemon(config);
       ensureRuntimeState(config);
       const path = process.platform === 'linux' ? installSystemd(config)

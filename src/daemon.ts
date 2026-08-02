@@ -53,6 +53,7 @@ export class DaemonSupervisor {
   private settled = false;
   private primaryError?: Error;
   private timer?: ReturnType<typeof setTimeout>;
+  private shutdownRequestTimer?: ReturnType<typeof setTimeout>;
   private currentStage?: WorkerStage;
 
   private readonly onSigint = (): void => this.requestShutdown('SIGINT');
@@ -64,6 +65,15 @@ export class DaemonSupervisor {
       return;
     }
     if (!this.initialized) return;
+    if (message.type === 'shutdown_request') {
+      // Let the worker finish the management RPC response after its IPC send
+      // is accepted, then enter the exact signal-driven bounded path.
+      this.shutdownRequestTimer ??= setTimeout(() => {
+        this.shutdownRequestTimer = undefined;
+        this.requestShutdown('SIGTERM');
+      }, 25);
+      return;
+    }
     if (message.type === 'stage' && typeof message.stage === 'string'
       && (WORKER_STAGES as readonly string[]).includes(message.stage)) {
       this.currentStage = message.stage as WorkerStage;
@@ -130,7 +140,9 @@ export class DaemonSupervisor {
 
   private cleanupListeners(): void {
     if (this.timer) clearTimeout(this.timer);
+    if (this.shutdownRequestTimer) clearTimeout(this.shutdownRequestTimer);
     this.timer = undefined;
+    this.shutdownRequestTimer = undefined;
     this.signals.off('SIGINT', this.onSigint);
     this.signals.off('SIGTERM', this.onSigterm);
     this.child.off('message', this.onMessage);

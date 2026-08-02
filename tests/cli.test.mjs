@@ -237,13 +237,33 @@ test('malformed, incomplete, and oversized RPC replies fail fast without a linge
   }
 });
 
-test('status, stop, and restart never claim or signal an unrelated PID and listener', async () => {
+test('status, stop, and restart ignore a purpose-built argv/PPID/PID/lock/socket spoof', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'cowork-cli-owner-'));
   await chmod(stateDir, 0o700);
-  const unrelated = spawn('sleep', ['30']);
+  const fakeWorkerProgram = 'setInterval(() => {}, 1000)';
+  const fakeParentProgram = `
+    const { spawn } = require('node:child_process');
+    const { writeFileSync } = require('node:fs');
+    const worker = spawn(process.execPath, ['--eval', ${JSON.stringify(fakeWorkerProgram)}, ${JSON.stringify(join(ROOT, 'dist', 'daemon.js'))}], { stdio: 'ignore' });
+    writeFileSync(${JSON.stringify(join(stateDir, 'daemon.lock'))}, worker.pid + '\\n', { mode: 0o600 });
+    process.on('exit', () => { try { worker.kill('SIGTERM'); } catch {} });
+    setInterval(() => {}, 1000);
+  `;
+  const unrelated = spawn(process.execPath, ['--eval', fakeParentProgram, CLI, 'serve'], { stdio: 'ignore' });
   assert(unrelated.pid);
   await writeFile(join(stateDir, 'daemon.pid'), `${unrelated.pid}\n`, { mode: 0o600 });
-  const listener = createServer((socket) => socket.end());
+  const lockDeadline = Date.now() + 2_000;
+  while (spawnSync('test', ['-f', join(stateDir, 'daemon.lock')]).status !== 0 && Date.now() < lockDeadline) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  }
+  const workerPid = Number((await readFile(join(stateDir, 'daemon.lock'), 'utf8')).trim());
+  assert(Number.isSafeInteger(workerPid));
+  const listener = createServer((socket) => {
+    socket.once('data', (bytes) => {
+      const request = JSON.parse(bytes.toString('utf8'));
+      socket.end(`${JSON.stringify({ version: 1, id: request.id, error: { code: 'method_not_found', message: 'no control capability' } })}\n`);
+    });
+  });
   await new Promise((resolveListen, reject) => {
     listener.once('error', reject);
     listener.listen(join(stateDir, 'management.sock'), resolveListen);
@@ -255,19 +275,73 @@ test('status, stop, and restart never claim or signal an unrelated PID and liste
     assert.equal(JSON.parse(status.stdout).error.code, 'daemon_unavailable');
 
     const stop = await runCli(['stop', '--json'], { env });
-    assert.equal(stop.code, 0);
-    assert.deepEqual(JSON.parse(stop.stdout).result, { stopped: false });
+    assert.equal(stop.code, 4);
     assert.equal(unrelated.exitCode, null, 'stop killed an unrelated process');
+    assert.doesNotThrow(() => process.kill(workerPid, 0), 'stop killed the unrelated child');
 
     const restart = await runCli(['restart', '--json'], { env });
     assert.equal(restart.code, 4);
     assert.equal(unrelated.exitCode, null, 'restart killed an unrelated process');
+    assert.doesNotThrow(() => process.kill(workerPid, 0), 'restart killed the unrelated child');
   } finally {
     await new Promise((resolveClose) => listener.close(resolveClose));
     if (unrelated.exitCode === null) unrelated.kill('SIGTERM');
     await new Promise((resolveClose) => unrelated.once('close', resolveClose));
+    try { process.kill(workerPid, 'SIGTERM'); } catch { /* already exited */ }
     await rm(stateDir, { recursive: true, force: true });
   }
+});
+
+test('a fake accepted shutdown that keeps the same control session cannot report stopped', { timeout: 20_000 }, async () => {
+  const session = 'ab'.repeat(16);
+  await withRawRpc((socket) => {
+    let bytes = '';
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk) => {
+      bytes += chunk;
+      const newline = bytes.indexOf('\n');
+      if (newline < 0) return;
+      const request = JSON.parse(bytes.slice(0, newline));
+      const result = request.method === 'daemon.status'
+        ? { version: 1, protocol: 'cowork-supervisor-control', running: true, session }
+        : request.method === 'daemon.shutdown'
+          ? { accepted: true, session }
+          : undefined;
+      socket.end(`${JSON.stringify({ version: 1, id: request.id, result })}\n`);
+    });
+  }, async (env) => {
+    const result = await runCli(['stop', '--json'], { env });
+    assert.equal(result.code, 4);
+    assert.equal(result.stderr, '');
+    assert.equal(JSON.parse(result.stdout).error.code, 'invalid_state');
+  });
+});
+
+test('real daemon start, status, and stop use the management control session', { timeout: 30_000 }, async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'cowork-cli-real-control-'));
+  await chmod(stateDir, 0o700);
+  const env = {
+    OURS_COWORK_STATE_DIR: stateDir,
+    OURS_COWORK_BROKER_URL: 'ws://127.0.0.1:1',
+  };
+  t.after(async () => {
+    const pidPath = join(stateDir, 'daemon.pid');
+    try {
+      const pid = Number((await readFile(pidPath, 'utf8')).trim());
+      if (Number.isSafeInteger(pid)) process.kill(pid, 'SIGKILL');
+    } catch { /* daemon stopped or never started */ }
+    await rm(stateDir, { recursive: true, force: true });
+  });
+  const started = await runCli(['start', '--json'], { env });
+  assert.equal(started.code, 0, `${started.stdout} ${started.stderr}`);
+  const status = await runCli(['status', '--json'], { env });
+  assert.equal(status.code, 0, `${status.stdout} ${status.stderr}`);
+  assert.deepEqual(JSON.parse(status.stdout).result, { running: true });
+  const stopped = await runCli(['stop', '--json'], { env });
+  assert.equal(stopped.code, 0, `${stopped.stdout} ${stopped.stderr}`);
+  assert.equal(JSON.parse(stopped.stdout).result.stopped, true);
+  const after = await runCli(['status', '--json'], { env });
+  assert.equal(after.code, 6);
 });
 
 test('--json serve emits exactly one JSON value and suppresses supervised diagnostics', async () => {
@@ -414,5 +488,34 @@ test('systemd ExecStart quotes a cowork CLI path containing spaces and special c
     }
   } finally {
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('service install rejects control characters before creating or replacing a unit', async () => {
+  for (const control of ['\n', '\r']) {
+    const home = await mkdtemp(join(tmpdir(), 'cowork-systemd-control-'));
+    const binDir = join(home, 'bin');
+    const unitPath = join(home, '.config', 'systemd', 'user', 'ours-cowork.service');
+    await mkdir(binDir, { mode: 0o700 });
+    for (const name of ['systemctl', 'loginctl']) {
+      await writeFile(join(binDir, name), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+      await chmod(join(binDir, name), 0o700);
+    }
+    await mkdir(resolve(unitPath, '..'), { recursive: true, mode: 0o700 });
+    await writeFile(unitPath, 'existing unit must remain');
+    try {
+      const result = await runCli(['install-service', '--json'], {
+        env: {
+          HOME: home,
+          PATH: `${binDir}:${process.env.PATH}`,
+          OURS_COWORK_STATE_DIR: join(home, `unsafe${control}state`),
+        },
+      });
+      assert.equal(result.code, 4);
+      assert.equal(result.stderr, '');
+      assert.equal(await readFile(unitPath, 'utf8'), 'existing unit must remain');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   }
 });

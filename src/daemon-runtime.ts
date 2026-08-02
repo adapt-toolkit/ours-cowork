@@ -97,6 +97,44 @@ export interface CoworkDaemonOptions {
   removePid?: (stateDir: string) => void;
   log?: (...parts: unknown[]) => void;
   onStage?: (stage: DaemonStage) => void;
+  control?: DaemonControl;
+}
+
+export interface DaemonControl {
+  session: string;
+  requestSupervisorShutdown(): Promise<boolean>;
+}
+
+export function createDaemonControlRoutes(control: DaemonControl) {
+  if (!/^[0-9a-f]{32}$/.test(control.session)) throw new TypeError('invalid daemon control session');
+  const requireExact = (params: Record<string, unknown>, keys: string[]): void => {
+    if (Object.keys(params).length !== keys.length || keys.some((key) => !Object.hasOwn(params, key))) {
+      throw new TypeError('invalid daemon control parameters');
+    }
+  };
+  return {
+    'daemon.status': {
+      auth: true as const,
+      run(params: Record<string, unknown>) {
+        requireExact(params, []);
+        return {
+          version: 1,
+          protocol: 'cowork-supervisor-control',
+          running: true,
+          session: control.session,
+        };
+      },
+    },
+    'daemon.shutdown': {
+      auth: true as const,
+      async run(params: Record<string, unknown>) {
+        requireExact(params, ['session']);
+        if (params.session !== control.session) throw new TypeError('daemon control session changed');
+        if (!await control.requestSupervisorShutdown()) throw new Error('supervisor IPC rejected shutdown request');
+        return { accepted: true, session: control.session };
+      },
+    },
+  };
 }
 
 export class CoworkDaemon {
@@ -195,7 +233,10 @@ export class CoworkDaemon {
       }
 
       const realService = this.service as RoomService;
-      const dispatcher = new RpcDispatcher(createServiceRoutes(realService));
+      const routes = this.options.control
+        ? { ...createServiceRoutes(realService), ...createDaemonControlRoutes(this.options.control) }
+        : createServiceRoutes(realService);
+      const dispatcher = new RpcDispatcher(routes);
       this.transports = this.options.transports ?? new TransportServer({
         socketPath: runtime.socketPath,
         rest: config.rest,

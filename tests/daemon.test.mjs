@@ -77,6 +77,30 @@ test('supervisor entry stays SDK-free and preserves unrelated signal listeners a
   }
 });
 
+test('an authenticated worker shutdown request enters the supervisor bounded shutdown path', async () => {
+  const capability = 'cd'.repeat(32);
+  const signals = new EventEmitter();
+  const sent = [];
+  const child = Object.assign(new EventEmitter(), {
+    connected: true, exitCode: null,
+    send(message) { sent.push(message); },
+    kill() { assert.fail('responsive worker must not be force-killed'); },
+  });
+  const supervisor = new DaemonSupervisor({ child, signals, shutdownTimeoutMs: 500, capability });
+  supervisor.start();
+  child.emit('message', { type: 'init_ack', capability });
+  child.emit('message', { type: 'shutdown_request', capability });
+  await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+  assert.deepEqual(sent, [
+    { type: 'init', capability },
+    { type: 'shutdown', signal: 'SIGTERM', capability },
+  ]);
+  child.emit('message', { type: 'shutdown_ack', requiresProcessExit: true, capability });
+  child.exitCode = 0;
+  child.emit('exit', 0, null);
+  assert.deepEqual(await supervisor.done, { code: 0, signal: null });
+});
+
 test('supervisor strips inherited preload and execution modes from its worker', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-exec-argv-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

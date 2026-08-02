@@ -414,6 +414,132 @@ test('startup removes only inode-verified owned stale private sockets within its
   await transport.stop();
 });
 
+test('publication preserves a private-alias replacement swapped at the final destructive operation', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-private-alias-swap-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'management.sock');
+  const prepared = join(dir, 'prepared-private-replacement');
+  writeFileSync(prepared, 'private alias replacement');
+  let privatePath;
+  let privateStats = 0;
+  let injected = false;
+  const fs = new Proxy(realFs, {
+    get(target, property) {
+      if (property === 'lstatSync') return (candidate, ...args) => {
+        const stat = target.lstatSync(candidate, ...args);
+        if (typeof candidate === 'string' && candidate.includes('.private-') && stat.isSocket()) {
+          privatePath = candidate;
+          privateStats += 1;
+        }
+        return stat;
+      };
+      if (property === 'unlinkSync') return (candidate) => {
+        if (!injected && candidate === privatePath && privateStats >= 2) {
+          injected = true;
+          target.renameSync(candidate, `${candidate}.owned`);
+          target.renameSync(prepared, candidate);
+        }
+        return target.unlinkSync(candidate);
+      };
+      if (property === 'renameSync') return (source, destination) => {
+        if (!injected && source === privatePath && privateStats >= 2) {
+          injected = true;
+          target.renameSync(source, `${source}.owned`);
+          target.renameSync(prepared, source);
+        }
+        return target.renameSync(source, destination);
+      };
+      return target[property];
+    },
+  });
+  const transport = new TransportServer({
+    socketPath: path, rest: { enabled: false, port: 1 }, fs,
+    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+  });
+  t.after(() => transport.stop());
+  await assert.rejects(transport.start(), /private|publish|changed|replacement|residue/i);
+  assert.equal(injected, true);
+  assert.equal(readFileSync(privatePath, 'utf8'), 'private alias replacement');
+});
+
+test('stale-prefix cleanup preserves a live same-UID private socket', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-live-private-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'management.sock');
+  const livePath = `${path}.private-${process.pid}-live`;
+  const live = net.createServer((socket) => socket.end());
+  await new Promise((resolve, reject) => {
+    live.once('error', reject);
+    live.listen(livePath, resolve);
+  });
+  t.after(async () => { await new Promise((resolve) => live.close(resolve)); });
+  const transport = new TransportServer({
+    socketPath: path, rest: { enabled: false, port: 1 },
+    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+  });
+  await transport.start();
+  t.after(() => transport.stop());
+  assert(lstatSync(livePath).isSocket());
+  await new Promise((resolve, reject) => {
+    const socket = net.createConnection(livePath);
+    socket.once('connect', () => { socket.destroy(); resolve(); });
+    socket.once('error', reject);
+  });
+});
+
+test('stale-prefix cleanup preserves a replacement swapped at its final destructive operation', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-stale-private-swap-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'management.sock');
+  const seed = join(dir, 'seed.sock');
+  const stale = `${path}.private-${process.pid}-swap`;
+  const prepared = join(dir, 'prepared-stale-replacement');
+  const staleServer = net.createServer();
+  await new Promise((resolve, reject) => {
+    staleServer.once('error', reject);
+    staleServer.listen(seed, resolve);
+  });
+  realFs.renameSync(seed, stale);
+  await new Promise((resolve) => staleServer.close(resolve));
+  writeFileSync(prepared, 'stale path replacement');
+  let observations = 0;
+  let injected = false;
+  const fs = new Proxy(realFs, {
+    get(target, property) {
+      if (property === 'lstatSync') return (candidate, ...args) => {
+        const stat = target.lstatSync(candidate, ...args);
+        if (candidate === stale && stat.isSocket()) observations += 1;
+        return stat;
+      };
+      if (property === 'unlinkSync') return (candidate) => {
+        if (!injected && candidate === stale && observations >= 2) {
+          injected = true;
+          target.renameSync(candidate, `${candidate}.owned`);
+          target.renameSync(prepared, candidate);
+        }
+        return target.unlinkSync(candidate);
+      };
+      if (property === 'renameSync') return (source, destination) => {
+        if (!injected && source === stale && observations >= 1) {
+          injected = true;
+          target.renameSync(source, `${source}.owned`);
+          target.renameSync(prepared, source);
+        }
+        return target.renameSync(source, destination);
+      };
+      return target[property];
+    },
+  });
+  const transport = new TransportServer({
+    socketPath: path, rest: { enabled: false, port: 1 }, fs,
+    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+  });
+  t.after(() => transport.stop());
+  await assert.rejects(transport.start(), /stale|changed|replacement|residue/i);
+  assert.equal(injected, true);
+  assert.equal(readFileSync(stale, 'utf8'), 'stale path replacement');
+});
+
 for (const kind of ['regular file', 'symlink', 'socket']) {
   test(`shutdown preserves a final-after-inspection ${kind} replacement`, async (t) => {
     const dir = mkdtempSync(join(tmpdir(), 'cowork-socket-inspection-race-'));

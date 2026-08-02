@@ -14,6 +14,13 @@ export const HTTP_KEEP_ALIVE_TIMEOUT_MS = 5_000;
 const MAX_STALE_PRIVATE_SOCKET_CLEANUP = 32;
 type HttpSocketPhase = 'headers' | 'body' | 'response' | 'idle';
 
+interface ProtectedPath {
+  target: string;
+  path: string;
+  dev: number;
+  ino: number;
+}
+
 const RpcIdSchema = z.union([
   z.string().min(1).max(256),
   z.number().int().nonnegative().safe(),
@@ -183,6 +190,7 @@ export class TransportServer {
   private stopWork?: Promise<void>;
   private ownedSocket?: { dev: number; ino: number; uid: number };
   private privateSocketPath?: string;
+  private protectedPrivateReplacement?: ProtectedPath;
 
   constructor(options: TransportServerOptions) {
     this.options = options;
@@ -206,7 +214,7 @@ export class TransportServer {
 
   private async startUnlocked(): Promise<void> {
     await this.prepareUnixPath();
-    this.cleanupStalePrivateSockets();
+    await this.cleanupStalePrivateSockets();
     const unix = net.createServer((socket) => this.handleUnix(socket));
     this.unixServer = unix;
     const privateSocketPath = `${this.options.socketPath}.private-${process.pid}-${randomBytes(6).toString('hex')}`;
@@ -236,7 +244,18 @@ export class TransportServer {
     } catch (error) {
       const quarantined = this.quarantinePublicPath();
       await this.closeServers();
-      if (quarantined) this.releaseQuarantinedPath(quarantined);
+      const cleanupErrors: unknown[] = [];
+      if (quarantined) {
+        try { this.releaseQuarantinedPath(quarantined); } catch (caught) { cleanupErrors.push(caught); }
+      }
+      const protectedPrivate = this.protectedPrivateReplacement;
+      this.protectedPrivateReplacement = undefined;
+      if (protectedPrivate) {
+        try { this.restoreProtectedPath(protectedPrivate); } catch (caught) { cleanupErrors.push(caught); }
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError([error, ...cleanupErrors], 'transport startup and ownership-safe cleanup failed');
+      }
       throw error;
     }
   }
@@ -458,10 +477,18 @@ export class TransportServer {
       || privateSocket.uid !== owned.uid || !privateSocket.isSocket() || privateSocket.isSymbolicLink()) {
       throw new Error('private management socket changed during publication');
     }
-    this.fs.unlinkSync(privateSocketPath);
+    const quarantined = this.quarantinePath(privateSocketPath, 'private-alias');
+    const moved = this.fs.lstatSync(quarantined.path);
+    if (moved.dev === owned.dev && moved.ino === owned.ino && moved.uid === owned.uid
+      && moved.isSocket() && !moved.isSymbolicLink()) {
+      this.fs.unlinkSync(quarantined.path);
+      return;
+    }
+    this.protectedPrivateReplacement = quarantined;
+    throw new Error(`private management socket changed during removal; replacement protected at ${quarantined.path}`);
   }
 
-  private cleanupStalePrivateSockets(): void {
+  private async cleanupStalePrivateSockets(): Promise<void> {
     // CoworkDaemon invokes transport startup only while holding the exclusive
     // daemon lock. Bound the number of stale path mutations per boot and never
     // remove a non-socket, symlink, foreign owner, or inode that changed after
@@ -482,14 +509,49 @@ export class TransportServer {
       }
       if (!observed.isSocket() || observed.isSymbolicLink()
         || (uid !== undefined && observed.uid !== uid)) continue;
-      let current: nodeFs.Stats;
-      try { current = this.fs.lstatSync(path); } catch (error) {
+      if (await unixSocketIsLive(path)) continue;
+      let quarantined: ProtectedPath;
+      try { quarantined = this.quarantinePath(path, 'stale-private'); } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
         throw error;
       }
-      if (current.dev !== observed.dev || current.ino !== observed.ino
-        || current.uid !== observed.uid || !current.isSocket() || current.isSymbolicLink()) continue;
-      this.fs.unlinkSync(path);
+      const moved = this.fs.lstatSync(quarantined.path);
+      if (moved.dev === observed.dev && moved.ino === observed.ino && moved.uid === observed.uid
+        && moved.isSocket() && !moved.isSymbolicLink()) {
+        this.fs.unlinkSync(quarantined.path);
+        continue;
+      }
+      this.restoreProtectedPath(quarantined);
+      throw new Error(`stale private socket changed during cleanup; replacement preserved with safe residue at ${quarantined.path}`);
+    }
+  }
+
+  private quarantinePath(target: string, label: string): ProtectedPath {
+    const path = `${this.options.socketPath}.${label}-${process.pid}-${randomBytes(6).toString('hex')}`;
+    this.fs.renameSync(target, path);
+    const moved = this.fs.lstatSync(path);
+    return { target, path, dev: moved.dev, ino: moved.ino };
+  }
+
+  private restoreProtectedPath(protectedPath: ProtectedPath): void {
+    const moved = this.fs.lstatSync(protectedPath.path);
+    if (moved.dev !== protectedPath.dev || moved.ino !== protectedPath.ino) {
+      throw new Error(`protected management path changed; safe residue remains at ${protectedPath.path}`);
+    }
+    try {
+      // Atomic no-replace restoration. Keep the collision-resistant alias as
+      // residue: deleting a non-owned inode by pathname would reintroduce the
+      // same final-instant substitution race this path is containing.
+      this.fs.linkSync(protectedPath.path, protectedPath.target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new Error(`management path reoccupied; replacement remains at safe residue ${protectedPath.path}`);
+      }
+      throw new Error(`failed to restore protected management path; safe residue remains at ${protectedPath.path}`, { cause: error });
+    }
+    const restored = this.fs.lstatSync(protectedPath.target);
+    if (restored.dev !== protectedPath.dev || restored.ino !== protectedPath.ino) {
+      throw new Error(`restored management path changed; safe residue remains at ${protectedPath.path}`);
     }
   }
 

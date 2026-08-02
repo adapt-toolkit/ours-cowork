@@ -433,16 +433,17 @@ export class RoomService {
         },
         category: 'chat',
         text: request.text,
+        recipient_identities: uniqueIdentities(room.seats.map((seat) => seat.identity)),
       });
       if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong room message kind');
-      for (const seat of room.seats) {
+      for (const recipientIdentity of appended.recipient_identities) {
         await this.store.append(id, {
           version: 1,
           kind: 'relay_intent',
           room_id: id,
           at: this.now(),
           message_id: appended.message_id,
-          recipient_identity: seat.identity,
+          recipient_identity: recipientIdentity,
         });
       }
       await this.intake.resumePending(id);
@@ -526,44 +527,42 @@ export class RoomService {
     let message: MessageRecord | undefined = records.find(
       (record): record is MessageRecord => record.kind === 'message' && record.category === 'briefing',
     );
-    if (!message) message = await this.appendBriefing(room);
+    if (!message) message = await this.appendBriefing(room, recipients);
     const intents = new Set(records
       .filter((record) => record.kind === 'relay_intent' && record.message_id === message!.message_id)
       .map((record) => record.kind === 'relay_intent' ? record.recipient_identity : ''));
-    for (const seat of recipients) {
-      if (!intents.has(seat.identity)) {
+    for (const recipientIdentity of message.recipient_identities) {
+      if (!intents.has(recipientIdentity)) {
         await this.store.append(room.room_id, {
           version: 1,
           kind: 'relay_intent',
           room_id: room.room_id,
           at: this.now(),
           message_id: message.message_id,
-          recipient_identity: seat.identity,
+          recipient_identity: recipientIdentity,
         });
       }
+    }
+    const originalAudience = new Set(message.recipient_identities);
+    for (const recipient of recipients) {
+      if (!originalAudience.has(recipient.identity)) await this.ensureLateBriefing(room, recipient);
     }
     return message.at;
   }
 
   private async ensureLateBriefing(room: Room, seat: Seat): Promise<void> {
     const records = await this.store.read(room.room_id);
-    const briefingIds = new Set(records
-      .filter((record) => record.kind === 'message' && record.category === 'briefing')
-      .map((record) => record.kind === 'message' ? record.message_id : ''));
-    const alreadyBriefed = records.some((record) =>
-      record.kind === 'relay_intent'
-      && briefingIds.has(record.message_id)
-      && record.recipient_identity === seat.identity);
-    if (alreadyBriefed) return;
-    const intentsByMessage = new Set(records
-      .filter((record) => record.kind === 'relay_intent')
-      .map((record) => record.kind === 'relay_intent' ? record.message_id : ''));
     let message: MessageRecord | undefined = [...records].reverse().find(
       (record): record is MessageRecord => record.kind === 'message'
         && record.category === 'briefing'
-        && !intentsByMessage.has(record.message_id),
+        && record.recipient_identities.includes(seat.identity),
     );
-    if (!message) message = await this.appendBriefing(room);
+    if (!message) message = await this.appendBriefing(room, [seat]);
+    const alreadyBriefed = records.some((record) =>
+      record.kind === 'relay_intent'
+      && record.message_id === message!.message_id
+      && record.recipient_identity === seat.identity);
+    if (alreadyBriefed) return;
     await this.store.append(room.room_id, {
       version: 1,
       kind: 'relay_intent',
@@ -574,7 +573,7 @@ export class RoomService {
     });
   }
 
-  private async appendBriefing(room: Room): Promise<MessageRecord> {
+  private async appendBriefing(room: Room, recipients: Seat[]): Promise<MessageRecord> {
     const record = await this.store.append(room.room_id, {
       version: 1,
       kind: 'message',
@@ -584,6 +583,7 @@ export class RoomService {
       author: { identity: room.identity_cid, display_name: room.identity_name, role: ROOM_ROLE },
       category: 'briefing',
       text: room.mission.briefing,
+      recipient_identities: uniqueIdentities(recipients.map((seat) => seat.identity)),
     });
     if (record.kind !== 'message') throw new RoomServiceError('storage returned the wrong briefing record kind');
     return record;
@@ -637,4 +637,8 @@ function generateUlid(): string {
     output[index] = CROCKFORD[(value >>> bits) & 31]!;
   }
   return output.join('');
+}
+
+function uniqueIdentities(identities: string[]): string[] {
+  return [...new Set(identities)];
 }

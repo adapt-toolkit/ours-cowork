@@ -212,6 +212,51 @@ application actor loads libraries
         ].
     }
 
+    // Atomically consume only the unread IDs admitted by a host snapshot.
+    // Unexpected arrivals remain unread throughout this one transaction; no
+    // second defer transaction or crash window exists.
+    trn consume_messages _:($expected_ids -> ids: int[])
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        wanted is (int ->> bool) = (,).
+        sc ids -- ( -> id) { wanted id -> TRUE. }
+        consumed is int[] = [].
+        deferred is int[] = [].
+        updated is message_t[] = [].
+        sc inbox -- ( -> message)
+        {
+            if (message $status) == "unread"
+            {
+                mid = message $msg_id.
+                if wanted mid
+                {
+                    consumed (_count consumed|) -> mid.
+                    updated (_count updated|) -> (
+                        $msg_id      -> message $msg_id,
+                        $sender_id   -> message $sender_id,
+                        $sender_name -> message $sender_name,
+                        $text        -> message $text,
+                        $date        -> message $date,
+                        $status      -> "processed",
+                        $wire_id     -> message $wire_id,
+                        $reply_to    -> message $reply_to
+                    ).
+                }
+                else
+                {
+                    deferred (_count deferred|) -> mid.
+                    updated (_count updated|) -> message.
+                }
+            }
+            else { updated (_count updated|) -> message. }
+        }
+        inbox -> updated.
+        return transaction::success [
+            _return_data ($consumed -> consumed, $deferred -> deferred),
+            _save_state NIL
+        ].
+    }
+
     trn defer_messages _:($msg_ids -> ids: int[])
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).

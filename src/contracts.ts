@@ -254,6 +254,19 @@ const MessageShape = {
   author: AuthorSnapshotSchema,
   category: z.enum(['briefing', 'chat']),
   text: MessageTextSchema,
+  recipient_identities: z.array(NonEmptyStringSchema).superRefine((identities, context) => {
+    const seen = new Set<string>();
+    for (const [index, identity] of identities.entries()) {
+      if (seen.has(identity)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index],
+          message: 'recipient identities must be unique',
+        });
+      }
+      seen.add(identity);
+    }
+  }),
   source_msg_id: z.number().int().nonnegative().safe().optional(),
   source_wire_id: NonEmptyStringSchema.optional(),
 } as const;

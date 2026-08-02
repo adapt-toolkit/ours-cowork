@@ -36,6 +36,7 @@ function message(text) {
     author: { identity: 'cid-alice', display_name: 'Alice', role: 'researcher' },
     category: 'chat',
     text,
+    recipient_identities: [],
   };
 }
 

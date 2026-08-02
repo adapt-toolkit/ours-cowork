@@ -182,6 +182,7 @@ test('canonical JSON recursively sorts keys and participant fan-out excludes its
   assert.deepEqual(message.author, { identity: 'cid-alice', display_name: 'Alice', role: 'builder' });
   assert.equal(message.source_msg_id, 7);
   assert.equal(message.source_wire_id, 'wire-in-7');
+  assert.deepEqual(message.recipient_identities, ['cid-bob', 'cid-cara']);
   assert.deepEqual(byKind(records, 'relay_intent').map((record) => record.recipient_identity), ['cid-bob', 'cid-cara']);
   assert.deepEqual(f.packet.consumeCalls, [[7]]);
   assert.deepEqual(f.packet.sendCalls.map((call) => call.recipient), ['cid-bob', 'cid-cara']);
@@ -203,6 +204,7 @@ test('canonical JSON recursively sorts keys and participant fan-out excludes its
     version: 1,
   });
   assert.equal('signature' in unsigned, false);
+  assert.equal('recipient_identities' in unsigned, false);
   assert.deepEqual(Object.keys(JSON.parse(f.packet.sendCalls[0].body)).sort(),
     ['at', 'author', 'kind', 'message_id', 'room_id', 'signature', 'text', 'version']);
 });
@@ -417,7 +419,7 @@ test('resumePending reconciles Task 5 briefing intents into signed room_briefing
         version: 1, kind: 'message', room_id: ROOM_ID, seq: 1, record_id: `${ROOM_ID}:1`, at: AT,
         message_id: briefingId,
         author: { identity: 'cid-room', display_name: `cowork-room-${ROOM_ID}`, role: 'room' },
-        category: 'briefing', text: 'Read the mission.',
+        category: 'briefing', text: 'Read the mission.', recipient_identities: ['cid-alice'],
       },
       {
         version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: 2, record_id: `${ROOM_ID}:2`, at: AT,
@@ -450,6 +452,7 @@ test('operator postMessage rejects all author-like keys before host authorship a
   assert.deepEqual(message.author, {
     identity: 'cid-room', display_name: `cowork-room-${ROOM_ID}`, role: 'room',
   });
+  assert.deepEqual(message.recipient_identities, ['cid-alice', 'cid-bob', 'cid-cara']);
   const records = await f.store.read(ROOM_ID);
   assert.deepEqual(byKind(records, 'relay_intent').map((record) => record.recipient_identity),
     ['cid-alice', 'cid-bob', 'cid-cara']);
@@ -476,10 +479,103 @@ test('operator room voice resumes a crash during intent creation before sending 
   assert.equal(byKind(records, 'message').length, 1);
   assert.equal(byKind(records, 'relay_intent').length, 1);
 
+  f.store.rooms.get(ROOM_ID).seats.push({
+    identity: 'cid-late', display_name: 'Late', role: 'late', invite_id: 'invite-late', accepted_at: AT,
+  });
   f.store.beforeAppend = undefined;
   await f.pump.resumePending(ROOM_ID);
   records = await f.store.read(ROOM_ID);
   assert.deepEqual(byKind(records, 'relay_intent').map((record) => record.recipient_identity),
     ['cid-alice', 'cid-bob', 'cid-cara']);
   assert.deepEqual(f.packet.sendCalls.map((call) => call.recipient), ['cid-alice', 'cid-bob', 'cid-cara']);
+});
+
+test('resumePending completes participant snapshot fanout and consumes its unread source before any send', async () => {
+  const f = fixture({
+    records: [
+      {
+        version: 1, kind: 'message', room_id: ROOM_ID, seq: 1, record_id: `${ROOM_ID}:1`,
+        at: incoming().date, message_id: MESSAGE_IDS[0],
+        author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' },
+        category: 'chat', text: incoming().text, source_msg_id: 7, source_wire_id: 'wire-in-7',
+        recipient_identities: ['cid-bob', 'cid-cara'],
+      },
+      {
+        version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: 2, record_id: `${ROOM_ID}:2`,
+        at: AT, message_id: MESSAGE_IDS[0], recipient_identity: 'cid-bob',
+      },
+    ],
+  });
+  f.packet.inbox.push(incoming());
+  f.packet.beforeSend = async () => {
+    assert.deepEqual(f.packet.consumeCalls, [[7]], 'source must be consumed before the first wire attempt');
+    assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_intent').length, 2,
+      'the complete snapshot fanout must be durable before the first wire attempt');
+  };
+
+  await f.pump.resumePending(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls.map((call) => call.recipient), ['cid-bob', 'cid-cara']);
+  assert.deepEqual(f.packet.consumeCalls, [[7]]);
+});
+
+test('resumePending after a pre-consume crash consumes before sending already-complete intents', async () => {
+  const f = fixture({
+    records: [
+      {
+        version: 1, kind: 'message', room_id: ROOM_ID, seq: 1, record_id: `${ROOM_ID}:1`,
+        at: incoming().date, message_id: MESSAGE_IDS[0],
+        author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' },
+        category: 'chat', text: incoming().text, source_msg_id: 7, source_wire_id: 'wire-in-7',
+        recipient_identities: ['cid-bob'],
+      },
+      {
+        version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: 2, record_id: `${ROOM_ID}:2`,
+        at: AT, message_id: MESSAGE_IDS[0], recipient_identity: 'cid-bob',
+      },
+    ],
+    room: { seats: room().seats.slice(0, 2) },
+  });
+  f.packet.inbox.push(incoming());
+  f.packet.beforeSend = () => assert.deepEqual(f.packet.consumeCalls, [[7]]);
+  await f.pump.resumePending(ROOM_ID);
+  assert.equal(f.packet.sendCalls.length, 1);
+});
+
+test('notify does not lose a wakeup queued in the final-drain microtask gap', async () => {
+  const f = fixture();
+  let calls = 0;
+  let releaseReplacement;
+  const replacementGate = new Promise((resolve) => { releaseReplacement = resolve; });
+  f.pump.pump = async () => {
+    calls += 1;
+    if (calls === 2) await replacementGate;
+  };
+  const first = f.pump.notify(ROOM_ID);
+  let replacement;
+  queueMicrotask(() => { replacement = f.pump.notify(ROOM_ID); });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 2);
+  let firstSettled = false;
+  void first.then(() => { firstSettled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(firstSettled, false, 'the original work promise must chain the replacement');
+  releaseReplacement();
+  await first;
+  await replacement;
+  assert.equal(calls, 2);
+});
+
+test('notify chains a dirty replacement after a failed worker and still reports the original failure', async () => {
+  const f = fixture();
+  let calls = 0;
+  f.pump.pump = async () => {
+    calls += 1;
+    if (calls === 1) throw new Error('worker failed');
+  };
+  const first = f.pump.notify(ROOM_ID);
+  let replacement;
+  queueMicrotask(() => { replacement = f.pump.notify(ROOM_ID); });
+  await assert.rejects(first, /worker failed/);
+  await replacement.catch(() => {});
+  assert.equal(calls, 2, 'dirty shutdown work must be handed to a replacement worker');
 });

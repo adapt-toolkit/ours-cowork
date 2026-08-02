@@ -255,7 +255,7 @@ export class PacketRegistry {
   private statePath(roomId: string): string { return join(this.liveDir(roomId), 'state_data.bin'); }
 }
 
-class HostedRoomPacket implements RoomPacket {
+export class HostedRoomPacket implements RoomPacket {
   readonly name: string;
   readonly cid: string;
   private readonly packet: Packet;
@@ -334,37 +334,31 @@ class HostedRoomPacket implements RoomPacket {
   }
 
   async consumeInbox(expectedIds: number[]): Promise<{ consumed: number[]; deferred: number[] }> {
-    const expected = new Set(expectedIds);
-    const drained = await withScopeAsync(async (lifetime) => {
-      const result = await this.packet.mutatingTx('::actor::get_messages', {}, lifetime);
-      return renderInbox(result.Reduce('messages'));
+    return withScopeAsync(async (lifetime) => {
+      const result = await this.packet.mutatingTx(
+        '::actor::consume_messages',
+        { expected_ids: expectedIds },
+        lifetime,
+      );
+      return {
+        consumed: renderIntegerArray(result.Reduce('consumed')),
+        deferred: renderIntegerArray(result.Reduce('deferred')),
+      };
     });
-    const consumed = drained.filter((message) => expected.has(message.msg_id)).map((message) => message.msg_id);
-    const deferred = drained.filter((message) => !expected.has(message.msg_id)).map((message) => message.msg_id);
-    if (deferred.length > 0) {
-      await withScopeAsync((lifetime) =>
-        this.packet.mutatingTx('::actor::defer_messages', { msg_ids: deferred }, lifetime));
-    }
-    return { consumed, deferred };
   }
 
   async send(contactCid: string, body: string): Promise<{ status: RelayStatus; wire_id?: string }> {
-    try {
-      return await withScopeAsync(async (lifetime) => {
-        const result = await this.packet.mutatingTx(
-          '::a2a_messaging::send_message',
-          { contact: contactCid, text: body },
-          lifetime,
-        );
-        const refused = !result.Reduce('downgrade_refused').IsNil();
-        return refused
-          ? { status: 'send_failed' as const }
-          : { status: 'queued' as const, wire_id: nilString(result.Reduce('wire_id')) || undefined };
-      });
-    } catch (error) {
-      if (error instanceof PacketPersistenceError) throw error;
-      return { status: 'send_failed' };
-    }
+    return withScopeAsync(async (lifetime) => {
+      const result = await this.packet.mutatingTx(
+        '::a2a_messaging::send_message',
+        { contact: contactCid, text: body },
+        lifetime,
+      );
+      const refused = !result.Reduce('downgrade_refused').IsNil();
+      return refused
+        ? { status: 'send_failed' as const }
+        : { status: 'queued' as const, wire_id: nilString(result.Reduce('wire_id')) || undefined };
+    });
   }
 
   async removeContact(contactCid: string): Promise<{
@@ -420,6 +414,17 @@ function renderInbox(value: AdaptValue): RenderedInbox[] {
       status: message.Reduce('status').Visualize(),
       wire_id: message.Reduce('wire_id').Visualize(),
     });
+  }
+  return output;
+}
+
+function renderIntegerArray(value: AdaptValue): number[] {
+  const output: number[] = [];
+  if (value.IsNil()) return output;
+  for (let index = 0; ; index += 1) {
+    const item = value.Reduce(index);
+    if (item.IsNil()) break;
+    output.push(Number(item.Visualize()));
   }
   return output;
 }

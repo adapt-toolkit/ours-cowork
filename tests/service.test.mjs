@@ -581,6 +581,7 @@ test('activation requires every non-revoked requirement and at least one unique 
   assert.equal(briefing.length, 1);
   assert.equal(briefing[0].category, 'briefing');
   assert.equal(briefing[0].text, 'Read the mission.');
+  assert.deepEqual(briefing[0].recipient_identities, ['cid-alice', 'cid-bob']);
 });
 
 test('a seat admitted after activation gets a new durable briefing and duplicate CID gets none', async () => {
@@ -602,6 +603,7 @@ test('a seat admitted after activation gets a new durable briefing and duplicate
   assert.equal(briefings.length, 2);
   const lateIntents = records.filter((record) => record.kind === 'relay_intent' && record.message_id === briefings[1].message_id);
   assert.deepEqual(lateIntents.map((record) => record.recipient_identity), ['cid-bob']);
+  assert.deepEqual(briefings[1].recipient_identities, ['cid-bob']);
 });
 
 test('activation resumes after crashes between briefing, intents, and metadata without duplication', async () => {
@@ -638,6 +640,33 @@ test('activation resumes after crashes between briefing, intents, and metadata w
   const records = await f.store.read(ROOM_ID);
   assert.equal(records.filter((record) => record.kind === 'message').length, 1);
   assert.equal(records.filter((record) => record.kind === 'relay_intent').length, 1);
+});
+
+test('a seat appearing after activation briefing fsync gets a distinct exact-snapshot briefing on recovery', async () => {
+  const f = fixture();
+  await create(f);
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  const packet = f.registry.get(ROOM_ID);
+  packet.contacts = [{ name: 'Alice', container_id: 'cid-alice' }];
+  packet.origins = { 'cid-alice': { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[3] } };
+  let fail = true;
+  f.store.beforeAppend = (draft) => {
+    if (fail && draft.kind === 'relay_intent') {
+      fail = false;
+      throw new Error('crash after exact briefing snapshot');
+    }
+  };
+  await assert.rejects(f.service.reconcileRoom(ROOM_ID), /exact briefing snapshot/);
+
+  packet.contacts.push({ name: 'Bob', container_id: 'cid-bob' });
+  packet.origins['cid-bob'] = { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[4] };
+  f.store.beforeAppend = undefined;
+  assert.equal((await f.service.reconcileRoom(ROOM_ID)).state, 'active');
+  const records = await f.store.read(ROOM_ID);
+  const briefings = records.filter((record) => record.kind === 'message');
+  assert.deepEqual(briefings.map((message) => message.recipient_identities), [['cid-alice'], ['cid-bob']]);
+  assert.deepEqual(records.filter((record) => record.kind === 'relay_intent')
+    .map((intent) => intent.recipient_identity), ['cid-alice', 'cid-bob']);
 });
 
 test('concurrent reconciliation and a late-seat save retry produce one seat and one late briefing', async () => {

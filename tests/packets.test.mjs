@@ -20,6 +20,7 @@ import {
 import {
   PacketPersistenceError,
   PacketRegistry,
+  HostedRoomPacket,
   atomicWriteFileSync,
 } from '../src/packets.ts';
 
@@ -122,6 +123,54 @@ async function settledWithin(promises, timeoutMs = 250) {
     Promise.allSettled(promises),
     new Promise((_, reject) => setTimeout(() => reject(new Error('pending work did not settle')), timeoutMs)),
   ]);
+}
+
+if (!process.argv.includes('--packet-driver')) {
+test('hosted sends propagate every rejected mutation and map only explicit refusal to send_failed', async () => {
+  for (const failure of [
+    new Error('timed out'),
+    new Error('ambiguous transaction failure'),
+    new Error('packet is closed'),
+    new PacketPersistenceError('disk full'),
+  ]) {
+    const native = {
+      name: 'fake-room', cid: 'cid-fake', pw: {},
+      mutatingTx: async () => { throw failure; },
+    };
+    const hosted = new HostedRoomPacket(native, () => {}, () => {});
+    await assert.rejects(hosted.send('cid-peer', 'body'), (error) => error === failure);
+  }
+
+  const nil = { IsNil: () => true, Visualize: () => '' };
+  const refusal = {
+    name: 'fake-room', cid: 'cid-fake', pw: {},
+    mutatingTx: async () => ({
+      Reduce: (key) => key === 'downgrade_refused' ? { IsNil: () => false } : nil,
+    }),
+  };
+  const hosted = new HostedRoomPacket(refusal, () => {}, () => {});
+  assert.deepEqual(await hosted.send('cid-peer', 'body'), { status: 'send_failed' });
+});
+
+test('hosted inbox consume uses one atomic expected-ID mutation', async () => {
+  const calls = [];
+  const list = (numbers) => ({
+    IsNil: () => false,
+    Reduce: (index) => index < numbers.length
+      ? { IsNil: () => false, Visualize: () => String(numbers[index]) }
+      : { IsNil: () => true },
+  });
+  const native = {
+    name: 'fake-room', cid: 'cid-fake', pw: {},
+    mutatingTx: async (name, target) => {
+      calls.push({ name, target });
+      return { Reduce: (key) => key === 'consumed' ? list([2]) : list([3, 4]) };
+    },
+  };
+  const hosted = new HostedRoomPacket(native, () => {}, () => {});
+  assert.deepEqual(await hosted.consumeInbox([2]), { consumed: [2], deferred: [3, 4] });
+  assert.deepEqual(calls, [{ name: '::actor::consume_messages', target: { expected_ids: [2] } }]);
+});
 }
 
 async function runPacketDriver() {
@@ -232,7 +281,7 @@ async function runPacketDriver() {
     assert.deepEqual(consumed.consumed, [expected[0].msg_id]);
     assert.equal(consumed.deferred.length, 1);
     assert.deepEqual(gamma.peekInbox().map((message) => message.msg_id), consumed.deferred,
-      'unexpected drained arrivals must be unread again before consume resolves');
+      'unexpected arrivals remain unread in the same atomic consume transaction');
 
     failStateWrite = true;
     await assert.rejects(

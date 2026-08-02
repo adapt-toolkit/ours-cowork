@@ -75,6 +75,16 @@ function renderMessages(value) {
   return messages;
 }
 
+function renderIntArray(value) {
+  const output = [];
+  for (let index = 0; ; index += 1) {
+    const item = value.Reduce(index);
+    if (item.IsNil()) break;
+    output.push(Number(item.Visualize()));
+  }
+  return output;
+}
+
 if (process.argv.includes('--packet-driver')) {
 test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180_000 }, async (t) => {
   const packets = [];
@@ -307,24 +317,31 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   await waitFor(() => inbox(bob).some((message) => message.text === 'room-to-bob'), 'room-to-peer message');
   await mutate(bob, '::a2a_messaging::send_message', { contact: room.cid, text: 'bob-to-room' });
   await waitFor(() => inbox(room).some((message) => message.text === 'bob-to-room'), 'peer-to-room message');
+  await mutate(charlie, '::a2a_messaging::send_message', { contact: room.cid, text: 'atomic-unexpected' });
+  await waitFor(() => inbox(room).some((message) => message.text === 'atomic-unexpected'), 'atomic unexpected arrival');
 
   let roomInbox = inbox(room);
-  assert.equal(roomInbox.length, 1);
-  assert.equal(roomInbox[0].status, 'unread');
-  const messageId = roomInbox[0].msg_id;
-  let drained = await mutate(room, '::actor::get_messages', {});
-  assert.deepEqual(renderMessages(drained.Reduce('messages')).map((message) => message.msg_id), [messageId]);
-  drained = await mutate(room, '::actor::get_messages', {});
-  assert.deepEqual(renderMessages(drained.Reduce('messages')), []);
+  assert.equal(roomInbox.length, 2);
+  assert(roomInbox.every((message) => message.status === 'unread'));
+  const messageId = roomInbox.find((message) => message.text === 'bob-to-room').msg_id;
+  const unexpectedId = roomInbox.find((message) => message.text === 'atomic-unexpected').msg_id;
+  let drained = await mutate(room, '::actor::consume_messages', { expected_ids: [messageId] });
+  assert.deepEqual(renderIntArray(drained.Reduce('consumed')), [messageId]);
+  assert.deepEqual(renderIntArray(drained.Reduce('deferred')), [unexpectedId]);
+  assert.deepEqual(inbox(room).filter((message) => message.status === 'unread').map((message) => message.msg_id),
+    [unexpectedId], 'unexpected arrival stays unread in the same transaction with no defer crash window');
+  drained = await mutate(room, '::actor::consume_messages', { expected_ids: [messageId] });
+  assert.deepEqual(renderIntArray(drained.Reduce('consumed')), []);
   let deferred = await mutate(room, '::actor::defer_messages', { msg_ids: [messageId] });
   assert.equal(Number(deferred.Reduce('deferred').Visualize()), 1);
-  drained = await mutate(room, '::actor::get_messages', {});
-  assert.deepEqual(renderMessages(drained.Reduce('messages')).map((message) => message.msg_id), [messageId]);
+  drained = await mutate(room, '::actor::consume_messages', { expected_ids: [messageId] });
+  assert.deepEqual(renderIntArray(drained.Reduce('consumed')), [messageId]);
+  await mutate(room, '::actor::consume_messages', { expected_ids: [unexpectedId] });
   await mutate(room, '::actor::gc', {});
   assert.equal(inbox(room)[0].status, 'ready_to_delete');
   deferred = await mutate(room, '::actor::defer_messages', { msg_ids: [messageId] });
   assert.equal(Number(deferred.Reduce('deferred').Visualize()), 1);
-  await mutate(room, '::actor::get_messages', {});
+  await mutate(room, '::actor::consume_messages', { expected_ids: [messageId] });
   await mutate(room, '::actor::gc', {});
   await mutate(room, '::actor::gc', {});
   assert.deepEqual(inbox(room), []);
@@ -414,8 +431,9 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   // then allocate the next arrival from the exported monotonic sequence.
   await mutate(charlie, '::a2a_messaging::send_message', { contact: room.cid, text: 'processed-before-export' });
   await waitFor(() => inbox(room).some((message) => message.text === 'processed-before-export'), 'processed export fixture');
-  drained = await mutate(room, '::actor::get_messages', {});
-  assert.deepEqual(renderMessages(drained.Reduce('messages')).map((message) => message.text), ['processed-before-export']);
+  const processedId = inbox(room).find((message) => message.text === 'processed-before-export').msg_id;
+  drained = await mutate(room, '::actor::consume_messages', { expected_ids: [processedId] });
+  assert.deepEqual(renderIntArray(drained.Reduce('consumed')), [processedId]);
   await mutate(permissive, '::a2a_messaging::send_message', { contact: room.cid, text: 'unread-before-export' });
   await waitFor(() => inbox(room).some((message) => message.text === 'unread-before-export'), 'unread export fixture');
   const beforeExportInbox = inbox(room);

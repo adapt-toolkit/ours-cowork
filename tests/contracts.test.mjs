@@ -196,6 +196,7 @@ test('communication records form a strict discriminated version-1 union', () => 
     author: { identity: 'cid-alice', display_name: 'Alice', role: 'researcher' },
     category: 'chat',
     text: 'hello',
+    recipient_identities: ['cid-bob'],
     source_msg_id: 7,
     source_wire_id: 'wire-7',
   };
@@ -216,6 +217,10 @@ test('communication records form a strict discriminated version-1 union', () => 
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, kind: 'delivery_result' }));
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, record_id: `${ROOM_ID}:2` }));
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, category: 'system' }));
+  assert.throws(() => CommunicationRecordSchema.parse({ ...message, recipient_identities: ['cid-bob', 'cid-bob'] }));
+  assert.throws(() => CommunicationRecordSchema.parse({ ...message, recipient_identities: ['', 'cid-bob'] }));
+  const { recipient_identities: _recipients, ...missingRecipients } = message;
+  assert.throws(() => CommunicationRecordSchema.parse(missingRecipients));
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, extra: true }));
   assert.throws(() => CommunicationRecordSchema.parse({ ...records.at(-1), key_material_retained: false }));
 

@@ -71,33 +71,63 @@ export class IntakePump {
     }
 
     const state: NotificationState = { dirty: true, work: Promise.resolve() };
-    state.work = (async () => {
-      while (state.dirty) {
-        state.dirty = false;
-        await this.pump(id);
-      }
-    })().finally(() => {
-      if (this.notifications.get(id) === state) this.notifications.delete(id);
-    });
     this.notifications.set(id, state);
+    state.work = this.runNotificationWorker(id, state);
     return state.work;
   }
 
   /** Process the current readonly inbox snapshot, then service durable intents. */
   async pump(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
-    await this.lock(id, async () => {
-      const packet = this.packet(id);
-      const snapshot = packet.peekInbox();
-      for (const item of snapshot) await this.processInboxItem(id, packet, item);
-      await this.resumePendingUnlocked(id, packet);
-    });
+    await this.lock(id, () => this.processAndRelayUnlocked(id, this.packet(id)));
   }
 
   /** Retry every durable relay intent which has no terminal result. */
   async resumePending(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
-    await this.lock(id, () => this.resumePendingUnlocked(id, this.packet(id)));
+    await this.lock(id, () => this.processAndRelayUnlocked(id, this.packet(id)));
+  }
+
+  private async runNotificationWorker(roomId: string, state: NotificationState): Promise<void> {
+    let failure: unknown;
+    try {
+      while (state.dirty) {
+        state.dirty = false;
+        await this.pump(roomId);
+      }
+    } catch (error) {
+      failure = error;
+    }
+
+    // Cleanup is deliberately inside this async worker, not Promise.finally:
+    // the map entry disappears synchronously before this work promise settles.
+    // A wakeup already marked dirty is handed to a replacement and awaited so
+    // shutdown cannot observe the original worker complete while work is lost.
+    if (this.notifications.get(roomId) === state) this.notifications.delete(roomId);
+    let replacementWork: Promise<void> | undefined;
+    if (state.dirty) {
+      replacementWork = this.notify(roomId);
+    }
+    // Give a wakeup which was already queued at the final-drain boundary one
+    // microtask to install its replacement after the synchronous deletion.
+    // The original work promise then chains that replacement before settling.
+    await Promise.resolve();
+    replacementWork ??= this.notifications.get(roomId)?.work;
+    if (replacementWork) {
+      try {
+        await replacementWork;
+      } catch (replacementFailure) {
+        if (failure === undefined) failure = replacementFailure;
+      }
+    }
+    if (failure !== undefined) throw failure;
+  }
+
+  private async processAndRelayUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
+    const snapshot = packet.peekInbox();
+    for (const item of snapshot) await this.processInboxItem(roomId, packet, item);
+    await this.completeSnapshotIntents(roomId);
+    await this.relayPendingUnlocked(roomId, packet);
   }
 
   private async processInboxItem(roomId: string, packet: RoomPacket, item: InboxItem): Promise<void> {
@@ -114,6 +144,9 @@ export class IntakePump {
     const before = await this.store.read(roomId);
     let message = this.findSourceMessage(before, item);
     if (!message) {
+      const recipientIdentities = unique(room.seats
+        .map((recipient) => recipient.identity)
+        .filter((identity) => identity !== seat.identity));
       const appended = await this.store.append(roomId, {
         version: 1,
         kind: 'message',
@@ -127,6 +160,7 @@ export class IntakePump {
         },
         category: 'chat',
         text: item.text,
+        recipient_identities: recipientIdentities,
         source_msg_id: item.msg_id,
         ...(item.wire_id === '' ? {} : { source_wire_id: item.wire_id }),
       });
@@ -134,59 +168,44 @@ export class IntakePump {
       message = appended;
     }
 
+    await this.completeMessageIntents(roomId, message);
+
+    // This is the irreversible packet effect. Every preceding append resolves
+    // only after its file fsync, so both the message and the complete fan-out
+    // exist durably first. HostedRoomPacket leaves IDs outside this snapshot
+    // unread in the same atomic actor transaction.
+    await packet.consumeInbox([item.msg_id]);
+  }
+
+  private async completeSnapshotIntents(roomId: string): Promise<void> {
+    const records = await this.store.read(roomId);
+    for (const message of records.filter(
+      (record): record is MessageRecord => record.kind === 'message',
+    )) await this.completeMessageIntents(roomId, message);
+  }
+
+  private async completeMessageIntents(roomId: string, message: MessageRecord): Promise<void> {
     const records = await this.store.read(roomId);
     const intended = new Set(records
       .filter((record): record is RelayIntentRecord =>
-        record.kind === 'relay_intent' && record.message_id === message!.message_id)
+        record.kind === 'relay_intent' && record.message_id === message.message_id)
       .map((intent) => intent.recipient_identity));
-    for (const recipient of room.seats) {
-      if (recipient.identity === seat.identity || intended.has(recipient.identity)) continue;
+    for (const recipientIdentity of message.recipient_identities) {
+      if (intended.has(recipientIdentity)) continue;
       await this.store.append(roomId, {
         version: 1,
         kind: 'relay_intent',
         room_id: roomId,
         at: this.now(),
         message_id: message.message_id,
-        recipient_identity: recipient.identity,
+        recipient_identity: recipientIdentity,
       });
-      intended.add(recipient.identity);
+      intended.add(recipientIdentity);
     }
-
-    // This is the irreversible packet effect. Every preceding append resolves
-    // only after its file fsync, so both the message and the complete fan-out
-    // exist durably first. HostedRoomPacket defers IDs not in this snapshot.
-    await packet.consumeInbox([item.msg_id]);
   }
 
-  private async resumePendingUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
-    let records = await this.store.read(roomId);
-    const room = await this.store.load(roomId);
-    let completedRoomFanout = false;
-    for (const message of records.filter((record): record is MessageRecord =>
-      record.kind === 'message'
-      && record.category === 'chat'
-      && record.author.identity === room.identity_cid
-      && record.author.role === 'room'
-      && record.source_msg_id === undefined)) {
-      const recipients = new Set(records
-        .filter((record): record is RelayIntentRecord =>
-          record.kind === 'relay_intent' && record.message_id === message.message_id)
-        .map((intent) => intent.recipient_identity));
-      for (const seat of room.seats) {
-        if (recipients.has(seat.identity)) continue;
-        await this.store.append(roomId, {
-          version: 1,
-          kind: 'relay_intent',
-          room_id: roomId,
-          at: this.now(),
-          message_id: message.message_id,
-          recipient_identity: seat.identity,
-        });
-        recipients.add(seat.identity);
-        completedRoomFanout = true;
-      }
-    }
-    if (completedRoomFanout) records = await this.store.read(roomId);
+  private async relayPendingUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
+    const records = await this.store.read(roomId);
     const messages = new Map(records
       .filter((record): record is MessageRecord => record.kind === 'message')
       .map((message) => [message.message_id, message]));
@@ -202,6 +221,7 @@ export class IntakePump {
       // A dangling intent is invalid cross-record state. Do not compound it
       // with a network effect or a result that would claim a send was tried.
       if (!message) continue;
+      if (!message.recipient_identities.includes(intent.recipient_identity)) continue;
 
       const unsigned = {
         version: 1 as const,
@@ -274,6 +294,10 @@ function canonicalValue(value: unknown): unknown {
     return output;
   }
   return value;
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values)];
 }
 
 function generateUlid(): string {

@@ -59,6 +59,8 @@ export interface RoomMutex {
 
 interface LockOwnership {
   active: boolean;
+  pending: Set<Promise<unknown>>;
+  failures: unknown[];
 }
 
 interface ScanResult {
@@ -92,7 +94,21 @@ export class CoworkStore {
   private withRoomMutex<T>(roomId: string, work: () => T | Promise<T>): Promise<T> {
     const inherited = this.lockOwnership.getStore();
     const ownership = inherited?.get(roomId);
-    if (ownership?.active) return Promise.resolve().then(work);
+    if (ownership?.active) {
+      const nested: Promise<T> = Promise.resolve().then(work);
+      ownership.pending.add(nested);
+      // Attach the rejection observer immediately so an intentionally
+      // unawaited nested call cannot become an unhandled rejection. The root
+      // owner propagates the recorded failure before releasing the FIFO.
+      void nested.then(
+        () => { ownership.pending.delete(nested); },
+        (error) => {
+          ownership.pending.delete(nested);
+          ownership.failures.push(error);
+        },
+      );
+      return nested;
+    }
 
     let queue = this.roomMutexes.get(roomId);
     if (!queue) {
@@ -100,16 +116,32 @@ export class CoworkStore {
       this.roomMutexes.set(roomId, queue);
     }
     return queue.runExclusive(async () => {
-      const acquired = { active: true };
+      const acquired: LockOwnership = { active: true, pending: new Set(), failures: [] };
       const context = new Map(inherited ?? []);
       context.set(roomId, acquired);
+      let result!: T;
+      let rootFailure: unknown;
+      let rootFailed = false;
       try {
-        return await this.lockOwnership.run(context, work);
+        try {
+          result = await this.lockOwnership.run(context, work);
+        } catch (error) {
+          rootFailed = true;
+          rootFailure = error;
+        }
+        // A child may register more reentrant work while an earlier snapshot
+        // settles, so drain until the ownership task group is actually empty.
+        while (acquired.pending.size > 0) {
+          await Promise.allSettled([...acquired.pending]);
+        }
       } finally {
         // Async resources spawned but not awaited by work retain the context.
         // Deactivation prevents them bypassing the FIFO after ownership ends.
         acquired.active = false;
       }
+      if (rootFailed) throw rootFailure;
+      if (acquired.failures.length > 0) throw acquired.failures[0];
+      return result;
     });
   }
 
@@ -136,8 +168,7 @@ export class CoworkStore {
         return room;
       } catch (error) {
         this.nextSequences.delete(room.room_id);
-        const residue = this.lstatIfPresent(roomDir);
-        if (roomCreated || (residue?.isDirectory() && !residue.isSymbolicLink())) {
+        if (roomCreated) {
           try {
             this.fs.rmSync(roomDir, { recursive: true, force: true });
             this.fsyncDirectory(this.roomsDirectory());

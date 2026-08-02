@@ -183,18 +183,18 @@ test('room mkdir/chmod failure cleans the reservation and permits retry', async 
   assert.equal((await temporary.store.load(ROOM_ID)).room_id, ROOM_ID);
 });
 
-test('room mkdir failure after creating the entry still cleans the reservation', async (t) => {
+test('room mkdir EEXIST race preserves the other creator directory and content', async (t) => {
   let stateDir;
-  let failRoomMkdir = true;
+  let injectRacingCreator = true;
   const ops = new Proxy(fs, {
     get(target, property) {
       if (property === 'mkdirSync') return (path, options) => {
-        const result = target.mkdirSync(path, options);
-        if (failRoomMkdir && stateDir && String(path) === join(stateDir, 'rooms', ROOM_ID)) {
-          failRoomMkdir = false;
-          throw Object.assign(new Error('injected post-create mkdir failure'), { code: 'EIO' });
+        if (injectRacingCreator && stateDir && String(path) === join(stateDir, 'rooms', ROOM_ID)) {
+          injectRacingCreator = false;
+          target.mkdirSync(path, options);
+          target.writeFileSync(join(String(path), 'other-creator'), 'preserve-me');
         }
-        return result;
+        return target.mkdirSync(path, options);
       };
       return Reflect.get(target, property);
     },
@@ -202,9 +202,8 @@ test('room mkdir failure after creating the entry still cleans the reservation',
   const temporary = temporaryStore({ fs: ops });
   stateDir = temporary.stateDir;
   t.after(temporary.cleanup);
-  await assert.rejects(temporary.store.create(room()), /mkdir failure/i);
-  assert.equal(fs.existsSync(join(stateDir, 'rooms', ROOM_ID)), false);
-  await temporary.store.create(room());
+  await assert.rejects(temporary.store.create(room()), /exist|EEXIST/i);
+  assert.equal(readFileSync(join(stateDir, 'rooms', ROOM_ID, 'other-creator'), 'utf8'), 'preserve-me');
 });
 
 test('room parent fsync failure cleans the mkdir entry and permits retry', async (t) => {
@@ -350,6 +349,86 @@ test('room mutex ownership is reentrant, excludes competitors, and releases afte
 
   await assert.rejects(store.mutex(ROOM_ID, async () => { throw new Error('release me'); }), /release me/);
   await store.mutex(ROOM_ID, () => {});
+});
+
+test('room mutex waits for unawaited and recursively registered children before FIFO release', async (t) => {
+  const { store, cleanup } = temporaryStore();
+  t.after(cleanup);
+  await store.create(room());
+
+  let signalChildStarted;
+  let releaseChild;
+  let releaseCompetitor;
+  const childStarted = new Promise((resolve) => { signalChildStarted = resolve; });
+  const childGate = new Promise((resolve) => { releaseChild = resolve; });
+  const competitorGate = new Promise((resolve) => { releaseCompetitor = resolve; });
+  let childSettled = false;
+  let competitorEntered = false;
+  let outerSettled = false;
+
+  const outer = store.mutex(ROOM_ID, () => {
+    void store.mutex(ROOM_ID, async () => {
+      signalChildStarted();
+      await childGate;
+      childSettled = true;
+    });
+  });
+  void outer.then(() => { outerSettled = true; });
+  await childStarted;
+  const competitor = store.mutex(ROOM_ID, async () => {
+    competitorEntered = true;
+    await competitorGate;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  try {
+    assert.equal(outerSettled, false);
+    assert.equal(competitorEntered, false);
+  } finally {
+    releaseChild();
+    releaseCompetitor();
+  }
+  await outer;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(childSettled, true);
+  assert.equal(competitorEntered, true);
+  await competitor;
+
+  let signalGrandchild;
+  let releaseGrandchild;
+  const grandchildStarted = new Promise((resolve) => { signalGrandchild = resolve; });
+  const grandchildGate = new Promise((resolve) => { releaseGrandchild = resolve; });
+  let recursiveOuterSettled = false;
+  const recursiveOuter = store.mutex(ROOM_ID, () => {
+    void store.mutex(ROOM_ID, () => {
+      void store.mutex(ROOM_ID, async () => {
+        signalGrandchild();
+        await grandchildGate;
+      });
+    });
+  });
+  void recursiveOuter.then(() => { recursiveOuterSettled = true; });
+  await grandchildStarted;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(recursiveOuterSettled, false);
+  releaseGrandchild();
+  await recursiveOuter;
+});
+
+test('unawaited nested mutex rejection rejects the root and never leaks the lock', async (t) => {
+  const { store, cleanup } = temporaryStore();
+  t.after(cleanup);
+  await store.create(room());
+  const outer = store.mutex(ROOM_ID, () => {
+    void store.mutex(ROOM_ID, async () => {
+      await Promise.resolve();
+      throw new Error('unawaited nested failure');
+    });
+  });
+  await assert.rejects(outer, /unawaited nested failure/);
+  await Promise.race([
+    store.mutex(ROOM_ID, () => {}),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('lock leaked after nested rejection')), 250)),
+  ]);
 });
 
 test('fsync failure does not leave an in-memory sequence reservation', async (t) => {

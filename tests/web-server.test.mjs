@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import * as realFs from 'node:fs';
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
@@ -92,4 +93,96 @@ test('a missing production web root degrades only GET / to a 503', async (t) => 
   assert.equal(index.statusCode, 503);
   assert.equal(index.body, 'web console assets unavailable');
   assert.equal((await request(port, '/assets/missing.js')).statusCode, 404);
+});
+
+test('an existing partial web root without assets is fatal', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-web-partial-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const root = join(dir, 'web');
+  mkdirSync(root);
+  writeFileSync(join(root, 'index.html'), '<div id="root"></div>');
+
+  assert.throws(() => loadWebAssets(root), /assets.*director|ENOENT/i);
+});
+
+test('a root swapped to an outside directory before index traversal loads no outside bytes', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-web-root-race-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const root = join(dir, 'web');
+  const saved = join(dir, 'saved-web');
+  const outside = join(dir, 'outside');
+  mkdirSync(join(root, 'assets'), { recursive: true });
+  mkdirSync(join(outside, 'assets'), { recursive: true });
+  writeFileSync(join(root, 'index.html'), '<div id="root">inside</div>');
+  writeFileSync(join(root, 'assets', 'app.js'), 'inside');
+  writeFileSync(join(outside, 'index.html'), '<div id="root">outside secret</div>');
+  writeFileSync(join(outside, 'assets', 'app.js'), 'outside secret');
+  const outsideIndex = realFs.lstatSync(join(outside, 'index.html'));
+  let swapped = false;
+  let outsideReads = 0;
+  const fs = new Proxy(realFs, {
+    get(target, property) {
+      if (property === 'lstatSync') return (path, ...args) => {
+        if (!swapped && path === join(root, 'index.html')) {
+          target.renameSync(root, saved);
+          target.symlinkSync(outside, root, 'dir');
+          swapped = true;
+        }
+        return target.lstatSync(path, ...args);
+      };
+      if (property === 'readFileSync') return (path, ...args) => {
+        if (typeof path === 'number') {
+          const opened = target.fstatSync(path);
+          if (opened.dev === outsideIndex.dev && opened.ino === outsideIndex.ino) outsideReads += 1;
+        }
+        return target.readFileSync(path, ...args);
+      };
+      return target[property];
+    },
+  });
+
+  assert.throws(() => loadWebAssets(root, fs), /root|director|changed/i);
+  assert.equal(swapped, true);
+  assert.equal(outsideReads, 0);
+});
+
+test('an assets directory swapped before enumeration loads no outside bytes', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-web-assets-race-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const root = join(dir, 'web');
+  const assets = join(root, 'assets');
+  const saved = join(root, 'saved-assets');
+  const outside = join(dir, 'outside-assets');
+  mkdirSync(assets, { recursive: true });
+  mkdirSync(outside);
+  writeFileSync(join(root, 'index.html'), '<div id="root">inside</div>');
+  writeFileSync(join(assets, 'app.js'), 'inside');
+  writeFileSync(join(outside, 'app.js'), 'outside secret');
+  const outsideApp = realFs.lstatSync(join(outside, 'app.js'));
+  let swapped = false;
+  let outsideReads = 0;
+  const fs = new Proxy(realFs, {
+    get(target, property) {
+      if (property === 'readdirSync') return (path, ...args) => {
+        if (!swapped && path === assets) {
+          target.renameSync(assets, saved);
+          target.symlinkSync(outside, assets, 'dir');
+          swapped = true;
+        }
+        return target.readdirSync(path, ...args);
+      };
+      if (property === 'readFileSync') return (path, ...args) => {
+        if (typeof path === 'number') {
+          const opened = target.fstatSync(path);
+          if (opened.dev === outsideApp.dev && opened.ino === outsideApp.ino) outsideReads += 1;
+        }
+        return target.readFileSync(path, ...args);
+      };
+      return target[property];
+    },
+  });
+
+  assert.throws(() => loadWebAssets(root, fs), /assets|director|changed/i);
+  assert.equal(swapped, true);
+  assert.equal(outsideReads, 0);
 });

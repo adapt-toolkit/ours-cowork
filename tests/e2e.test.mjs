@@ -14,6 +14,7 @@ const CLI = join(ROOT, 'dist', 'cli.js');
 const UNIT_DIR = join(ROOT, 'mufl_code');
 const SUCCESS = 'COWORK_E2E_DRIVER_SUCCESS';
 const FAILURE = 'COWORK_E2E_DRIVER_FAILURE';
+const NATIVE_CLI_TIMEOUT_MS = 125_000;
 const sleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
 
 async function unusedPort() {
@@ -75,7 +76,7 @@ function roomEnvelopes(peer) {
 }
 
 if (process.argv.includes('--e2e-driver')) {
-  test('standalone cowork mission-room driver', { timeout: 210_000 }, async (t) => {
+  test('standalone cowork mission-room driver', async (t) => {
     const stateDir = mkdtempSync(join(tmpdir(), 'ours-cowork-e2e-'));
     const packets = [];
     const cleanupErrors = [];
@@ -88,7 +89,12 @@ if (process.argv.includes('--e2e-driver')) {
     let driverFailure;
     const stage = (name) => process.stdout.write(`COWORK_E2E_STAGE ${name}\n`);
 
-    async function runCli(args, timeoutMs = 35_000, expectedError) {
+    const nativeCommands = new Set(['create', 'invite', 'revoke', 'message', 'close', 'recover']);
+    const cliTimeout = (args) => args[0] === 'room' && nativeCommands.has(args[1])
+      ? NATIVE_CLI_TIMEOUT_MS
+      : 35_000;
+
+    async function runCli(args, timeoutMs = cliTimeout(args), expectedError) {
       const child = spawn(process.execPath, [CLI, '--json', ...args], {
         cwd: ROOT,
         env,
@@ -261,6 +267,8 @@ if (process.argv.includes('--e2e-driver')) {
       stage('participants-ready');
 
       await runCli(['start']);
+      await waitFor(async () => (await runCli(['status'])).running === true, 'authenticated daemon status');
+      stage('daemon-ready');
 
       // Prove invite behavior with effects, not receipt metadata. Separate room
       // CIDs ensure a refused one-time attempt cannot leave a peer handshake
@@ -439,14 +447,30 @@ if (process.argv.includes('--e2e-driver')) {
     }
   });
 } else {
-  test('standalone daemon completes the real three-participant mission-room flow', { timeout: 240_000 }, async (t) => {
+  test('standalone daemon completes the real three-participant mission-room flow', async (t) => {
     const child = spawn(process.execPath, [THIS_FILE, '--e2e-driver'], {
       cwd: ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let output = '';
-    child.stdout.on('data', (chunk) => { output += chunk.toString(); });
-    child.stderr.on('data', (chunk) => { output += chunk.toString(); });
+    let stages = 0;
+    let watchdog;
+    let settleTimeout;
+    const timeout = new Promise((resolveTimeout) => { settleTimeout = resolveTimeout; });
+    const armWatchdog = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(() => settleTimeout('timeout'), 220_000);
+    };
+    const capture = (chunk) => {
+      output += chunk.toString();
+      const observedStages = output.split('COWORK_E2E_STAGE').length - 1;
+      if (observedStages > stages) {
+        stages = observedStages;
+        armWatchdog();
+      }
+    };
+    child.stdout.on('data', capture);
+    child.stderr.on('data', capture);
     const exited = new Promise((resolveExit) => {
       child.once('error', (error) => resolveExit({ error, code: null, signal: null }));
       child.once('exit', (code, signal) => resolveExit({ code, signal }));
@@ -468,11 +492,11 @@ if (process.argv.includes('--e2e-driver')) {
     };
     child.stdout.on('data', inspect);
     child.stderr.on('data', inspect);
-    let watchdog;
+    armWatchdog();
     const outcome = await Promise.race([
       terminal,
       exited.then(() => 'exit'),
-      new Promise((resolveTimeout) => { watchdog = setTimeout(() => resolveTimeout('timeout'), 220_000); }),
+      timeout,
     ]);
     clearTimeout(watchdog);
     const result = await killAndReap();

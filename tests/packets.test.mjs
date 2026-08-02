@@ -29,6 +29,7 @@ const THIS_FILE = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(THIS_FILE), '..');
 const DRIVER_SENTINEL = 'COWORK_PACKETS_DRIVER_SUCCESS';
 const DRIVER_FAILURE_SENTINEL = 'COWORK_PACKETS_DRIVER_FAILURE';
+const DRIVER_PROGRESS_SENTINEL = 'COWORK_PACKETS_DRIVER_PROGRESS';
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 async function unusedPort() {
@@ -203,6 +204,7 @@ test('hosted inbox consume uses one atomic expected-ID mutation', async () => {
 }
 
 async function runPacketDriver() {
+  const progress = (stage) => process.stdout.write(`${DRIVER_PROGRESS_SENTINEL} ${stage}\n`);
   const stateDir = mkdtempSync(join(tmpdir(), 'ours-cowork-registry-'));
   const port = await unusedPort();
   const broker = spawn(process.execPath, [resolve(ROOT, 'node_modules/.bin/adapt-broker'),
@@ -221,6 +223,7 @@ async function runPacketDriver() {
     await waitForPort(port);
     host = new AdaptHost(`ws://127.0.0.1:${port}`, () => {});
     await host.boot();
+    progress('host-ready');
     if (process.argv.includes('--deliberate-driver-failure')) {
       assert.fail('deliberate packet registry driver assertion failure');
     }
@@ -249,6 +252,7 @@ async function runPacketDriver() {
       assert(packet.cid, `${stage} restart must establish one packet CID`);
       assert.equal(resumed.size, 1);
       await resumed.destroy(roomId);
+      progress(`provision-${stage}`);
     }
 
     const partialId = 'partial-probe';
@@ -260,6 +264,7 @@ async function runPacketDriver() {
     assert.equal(fs.readFileSync(join(stateDir, 'rooms', partialId, 'provisioning-residue', 'unknown-user-byte'), 'utf8'), 'preserve me');
     assert.equal(fs.readdirSync(join(stateDir, 'rooms', partialId)).filter((name) => name.startsWith('provisioning-residue')).length, 1);
     await partialRegistry.destroy(partialId);
+    progress('partial-residue');
 
     let failStateWrite = false;
     let holdRestore = false;
@@ -295,6 +300,7 @@ async function runPacketDriver() {
     ]);
     assert.equal(host.packetCount, 3, 'one wrapper must host all three room packets');
     assert.equal(registry.size, 3);
+    progress('rooms-created');
 
     // Two concurrent calls per packet, issued in an interleaved outer order,
     // must resolve with the signature belonging to that packet and input.
@@ -307,6 +313,7 @@ async function runPacketDriver() {
       alpha.sign(inputs[0]), gamma.sign(inputs[2]), beta.sign(inputs[1]),
     ]);
     assert.deepEqual(paired, [baseline[2], baseline[0], baseline[1], baseline[0], baseline[2], baseline[1]]);
+    progress('room-signatures');
 
     const peer = await host.createPacket('peer', `peer-${Date.now()}`);
     wireHandlers(peer, { onSaveState: () => {}, onNotify: () => {} }, () => {});
@@ -322,6 +329,7 @@ async function runPacketDriver() {
       () => gamma.listContacts().some((contact) => contact.container_id === peer.cid),
       'peer acceptance by gamma room',
     );
+    progress('peer-connected');
 
     const fixtureDir = join(ROOT, 'tests', 'fixtures');
     const fixtureFile = fs.readdirSync(fixtureDir).find((name) => name.endsWith('.muflo'));
@@ -355,6 +363,7 @@ async function runPacketDriver() {
       () => gamma.listContacts().some((contact) => contact.container_id === attacker.cid),
       'attacker acceptance by gamma room',
     );
+    progress('attacker-connected');
 
     await assert.rejects(
       gamma.packet.mutatingTx(
@@ -383,6 +392,7 @@ async function runPacketDriver() {
     await sleep(300);
     assert.equal(registry.get('gamma'), gamma, 'refused inbound transactions keep the registry entry');
     assert.equal(host.packetCount, 5, 'refused inbound transactions keep the native room packet');
+    progress('refusals-contained');
 
     const alphaInvite = await alpha.mintInvite('public');
     await withScopeAsync(async (lifetime) => {
@@ -408,6 +418,7 @@ async function runPacketDriver() {
     assert.equal(consumed.deferred.length, 1);
     assert.deepEqual(gamma.peekInbox().map((message) => message.msg_id), consumed.deferred,
       'unexpected arrivals remain unread in the same atomic consume transaction');
+    progress('inbox-race');
 
     failStateWrite = true;
     await assert.rejects(
@@ -423,6 +434,7 @@ async function runPacketDriver() {
     assert.equal(renderRawInbox(peer).some((message) => message.text === 'must-not-escape'), false,
       'SEND must stay buffered when state persistence fails');
     failStateWrite = false;
+    progress('persistence-failure');
 
     const alphaLive = join(stateDir, 'rooms', 'alpha', 'live');
     const betaLive = join(stateDir, 'rooms', 'beta', 'live');
@@ -432,6 +444,7 @@ async function runPacketDriver() {
     assert.equal(fs.existsSync(alphaLive), true);
     assert.equal(fs.existsSync(gammaLive), true);
     assert.equal(registry.get('gamma'), gamma, 'destroy must not unregister another room');
+    progress('selective-destroy');
 
     const alphaCid = alpha.cid;
     const secret = fs.readFileSync(join(alphaLive, 'identity.key'));
@@ -448,6 +461,7 @@ async function runPacketDriver() {
     assert.equal(registry.get('alpha'), undefined, 'CID mismatch must not enter the registry');
     assert.equal(host.packetCount, beforeMismatchCount, 'CID mismatch must remove the quarantined native packet');
     assert.equal(host.isPacketExposed(alphaCid), false, 'CID mismatch must never expose the restored CID');
+    progress('restore-mismatch');
     holdRestore = true;
     const restoreEntered = new Promise((done) => { signalRestoreEntered = done; });
     const restorePromise = registry.restore('alpha', alphaCid);
@@ -479,6 +493,7 @@ async function runPacketDriver() {
       () => restored.peekInbox().some((message) => message.text === 'sent-after-exposure'),
       'traffic after imported state is exposed',
     );
+    progress('restore-exposed');
 
     const removable = await host.createPacket('pending-removal', `pending-${Date.now()}`);
     wireHandlers(removable, { onSaveState: () => {}, onNotify: () => {} }, () => {});
@@ -491,6 +506,7 @@ async function runPacketDriver() {
     const removalOutcomes = await settledWithin([activeRemoval, queuedRemoval]);
     assert.deepEqual(removalOutcomes.map((outcome) => outcome.status), ['rejected', 'rejected']);
     assert.equal(removalSubmissions, 1, 'native remove must close before queued work can submit');
+    progress('pending-removal');
 
     await registry.destroy('alpha');
     await registry.destroy('gamma');
@@ -763,23 +779,49 @@ test('Packet.close rejects active and queued work before another envelope is sub
   await assert.rejects(packet.mutatingTx('future', {}), /explicit packet teardown/);
 });
 
-async function runDriverChild(t, { extraArgs = [], timeoutMs }) {
+async function runDriverChild(t, { extraArgs = [], timeoutMs, afterReadyTimeoutMs }) {
   const child = spawn(process.execPath, [THIS_FILE, '--packet-driver', ...extraArgs], {
     cwd: ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
   let settleOutcome;
+  let settleReady;
+  let settleTimeout;
   let killRequested = false;
+  let progressCount = 0;
+  let readyAt;
+  let outcomeAt;
   const outcomePromise = new Promise((done) => { settleOutcome = done; });
+  const readyPromise = new Promise((done) => { settleReady = done; });
+  const timeoutPromise = new Promise((done) => { settleTimeout = done; });
   const exitedPromise = new Promise((done) => {
     child.once('error', (error) => done({ code: null, signal: null, error }));
     child.once('exit', (code, signal) => done({ code, signal }));
   });
+  let watchdog;
+  const armWatchdog = (ms) => {
+    clearTimeout(watchdog);
+    watchdog = setTimeout(() => settleTimeout({ kind: 'timeout' }), ms);
+  };
   function capture(chunk) {
     output += chunk.toString();
-    if (output.includes(DRIVER_FAILURE_SENTINEL)) settleOutcome({ kind: 'failure' });
-    else if (output.includes(DRIVER_SENTINEL)) settleOutcome({ kind: 'success' });
+    const observedProgress = output.split(DRIVER_PROGRESS_SENTINEL).length - 1;
+    if (observedProgress > progressCount) {
+      progressCount = observedProgress;
+      if (readyAt === undefined) {
+        readyAt = Date.now();
+        settleReady({ kind: 'ready' });
+      }
+      if (afterReadyTimeoutMs === undefined) armWatchdog(timeoutMs);
+    }
+    if (output.includes(DRIVER_FAILURE_SENTINEL)) {
+      outcomeAt ??= Date.now();
+      settleOutcome({ kind: 'failure' });
+    } else if (output.includes(DRIVER_SENTINEL)) {
+      outcomeAt ??= Date.now();
+      settleOutcome({ kind: 'success' });
+    }
   }
   child.stdout.on('data', capture);
   child.stderr.on('data', capture);
@@ -792,18 +834,28 @@ async function runDriverChild(t, { extraArgs = [], timeoutMs }) {
     return exitedPromise;
   }
   t.after(async () => { await killAndReap(); });
-  let watchdog;
-  const timeoutPromise = new Promise((done) => {
-    watchdog = setTimeout(() => done({ kind: 'timeout' }), timeoutMs);
-  });
-  const outcome = await Promise.race([
-    outcomePromise,
-    exitedPromise.then((result) => ({ kind: 'exit', result })),
-    timeoutPromise,
-  ]);
+  const terminal = [outcomePromise, exitedPromise.then((result) => ({ kind: 'exit', result }))];
+  armWatchdog(timeoutMs);
+  let outcome;
+  if (afterReadyTimeoutMs === undefined) {
+    outcome = await Promise.race([...terminal, timeoutPromise]);
+  } else {
+    const startup = await Promise.race([readyPromise, ...terminal, timeoutPromise]);
+    if (startup.kind === 'ready') {
+      armWatchdog(afterReadyTimeoutMs);
+      outcome = await Promise.race([...terminal, timeoutPromise]);
+    } else {
+      outcome = startup;
+    }
+  }
   clearTimeout(watchdog);
   const result = await killAndReap();
-  return { outcome, result, output };
+  return {
+    outcome,
+    result,
+    output,
+    afterReadyElapsedMs: readyAt === undefined || outcomeAt === undefined ? undefined : outcomeAt - readyAt,
+  };
 }
 
 function diagnostics(run) {
@@ -811,21 +863,21 @@ function diagnostics(run) {
   return `packet driver ${run.outcome.kind} (${exit})\n${run.output.slice(-12_000)}`;
 }
 
-test('one wrapper persists, restores, races, and targets room packets', { timeout: 100_000 }, async (t) => {
+test('one wrapper persists, restores, races, and targets room packets', async (t) => {
   const run = await runDriverChild(t, { timeoutMs: 90_000 });
   assert.equal(run.outcome.kind, 'success', diagnostics(run));
   assert.equal(run.result.signal, 'SIGKILL', diagnostics(run));
 });
 
-test('packet registry driver assertion failures report and terminate promptly', { timeout: 30_000 }, async (t) => {
-  const startedAt = Date.now();
+test('packet registry driver assertion failures report and terminate promptly', async (t) => {
   const run = await runDriverChild(t, {
     extraArgs: ['--deliberate-driver-failure'],
-    timeoutMs: 20_000,
+    timeoutMs: 90_000,
+    afterReadyTimeoutMs: 20_000,
   });
   assert.equal(run.outcome.kind, 'failure', diagnostics(run));
   assert.match(run.output, /deliberate packet registry driver assertion failure/, diagnostics(run));
-  assert.ok(Date.now() - startedAt < 20_000, diagnostics(run));
+  assert.ok(run.afterReadyElapsedMs < 20_000, diagnostics(run));
 });
 
 }

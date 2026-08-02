@@ -203,5 +203,6 @@ test('CI repeats E2E and invokes the asserted release gate', () => {
   assert.match(workflow, /for i in 1 2 3; do node --test tests\/e2e\.test\.mjs \|\| exit 1; done/);
   assert.match(workflow, /npm run test:release/);
   const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+  assert.equal(manifest.scripts.test, 'node --test --test-concurrency=1 tests/*.test.mjs');
   assert.equal(manifest.scripts['test:release'], 'node --test tests/static-gates.test.mjs');
 });

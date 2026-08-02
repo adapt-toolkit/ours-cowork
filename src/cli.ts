@@ -4,7 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import { connect } from 'node:net';
 import { homedir, userInfo } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { ensureRuntimeState, loadConfig, type CoworkConfig } from './config.ts';
@@ -19,6 +19,7 @@ const EXIT = {
   internal: 7,
 } as const;
 const RPC_TIMEOUT_MS = 10_000;
+export const NATIVE_RPC_TIMEOUT_MS = 120_000;
 const START_TIMEOUT_MS = 30_000;
 const STOP_TIMEOUT_MS = 12_000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
@@ -65,6 +66,20 @@ class RpcTransportError extends CliError {
     this.name = 'RpcTransportError';
     this.connected = connected;
   }
+}
+
+const NATIVE_MUTATION_METHODS = new Set([
+  'room.create',
+  'room.invite',
+  'room.revoke',
+  'room.message',
+  'room.close',
+  'room.recover',
+  'room.recover.confirm',
+]);
+
+export function rpcTimeoutForMethod(method: string): number {
+  return NATIVE_MUTATION_METHODS.has(method) ? NATIVE_RPC_TIMEOUT_MS : RPC_TIMEOUT_MS;
 }
 
 interface Output {
@@ -289,7 +304,7 @@ function roomRequest(command: string | undefined, args: string[]): { method: str
   }
 }
 
-function rpcCall(
+export function rpcCall(
   socketPath: string,
   method: string,
   params: Record<string, unknown>,
@@ -677,7 +692,12 @@ async function execute(args: string[], output: Output): Promise<void> {
   if (command === 'room') {
     const request = roomRequest(args[1], args.slice(2));
     const config = loadCliConfig();
-    const result = await rpcCall(join(config.stateDir, 'management.sock'), request.method, request.params);
+    const result = await rpcCall(
+      join(config.stateDir, 'management.sock'),
+      request.method,
+      request.params,
+      rpcTimeoutForMethod(request.method),
+    );
     output.success(result);
     return;
   }
@@ -771,4 +791,4 @@ async function main(): Promise<void> {
   }
 }
 
-void main();
+if (process.argv[1] && resolve(process.argv[1]) === SELF) void main();

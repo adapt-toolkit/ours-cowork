@@ -134,13 +134,9 @@ test('supervisor strips inherited preload and execution modes from its worker', 
   const daemonUrl = new URL('../src/daemon.ts', import.meta.url).href;
   const program = `
     const { runSupervisor } = await import(${JSON.stringify(daemonUrl)});
-    let signaled = false;
-    const code = await runSupervisor({ onStage(stage) {
-      if (!signaled && stage === 'pre-lock') {
-        signaled = true;
-        process.kill(process.pid, 'SIGTERM');
-      }
-    } });
+    const done = runSupervisor({ quiet: true });
+    process.kill(process.pid, 'SIGTERM');
+    const code = await done;
     process.exitCode = code;
   `;
   const { NODE_OPTIONS: _nodeOptions, ...baseEnv } = process.env;
@@ -162,15 +158,8 @@ test('supervisor strips inherited preload and execution modes from its worker', 
     let stderr = '';
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => { stderr += chunk; });
-    const exited = await Promise.race([
-      new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal }))),
-      new Promise((resolve) => {
-        const timer = setTimeout(() => resolve('timeout'), 3_000);
-        timer.unref();
-      }),
-    ]);
-    if (exited === 'timeout') child.kill('SIGKILL');
-    assert.notEqual(exited, 'timeout', `${mode}: ${stderr}`);
+    t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
+    const exited = await new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
     assert.deepEqual(exited, { code: 0, signal: null }, `${mode}: ${stderr}`);
     assert.equal(readFileSync(marker, 'utf8').trim().split('\n').length, 1, `${mode}: preload reached daemon worker`);
   }

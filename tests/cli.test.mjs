@@ -6,6 +6,8 @@ import { join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 
+import { NATIVE_RPC_TIMEOUT_MS, rpcCall, rpcTimeoutForMethod } from '../src/cli.ts';
+
 const ROOT = resolve(new URL('..', import.meta.url).pathname);
 const CLI = join(ROOT, 'dist', 'cli.js');
 const TOKEN_PATTERN = /\b[0-9a-f]{64}\b/;
@@ -134,6 +136,42 @@ test('room commands send exactly one JSONL request over management.sock', async 
       assert.deepEqual(rpc.requests[0].params, expected.params);
     });
   }
+});
+
+test('native mutations wait for one slow response while reads stay short and timeout is an honest unknown outcome', { timeout: 20_000 }, async () => {
+  assert.equal(NATIVE_RPC_TIMEOUT_MS, 120_000);
+  for (const method of ['room.create', 'room.invite', 'room.revoke', 'room.message', 'room.close', 'room.recover', 'room.recover.confirm']) {
+    assert.equal(rpcTimeoutForMethod(method), NATIVE_RPC_TIMEOUT_MS, method);
+  }
+  for (const method of ['room.list', 'room.show', 'room.participants', 'room.history', 'room.settings', 'room.delete', 'daemon.status']) {
+    assert.equal(rpcTimeoutForMethod(method), 10_000, method);
+  }
+
+  let slowRequests = 0;
+  await withRawRpc((socket) => {
+    socket.once('data', (bytes) => {
+      const request = JSON.parse(bytes.toString('utf8'));
+      slowRequests += 1;
+      setTimeout(() => socket.end(`${JSON.stringify({ version: 1, id: request.id, result: { room_id: 'slow-room' } })}\n`), 10_250);
+    });
+  }, async (env) => {
+    const result = await runCli(['room', 'create', '--goal', 'Slow', '--briefing', 'Exactly once'], { env });
+    assert.equal(result.code, 0, result.stdout);
+    assert.deepEqual(JSON.parse(result.stdout), { room_id: 'slow-room' });
+  });
+  assert.equal(slowRequests, 1, 'slow native mutation must never be retried');
+
+  let timedOutRequests = 0;
+  await withRawRpc((socket) => {
+    socket.once('data', () => { timedOutRequests += 1; });
+  }, async (env) => {
+    const socketPath = join(env.OURS_COWORK_STATE_DIR, 'management.sock');
+    await assert.rejects(
+      rpcCall(socketPath, 'room.create', { goal: 'Unknown', briefing: 'Outcome' }, 25),
+      (error) => error?.code === 'daemon_unavailable' && error?.connected === true,
+    );
+  });
+  assert.equal(timedOutRequests, 1, 'timed-out mutation must remain one unknown-outcome request');
 });
 
 test('JSON mode emits one stdout-only JSON value on success and errors', async () => {

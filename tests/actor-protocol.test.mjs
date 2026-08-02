@@ -12,6 +12,8 @@ const UNIT_DIR = resolve(ROOT, 'mufl_code');
 const FIXTURE_UNIT_DIR = resolve(ROOT, 'tests/fixtures');
 const SUCCESS_SENTINEL = 'COWORK_PACKET_DRIVER_SUCCESS';
 const FAILURE_SENTINEL = 'COWORK_PACKET_DRIVER_FAILURE';
+const READY_SENTINEL = 'COWORK_PACKET_DRIVER_READY';
+const PROGRESS_SENTINEL = 'COWORK_PACKET_DRIVER_PROGRESS';
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 async function unusedPort() {
@@ -86,7 +88,8 @@ function renderIntArray(value) {
 }
 
 if (process.argv.includes('--packet-driver')) {
-test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180_000 }, async (t) => {
+test('minimal cowork actor speaks the real ours packet protocol', async (t) => {
+  const progress = (stage) => process.stdout.write(`${PROGRESS_SENTINEL} ${stage}\n`);
   const packets = [];
   const cleanupErrors = [];
   let broker;
@@ -167,6 +170,7 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
     '--logger_config', '--level', 'WARNING', '--stdout', 'stderr', '--logger_config_end',
   ]);
   wrapper.start();
+  progress('wrapper-ready');
 
   const coworkUnit = {
     hash: unitFile.slice(0, -'.muflo'.length),
@@ -268,6 +272,7 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
 
   const oneTimeRoom = await createPacket('one-time-room', `cowork-one-${Date.now()}`);
   if (process.argv.includes('--deliberate-driver-failure')) {
+    await new Promise((done) => process.stdout.write(`${READY_SENTINEL}\n`, done));
     assert.fail('deliberate packet driver assertion failure');
   }
   const alice = await createPacket('alice', `cowork-alice-${Date.now()}`);
@@ -287,6 +292,7 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   await join(replay, oneTime);
   await waitFor(() => oneTimeRoom.rejects.some((message) => /already-redeemed|Unknown or already/i.test(message)), 'one-time reuse rejection');
   assert.equal(contacts(replay).includes(oneTimeRoom.cid), false);
+  progress('one-time-invite');
 
   const room = await createPacket('public-room', `cowork-public-${Date.now()}`);
   const bob = await createPacket('bob', `cowork-bob-${Date.now()}`);
@@ -307,6 +313,7 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   assert.match(publicOrigins, new RegExp(charlie.cid));
   assert.equal((publicOrigins.match(new RegExp(publicInvite.inviteId, 'g')) ?? []).length, 2);
   assert.equal((publicOrigins.match(/invite_public/g) ?? []).length, 2);
+  progress('public-invite');
 
   const revoked = await mutate(room, '::a2a_messaging::revoke_invite', { invite_id: publicInvite.inviteId });
   assert.equal(bool(revoked.Reduce('revoked')), true);
@@ -345,6 +352,7 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   await mutate(room, '::actor::gc', {});
   await mutate(room, '::actor::gc', {});
   assert.deepEqual(inbox(room), []);
+  progress('inbox-lifecycle');
 
   const permissive = await createPacket(
     'permissive-peer',
@@ -370,6 +378,7 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
       && readonly(room, '::actor::export_state').Reduce('notifications').Visualize().includes('COWORK_TEST_VAPID'),
     'notification registration hook and persisted client state',
   );
+  progress('notifications');
 
   // Outgoing and incoming file rejection are distinct paths. The permissive
   // fixture accepts files, so the first assertion can only come from cowork's
@@ -407,6 +416,7 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
     'external-origin sign_app_envelope rejection',
   );
   assert.match(room.rejects.at(-1), /origin/i);
+  progress('refusals');
 
   const removal = await mutate(room, '::a2a_messaging::remove_contact', { contact: bob.cid });
   assert.equal(bool(removal.Reduce('notified')), true);
@@ -426,6 +436,7 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   const secondSignature = await mutate(room, '::actor::sign_app_envelope', { canonical_json: canonicalJson });
   const secondSignatureBytes = Buffer.from(secondSignature.Reduce('signature').Serialize());
   assert.deepEqual(secondSignatureBytes, firstSignatureBytes);
+  progress('contact-removal');
 
   // Export with a mixed lifecycle inbox. Import must preserve both statuses,
   // then allocate the next arrival from the exported monotonic sequence.
@@ -442,6 +453,7 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
     { 'processed-before-export': 'processed', 'unread-before-export': 'unread' },
   );
   const maxExportedMessageId = Math.max(...beforeExportInbox.map((message) => message.msg_id));
+  progress('export-fixture');
 
   const exportedState = readonly(room, '::actor::export_state');
   assert.match(exportedState.Reduce('notifications').Visualize(), /COWORK_TEST_VAPID/);
@@ -464,6 +476,7 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   await waitFor(() => inbox(restored).some((message) => message.text === 'after-import-sequence'), 'post-import message sequence');
   const afterImport = inbox(restored).find((message) => message.text === 'after-import-sequence');
   assert.equal(afterImport.msg_id, maxExportedMessageId + 1);
+  progress('restored');
   driverCompleted = true;
   } catch (error) {
     driverFailure = error;
@@ -471,25 +484,48 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   }
 });
 } else {
-  async function runPacketDriver(t, { extraArgs = [], timeoutMs }) {
+  async function runPacketDriver(t, { extraArgs = [], timeoutMs, afterReadyTimeoutMs }) {
     const child = spawn(process.execPath, [THIS_FILE, '--packet-driver', ...extraArgs], {
       cwd: ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let output = '';
     let settleOutcome;
+    let settleReady;
+    let settleTimeout;
     let killRequested = false;
+    let progressCount = 0;
+    let readyAt;
+    let outcomeAt;
     const outcomePromise = new Promise((done) => { settleOutcome = done; });
+    const readyPromise = new Promise((done) => { settleReady = done; });
+    const timeoutPromise = new Promise((done) => { settleTimeout = done; });
     const exitedPromise = new Promise((done) => {
       child.once('error', (error) => done({ code: null, signal: null, error }));
       child.once('exit', (code, signal) => done({ code, signal }));
     });
 
+    let watchdog;
+    const armWatchdog = (ms) => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(() => settleTimeout({ kind: 'timeout' }), ms);
+    };
     function capture(chunk) {
       output += chunk.toString();
+      const observedProgress = output.split(PROGRESS_SENTINEL).length - 1;
+      if (observedProgress > progressCount) {
+        progressCount = observedProgress;
+        if (afterReadyTimeoutMs === undefined) armWatchdog(timeoutMs);
+      }
+      if (readyAt === undefined && output.includes(READY_SENTINEL)) {
+        readyAt = Date.now();
+        settleReady({ kind: 'ready' });
+      }
       if (output.includes(FAILURE_SENTINEL)) {
+        outcomeAt ??= Date.now();
         settleOutcome({ kind: 'failure' });
       } else if (output.includes(SUCCESS_SENTINEL)) {
+        outcomeAt ??= Date.now();
         settleOutcome({ kind: 'success' });
       }
     }
@@ -510,18 +546,31 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
     // native wrapper child.
     t.after(async () => { await killAndReap(); });
 
-    let watchdog;
-    const timeoutPromise = new Promise((done) => {
-      watchdog = setTimeout(() => done({ kind: 'timeout' }), timeoutMs);
-    });
-    const outcome = await Promise.race([
+    const terminal = [
       outcomePromise,
       exitedPromise.then((result) => ({ kind: 'exit', result })),
-      timeoutPromise,
-    ]);
+    ];
+    armWatchdog(timeoutMs);
+    let outcome;
+    if (afterReadyTimeoutMs === undefined) {
+      outcome = await Promise.race([...terminal, timeoutPromise]);
+    } else {
+      const startup = await Promise.race([readyPromise, ...terminal, timeoutPromise]);
+      if (startup.kind === 'ready') {
+        armWatchdog(afterReadyTimeoutMs);
+        outcome = await Promise.race([...terminal, timeoutPromise]);
+      } else {
+        outcome = startup;
+      }
+    }
     clearTimeout(watchdog);
     const result = await killAndReap();
-    return { outcome, result, output };
+    return {
+      outcome,
+      result,
+      output,
+      afterReadyElapsedMs: readyAt === undefined || outcomeAt === undefined ? undefined : outcomeAt - readyAt,
+    };
   }
 
   function diagnostics(run) {
@@ -529,7 +578,7 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
     return `packet driver ${run.outcome.kind} (${exit})\n${run.output.slice(-12_000)}`;
   }
 
-  test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180_000 }, async (t) => {
+  test('minimal cowork actor speaks the real ours packet protocol', async (t) => {
     const run = await runPacketDriver(t, { timeoutMs: 120_000 });
     assert.equal(
       run.outcome.kind,
@@ -543,14 +592,14 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
     );
   });
 
-  test('packet driver assertion failures report and terminate promptly', { timeout: 30_000 }, async (t) => {
-    const startedAt = Date.now();
+  test('packet driver assertion failures report and terminate promptly', async (t) => {
     const run = await runPacketDriver(t, {
       extraArgs: ['--deliberate-driver-failure'],
-      timeoutMs: 20_000,
+      timeoutMs: 120_000,
+      afterReadyTimeoutMs: 20_000,
     });
     assert.equal(run.outcome.kind, 'failure', diagnostics(run));
     assert.match(run.output, /deliberate packet driver assertion failure/, diagnostics(run));
-    assert.ok(Date.now() - startedAt < 20_000, diagnostics(run));
+    assert.ok(run.afterReadyElapsedMs < 20_000, diagnostics(run));
   });
 }

@@ -337,7 +337,81 @@ test('Unix listener binds privately before publishing the management path', () =
   const source = readFileSync(new URL('../src/transports.ts', import.meta.url), 'utf8');
   assert.match(source, /privateSocketPath/);
   assert.match(source, /listen\(unix,\s*private/);
-  assert.match(source, /renameSync\([^,]*private[^,]*,\s*this\.options\.socketPath\)/s);
+  assert.match(source, /linkSync\([^,]*private[^,]*,\s*this\.options\.socketPath\)/s);
+  assert.doesNotMatch(source, /renameSync\([^,]*private[^,]*,\s*this\.options\.socketPath\)/s);
+});
+
+for (const kind of ['regular file', 'symlink', 'socket']) {
+  test(`publication atomically preserves a last-instant ${kind} occupant`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'cowork-socket-publish-race-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const path = join(dir, 'management.sock');
+    const prepared = join(dir, 'prepared-occupant');
+    let replacementServer;
+    if (kind === 'regular file') writeFileSync(prepared, 'last-instant occupant');
+    else if (kind === 'symlink') symlinkSync('occupant-target', prepared);
+    else {
+      replacementServer = net.createServer();
+      await new Promise((resolve, reject) => {
+        replacementServer.once('error', reject);
+        replacementServer.listen(prepared, resolve);
+      });
+      t.after(async () => { await new Promise((resolve) => replacementServer.close(resolve)); });
+    }
+    let injected = false;
+    const fs = new Proxy(realFs, {
+      get(target, property) {
+        if (property === 'linkSync') return (source, destination) => {
+          if (!injected && destination === path) {
+            injected = true;
+            target.renameSync(prepared, path);
+          }
+          return target.linkSync(source, destination);
+        };
+        return target[property];
+      },
+    });
+    const transport = new TransportServer({
+      socketPath: path, rest: { enabled: false, port: 1 }, fs,
+      dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+    });
+    t.after(() => transport.stop());
+    await assert.rejects(transport.start(), /exist|occupied|publish/i);
+    assert.equal(injected, true);
+    const stat = lstatSync(path);
+    if (kind === 'regular file') assert.equal(readFileSync(path, 'utf8'), 'last-instant occupant');
+    else if (kind === 'symlink') assert(stat.isSymbolicLink());
+    else assert(stat.isSocket());
+  });
+}
+
+test('startup removes only inode-verified owned stale private sockets within its cleanup bound', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-private-stale-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'management.sock');
+  const seed = join(dir, 'seed.sock');
+  const stale = `${path}.private-${process.pid}-stale`;
+  const preservedFile = `${path}.private-${process.pid}-regular`;
+  const preservedLink = `${path}.private-${process.pid}-symlink`;
+  const staleServer = net.createServer();
+  await new Promise((resolve, reject) => {
+    staleServer.once('error', reject);
+    staleServer.listen(seed, resolve);
+  });
+  realFs.renameSync(seed, stale);
+  await new Promise((resolve) => staleServer.close(resolve));
+  writeFileSync(preservedFile, 'preserve');
+  symlinkSync('preserve-target', preservedLink);
+  const transport = new TransportServer({
+    socketPath: path, rest: { enabled: false, port: 1 },
+    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+  });
+  t.after(() => transport.stop());
+  await transport.start();
+  assert.equal(realFs.existsSync(stale), false);
+  assert.equal(readFileSync(preservedFile, 'utf8'), 'preserve');
+  assert(lstatSync(preservedLink).isSymbolicLink());
+  await transport.stop();
 });
 
 for (const kind of ['regular file', 'symlink', 'socket']) {

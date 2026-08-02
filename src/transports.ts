@@ -2,6 +2,7 @@ import { randomBytes, timingSafeEqual as nodeTimingSafeEqual } from 'node:crypto
 import * as http from 'node:http';
 import * as net from 'node:net';
 import * as nodeFs from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 
 import { z } from 'zod';
 
@@ -10,6 +11,7 @@ export const HTTP_HEADERS_TIMEOUT_MS = 5_000;
 export const HTTP_REQUEST_TIMEOUT_MS = 10_000;
 export const HTTP_BODY_IDLE_TIMEOUT_MS = 5_000;
 export const HTTP_KEEP_ALIVE_TIMEOUT_MS = 5_000;
+const MAX_STALE_PRIVATE_SOCKET_CLEANUP = 32;
 type HttpSocketPhase = 'headers' | 'body' | 'response' | 'idle';
 
 const RpcIdSchema = z.union([
@@ -204,6 +206,7 @@ export class TransportServer {
 
   private async startUnlocked(): Promise<void> {
     await this.prepareUnixPath();
+    this.cleanupStalePrivateSockets();
     const unix = net.createServer((socket) => this.handleUnix(socket));
     this.unixServer = unix;
     const privateSocketPath = `${this.options.socketPath}.private-${process.pid}-${randomBytes(6).toString('hex')}`;
@@ -433,17 +436,60 @@ export class TransportServer {
 
   private publishPrivateSocket(privateSocketPath: string): void {
     try {
-      this.fs.lstatSync(this.options.socketPath);
-      throw new Error('management socket path was occupied before publication');
+      // link(2) is an atomic no-replace publication within the state
+      // directory: an occupant appearing at the final instant wins EEXIST and
+      // is never overwritten.
+      this.fs.linkSync(privateSocketPath, this.options.socketPath);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new Error('management socket path was occupied during atomic publication', { cause: error });
+      }
+      throw error;
     }
-    this.fs.renameSync(privateSocketPath, this.options.socketPath);
     const owned = this.ownedSocket;
     const published = this.fs.lstatSync(this.options.socketPath);
     if (!owned || published.dev !== owned.dev || published.ino !== owned.ino
+      || published.uid !== owned.uid || (published.mode & 0o777) !== 0o600
       || !published.isSocket() || published.isSymbolicLink()) {
       throw new Error('management socket changed during private publication');
+    }
+    const privateSocket = this.fs.lstatSync(privateSocketPath);
+    if (privateSocket.dev !== owned.dev || privateSocket.ino !== owned.ino
+      || privateSocket.uid !== owned.uid || !privateSocket.isSocket() || privateSocket.isSymbolicLink()) {
+      throw new Error('private management socket changed during publication');
+    }
+    this.fs.unlinkSync(privateSocketPath);
+  }
+
+  private cleanupStalePrivateSockets(): void {
+    // CoworkDaemon invokes transport startup only while holding the exclusive
+    // daemon lock. Bound the number of stale path mutations per boot and never
+    // remove a non-socket, symlink, foreign owner, or inode that changed after
+    // inspection.
+    const directory = dirname(this.options.socketPath);
+    const prefix = `${basename(this.options.socketPath)}.private-`;
+    const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+    const candidates = this.fs.readdirSync(directory)
+      .filter((name) => name.startsWith(prefix))
+      .sort()
+      .slice(0, MAX_STALE_PRIVATE_SOCKET_CLEANUP);
+    for (const name of candidates) {
+      const path = join(directory, name);
+      let observed: nodeFs.Stats;
+      try { observed = this.fs.lstatSync(path); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
+      if (!observed.isSocket() || observed.isSymbolicLink()
+        || (uid !== undefined && observed.uid !== uid)) continue;
+      let current: nodeFs.Stats;
+      try { current = this.fs.lstatSync(path); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
+      if (current.dev !== observed.dev || current.ino !== observed.ino
+        || current.uid !== observed.uid || !current.isSocket() || current.isSymbolicLink()) continue;
+      this.fs.unlinkSync(path);
     }
   }
 

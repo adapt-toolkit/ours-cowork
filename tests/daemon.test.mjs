@@ -149,7 +149,7 @@ test('supervisor watchdog kills acknowledged and unacknowledged hangs and contai
     await supervisor.done;
   }
 
-  for (const failure of ['throw', 'callback', 'disconnect', 'error']) {
+  for (const failure of ['throw', 'callback', 'disconnect']) {
     const capability = 'ef'.repeat(32);
     const signals = new EventEmitter();
     const killed = [];
@@ -165,7 +165,6 @@ test('supervisor watchdog kills acknowledged and unacknowledged hangs and contai
     const supervisor = new DaemonSupervisor({ child, signals, shutdownTimeoutMs: 20, capability });
     supervisor.start();
     if (failure === 'disconnect') child.emit('disconnect');
-    else if (failure === 'error') assert.doesNotThrow(() => child.emit('error', new Error('child failed')));
     else assert.doesNotThrow(() => signals.emit('SIGINT'));
     await new Promise((resolve) => setTimeout(resolve, 35));
     assert.deepEqual(killed, ['SIGKILL']);
@@ -173,6 +172,59 @@ test('supervisor watchdog kills acknowledged and unacknowledged hangs and contai
     child.emit('exit', 1, null);
     assert.equal((await supervisor.done).code, 1);
   }
+});
+
+test('supervisor settles idempotently on error and close terminal events', async () => {
+  for (const terminal of ['error-only', 'error-close', 'close-only']) {
+    const capability = 'fa'.repeat(32);
+    const signals = new EventEmitter();
+    const child = Object.assign(new EventEmitter(), {
+      connected: true, exitCode: null,
+      send(_message, callback) { callback?.(); },
+      kill() {},
+    });
+    const supervisor = new DaemonSupervisor({ child, signals, shutdownTimeoutMs: 20, capability });
+    supervisor.start();
+    const primary = new Error(`${terminal} spawn failure`);
+    if (terminal !== 'close-only') child.emit('error', primary);
+    if (terminal !== 'error-only') child.emit('close', 1, null);
+    const result = await Promise.race([
+      supervisor.done,
+      new Promise((resolve) => setTimeout(() => resolve('timeout'), 75)),
+    ]);
+    assert.notEqual(result, 'timeout', `${terminal} left supervisor.done pending`);
+    assert.equal(result.code, terminal === 'close-only' ? 1 : null);
+    assert.equal(result.signal, null);
+    if (terminal !== 'close-only') assert.equal(result.error, primary);
+    child.emit('exit', 2, 'SIGKILL');
+    child.emit('close', 2, 'SIGKILL');
+    assert.equal(await supervisor.done, result);
+  }
+});
+
+test('supervisor settles on an actual OS spawn failure without exit', async (t) => {
+  const child = spawn(join(tmpdir(), `cowork-missing-executable-${process.pid}`), [], {
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+  });
+  t.after(() => {
+    try { child.disconnect(); } catch {}
+    try { child.kill('SIGKILL'); } catch {}
+  });
+  const supervisor = new DaemonSupervisor({
+    child,
+    signals: new EventEmitter(),
+    shutdownTimeoutMs: 20,
+    capability: 'fb'.repeat(32),
+  });
+  supervisor.start();
+  const result = await Promise.race([
+    supervisor.done,
+    new Promise((resolve) => setTimeout(() => resolve('timeout'), 1_000)),
+  ]);
+  assert.notEqual(result, 'timeout');
+  assert(result.error instanceof Error);
+  assert.equal(result.error.code, 'ENOENT');
+  assert.equal(result.signal, null);
 });
 
 test('authorized worker shutdown before and during capability handshake never creates runtime state', async (t) => {

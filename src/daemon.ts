@@ -15,6 +15,7 @@ export const DAEMON_SHUTDOWN_TIMEOUT_MS = 10_000;
 interface SupervisorResult {
   code: number | null;
   signal: NodeJS.Signals | null;
+  error?: Error;
 }
 
 export interface SupervisorChild extends EventEmitter {
@@ -50,6 +51,7 @@ export class DaemonSupervisor {
   private stopping = false;
   private initialized = false;
   private settled = false;
+  private primaryError?: Error;
   private timer?: ReturnType<typeof setTimeout>;
   private currentStage?: WorkerStage;
 
@@ -75,17 +77,21 @@ export class DaemonSupervisor {
     }
   };
   private readonly onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
-    this.finish({ code, signal });
+    this.finish({ code, signal, ...(this.primaryError ? { error: this.primaryError } : {}) });
+  };
+  private readonly onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
+    this.finish({ code, signal, ...(this.primaryError ? { error: this.primaryError } : {}) });
   };
   private readonly onDisconnect = (): void => {
     if (this.settled) return;
     this.stopping = true;
     this.armWatchdog();
   };
-  private readonly onError = (): void => {
+  private readonly onError = (error: Error): void => {
     if (this.settled) return;
     this.stopping = true;
-    this.armWatchdog();
+    this.primaryError ??= error;
+    this.finish({ code: this.child.exitCode, signal: null, error: this.primaryError });
   };
 
   constructor(options: DaemonSupervisorOptions) {
@@ -105,6 +111,7 @@ export class DaemonSupervisor {
     this.signals.on('SIGTERM', this.onSigterm);
     this.child.on('message', this.onMessage);
     this.child.once('exit', this.onExit);
+    this.child.once('close', this.onClose);
     this.child.on('disconnect', this.onDisconnect);
     this.child.on('error', this.onError);
     this.send({ type: 'init', capability: this.capability });
@@ -127,6 +134,8 @@ export class DaemonSupervisor {
     this.signals.off('SIGINT', this.onSigint);
     this.signals.off('SIGTERM', this.onSigterm);
     this.child.off('message', this.onMessage);
+    this.child.off('exit', this.onExit);
+    this.child.off('close', this.onClose);
     this.child.off('disconnect', this.onDisconnect);
     this.child.off('error', this.onError);
   }
@@ -182,6 +191,7 @@ export async function runSupervisor(options: { onStage?: (stage: WorkerStage) =>
   const supervisor = new DaemonSupervisor({ child, onStage: options.onStage });
   supervisor.start();
   const result = await supervisor.done;
+  if (result.error) return 1;
   if (result.signal !== null) return 1;
   return result.code ?? 1;
 }

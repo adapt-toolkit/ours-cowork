@@ -130,8 +130,29 @@ if (!process.argv.includes('--packet-driver')) {
 test('native ADAPT time rendering is normalized to strict RFC3339', () => {
   assert.equal(adaptTimeToRfc3339('2026-08-02 12:34:56.123456789 (UTC+0)'), '2026-08-02T12:34:56.123Z');
   assert.equal(adaptTimeToRfc3339('2026-08-02 14:34:56 (UTC+2)'), '2026-08-02T12:34:56.000Z');
+  assert.equal(adaptTimeToRfc3339('2026-01-01T00:30:00+02:00'), '2025-12-31T22:30:00.000Z');
+  assert.equal(adaptTimeToRfc3339('2024-02-29T23:59:59.1Z'), '2024-02-29T23:59:59.100Z');
+  assert.equal(adaptTimeToRfc3339('2024-02-29 23:59:59.12 (UTC-2)'), '2024-03-01T01:59:59.120Z');
   assert.equal(adaptTimeToRfc3339('2026-08-02T12:34:56.123Z'), '2026-08-02T12:34:56.123Z');
-  assert.throws(() => adaptTimeToRfc3339('not a time'), /unexpected ADAPT time/);
+  for (const invalid of [
+    'not a time',
+    '2023-02-29T00:00:00Z',
+    '2026-02-30T00:00:00Z',
+    '2026-02-30 00:00:00 (UTC+0)',
+    '2026-13-01T00:00:00Z',
+    '2026-01-01T24:00:00Z',
+    '2026-01-01T23:60:00Z',
+    '2026-01-01T23:59:60Z',
+    '2026-01-01T00:00:00+99:99',
+    '2026-01-01T00:00:00-00:00',
+    '2026-01-01T00:00:00.1234Z',
+    '2026-01-01 00:00:00Z',
+    '2026-01-01t00:00:00z',
+    '2026-01-01 00:00:00.1234567890 (UTC+0)',
+    '2026-01-01 00:00:00 (UTC+02)',
+    '2026-01-01 00:00:00 (UTC-0)',
+    '2026-01-01 00:00:00 (UTC+24)',
+  ]) assert.throws(() => adaptTimeToRfc3339(invalid), /unexpected ADAPT time/, invalid);
 });
 
 test('hosted sends propagate every rejected mutation and map only explicit refusal to send_failed', async () => {

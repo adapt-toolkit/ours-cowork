@@ -88,7 +88,7 @@ if (process.argv.includes('--e2e-driver')) {
     let driverFailure;
     const stage = (name) => process.stdout.write(`COWORK_E2E_STAGE ${name}\n`);
 
-    async function runCli(args, timeoutMs = 35_000) {
+    async function runCli(args, timeoutMs = 35_000, expectedError) {
       const child = spawn(process.execPath, [CLI, '--json', ...args], {
         cwd: ROOT,
         env,
@@ -118,6 +118,9 @@ if (process.argv.includes('--e2e-driver')) {
       let body;
       try { body = JSON.parse(stdout); }
       catch { throw new Error(`CLI returned invalid JSON (${args.join(' ')}): ${stdout}\n${stderr}`); }
+      if (expectedError !== undefined && result.code !== 0 && body.ok === false && body.error?.code === expectedError) {
+        return body.error;
+      }
       if (result.code !== 0 || body.ok !== true) {
         throw new Error(`CLI failed (${args.join(' ')}): exit=${result.code} ${stdout}\n${stderr}`);
       }
@@ -258,6 +261,57 @@ if (process.argv.includes('--e2e-driver')) {
       stage('participants-ready');
 
       await runCli(['start']);
+
+      // Prove invite behavior with effects, not receipt metadata. Separate room
+      // CIDs ensure a refused one-time attempt cannot leave a peer handshake
+      // that interferes with the independent public-reuse proof.
+      const oneTimeProof = await runCli(['room', 'create', '--goal', 'Prove one-time semantics', '--briefing', 'One-time proof briefing']);
+      const proofOneTime = await runCli(['room', 'invite', oneTimeProof.room_id, '--mode', 'one_time', '--role', 'single', '--min-accepts', '1']);
+      await joinInvite(alice, proofOneTime.blob);
+      await waitFor(() => alice.contacts().includes(oneTimeProof.identity_cid), 'first one-time redemption');
+      await joinInvite(bob, proofOneTime.blob);
+
+      const publicProof = await runCli(['room', 'create', '--goal', 'Prove public semantics', '--briefing', 'Public proof briefing']);
+      const proofPublic = await runCli(['room', 'invite', publicProof.room_id, '--mode', 'public', '--role', 'shared', '--min-accepts', '2']);
+      await Promise.all([joinInvite(bob, proofPublic.blob), joinInvite(charlie, proofPublic.blob)]);
+      await waitFor(() => bob.contacts().includes(publicProof.identity_cid)
+        && charlie.contacts().includes(publicProof.identity_cid), 'two public invite redemptions');
+      await runCli(['room', 'recover', publicProof.room_id]);
+      const replayRefusal = await runCli(['room', 'recover', oneTimeProof.room_id], 35_000, 'internal');
+      assert.match(replayRefusal.message, /Unknown or already-redeemed invite/);
+      await runCli(['restart']);
+      await runCli(['room', 'recover', oneTimeProof.room_id]);
+      const oneTimeRoom = await runCli(['room', 'show', oneTimeProof.room_id]);
+      const publicRoom = await runCli(['room', 'show', publicProof.room_id]);
+      assert.equal(oneTimeRoom.state, 'active');
+      assert.equal(publicRoom.state, 'active');
+      assert.deepEqual(oneTimeRoom.seats.map((seat) => [seat.identity, seat.role, seat.invite_id]), [
+        [alice.cid, 'single', proofOneTime.invite.invite_id],
+      ]);
+      assert.deepEqual(
+        publicRoom.seats.map((seat) => [seat.identity, seat.role, seat.invite_id]).sort(([left], [right]) => left.localeCompare(right)),
+        [
+          [bob.cid, 'shared', proofPublic.invite.invite_id],
+          [charlie.cid, 'shared', proofPublic.invite.invite_id],
+        ].sort(([left], [right]) => left.localeCompare(right)),
+      );
+      assert.deepEqual(
+        oneTimeRoom.invites.find((invite) => invite.invite_id === proofOneTime.invite.invite_id).accepted_cids,
+        [alice.cid],
+        'the second one-time redemption is refused and never admitted',
+      );
+      assert.equal(bob.contacts().includes(oneTimeProof.identity_cid), false);
+      assert.deepEqual(
+        new Set(publicRoom.invites.find((invite) => invite.invite_id === proofPublic.invite.invite_id).accepted_cids),
+        new Set([bob.cid, charlie.cid]),
+        'one public blob admits two distinct exact origins',
+      );
+      await runCli(['room', 'close', oneTimeProof.room_id]);
+      await runCli(['room', 'close', publicProof.room_id]);
+      await runCli(['room', 'delete', oneTimeProof.room_id, '--yes']);
+      await runCli(['room', 'delete', publicProof.room_id, '--yes']);
+      stage('invite-redemption-semantics');
+
       const created = await runCli(['room', 'create', '--goal', 'Ship the release', '--briefing', 'Keep evidence and blockers explicit']);
       const roomId = created.room_id;
       const roomCid = created.identity_cid;

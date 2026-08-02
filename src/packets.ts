@@ -525,24 +525,67 @@ function nilString(value: AdaptValue): string {
 
 /** Normalize the SDK's native TIME visualization into the host storage contract. */
 export function adaptTimeToRfc3339(value: string): string {
-  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) {
-    return value;
+  const rfc3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(?:Z|([+-])(\d{2}):(\d{2}))$/.exec(value);
+  if (rfc3339) {
+    const [, year, month, day, hour, minute, second, fraction = '', sign, offsetHour = '0', offsetMinute = '0'] = rfc3339;
+    if (sign === '-' && offsetHour === '00' && offsetMinute === '00') return invalidAdaptTime(value);
+    return canonicalUtcTime(value, year!, month!, day!, hour!, minute!, second!, fraction, sign, offsetHour, offsetMinute);
   }
-  const match = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))? \(UTC(?:(\+|-)(\d{1,2}))?\)$/.exec(value);
-  if (!match) throw new Error(`unexpected ADAPT time visualization: ${value}`);
-  const [, date, time, fraction = '', sign, hours = '0'] = match;
-  const offsetHours = Number(hours);
-  if (!Number.isInteger(offsetHours) || offsetHours > 23) {
-    throw new Error(`unexpected ADAPT time visualization: ${value}`);
+
+  // Native SDK TIME values visualize exactly as documented here: a space
+  // separator, optional 1..9 fractional digits, and UTC with an optional
+  // unpadded whole-hour offset. RFC-shaped variants are intentionally refused.
+  const native = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))? \(UTC(?:([+-])(0|[1-9]|1\d|2[0-3]))?\)$/.exec(value);
+  if (!native) return invalidAdaptTime(value);
+  const [, year, month, day, hour, minute, second, fraction = '', sign, offsetHour = '0'] = native;
+  if (sign === '-' && offsetHour === '0') return invalidAdaptTime(value);
+  return canonicalUtcTime(value, year!, month!, day!, hour!, minute!, second!, fraction, sign, offsetHour, '0');
+}
+
+function canonicalUtcTime(
+  source: string,
+  yearText: string,
+  monthText: string,
+  dayText: string,
+  hourText: string,
+  minuteText: string,
+  secondText: string,
+  fraction: string,
+  offsetSign: string | undefined,
+  offsetHourText: string,
+  offsetMinuteText: string,
+): string {
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const offsetHour = Number(offsetHourText);
+  const offsetMinute = Number(offsetMinuteText);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12 || day < 1 || day > monthDays[month - 1]!
+    || hour > 23 || minute > 59 || second > 59
+    || offsetHour > 23 || offsetMinute > 59) return invalidAdaptTime(source);
+
+  const milliseconds = Number(fraction.slice(0, 3).padEnd(3, '0'));
+  const local = new Date(0);
+  local.setUTCFullYear(year, month - 1, day);
+  local.setUTCHours(hour, minute, second, milliseconds);
+  if (local.getUTCFullYear() !== year || local.getUTCMonth() !== month - 1 || local.getUTCDate() !== day
+    || local.getUTCHours() !== hour || local.getUTCMinutes() !== minute || local.getUTCSeconds() !== second) {
+    return invalidAdaptTime(source);
   }
-  const milliseconds = fraction.slice(0, 3).padEnd(3, '0');
-  const offset = sign === undefined || offsetHours === 0
-    ? 'Z'
-    : `${sign}${String(offsetHours).padStart(2, '0')}:00`;
-  const timestamp = `${date}T${time}.${milliseconds}${offset}`;
-  const parsed = new Date(timestamp);
-  if (Number.isNaN(parsed.getTime())) throw new Error(`unexpected ADAPT time visualization: ${value}`);
-  return parsed.toISOString();
+  const direction = offsetSign === '-' ? -1 : 1;
+  const offsetMilliseconds = direction * ((offsetHour * 60) + offsetMinute) * 60_000;
+  const canonical = new Date(local.getTime() - offsetMilliseconds).toISOString();
+  if (!/^\d{4}-/.test(canonical)) return invalidAdaptTime(source);
+  return canonical;
+}
+
+function invalidAdaptTime(value: string): never {
+  throw new Error(`unexpected ADAPT time visualization: ${value}`);
 }
 
 function inviteMode(value: string): InviteMode {

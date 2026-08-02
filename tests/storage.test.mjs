@@ -95,6 +95,10 @@ test('metadata replacement fsyncs the temp file before rename and the directory 
         if (failRename && String(to).endsWith('room.json')) throw Object.assign(new Error('injected rename failure'), { code: 'EIO' });
         return target.renameSync(from, to);
       };
+      if (property === 'chmodSync') return (path, mode) => {
+        events.push(['chmod', String(path), mode]);
+        return target.chmodSync(path, mode);
+      };
       return Reflect.get(target, property);
     },
   });
@@ -108,11 +112,135 @@ test('metadata replacement fsyncs the temp file before rename and the directory 
   assert(renameIndex > 0);
   assert(events.slice(0, renameIndex).some(([kind, path]) => kind === 'fsync' && path.includes('room.json.tmp-')));
   assert(events.slice(renameIndex + 1).some(([kind, path]) => kind === 'fsync' && path.endsWith(`rooms/${ROOM_ID}`)));
+  assert.equal(events.slice(renameIndex + 1).some(([kind, path]) => kind === 'chmod' && path.endsWith('room.json')), false);
 
   failRename = true;
   await assert.rejects(store.save(room({ state: 'closed', closed_at: AT })), /rename failure/i);
   assert.equal((await new CoworkStore(stateDir).load(ROOM_ID)).state, 'active');
   assert.equal(fs.readdirSync(join(stateDir, 'rooms', ROOM_ID)).some((name) => name.includes('.tmp-')), false);
+});
+
+test('create persists base and room directory entries before creating files', async (t) => {
+  const events = [];
+  const pathsByFd = new Map();
+  const { stateDir, cleanup } = temporaryStore();
+  cleanup();
+  fs.mkdirSync(stateDir, { mode: 0o700 });
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const ops = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'mkdirSync') return (path, options) => {
+        events.push(['mkdir', String(path)]);
+        return target.mkdirSync(path, options);
+      };
+      if (property === 'openSync') return (path, ...args) => {
+        const fd = target.openSync(path, ...args);
+        pathsByFd.set(fd, String(path));
+        events.push(['open', String(path)]);
+        return fd;
+      };
+      if (property === 'closeSync') return (fd) => { pathsByFd.delete(fd); return target.closeSync(fd); };
+      if (property === 'fsyncSync') return (fd) => {
+        events.push(['fsync', pathsByFd.get(fd)]);
+        return target.fsyncSync(fd);
+      };
+      return Reflect.get(target, property);
+    },
+  });
+  await new CoworkStore(stateDir, { fs: ops }).create(room());
+  const roomsDir = join(stateDir, 'rooms');
+  const roomDir = join(roomsDir, ROOM_ID);
+  const roomsMkdir = events.findIndex(([kind, path]) => kind === 'mkdir' && path === roomsDir);
+  const stateFsync = events.findIndex(([kind, path]) => kind === 'fsync' && path === stateDir);
+  const roomMkdir = events.findIndex(([kind, path]) => kind === 'mkdir' && path === roomDir);
+  const roomsFsync = events.findIndex(([kind, path], index) => index > roomMkdir && kind === 'fsync' && path === roomsDir);
+  const archiveOpen = events.findIndex(([kind, path]) => kind === 'open' && path.endsWith('archive.jsonl'));
+  assert(roomsMkdir >= 0 && stateFsync > roomsMkdir, JSON.stringify(events));
+  assert(roomMkdir >= 0 && roomsFsync > roomMkdir && roomsFsync < archiveOpen, JSON.stringify(events));
+});
+
+test('room mkdir/chmod failure cleans the reservation and permits retry', async (t) => {
+  let failRoomChmod = true;
+  let stateDir;
+  const ops = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'chmodSync') return (path, mode) => {
+        if (failRoomChmod && stateDir && String(path) === join(stateDir, 'rooms', ROOM_ID)) {
+          throw Object.assign(new Error('injected room chmod failure'), { code: 'EIO' });
+        }
+        return target.chmodSync(path, mode);
+      };
+      return Reflect.get(target, property);
+    },
+  });
+  const temporary = temporaryStore({ fs: ops });
+  stateDir = temporary.stateDir;
+  t.after(temporary.cleanup);
+  await assert.rejects(temporary.store.create(room()), /chmod failure/i);
+  assert.equal(fs.existsSync(join(stateDir, 'rooms', ROOM_ID)), false);
+  failRoomChmod = false;
+  await temporary.store.create(room());
+  assert.equal((await temporary.store.load(ROOM_ID)).room_id, ROOM_ID);
+});
+
+test('room mkdir failure after creating the entry still cleans the reservation', async (t) => {
+  let stateDir;
+  let failRoomMkdir = true;
+  const ops = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'mkdirSync') return (path, options) => {
+        const result = target.mkdirSync(path, options);
+        if (failRoomMkdir && stateDir && String(path) === join(stateDir, 'rooms', ROOM_ID)) {
+          failRoomMkdir = false;
+          throw Object.assign(new Error('injected post-create mkdir failure'), { code: 'EIO' });
+        }
+        return result;
+      };
+      return Reflect.get(target, property);
+    },
+  });
+  const temporary = temporaryStore({ fs: ops });
+  stateDir = temporary.stateDir;
+  t.after(temporary.cleanup);
+  await assert.rejects(temporary.store.create(room()), /mkdir failure/i);
+  assert.equal(fs.existsSync(join(stateDir, 'rooms', ROOM_ID)), false);
+  await temporary.store.create(room());
+});
+
+test('room parent fsync failure cleans the mkdir entry and permits retry', async (t) => {
+  let stateDir;
+  let roomWasMade = false;
+  let failParentFsync = true;
+  const pathsByFd = new Map();
+  const ops = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'mkdirSync') return (path, options) => {
+        const result = target.mkdirSync(path, options);
+        if (stateDir && String(path) === join(stateDir, 'rooms', ROOM_ID)) roomWasMade = true;
+        return result;
+      };
+      if (property === 'openSync') return (path, ...args) => {
+        const fd = target.openSync(path, ...args);
+        pathsByFd.set(fd, String(path));
+        return fd;
+      };
+      if (property === 'closeSync') return (fd) => { pathsByFd.delete(fd); return target.closeSync(fd); };
+      if (property === 'fsyncSync') return (fd) => {
+        if (failParentFsync && roomWasMade && pathsByFd.get(fd) === join(stateDir, 'rooms')) {
+          failParentFsync = false;
+          throw Object.assign(new Error('injected parent fsync failure'), { code: 'EIO' });
+        }
+        return target.fsyncSync(fd);
+      };
+      return Reflect.get(target, property);
+    },
+  });
+  const temporary = temporaryStore({ fs: ops });
+  stateDir = temporary.stateDir;
+  t.after(temporary.cleanup);
+  await assert.rejects(temporary.store.create(room()), /parent fsync failure/i);
+  assert.equal(fs.existsSync(join(stateDir, 'rooms', ROOM_ID)), false);
+  await temporary.store.create(room());
 });
 
 test('append serializes by room, assigns monotonic records, and survives restart', async (t) => {
@@ -161,6 +289,67 @@ test('append handles partial writes, closes descriptors, rolls back, and never a
   assert.equal(readFileSync(join(stateDir, 'rooms', ROOM_ID, 'archive.jsonl'), 'utf8'), '');
   const record = await store.append(ROOM_ID, message('works'));
   assert.equal(record.seq, 1);
+});
+
+test('append fchmod failure cannot truncate an existing archive', async (t) => {
+  let failArchiveChmod = false;
+  const archiveFds = new Set();
+  const ops = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'openSync') return (path, ...args) => {
+        const fd = target.openSync(path, ...args);
+        if (String(path).endsWith('archive.jsonl')) archiveFds.add(fd);
+        return fd;
+      };
+      if (property === 'closeSync') return (fd) => { archiveFds.delete(fd); return target.closeSync(fd); };
+      if (property === 'fchmodSync') return (fd, mode) => {
+        if (failArchiveChmod && archiveFds.has(fd)) throw Object.assign(new Error('injected fchmod failure'), { code: 'EIO' });
+        return target.fchmodSync(fd, mode);
+      };
+      return Reflect.get(target, property);
+    },
+  });
+  const { stateDir, store, cleanup } = temporaryStore({ fs: ops });
+  t.after(cleanup);
+  await store.create(room());
+  await store.append(ROOM_ID, message('preserve-me'));
+  const archivePath = join(stateDir, 'rooms', ROOM_ID, 'archive.jsonl');
+  const before = readFileSync(archivePath);
+  failArchiveChmod = true;
+  await assert.rejects(store.append(ROOM_ID, message('must-fail')), /fchmod failure/i);
+  assert.deepEqual(readFileSync(archivePath), before);
+  failArchiveChmod = false;
+  assert.equal((await store.append(ROOM_ID, message('second'))).seq, 2);
+});
+
+test('room mutex ownership is reentrant, excludes competitors, and releases after exceptions', async (t) => {
+  const { store, cleanup } = temporaryStore();
+  t.after(cleanup);
+  await store.create(room());
+  let enterOuter;
+  let leaveOuter;
+  const entered = new Promise((resolve) => { enterOuter = resolve; });
+  const leave = new Promise((resolve) => { leaveOuter = resolve; });
+  let competitorEntered = false;
+
+  const outer = store.mutex(ROOM_ID, async () => {
+    assert.equal((await store.load(ROOM_ID)).room_id, ROOM_ID);
+    await store.save(room({ state: 'active', activated_at: AT }));
+    await store.mutex(ROOM_ID).runExclusive(() => store.append(ROOM_ID, message('nested')));
+    enterOuter();
+    await leave;
+  });
+  await Promise.race([outer, entered, new Promise((_, reject) => setTimeout(() => reject(new Error('nested room mutex deadlocked')), 250))]);
+  const competitor = store.mutex(ROOM_ID, () => { competitorEntered = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(competitorEntered, false);
+  leaveOuter();
+  await outer;
+  await competitor;
+  assert.equal(competitorEntered, true);
+
+  await assert.rejects(store.mutex(ROOM_ID, async () => { throw new Error('release me'); }), /release me/);
+  await store.mutex(ROOM_ID, () => {});
 });
 
 test('fsync failure does not leave an in-memory sequence reservation', async (t) => {
@@ -229,6 +418,61 @@ test('room IDs cannot traverse paths and room symlinks fail closed', async (t) =
   await assert.rejects(store.create(room()), /symbolic link|symlink/i);
 });
 
+test('hardlink and open/path inode substitution cannot expose or modify another file', async (t) => {
+  await t.test('archive hardlink', async (t) => {
+    const { stateDir, store, cleanup } = temporaryStore();
+    t.after(cleanup);
+    await store.create(room());
+    const archivePath = join(stateDir, 'rooms', ROOM_ID, 'archive.jsonl');
+    const victimPath = join(stateDir, 'victim');
+    writeFileSync(victimPath, 'do-not-touch', { mode: 0o640 });
+    fs.unlinkSync(archivePath);
+    fs.linkSync(victimPath, archivePath);
+    const before = readFileSync(victimPath);
+    const beforeMode = mode(victimPath);
+    await assert.rejects(store.append(ROOM_ID, message('attack')), /hardlink|link count|inode/i);
+    assert.deepEqual(readFileSync(victimPath), before);
+    assert.equal(mode(victimPath), beforeMode);
+  });
+
+  await t.test('metadata hardlink', async (t) => {
+    const { stateDir, store, cleanup } = temporaryStore();
+    t.after(cleanup);
+    await store.create(room());
+    const metadataPath = join(stateDir, 'rooms', ROOM_ID, 'room.json');
+    const victimPath = join(stateDir, 'metadata-victim');
+    fs.renameSync(metadataPath, victimPath);
+    fs.linkSync(victimPath, metadataPath);
+    await assert.rejects(store.load(ROOM_ID), /hardlink|link count|inode/i);
+  });
+
+  await t.test('path inode swapped after open', async (t) => {
+    let swap = false;
+    let metadataPath;
+    const ops = new Proxy(fs, {
+      get(target, property) {
+        if (property === 'openSync') return (path, ...args) => {
+          const fd = target.openSync(path, ...args);
+          if (swap && String(path) === metadataPath) {
+            swap = false;
+            const heldPath = `${metadataPath}.held`;
+            target.renameSync(metadataPath, heldPath);
+            target.writeFileSync(metadataPath, `${JSON.stringify(room({ state: 'closed', closed_at: AT }))}\n`, { mode: 0o600 });
+          }
+          return fd;
+        };
+        return Reflect.get(target, property);
+      },
+    });
+    const temporary = temporaryStore({ fs: ops });
+    t.after(temporary.cleanup);
+    metadataPath = join(temporary.stateDir, 'rooms', ROOM_ID, 'room.json');
+    await temporary.store.create(room());
+    swap = true;
+    await assert.rejects(temporary.store.load(ROOM_ID), /inode|changed during open/i);
+  });
+});
+
 test('delete removes archive then metadata without creating an on-disk lock', async (t) => {
   const { stateDir, store, cleanup } = temporaryStore();
   t.after(cleanup);
@@ -237,4 +481,52 @@ test('delete removes archive then metadata without creating an on-disk lock', as
   await store.delete(ROOM_ID);
   assert.equal(fs.existsSync(join(stateDir, 'rooms', ROOM_ID)), false);
   assert.equal(fs.readdirSync(join(stateDir, 'rooms')).some((name) => name.includes('lock')), false);
+});
+
+test('delete resumes every expected partial stage but rejects live residue', async (t) => {
+  for (const stage of ['archive-gone', 'files-gone', 'directory-gone']) {
+    await t.test(stage, async (t) => {
+      const { stateDir, store, cleanup } = temporaryStore();
+      t.after(cleanup);
+      await store.create(room({ state: 'closed', closed_at: AT }));
+      const roomDir = join(stateDir, 'rooms', ROOM_ID);
+      fs.unlinkSync(join(roomDir, 'archive.jsonl'));
+      if (stage !== 'archive-gone') fs.unlinkSync(join(roomDir, 'room.json'));
+      if (stage === 'directory-gone') fs.rmdirSync(roomDir);
+      await store.delete(ROOM_ID);
+      assert.equal(fs.existsSync(roomDir), false);
+    });
+  }
+
+  await t.test('retry after metadata unlink failure', async (t) => {
+    let failMetadataUnlink = true;
+    const ops = new Proxy(fs, {
+      get(target, property) {
+        if (property === 'unlinkSync') return (path) => {
+          if (failMetadataUnlink && String(path).endsWith('room.json')) {
+            failMetadataUnlink = false;
+            throw Object.assign(new Error('injected metadata unlink failure'), { code: 'EIO' });
+          }
+          return target.unlinkSync(path);
+        };
+        return Reflect.get(target, property);
+      },
+    });
+    const { stateDir, store, cleanup } = temporaryStore({ fs: ops });
+    t.after(cleanup);
+    await store.create(room({ state: 'closed', closed_at: AT }));
+    await assert.rejects(store.delete(ROOM_ID), /unlink failure/i);
+    assert.equal(fs.existsSync(join(stateDir, 'rooms', ROOM_ID, 'archive.jsonl')), false);
+    await store.delete(ROOM_ID);
+    assert.equal(fs.existsSync(join(stateDir, 'rooms', ROOM_ID)), false);
+  });
+
+  await t.test('live residue', async (t) => {
+    const { stateDir, store, cleanup } = temporaryStore();
+    t.after(cleanup);
+    await store.create(room({ state: 'closed', closed_at: AT }));
+    fs.mkdirSync(join(stateDir, 'rooms', ROOM_ID, 'live'), { mode: 0o700 });
+    await assert.rejects(store.delete(ROOM_ID), /live or unexpected residue/i);
+    assert.equal(fs.existsSync(join(stateDir, 'rooms', ROOM_ID, 'archive.jsonl')), true);
+  });
 });

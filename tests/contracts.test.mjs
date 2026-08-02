@@ -8,6 +8,7 @@ import {
   LowerCrockfordUlidSchema,
   MessageTextSchema,
   PostMessageInputSchema,
+  Rfc3339Schema,
   RoleSchema,
   RoomInviteSchema,
   RoomSchema,
@@ -46,6 +47,26 @@ test('IDs are exactly 26 lowercase Crockford ULID characters', () => {
   ]) {
     assert.throws(() => LowerCrockfordUlidSchema.parse(invalid));
   }
+});
+
+test('RFC3339 timestamps require valid calendar/time and colonized bounded offsets', () => {
+  for (const valid of [
+    '2026-08-02T10:11:12Z',
+    '2024-02-29T23:59:59.123456+02:30',
+    '2026-01-01T00:00:00-23:59',
+  ]) assert.equal(Rfc3339Schema.parse(valid), valid);
+
+  for (const invalid of [
+    '2026-08-02T10:11:12+0200',
+    '2026-08-02T10:11:12+24:00',
+    '2026-08-02T10:11:12+23:60',
+    '2026-08-02T10:11:12+99:99',
+    '2026-02-29T10:11:12Z',
+    '2026-13-01T10:11:12Z',
+    '2026-01-01T24:00:00Z',
+    '2026-01-01T00:60:00Z',
+    '2026-01-01T00:00:60Z',
+  ]) assert.throws(() => Rfc3339Schema.parse(invalid), invalid);
 });
 
 test('text bounds count exact UTF-8 bytes, not JavaScript code units', () => {

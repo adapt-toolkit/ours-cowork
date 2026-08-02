@@ -46,7 +46,13 @@ export const MessageTextSchema = utf8Bounded('message text', MAX_TEXT_BYTES);
 
 export const RoomStateSchema = z.enum(['provisioning', 'active', 'closing', 'closed']);
 export const InviteModeSchema = z.enum(['one_time', 'public']);
-export const InviteStateSchema = z.enum(['live', 'consumed', 'revoked', 'replacement_required']);
+export const InviteStateSchema = z.enum([
+  'live',
+  'consumed',
+  'revoked',
+  'replacement_required',
+  'receipt_pending',
+]);
 export const RelayStatusSchema = z.enum(['queued', 'send_failed']);
 
 export const SeatSchema = z.object({
@@ -64,6 +70,7 @@ export const RoomInviteSchema = z.object({
   min_accepts: PositiveSafeIntegerSchema,
   accepted_cids: z.array(NonEmptyStringSchema),
   state: InviteStateSchema,
+  recovery_of: NonEmptyStringSchema.optional(),
   created_at: Rfc3339Schema,
 }).strict().superRefine((invite, context) => {
   if (invite.mode === 'one_time' && invite.min_accepts !== 1) {
@@ -71,6 +78,27 @@ export const RoomInviteSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ['min_accepts'],
       message: 'one_time invites require min_accepts === 1',
+    });
+  }
+  if (invite.state === 'receipt_pending' && invite.recovery_of === undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['recovery_of'],
+      message: 'receipt_pending invites require recovery_of',
+    });
+  }
+  if (invite.state !== 'receipt_pending' && invite.recovery_of !== undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['recovery_of'],
+      message: 'only receipt_pending invites may carry recovery_of',
+    });
+  }
+  if (invite.state === 'receipt_pending' && invite.accepted_cids.length > 0) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['accepted_cids'],
+      message: 'receipt_pending invites cannot have accepted CIDs',
     });
   }
 });
@@ -84,7 +112,7 @@ export const RoomSchema = z.object({
   version: z.literal(1),
   room_id: LowerCrockfordUlidSchema,
   identity_name: NonEmptyStringSchema,
-  identity_cid: NonEmptyStringSchema,
+  identity_cid: z.string(),
   mission: MissionSchema,
   state: RoomStateSchema,
   status: NonEmptyStringSchema.optional(),
@@ -93,7 +121,56 @@ export const RoomSchema = z.object({
   created_at: Rfc3339Schema,
   activated_at: Rfc3339Schema.optional(),
   closed_at: Rfc3339Schema.optional(),
-}).strict();
+}).strict().superRefine((room, context) => {
+  const pendingIdentityName = `cowork-room-${room.room_id}`;
+  const exactPacketPending = room.state === 'provisioning'
+    && room.status === 'packet_pending'
+    && room.identity_name === pendingIdentityName;
+  if (room.identity_cid === '' && !exactPacketPending) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['identity_cid'],
+      message: 'empty identity_cid is reserved for the exact packet_pending provisioning sentinel',
+    });
+  }
+  if (room.identity_cid !== '' && room.status === 'packet_pending') {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['status'],
+      message: 'packet_pending status requires an empty identity_cid',
+    });
+  }
+  const pendingByRecovery = new Map<string, number>();
+  for (const [index, invite] of room.invites.entries()) {
+    if (invite.state !== 'receipt_pending') continue;
+    const recoveryOf = invite.recovery_of!;
+    const source = room.invites.find((candidate) => candidate.invite_id === recoveryOf);
+    if (!source || source.invite_id === invite.invite_id || source.state !== 'replacement_required') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['invites', index, 'recovery_of'],
+        message: 'receipt_pending recovery_of must point to a replacement_required invite in this room',
+      });
+    } else if (invite.mode !== source.mode
+      || invite.role !== source.role
+      || invite.min_accepts !== source.min_accepts) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['invites', index],
+        message: 'receipt_pending descriptor must copy source mode, role, and min_accepts',
+      });
+    }
+    const count = (pendingByRecovery.get(recoveryOf) ?? 0) + 1;
+    pendingByRecovery.set(recoveryOf, count);
+    if (count > 1) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['invites', index, 'recovery_of'],
+        message: 'only one receipt_pending invite may exist per recovery_of pointer',
+      });
+    }
+  }
+});
 
 /** Caller-controlled room creation fields. Identity and authorship are host-owned. */
 export const CreateRoomInputSchema = z.object({

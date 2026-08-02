@@ -7,6 +7,7 @@ import {
   InviteModeSchema,
   LowerCrockfordUlidSchema,
   RoleSchema,
+  RoomInviteSchema,
   RoomSchema,
   UpdateRoomInputSchema,
   type CommunicationRecord,
@@ -99,9 +100,10 @@ export class RoomService {
         // PacketRegistry needs the durable room directory to exist first. A
         // valid, explicitly provisional value lets startup resume this exact
         // two-resource boundary without claiming a packet CID yet.
-        identity_cid: `provisioning:${roomId}`,
+        identity_cid: '',
         mission: { goal: settings.goal, briefing: settings.briefing },
         state: 'provisioning',
+        status: 'packet_pending',
         invites: [],
         seats: [],
         created_at: this.now(),
@@ -112,7 +114,8 @@ export class RoomService {
         identityName,
         `ours-cowork mission room ${roomId}`,
       );
-      return this.store.save(RoomSchema.parse({ ...provisional, identity_cid: packet.cid }));
+      const { status: _packetPending, ...created } = provisional;
+      return this.store.save(RoomSchema.parse({ ...created, identity_cid: packet.cid }));
     });
   }
 
@@ -121,30 +124,50 @@ export class RoomService {
     return this.lock(id, async () => {
       let room = await this.store.load(id);
       if (room.state === 'closed') return room;
+      const packetPending = this.isPacketPending(room);
       let packet = this.packets.get(id);
-      if (!packet) {
-        let restoreFailure: unknown;
+      if (packet) {
+        if (!packetPending && packet.cid !== room.identity_cid) {
+          throw new RoomServiceError(
+            `restored room packet CID mismatch for "${id}": expected "${room.identity_cid}", found "${packet.cid}"`,
+          );
+        }
+      } else if (packetPending) {
         if (this.packets.restore) {
           try {
             packet = await this.packets.restore(id);
-          } catch (error) {
-            restoreFailure = error;
-          }
+          } catch { /* no live packet was durably established; provision below */ }
         }
         if (!packet) {
           try {
             packet = await this.packets.create(id, room.identity_name, `ours-cowork mission room ${id}`);
           } catch (createFailure) {
             throw new RoomServiceError(`failed to recover room packet "${id}"`, {
-              cause: restoreFailure === undefined
-                ? createFailure
-                : new AggregateError([restoreFailure, createFailure], 'packet restore and provisioning both failed'),
+              cause: createFailure,
             });
           }
         }
+      } else {
+        if (!this.packets.restore) {
+          throw new RoomServiceError(`room packet "${id}" with established CID must be restored, not created`);
+        }
+        try {
+          packet = await this.packets.restore(id);
+        } catch (error) {
+          throw new RoomServiceError(
+            `failed to restore established room packet "${id}": ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
+          );
+        }
+        if (packet.cid !== room.identity_cid) {
+          throw new RoomServiceError(
+            `restored room packet CID mismatch for "${id}": expected "${room.identity_cid}", found "${packet.cid}"`,
+          );
+        }
       }
-      if (room.identity_cid !== packet.cid) {
-        room = await this.store.save(RoomSchema.parse({ ...room, identity_cid: packet.cid }));
+      if (packetPending) {
+        const { status: _packetPending, ...established } = room;
+        room = await this.store.save(RoomSchema.parse({ ...established, identity_cid: packet.cid }));
       }
       return this.reconcileUnlocked(room, packet);
     });
@@ -176,7 +199,7 @@ export class RoomService {
       this.assertMutable(room, 'create an invite for');
       const packet = this.packet(id);
       const minted = await packet.mintInvite(request.mode);
-      const invite = RoomSchema.shape.invites.element.parse({
+      const invite = RoomInviteSchema.parse({
         invite_id: minted.invite_id,
         mode: request.mode,
         role: request.role,
@@ -208,12 +231,14 @@ export class RoomService {
     const parsedInviteId = z.string().min(1).parse(inviteId);
     return this.lock(id, async () => {
       const room = await this.store.load(id);
+      this.assertMutable(room, 'revoke an invite for');
       const index = room.invites.findIndex((invite) => invite.invite_id === parsedInviteId);
       if (index < 0) throw new RoomServiceError(`invite "${parsedInviteId}" does not belong to room "${id}"`);
       const current = room.invites[index]!;
       if (current.state === 'revoked') return current;
       await this.packet(id).revokeInvite(parsedInviteId);
-      const revoked: RoomInvite = { ...current, state: 'revoked' };
+      const { recovery_of: _recoveryOf, ...withoutRecovery } = current;
+      const revoked: RoomInvite = { ...withoutRecovery, state: 'revoked' };
       const invites = [...room.invites];
       invites[index] = revoked;
       await this.store.save(RoomSchema.parse({ ...room, invites }));
@@ -233,24 +258,56 @@ export class RoomService {
       const packet = this.packet(id);
       const receipts: InviteReceipt[] = [];
       for (const stale of room.invites.filter((invite) => invite.state === 'replacement_required')) {
+        const priorPending = room.invites.filter((invite) =>
+          invite.state === 'receipt_pending' && invite.recovery_of === stale.invite_id);
+        for (const pending of priorPending) {
+          await packet.revokeInvite(pending.invite_id);
+        }
+        if (priorPending.length > 0) {
+          const pendingIds = new Set(priorPending.map((invite) => invite.invite_id));
+          room = await this.store.save(RoomSchema.parse({
+            ...room,
+            invites: room.invites.map((invite) => {
+              if (!pendingIds.has(invite.invite_id)) return invite;
+              const { recovery_of: _recoveryOf, ...descriptor } = invite;
+              return { ...descriptor, state: 'revoked' as const };
+            }),
+          }));
+        }
         try { await packet.revokeInvite(stale.invite_id); } catch { /* the missing secret is already unusable */ }
         const minted = await packet.mintInvite(stale.mode);
-        const replacement: RoomInvite = {
+        const replacement: RoomInvite = RoomInviteSchema.parse({
           invite_id: minted.invite_id,
           mode: stale.mode,
           role: stale.role,
           min_accepts: stale.min_accepts,
           accepted_cids: [],
-          state: 'live',
+          state: 'receipt_pending',
+          recovery_of: stale.invite_id,
           created_at: this.now(),
-        };
-        const nextInvites = room.invites.map((invite) =>
-          invite.invite_id === stale.invite_id ? { ...invite, state: 'revoked' as const } : invite);
-        nextInvites.push(replacement);
+        });
         try {
-          room = await this.store.save(RoomSchema.parse({ ...room, invites: nextInvites }));
+          room = await this.store.save(RoomSchema.parse({ ...room, invites: [...room.invites, replacement] }));
         } catch (error) {
-          try { await packet.revokeInvite(minted.invite_id); } catch { /* original save failure wins */ }
+          let replacementRevoked = false;
+          try {
+            await packet.revokeInvite(minted.invite_id);
+            replacementRevoked = true;
+          } catch { /* leave a persisted descriptor pending so retry revokes it */ }
+          try {
+            const observed = await this.store.load(id);
+            if (replacementRevoked && observed.invites.some((invite) =>
+              invite.invite_id === minted.invite_id && invite.state === 'receipt_pending')) {
+              await this.store.save(RoomSchema.parse({
+                ...observed,
+                invites: observed.invites.map((invite) => {
+                  if (invite.invite_id !== minted.invite_id) return invite;
+                  const { recovery_of: _recoveryOf, ...descriptor } = invite;
+                  return { ...descriptor, state: 'revoked' as const };
+                }),
+              }));
+            }
+          } catch { /* retry rotates any still-pending descriptor */ }
           throw error;
         }
         receipts.push({
@@ -262,6 +319,50 @@ export class RoomService {
         });
       }
       return receipts;
+    });
+  }
+
+  async confirmRecoveredInvite(roomId: string, recoveryOf: string, inviteId: string): Promise<RoomInvite> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const oldId = z.string().min(1).parse(recoveryOf);
+    const replacementId = z.string().min(1).parse(inviteId);
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'confirm a recovered invite for');
+      const oldIndex = room.invites.findIndex((invite) => invite.invite_id === oldId);
+      const replacementIndex = room.invites.findIndex((invite) => invite.invite_id === replacementId);
+      if (oldIndex < 0 || replacementIndex < 0 || oldIndex === replacementIndex) {
+        throw new RoomServiceError('recovered invite confirmation does not match a persisted descriptor');
+      }
+      const old = room.invites[oldIndex]!;
+      const replacement = room.invites[replacementIndex]!;
+      if (old.state === 'revoked' && replacement.state === 'live' && replacement.recovery_of === undefined) {
+        return replacement;
+      }
+      if (old.state !== 'replacement_required'
+        || replacement.state !== 'receipt_pending'
+        || replacement.recovery_of !== oldId) {
+        throw new RoomServiceError('recovered invite confirmation pointer/state mismatch');
+      }
+      const coreInvite = this.packet(id).listInvites().find((invite) => invite.invite_id === replacementId);
+      if (!coreInvite || coreInvite.mode !== replacement.mode) {
+        throw new RoomServiceError('recovered invite is no longer present in packet state');
+      }
+      const confirmed: RoomInvite = {
+        invite_id: replacement.invite_id,
+        mode: replacement.mode,
+        role: replacement.role,
+        min_accepts: replacement.min_accepts,
+        accepted_cids: [],
+        state: 'live',
+        created_at: replacement.created_at,
+      };
+      const { recovery_of: _oldRecovery, ...oldDescriptor } = old;
+      const invites = [...room.invites];
+      invites[oldIndex] = { ...oldDescriptor, state: 'revoked' };
+      invites[replacementIndex] = confirmed;
+      await this.store.save(RoomSchema.parse({ ...room, invites }));
+      return confirmed;
     });
   }
 
@@ -304,7 +405,7 @@ export class RoomService {
       const origin = origins[cid];
       if (!origin || (origin.via !== 'invite_one_time' && origin.via !== 'invite_public')) continue;
       const invite = inviteById.get(origin.invite_id);
-      if (!invite) continue;
+      if (!invite || invite.state === 'receipt_pending' || invite.state === 'revoked') continue;
       newSeats.push({
         identity: cid,
         display_name: displayName,
@@ -439,6 +540,13 @@ export class RoomService {
     if (room.state === 'closing' || room.state === 'closed') {
       throw new RoomServiceError(`cannot ${action} room "${room.room_id}" while it is ${room.state}`);
     }
+  }
+
+  private isPacketPending(room: Room): boolean {
+    return room.identity_cid === ''
+      && room.state === 'provisioning'
+      && room.status === 'packet_pending'
+      && room.identity_name === `cowork-room-${room.room_id}`;
   }
 
   private now(): string {

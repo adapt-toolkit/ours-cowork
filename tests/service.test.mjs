@@ -27,6 +27,7 @@ class MemoryStore {
   tails = new Map();
   ownership = new AsyncLocalStorage();
   beforeSave;
+  afterSave;
   beforeAppend;
 
   mutex(roomId, work) {
@@ -54,6 +55,7 @@ class MemoryStore {
   async save(room) {
     if (this.beforeSave) await this.beforeSave(room);
     this.rooms.set(room.room_id, structuredClone(room));
+    if (this.afterSave) await this.afterSave(room);
     return structuredClone(room);
   }
 
@@ -112,7 +114,10 @@ class FakePacket {
 class FakeRegistry {
   packets = new Map();
   createCalls = [];
+  restoreCalls = [];
   failCreate;
+  restoreResult;
+  restoreFailure = new Error('live packet state is missing');
 
   get(roomId) { return this.packets.get(roomId); }
 
@@ -129,7 +134,14 @@ class FakeRegistry {
     return packet;
   }
 
-  async restore() { throw new Error('live packet state is missing'); }
+  async restore(roomId) {
+    this.restoreCalls.push(roomId);
+    if (this.restoreResult) {
+      this.packets.set(roomId, this.restoreResult);
+      return this.restoreResult;
+    }
+    throw this.restoreFailure;
+  }
 }
 
 function fixture() {
@@ -173,13 +185,68 @@ test('recoverRoom resumes the durable provisioning boundary with exactly one liv
   f.registry.failCreate = new Error('crash before live packet creation');
   await assert.rejects(create(f), /crash before live/);
   const provisional = await f.store.load(ROOM_ID);
-  assert.equal(provisional.identity_cid, `provisioning:${ROOM_ID}`);
+  assert.equal(provisional.identity_cid, '');
+  assert.equal(provisional.status, 'packet_pending');
   assert.equal(f.registry.packets.size, 0);
 
   const recovered = await f.service.recoverRoom(ROOM_ID);
   assert.equal(recovered.identity_cid, `cid-room-${ROOM_ID}`);
   assert.equal(f.registry.packets.size, 1);
   assert.equal(f.registry.createCalls.length, 2);
+});
+
+test('recoverRoom restores rather than creates when a packet exists behind the provisioning sentinel', async () => {
+  const f = fixture();
+  f.registry.failCreate = new Error('crash after metadata reservation');
+  await assert.rejects(create(f), /metadata reservation/);
+  const restored = new FakePacket(`cowork-room-${ROOM_ID}`, 'cid-restored-from-live');
+  f.registry.restoreResult = restored;
+  const createCount = f.registry.createCalls.length;
+  const recovered = await f.service.recoverRoom(ROOM_ID);
+  assert.equal(recovered.identity_cid, restored.cid);
+  assert.equal('status' in recovered, false);
+  assert.equal(f.registry.createCalls.length, createCount);
+  assert.deepEqual(f.registry.restoreCalls, [ROOM_ID]);
+});
+
+test('recoverRoom never creates over an established CID when restore fails', async () => {
+  for (const state of ['active', 'closing', 'provisioning']) {
+    const f = fixture();
+    await create(f);
+    const created = await f.store.load(ROOM_ID);
+    const established = {
+      ...created,
+      state,
+      ...(state === 'active' ? { activated_at: TIMES[2] } : {}),
+    };
+    await f.store.save(established);
+    f.registry.packets.clear();
+    f.registry.restoreFailure = new Error(`injected ${state} restore failure`);
+    const createCount = f.registry.createCalls.length;
+    await assert.rejects(f.service.recoverRoom(ROOM_ID), new RegExp(`${state} restore failure`));
+    assert.equal(f.registry.createCalls.length, createCount, `${state} must be restore-only`);
+    assert.deepEqual(await f.store.load(ROOM_ID), established, `${state} metadata must remain unchanged`);
+  }
+});
+
+test('recoverRoom rejects a restored CID mismatch without changing established metadata', async () => {
+  for (const state of ['active', 'closing', 'provisioning']) {
+    const f = fixture();
+    await create(f);
+    const created = await f.store.load(ROOM_ID);
+    const established = {
+      ...created,
+      state,
+      ...(state === 'active' ? { activated_at: TIMES[2] } : {}),
+    };
+    await f.store.save(established);
+    f.registry.packets.clear();
+    f.registry.restoreResult = new FakePacket(`cowork-room-${ROOM_ID}`, `cid-wrong-${state}`);
+    const createCount = f.registry.createCalls.length;
+    await assert.rejects(f.service.recoverRoom(ROOM_ID), /CID mismatch/i);
+    assert.equal(f.registry.createCalls.length, createCount);
+    assert.deepEqual(await f.store.load(ROOM_ID), established);
+  }
 });
 
 test('invite passes the typed mode and persists metadata without the secret blob', async () => {
@@ -211,50 +278,99 @@ test('revoke calls the packet once and repeated revocation is idempotent', async
   assert.deepEqual(f.registry.get(ROOM_ID).revokeCalls, [invite.invite_id]);
 });
 
-test('recovery replaces absent core secrets, returns only the new blob, and is idempotent', async () => {
+test('revoke rejects closing and closed rooms before calling core', async () => {
+  for (const state of ['closing', 'closed']) {
+    const f = fixture();
+    await create(f);
+    const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'one_time', role: 'builder', min_accepts: 1 });
+    const packet = f.registry.get(ROOM_ID);
+    const room = await f.store.load(ROOM_ID);
+    await f.store.save({ ...room, state, ...(state === 'closed' ? { closed_at: TIMES[3] } : {}) });
+    await assert.rejects(f.service.revokeInvite(ROOM_ID, invite.invite_id), new RegExp(state));
+    assert.deepEqual(packet.revokeCalls, []);
+  }
+});
+
+test('recovery persists a pending descriptor, rotates a lost receipt, and confirms idempotently', async () => {
   const f = fixture();
   await create(f);
   const original = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'reviewer', min_accepts: 2 });
   const packet = f.registry.get(ROOM_ID);
   packet.invites = []; // faithful recreation: the public-invite secret is absent
 
-  const receipts = await f.service.recoverInvites(ROOM_ID);
-  assert.equal(receipts.length, 1);
-  assert.equal(receipts[0].recovery_of, original.invite.invite_id);
-  assert.equal(receipts[0].invite.invite_id, 'core-invite-2');
-  assert.equal(receipts[0].invite.mode, 'public');
-  assert.equal(receipts[0].invite.role, 'reviewer');
-  assert.equal(receipts[0].invite.min_accepts, 2);
-  assert.equal(receipts[0].blob, 'SECRET-BLOB-core-invite-2');
-  const stored = await f.store.load(ROOM_ID);
-  assert.equal(stored.invites.find((invite) => invite.invite_id === original.invite.invite_id).state, 'revoked');
-  assert.equal(stored.invites.find((invite) => invite.invite_id === 'core-invite-2').state, 'live');
+  const [lostReceipt] = await f.service.recoverInvites(ROOM_ID);
+  assert.equal(lostReceipt.recovery_of, original.invite.invite_id);
+  assert.equal(lostReceipt.invite.invite_id, 'core-invite-2');
+  let stored = await f.store.load(ROOM_ID);
+  assert.equal(stored.invites.find((invite) => invite.invite_id === original.invite.invite_id).state, 'replacement_required');
+  assert.deepEqual(stored.invites.find((invite) => invite.invite_id === 'core-invite-2'), {
+    ...lostReceipt.invite,
+    state: 'receipt_pending',
+    recovery_of: original.invite.invite_id,
+  });
   assert.equal(JSON.stringify(stored).includes('SECRET-BLOB'), false);
-  assert.deepEqual(await f.service.recoverInvites(ROOM_ID), []);
+
+  // The first response was lost before confirm. Retry must invalidate that
+  // inaccessible blob and return a freshly persisted descriptor/blob pair.
+  const [receipt] = await f.service.recoverInvites(ROOM_ID);
+  assert(packet.revokeCalls.includes('core-invite-2'));
+  assert.equal(receipt.invite.invite_id, 'core-invite-3');
+  assert.equal(receipt.blob, 'SECRET-BLOB-core-invite-3');
+  stored = await f.store.load(ROOM_ID);
+  assert.equal(stored.invites.find((invite) => invite.invite_id === 'core-invite-2').state, 'revoked');
+  assert.equal(stored.invites.find((invite) => invite.invite_id === 'core-invite-3').state, 'receipt_pending');
+
+  const confirmed = await f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, receipt.invite.invite_id);
+  assert.equal(confirmed.state, 'live');
+  assert.equal('recovery_of' in confirmed, false);
+  const replay = await f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, receipt.invite.invite_id);
+  assert.deepEqual(replay, confirmed);
+  stored = await f.store.load(ROOM_ID);
+  assert.equal(stored.invites.find((invite) => invite.invite_id === original.invite.invite_id).state, 'revoked');
+  assert.equal(stored.invites.find((invite) => invite.invite_id === 'core-invite-3').state, 'live');
 });
 
-test('recovery save failure revokes the unrecorded replacement and a retry mints a fresh receipt', async () => {
+test('ambiguous recovery save revokes/records the pending replacement and retry converges', async () => {
   const f = fixture();
   await create(f);
   await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'reviewer', min_accepts: 1 });
   const packet = f.registry.get(ROOM_ID);
   packet.invites = [];
-  let failReplacementSave = true;
-  f.store.beforeSave = (room) => {
-    if (failReplacementSave && room.invites.some((invite) => invite.invite_id === 'core-invite-2')) {
-      failReplacementSave = false;
-      throw new Error('injected replacement metadata failure');
+  let failReplacementReply = true;
+  f.store.afterSave = (room) => {
+    if (failReplacementReply && room.invites.some((invite) => invite.invite_id === 'core-invite-2' && invite.state === 'receipt_pending')) {
+      failReplacementReply = false;
+      throw new Error('injected post-save pre-reply failure');
     }
   };
-  await assert.rejects(f.service.recoverInvites(ROOM_ID), /replacement metadata failure/);
+  await assert.rejects(f.service.recoverInvites(ROOM_ID), /post-save pre-reply/);
   assert(packet.revokeCalls.includes('core-invite-2'), 'the unrecorded blob must be invalidated when possible');
-  assert.equal((await f.store.load(ROOM_ID)).invites.some((invite) => invite.invite_id === 'core-invite-2'), false);
+  assert.notEqual((await f.store.load(ROOM_ID)).invites.find((invite) => invite.invite_id === 'core-invite-2')?.state, 'live');
 
-  f.store.beforeSave = undefined;
+  f.store.afterSave = undefined;
   const retried = await f.service.recoverInvites(ROOM_ID);
   assert.equal(retried.length, 1);
   assert.equal(retried[0].invite.invite_id, 'core-invite-3');
   assert.equal(retried[0].blob, 'SECRET-BLOB-core-invite-3');
+});
+
+test('receipt-pending IDs never admit seats and survive startup reconciliation as known descriptors', async () => {
+  const f = fixture();
+  await create(f);
+  await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'reviewer', min_accepts: 1 });
+  const packet = f.registry.get(ROOM_ID);
+  packet.invites = [];
+  const [receipt] = await f.service.recoverInvites(ROOM_ID);
+  const revokeCount = packet.revokeCalls.length;
+  packet.contacts = [{ name: 'Pending Alice', container_id: 'cid-pending' }];
+  packet.origins = {
+    'cid-pending': { via: 'invite_public', invite_id: receipt.invite.invite_id, at: TIMES[4] },
+  };
+
+  const reconciled = await f.service.reconcileRoom(ROOM_ID);
+  assert.deepEqual(reconciled.seats, []);
+  assert.equal(reconciled.invites.find((invite) => invite.invite_id === receipt.invite.invite_id).state, 'receipt_pending');
+  assert.equal(packet.revokeCalls.length, revokeCount, 'startup reconcile must not treat pending as an orphan');
 });
 
 test('reconciliation revokes a core invite orphaned before its metadata save', async () => {

@@ -482,7 +482,9 @@ test('PacketRegistry public lifecycle surface is standalone', () => {
   assert.doesNotMatch(daemon, /ours-mcp|@ours\.network\/mcp/);
   assert.doesNotMatch(runtime, /ours-mcp|@ours\.network\/mcp/);
   const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-  assert.match(cli, /Build-only placeholder/);
+  assert.match(cli, /function roomRequest/);
+  assert.match(cli, /management\.sock/);
+  assert.doesNotMatch(cli, /from ['"]\.\/(?:adapt|packets|service|transports|daemon-runtime)/);
   assert.doesNotMatch(cli, /ours-mcp|@ours\.network\/mcp/);
 });
 

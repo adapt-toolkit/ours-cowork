@@ -414,6 +414,80 @@ test('startup removes only inode-verified owned stale private sockets within its
   await transport.stop();
 });
 
+test('publication retains its exact owned socket at a non-scannable residue without unlinking quarantine', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-private-residue-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'management.sock');
+  const forbiddenUnlinks = [];
+  const fs = new Proxy(realFs, {
+    get(target, property) {
+      if (property === 'unlinkSync') return (candidate) => {
+        if (typeof candidate === 'string' && (candidate.includes('.private-alias-')
+          || candidate.includes('.safe-residue-private-alias-')
+          || candidate.includes('.replacement-'))) forbiddenUnlinks.push(candidate);
+        return target.unlinkSync(candidate);
+      };
+      return target[property];
+    },
+  });
+  const transport = new TransportServer({
+    socketPath: path, rest: { enabled: false, port: 1 }, fs,
+    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+  });
+  await transport.start();
+  t.after(() => transport.stop());
+  const published = lstatSync(path);
+  await transport.stop();
+  assert.deepEqual(forbiddenUnlinks, []);
+  const residueName = readdirSync(dir).find((name) => name.includes('.safe-residue-private-alias-'));
+  assert(residueName);
+  assert.equal(residueName.startsWith('management.sock.private-'), false);
+  const residue = lstatSync(join(dir, residueName));
+  assert(residue.isSocket());
+  assert.deepEqual([residue.dev, residue.ino], [published.dev, published.ino]);
+});
+
+test('stale cleanup retains the exact inert socket residue without unlinking quarantine', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-stale-residue-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'management.sock');
+  const seed = join(dir, 'seed.sock');
+  const stale = `${path}.private-${process.pid}-stale-residue`;
+  const staleServer = net.createServer();
+  await new Promise((resolve, reject) => {
+    staleServer.once('error', reject);
+    staleServer.listen(seed, resolve);
+  });
+  realFs.renameSync(seed, stale);
+  await new Promise((resolve) => staleServer.close(resolve));
+  const original = lstatSync(stale);
+  const forbiddenUnlinks = [];
+  const fs = new Proxy(realFs, {
+    get(target, property) {
+      if (property === 'unlinkSync') return (candidate) => {
+        if (typeof candidate === 'string' && (candidate.includes('.stale-private-')
+          || candidate.includes('.safe-residue-stale-private-'))) forbiddenUnlinks.push(candidate);
+        return target.unlinkSync(candidate);
+      };
+      return target[property];
+    },
+  });
+  const transport = new TransportServer({
+    socketPath: path, rest: { enabled: false, port: 1 }, fs,
+    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+  });
+  await transport.start();
+  t.after(() => transport.stop());
+  assert.deepEqual(forbiddenUnlinks, []);
+  assert.equal(realFs.existsSync(stale), false);
+  const residueName = readdirSync(dir).find((name) => name.includes('.safe-residue-stale-private-'));
+  assert(residueName);
+  assert.equal(residueName.startsWith('management.sock.private-'), false);
+  const residue = lstatSync(join(dir, residueName));
+  assert(residue.isSocket());
+  assert.deepEqual([residue.dev, residue.ino], [original.dev, original.ino]);
+});
+
 test('publication preserves a private-alias replacement swapped at the final destructive operation', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-private-alias-swap-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

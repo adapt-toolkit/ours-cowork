@@ -481,7 +481,8 @@ export class TransportServer {
     const moved = this.fs.lstatSync(quarantined.path);
     if (moved.dev === owned.dev && moved.ino === owned.ino && moved.uid === owned.uid
       && moved.isSocket() && !moved.isSymbolicLink()) {
-      this.fs.unlinkSync(quarantined.path);
+      // POSIX has no conditional unlink-by-inode. The unpredictable alias is
+      // therefore the terminal safe residue for this inert owned socket.
       return;
     }
     this.protectedPrivateReplacement = quarantined;
@@ -518,7 +519,8 @@ export class TransportServer {
       const moved = this.fs.lstatSync(quarantined.path);
       if (moved.dev === observed.dev && moved.ino === observed.ino && moved.uid === observed.uid
         && moved.isSocket() && !moved.isSymbolicLink()) {
-        this.fs.unlinkSync(quarantined.path);
+        // Do not unlink even an inspected owned socket: a final-instant name
+        // substitution cannot be detected atomically by Node/POSIX.
         continue;
       }
       this.restoreProtectedPath(quarantined);
@@ -527,7 +529,12 @@ export class TransportServer {
   }
 
   private quarantinePath(target: string, label: string): ProtectedPath {
-    const path = `${this.options.socketPath}.${label}-${process.pid}-${randomBytes(6).toString('hex')}`;
+    // Residues deliberately do not match the `.private-*` discovery prefix.
+    // One daemon lifecycle creates at most one private-alias residue and one
+    // public residue; a stale pass creates at most 32. They remain inert until
+    // the configured state directory is removed offline (or OS-cleared when
+    // callers deliberately place that directory in a runtime filesystem).
+    const path = `${this.options.socketPath}.safe-residue-${label}-${process.pid}-${randomBytes(6).toString('hex')}`;
     this.fs.renameSync(target, path);
     const moved = this.fs.lstatSync(path);
     return { target, path, dev: moved.dev, ino: moved.ino };
@@ -581,7 +588,8 @@ export class TransportServer {
       throw new Error(`quarantined management path changed; safe residue remains at ${quarantined.path}`);
     }
     if (quarantined.owned) {
-      this.fs.unlinkSync(quarantined.path);
+      // Keep exact owned socket inodes as terminal safe residues. Removing a
+      // pathname after inspection would permit an undetectable final swap.
       return;
     }
     try {

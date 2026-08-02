@@ -46,7 +46,7 @@ type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 export interface RoomPacketRegistry {
   get(roomId: string): RoomPacket | undefined;
   create(roomId: string, identityName?: string, bio?: string): Promise<RoomPacket>;
-  restore?(roomId: string): Promise<RoomPacket>;
+  restore?(roomId: string, expectedCid?: string): Promise<RoomPacket>;
 }
 
 export interface RoomServiceOptions {
@@ -152,7 +152,7 @@ export class RoomService {
           throw new RoomServiceError(`room packet "${id}" with established CID must be restored, not created`);
         }
         try {
-          packet = await this.packets.restore(id);
+          packet = await this.packets.restore(id, room.identity_cid);
         } catch (error) {
           throw new RoomServiceError(
             `failed to restore established room packet "${id}": ${error instanceof Error ? error.message : String(error)}`,
@@ -236,11 +236,17 @@ export class RoomService {
       if (index < 0) throw new RoomServiceError(`invite "${parsedInviteId}" does not belong to room "${id}"`);
       const current = room.invites[index]!;
       if (current.state === 'revoked') return current;
-      await this.packet(id).revokeInvite(parsedInviteId);
-      const { recovery_of: _recoveryOf, ...withoutRecovery } = current;
-      const revoked: RoomInvite = { ...withoutRecovery, state: 'revoked' };
-      const invites = [...room.invites];
-      invites[index] = revoked;
+      const packet = this.packet(id);
+      const pendingChildren = current.state === 'replacement_required'
+        ? room.invites.filter((invite) =>
+          invite.state === 'receipt_pending' && invite.recovery_of === current.invite_id)
+        : [];
+      for (const pending of pendingChildren) await packet.revokeInvite(pending.invite_id);
+      await packet.revokeInvite(parsedInviteId);
+      const cascadeIds = new Set([parsedInviteId, ...pendingChildren.map((invite) => invite.invite_id)]);
+      const invites = room.invites.map((invite): RoomInvite =>
+        cascadeIds.has(invite.invite_id) ? { ...invite, state: 'revoked' } : invite);
+      const revoked = invites[index]!;
       await this.store.save(RoomSchema.parse({ ...room, invites }));
       return revoked;
     });
@@ -269,8 +275,7 @@ export class RoomService {
             ...room,
             invites: room.invites.map((invite) => {
               if (!pendingIds.has(invite.invite_id)) return invite;
-              const { recovery_of: _recoveryOf, ...descriptor } = invite;
-              return { ...descriptor, state: 'revoked' as const };
+              return { ...invite, state: 'revoked' as const };
             }),
           }));
         }
@@ -302,8 +307,7 @@ export class RoomService {
                 ...observed,
                 invites: observed.invites.map((invite) => {
                   if (invite.invite_id !== minted.invite_id) return invite;
-                  const { recovery_of: _recoveryOf, ...descriptor } = invite;
-                  return { ...descriptor, state: 'revoked' as const };
+                  return { ...invite, state: 'revoked' as const };
                 }),
               }));
             }
@@ -336,7 +340,12 @@ export class RoomService {
       }
       const old = room.invites[oldIndex]!;
       const replacement = room.invites[replacementIndex]!;
-      if (old.state === 'revoked' && replacement.state === 'live' && replacement.recovery_of === undefined) {
+      if (old.state === 'revoked'
+        && replacement.recovery_of === oldId
+        && (replacement.state === 'live'
+          || replacement.state === 'consumed'
+          || replacement.state === 'replacement_required'
+          || replacement.state === 'revoked')) {
         return replacement;
       }
       if (old.state !== 'replacement_required'
@@ -355,11 +364,11 @@ export class RoomService {
         min_accepts: replacement.min_accepts,
         accepted_cids: [],
         state: 'live',
+        recovery_of: oldId,
         created_at: replacement.created_at,
       };
-      const { recovery_of: _oldRecovery, ...oldDescriptor } = old;
       const invites = [...room.invites];
-      invites[oldIndex] = { ...oldDescriptor, state: 'revoked' };
+      invites[oldIndex] = { ...old, state: 'revoked' };
       invites[replacementIndex] = confirmed;
       await this.store.save(RoomSchema.parse({ ...room, invites }));
       return confirmed;
@@ -405,7 +414,7 @@ export class RoomService {
       const origin = origins[cid];
       if (!origin || (origin.via !== 'invite_one_time' && origin.via !== 'invite_public')) continue;
       const invite = inviteById.get(origin.invite_id);
-      if (!invite || invite.state === 'receipt_pending' || invite.state === 'revoked') continue;
+      if (!invite || invite.state === 'receipt_pending') continue;
       newSeats.push({
         identity: cid,
         display_name: displayName,

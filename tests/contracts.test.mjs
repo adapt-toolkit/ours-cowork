@@ -117,14 +117,20 @@ test('room and invite schemas are strict, versioned, and enforce invite threshol
   };
   assert.equal(RoomInviteSchema.parse(pending).recovery_of, 'invite-1');
   assert.throws(() => RoomInviteSchema.parse({ ...pending, recovery_of: undefined }));
-  assert.throws(() => RoomInviteSchema.parse({ ...pending, state: 'live' }));
-  assert.throws(() => RoomInviteSchema.parse({ ...pending, state: 'replacement_required' }));
+  assert.equal(RoomInviteSchema.parse({ ...pending, state: 'live' }).recovery_of, 'invite-1');
+  assert.equal(RoomInviteSchema.parse({ ...pending, state: 'consumed' }).recovery_of, 'invite-1');
+  assert.equal(RoomInviteSchema.parse({ ...pending, state: 'revoked' }).recovery_of, 'invite-1');
 
   const source = { ...pending, invite_id: 'invite-1', state: 'replacement_required' };
   delete source.recovery_of;
   assert.equal(RoomSchema.parse(room({ invites: [source, pending] })).invites[1].state, 'receipt_pending');
   assert.throws(() => RoomSchema.parse(room({ invites: [source, { ...pending, role: 'different' }] })));
   assert.throws(() => RoomSchema.parse(room({ invites: [pending] })));
+
+  const confirmedSource = { ...source, state: 'revoked' };
+  const confirmed = { ...pending, state: 'live' };
+  assert.equal(RoomSchema.parse(room({ invites: [confirmedSource, confirmed] })).invites[1].recovery_of, 'invite-1');
+  assert.throws(() => RoomSchema.parse(room({ invites: [source, confirmed] })));
 });
 
 test('only the exact packet-pending room sentinel may have an empty identity CID', () => {
@@ -136,6 +142,15 @@ test('only the exact packet-pending room sentinel may have an empty identity CID
   assert.throws(() => RoomSchema.parse({ ...pending, status: undefined }));
   assert.throws(() => RoomSchema.parse({ ...pending, state: 'active', activated_at: AT }));
   assert.throws(() => RoomSchema.parse({ ...pending, identity_name: 'another-name' }));
+  assert.throws(() => RoomSchema.parse({ ...pending, invites: [{
+    invite_id: 'invite-1', mode: 'one_time', role: 'x', min_accepts: 1,
+    accepted_cids: [], state: 'live', created_at: AT,
+  }] }));
+  assert.throws(() => RoomSchema.parse({ ...pending, seats: [{
+    identity: 'cid', display_name: 'Alice', role: 'x', invite_id: 'invite-1', accepted_at: AT,
+  }] }));
+  assert.throws(() => RoomSchema.parse({ ...pending, activated_at: AT }));
+  assert.throws(() => RoomSchema.parse({ ...pending, closed_at: AT }));
 });
 
 test('operator request schemas strictly reject caller-supplied authorship', () => {

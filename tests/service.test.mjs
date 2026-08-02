@@ -81,6 +81,7 @@ class FakePacket {
   cid;
   mintCalls = [];
   revokeCalls = [];
+  revokeFailures = new Map();
   invites = [];
   contacts = [];
   origins = {};
@@ -97,6 +98,11 @@ class FakePacket {
 
   async revokeInvite(inviteId) {
     this.revokeCalls.push(inviteId);
+    const failure = this.revokeFailures.get(inviteId);
+    if (failure) {
+      this.revokeFailures.delete(inviteId);
+      throw failure;
+    }
     this.invites = this.invites.filter((invite) => invite.invite_id !== inviteId);
     return { revoked: true };
   }
@@ -134,8 +140,8 @@ class FakeRegistry {
     return packet;
   }
 
-  async restore(roomId) {
-    this.restoreCalls.push(roomId);
+  async restore(roomId, expectedCid) {
+    this.restoreCalls.push({ roomId, expectedCid });
     if (this.restoreResult) {
       this.packets.set(roomId, this.restoreResult);
       return this.restoreResult;
@@ -206,7 +212,7 @@ test('recoverRoom restores rather than creates when a packet exists behind the p
   assert.equal(recovered.identity_cid, restored.cid);
   assert.equal('status' in recovered, false);
   assert.equal(f.registry.createCalls.length, createCount);
-  assert.deepEqual(f.registry.restoreCalls, [ROOM_ID]);
+  assert.deepEqual(f.registry.restoreCalls, [{ roomId: ROOM_ID, expectedCid: undefined }]);
 });
 
 test('recoverRoom never creates over an established CID when restore fails', async () => {
@@ -224,6 +230,7 @@ test('recoverRoom never creates over an established CID when restore fails', asy
     f.registry.restoreFailure = new Error(`injected ${state} restore failure`);
     const createCount = f.registry.createCalls.length;
     await assert.rejects(f.service.recoverRoom(ROOM_ID), new RegExp(`${state} restore failure`));
+    assert.deepEqual(f.registry.restoreCalls, [{ roomId: ROOM_ID, expectedCid: established.identity_cid }]);
     assert.equal(f.registry.createCalls.length, createCount, `${state} must be restore-only`);
     assert.deepEqual(await f.store.load(ROOM_ID), established, `${state} metadata must remain unchanged`);
   }
@@ -244,6 +251,7 @@ test('recoverRoom rejects a restored CID mismatch without changing established m
     f.registry.restoreResult = new FakePacket(`cowork-room-${ROOM_ID}`, `cid-wrong-${state}`);
     const createCount = f.registry.createCalls.length;
     await assert.rejects(f.service.recoverRoom(ROOM_ID), /CID mismatch/i);
+    assert.deepEqual(f.registry.restoreCalls, [{ roomId: ROOM_ID, expectedCid: established.identity_cid }]);
     assert.equal(f.registry.createCalls.length, createCount);
     assert.deepEqual(await f.store.load(ROOM_ID), established);
   }
@@ -291,6 +299,37 @@ test('revoke rejects closing and closed rooms before calling core', async () => 
   }
 });
 
+test('revoking a replacement source cascades pending child first and retry converges after failure', async () => {
+  const f = fixture();
+  await create(f);
+  const original = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'reviewer', min_accepts: 1 });
+  const packet = f.registry.get(ROOM_ID);
+  packet.invites = [];
+  const [receipt] = await f.service.recoverInvites(ROOM_ID);
+  packet.revokeCalls.length = 0;
+  packet.revokeFailures.set(original.invite.invite_id, new Error('injected source revoke failure'));
+
+  await assert.rejects(f.service.revokeInvite(ROOM_ID, original.invite.invite_id), /source revoke failure/);
+  assert.deepEqual(packet.revokeCalls, [receipt.invite.invite_id, original.invite.invite_id]);
+  let stored = await f.store.load(ROOM_ID);
+  assert.equal(stored.invites.find((invite) => invite.invite_id === original.invite.invite_id).state, 'replacement_required');
+  assert.equal(stored.invites.find((invite) => invite.invite_id === receipt.invite.invite_id).state, 'receipt_pending');
+
+  const revoked = await f.service.revokeInvite(ROOM_ID, original.invite.invite_id);
+  assert.equal(revoked.state, 'revoked');
+  assert.deepEqual(packet.revokeCalls, [
+    receipt.invite.invite_id, original.invite.invite_id,
+    receipt.invite.invite_id, original.invite.invite_id,
+  ]);
+  stored = await f.store.load(ROOM_ID);
+  assert.equal(stored.invites.find((invite) => invite.invite_id === original.invite.invite_id).state, 'revoked');
+  const child = stored.invites.find((invite) => invite.invite_id === receipt.invite.invite_id);
+  assert.equal(child.state, 'revoked');
+  assert.equal(child.recovery_of, original.invite.invite_id);
+  await f.service.revokeInvite(ROOM_ID, original.invite.invite_id);
+  assert.equal(packet.revokeCalls.length, 4, 'committed cascade replay must have no effects');
+});
+
 test('recovery persists a pending descriptor, rotates a lost receipt, and confirms idempotently', async () => {
   const f = fixture();
   await create(f);
@@ -322,12 +361,67 @@ test('recovery persists a pending descriptor, rotates a lost receipt, and confir
 
   const confirmed = await f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, receipt.invite.invite_id);
   assert.equal(confirmed.state, 'live');
-  assert.equal('recovery_of' in confirmed, false);
+  assert.equal(confirmed.recovery_of, original.invite.invite_id);
   const replay = await f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, receipt.invite.invite_id);
   assert.deepEqual(replay, confirmed);
   stored = await f.store.load(ROOM_ID);
   assert.equal(stored.invites.find((invite) => invite.invite_id === original.invite.invite_id).state, 'revoked');
   assert.equal(stored.invites.find((invite) => invite.invite_id === 'core-invite-3').state, 'live');
+});
+
+test('confirm replay requires exact durable lineage and one-time consumption retains it', async () => {
+  const f = fixture();
+  await create(f);
+  const original = await f.service.createInvite(ROOM_ID, { mode: 'one_time', role: 'builder', min_accepts: 1 });
+  const unrelated = await f.service.createInvite(ROOM_ID, { mode: 'one_time', role: 'other', min_accepts: 1 });
+  const packet = f.registry.get(ROOM_ID);
+  packet.invites = packet.invites.filter((invite) => invite.invite_id === unrelated.invite.invite_id);
+  const [receipt] = await f.service.recoverInvites(ROOM_ID);
+  await f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, receipt.invite.invite_id);
+  await assert.rejects(
+    f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, unrelated.invite.invite_id),
+    /lineage|pointer|descriptor/i,
+  );
+
+  packet.contacts = [{ name: 'Alice', container_id: 'cid-alice' }];
+  packet.origins = {
+    'cid-alice': { via: 'invite_one_time', invite_id: receipt.invite.invite_id, at: TIMES[5] },
+  };
+  packet.invites = packet.invites.filter((invite) => invite.invite_id !== receipt.invite.invite_id);
+  const reconciled = await f.service.reconcileRoom(ROOM_ID);
+  const consumed = reconciled.invites.find((invite) => invite.invite_id === receipt.invite.invite_id);
+  assert.equal(consumed.state, 'consumed');
+  assert.equal(consumed.recovery_of, original.invite.invite_id);
+  assert.deepEqual(
+    await f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, receipt.invite.invite_id),
+    consumed,
+  );
+});
+
+test('contacts accepted before revocation or replacement are still admitted by exact origin', async () => {
+  const f = fixture();
+  await create(f);
+  const revokedInvite = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'revoked-role', min_accepts: 1 });
+  const missingInvite = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'missing-role', min_accepts: 1 });
+  const packet = f.registry.get(ROOM_ID);
+  packet.contacts = [
+    { name: 'Before revoke', container_id: 'cid-revoked' },
+    { name: 'Before restore', container_id: 'cid-replacement' },
+  ];
+  packet.origins = {
+    'cid-revoked': { via: 'invite_public', invite_id: revokedInvite.invite.invite_id, at: TIMES[4] },
+    'cid-replacement': { via: 'invite_public', invite_id: missingInvite.invite.invite_id, at: TIMES[5] },
+  };
+  await f.service.revokeInvite(ROOM_ID, revokedInvite.invite.invite_id);
+  packet.invites = packet.invites.filter((invite) => invite.invite_id !== missingInvite.invite.invite_id);
+
+  const room = await f.service.reconcileRoom(ROOM_ID);
+  assert.deepEqual(room.seats.map((seat) => [seat.identity, seat.role]), [
+    ['cid-revoked', 'revoked-role'],
+    ['cid-replacement', 'missing-role'],
+  ]);
+  assert.equal(room.invites.find((invite) => invite.invite_id === revokedInvite.invite.invite_id).state, 'revoked');
+  assert.equal(room.invites.find((invite) => invite.invite_id === missingInvite.invite.invite_id).state, 'replacement_required');
 });
 
 test('ambiguous recovery save revokes/records the pending replacement and retry converges', async () => {

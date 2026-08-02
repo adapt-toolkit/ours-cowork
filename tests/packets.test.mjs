@@ -260,9 +260,17 @@ async function runPacketDriver() {
     fs.mkdirSync(alphaLive, { recursive: true, mode: 0o700 });
     fs.writeFileSync(join(alphaLive, 'identity.key'), secret, { mode: 0o600 });
     fs.writeFileSync(join(alphaLive, 'state_data.bin'), state, { mode: 0o600 });
+    const beforeMismatchCount = host.packetCount;
+    await assert.rejects(
+      registry.restore('alpha', 'cid-that-must-not-match'),
+      /CID mismatch.*expected.*cid-that-must-not-match/i,
+    );
+    assert.equal(registry.get('alpha'), undefined, 'CID mismatch must not enter the registry');
+    assert.equal(host.packetCount, beforeMismatchCount, 'CID mismatch must remove the quarantined native packet');
+    assert.equal(host.isPacketExposed(alphaCid), false, 'CID mismatch must never expose the restored CID');
     holdRestore = true;
     const restoreEntered = new Promise((done) => { signalRestoreEntered = done; });
-    const restorePromise = registry.restore('alpha');
+    const restorePromise = registry.restore('alpha', alphaCid);
     const quarantined = await restoreEntered;
     assert.equal(quarantined.cid, alphaCid);
     assert.equal(host.isPacketExposed(alphaCid), false,

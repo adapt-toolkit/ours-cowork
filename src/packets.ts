@@ -173,7 +173,7 @@ export class PacketRegistry {
     }
   }
 
-  async restore(roomId: string): Promise<RoomPacket> {
+  async restore(roomId: string, expectedCid?: string): Promise<RoomPacket> {
     validateRoomId(roomId);
     if (this.packets.has(roomId)) throw new Error(`room packet "${roomId}" is already hosted`);
     const liveDir = this.liveDir(roomId);
@@ -195,6 +195,12 @@ export class PacketRegistry {
       secret,
       { deferredExposure: true },
     );
+    if (expectedCid !== undefined && native.cid !== expectedCid) {
+      try { this.host.removePacket(native.cid); } catch { /* CID mismatch is authoritative */ }
+      throw new Error(
+        `restored room packet CID mismatch for "${roomId}": expected "${expectedCid}", found "${native.cid}"`,
+      );
+    }
     const room = new HostedRoomPacket(native, () => this.saveState(native, liveDir), this.log);
     try {
       await withScopeAsync(async (lifetime) => {

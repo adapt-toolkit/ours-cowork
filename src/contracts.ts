@@ -71,6 +71,7 @@ export const RoomInviteSchema = z.object({
   accepted_cids: z.array(NonEmptyStringSchema),
   state: InviteStateSchema,
   recovery_of: NonEmptyStringSchema.optional(),
+  recovery_confirmed: z.boolean().optional(),
   created_at: Rfc3339Schema,
 }).strict().superRefine((invite, context) => {
   if (invite.mode === 'one_time' && invite.min_accepts !== 1) {
@@ -85,6 +86,36 @@ export const RoomInviteSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ['recovery_of'],
       message: 'receipt_pending invites require recovery_of',
+    });
+  }
+  if (invite.recovery_of === undefined && invite.recovery_confirmed !== undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['recovery_confirmed'],
+      message: 'recovery_confirmed is forbidden without recovery_of',
+    });
+  }
+  if (invite.recovery_of !== undefined && invite.recovery_confirmed === undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['recovery_confirmed'],
+      message: 'recovery_confirmed is required with recovery_of',
+    });
+  }
+  if (invite.state === 'receipt_pending' && invite.recovery_confirmed !== false) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['recovery_confirmed'],
+      message: 'receipt_pending recovery lineage must be unconfirmed',
+    });
+  }
+  if (invite.recovery_of !== undefined
+    && (invite.state === 'live' || invite.state === 'consumed' || invite.state === 'replacement_required')
+    && invite.recovery_confirmed !== true) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['recovery_confirmed'],
+      message: 'live, consumed, and replacement_required recovery lineage must be confirmed',
     });
   }
   if (invite.state === 'receipt_pending' && invite.accepted_cids.length > 0) {

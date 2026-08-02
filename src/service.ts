@@ -289,6 +289,7 @@ export class RoomService {
           accepted_cids: [],
           state: 'receipt_pending',
           recovery_of: stale.invite_id,
+          recovery_confirmed: false,
           created_at: this.now(),
         });
         try {
@@ -342,6 +343,7 @@ export class RoomService {
       const replacement = room.invites[replacementIndex]!;
       if (old.state === 'revoked'
         && replacement.recovery_of === oldId
+        && replacement.recovery_confirmed === true
         && (replacement.state === 'live'
           || replacement.state === 'consumed'
           || replacement.state === 'replacement_required'
@@ -350,7 +352,8 @@ export class RoomService {
       }
       if (old.state !== 'replacement_required'
         || replacement.state !== 'receipt_pending'
-        || replacement.recovery_of !== oldId) {
+        || replacement.recovery_of !== oldId
+        || replacement.recovery_confirmed !== false) {
         throw new RoomServiceError('recovered invite confirmation pointer/state mismatch');
       }
       const coreInvite = this.packet(id).listInvites().find((invite) => invite.invite_id === replacementId);
@@ -365,6 +368,7 @@ export class RoomService {
         accepted_cids: [],
         state: 'live',
         recovery_of: oldId,
+        recovery_confirmed: true,
         created_at: replacement.created_at,
       };
       const invites = [...room.invites];
@@ -414,7 +418,9 @@ export class RoomService {
       const origin = origins[cid];
       if (!origin || (origin.via !== 'invite_one_time' && origin.via !== 'invite_public')) continue;
       const invite = inviteById.get(origin.invite_id);
-      if (!invite || invite.state === 'receipt_pending') continue;
+      if (!invite
+        || invite.state === 'receipt_pending'
+        || (invite.recovery_of !== undefined && invite.recovery_confirmed !== true)) continue;
       newSeats.push({
         identity: cid,
         display_name: displayName,

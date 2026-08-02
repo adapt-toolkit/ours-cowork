@@ -113,22 +113,31 @@ test('room and invite schemas are strict, versioned, and enforce invite threshol
 
   const pending = {
     invite_id: 'invite-2', mode: 'public', role: 'reviewer', min_accepts: 2,
-    accepted_cids: [], state: 'receipt_pending', recovery_of: 'invite-1', created_at: AT,
+    accepted_cids: [], state: 'receipt_pending', recovery_of: 'invite-1', recovery_confirmed: false, created_at: AT,
   };
   assert.equal(RoomInviteSchema.parse(pending).recovery_of, 'invite-1');
   assert.throws(() => RoomInviteSchema.parse({ ...pending, recovery_of: undefined }));
-  assert.equal(RoomInviteSchema.parse({ ...pending, state: 'live' }).recovery_of, 'invite-1');
-  assert.equal(RoomInviteSchema.parse({ ...pending, state: 'consumed' }).recovery_of, 'invite-1');
+  assert.throws(() => RoomInviteSchema.parse({ ...pending, recovery_confirmed: undefined }));
+  assert.throws(() => RoomInviteSchema.parse({ ...pending, state: 'live' }));
+  assert.equal(RoomInviteSchema.parse({ ...pending, state: 'live', recovery_confirmed: true }).recovery_of, 'invite-1');
+  assert.equal(RoomInviteSchema.parse({ ...pending, state: 'consumed', recovery_confirmed: true }).recovery_of, 'invite-1');
   assert.equal(RoomInviteSchema.parse({ ...pending, state: 'revoked' }).recovery_of, 'invite-1');
+  assert.throws(() => RoomInviteSchema.parse({ ...pending, state: 'revoked', recovery_confirmed: undefined }));
+  assert.equal(RoomInviteSchema.parse({ ...pending, state: 'revoked', recovery_confirmed: true }).recovery_confirmed, true);
+  assert.throws(() => RoomInviteSchema.parse({
+    invite_id: 'ordinary', mode: 'public', role: 'x', min_accepts: 1,
+    accepted_cids: [], state: 'live', recovery_confirmed: false, created_at: AT,
+  }));
 
   const source = { ...pending, invite_id: 'invite-1', state: 'replacement_required' };
   delete source.recovery_of;
+  delete source.recovery_confirmed;
   assert.equal(RoomSchema.parse(room({ invites: [source, pending] })).invites[1].state, 'receipt_pending');
   assert.throws(() => RoomSchema.parse(room({ invites: [source, { ...pending, role: 'different' }] })));
   assert.throws(() => RoomSchema.parse(room({ invites: [pending] })));
 
   const confirmedSource = { ...source, state: 'revoked' };
-  const confirmed = { ...pending, state: 'live' };
+  const confirmed = { ...pending, state: 'live', recovery_confirmed: true };
   assert.equal(RoomSchema.parse(room({ invites: [confirmedSource, confirmed] })).invites[1].recovery_of, 'invite-1');
   assert.throws(() => RoomSchema.parse(room({ invites: [source, confirmed] })));
 });

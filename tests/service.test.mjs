@@ -346,6 +346,7 @@ test('recovery persists a pending descriptor, rotates a lost receipt, and confir
     ...lostReceipt.invite,
     state: 'receipt_pending',
     recovery_of: original.invite.invite_id,
+    recovery_confirmed: false,
   });
   assert.equal(JSON.stringify(stored).includes('SECRET-BLOB'), false);
 
@@ -362,6 +363,7 @@ test('recovery persists a pending descriptor, rotates a lost receipt, and confir
   const confirmed = await f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, receipt.invite.invite_id);
   assert.equal(confirmed.state, 'live');
   assert.equal(confirmed.recovery_of, original.invite.invite_id);
+  assert.equal(confirmed.recovery_confirmed, true);
   const replay = await f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, receipt.invite.invite_id);
   assert.deepEqual(replay, confirmed);
   stored = await f.store.load(ROOM_ID);
@@ -392,9 +394,65 @@ test('confirm replay requires exact durable lineage and one-time consumption ret
   const consumed = reconciled.invites.find((invite) => invite.invite_id === receipt.invite.invite_id);
   assert.equal(consumed.state, 'consumed');
   assert.equal(consumed.recovery_of, original.invite.invite_id);
+  assert.equal(consumed.recovery_confirmed, true);
   assert.deepEqual(
     await f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, receipt.invite.invite_id),
     consumed,
+  );
+});
+
+test('discarded pending lineage cannot admit or satisfy confirm after rotation/cascade', async () => {
+  const f = fixture();
+  await create(f);
+  const original = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'reviewer', min_accepts: 1 });
+  const packet = f.registry.get(ROOM_ID);
+  packet.invites = [];
+  const [discarded] = await f.service.recoverInvites(ROOM_ID);
+  await f.service.recoverInvites(ROOM_ID); // rotates discarded to revoked/unconfirmed
+
+  packet.contacts = [{ name: 'Discarded contact', container_id: 'cid-discarded' }];
+  packet.origins = {
+    'cid-discarded': { via: 'invite_public', invite_id: discarded.invite.invite_id, at: TIMES[5] },
+  };
+  let room = await f.service.reconcileRoom(ROOM_ID);
+  const retired = room.invites.find((invite) => invite.invite_id === discarded.invite.invite_id);
+  assert.equal(retired.state, 'revoked');
+  assert.equal(retired.recovery_confirmed, false);
+  assert.deepEqual(room.seats, [], 'a discarded pending blob must never authorize a seat');
+
+  const latestPending = room.invites.find((invite) =>
+    invite.state === 'receipt_pending' && invite.recovery_of === original.invite.invite_id);
+  await f.service.revokeInvite(ROOM_ID, original.invite.invite_id); // cascade latest pending + source
+  await assert.rejects(
+    f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, latestPending.invite_id),
+    /confirm|lineage|pointer|state/i,
+  );
+  room = await f.service.showRoom(ROOM_ID);
+  assert.equal(room.invites.find((invite) => invite.invite_id === latestPending.invite_id).recovery_confirmed, false);
+});
+
+test('confirmed then revoked recovery lineage remains historically admissible and replay-valid', async () => {
+  const f = fixture();
+  await create(f);
+  const original = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'confirmed-role', min_accepts: 1 });
+  const packet = f.registry.get(ROOM_ID);
+  packet.invites = [];
+  const [receipt] = await f.service.recoverInvites(ROOM_ID);
+  await f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, receipt.invite.invite_id);
+  await f.service.revokeInvite(ROOM_ID, receipt.invite.invite_id);
+
+  packet.contacts = [{ name: 'Accepted before confirmed revoke', container_id: 'cid-confirmed' }];
+  packet.origins = {
+    'cid-confirmed': { via: 'invite_public', invite_id: receipt.invite.invite_id, at: TIMES[5] },
+  };
+  const room = await f.service.reconcileRoom(ROOM_ID);
+  assert.deepEqual(room.seats.map((seat) => [seat.identity, seat.role]), [['cid-confirmed', 'confirmed-role']]);
+  const revoked = room.invites.find((invite) => invite.invite_id === receipt.invite.invite_id);
+  assert.equal(revoked.state, 'revoked');
+  assert.equal(revoked.recovery_confirmed, true);
+  assert.deepEqual(
+    await f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, receipt.invite.invite_id),
+    revoked,
   );
 });
 

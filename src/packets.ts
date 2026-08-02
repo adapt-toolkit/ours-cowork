@@ -409,9 +409,17 @@ export class HostedRoomPacket implements RoomPacket {
         { contact: contactCid },
         lifetime,
       );
+      const notified = strictBooleanValue(result.Reduce('notified'), 'remove_contact notified');
+      const keyMaterialRetained = strictBooleanValue(
+        result.Reduce('key_material_retained'),
+        'remove_contact key_material_retained',
+      );
+      if (!keyMaterialRetained) {
+        throw new Error('remove_contact key_material_retained must be true');
+      }
       return {
-        status: 'queued' as const,
-        notified: booleanValue(result.Reduce('notified')),
+        status: notified ? 'queued' as const : 'send_failed' as const,
+        notified,
         key_material_retained: true as const,
       };
     });
@@ -469,6 +477,18 @@ function dictionaryEntries(value: AdaptValue): Array<[string, AdaptValue]> {
 function booleanValue(value: AdaptValue): boolean {
   if (value.IsNil()) return false;
   try { return value.GetBoolean(); } catch { return /true/i.test(value.Visualize()); }
+}
+
+function strictBooleanValue(value: AdaptValue, label: string): boolean {
+  if (value.IsNil()) throw new Error(`${label} must be a boolean`);
+  let decoded: unknown;
+  try {
+    decoded = value.GetBoolean();
+  } catch (error) {
+    throw new Error(`${label} must be a boolean`, { cause: error });
+  }
+  if (typeof decoded !== 'boolean') throw new Error(`${label} must be a boolean`);
+  return decoded;
 }
 
 function nilString(value: AdaptValue): string {

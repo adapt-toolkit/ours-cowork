@@ -430,8 +430,18 @@ export class RoomService {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     return this.lock(id, async () => {
       let room = await this.store.load(id);
-      if (room.state === 'closed') return room;
-      if (room.state !== 'closing') {
+      if (room.state === 'closed') {
+        // A previous atomic rename may have committed closed metadata while
+        // its directory fsync failed. Replacing the exact snapshot repeats
+        // that durability barrier before close reports success.
+        return this.store.save(room);
+      }
+      if (room.state === 'closing') {
+        // Likewise, never resume external effects from a merely observed
+        // closing rename. Re-save the exact snapshot and complete its parent
+        // directory barrier first.
+        room = await this.store.save(room);
+      } else {
         room = await this.store.save(RoomSchema.parse({ ...room, state: 'closing' }));
       }
       return this.closeUnlocked(room);

@@ -8,6 +8,7 @@ import test from 'node:test';
 
 import { HostedRoomPacket, PacketPersistenceError, PacketRegistry } from '../src/packets.ts';
 import { RoomService } from '../src/service.ts';
+import { CoworkStore } from '../src/storage.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const AT = '2026-08-02T10:11:12.000Z';
@@ -188,6 +189,158 @@ test('hosted contact removal propagates every unknown mutation failure', async (
     const hosted = new HostedRoomPacket(native, () => {}, () => {});
     await assert.rejects(hosted.removeContact('cid-peer'), (error) => error === failure);
   }
+});
+
+function fakeAdaptBoolean(value) {
+  if (value === undefined) {
+    return { IsNil: () => true, GetBoolean: () => { throw new Error('nil'); }, Visualize: () => 'NIL' };
+  }
+  if (typeof value === 'boolean') {
+    return { IsNil: () => false, GetBoolean: () => value, Visualize: () => String(value) };
+  }
+  return {
+    IsNil: () => false,
+    GetBoolean: () => { throw new Error('not a boolean'); },
+    Visualize: () => String(value),
+  };
+}
+
+function hostedRemovalResult({ notified, retained }) {
+  const native = {
+    name: 'fake-room', cid: 'cid-fake', pw: {},
+    mutatingTx: async () => ({
+      Reduce(key) {
+        if (key === 'notified') return fakeAdaptBoolean(notified);
+        if (key === 'key_material_retained') return fakeAdaptBoolean(retained);
+        return fakeAdaptBoolean(undefined);
+      },
+    }),
+  };
+  return new HostedRoomPacket(native, () => {}, () => {}).removeContact('cid-peer');
+}
+
+test('hosted contact removal truthfully decodes notice and retained-key results', async () => {
+  assert.deepEqual(await hostedRemovalResult({ notified: true, retained: true }), {
+    status: 'queued', notified: true, key_material_retained: true,
+  });
+  assert.deepEqual(await hostedRemovalResult({ notified: false, retained: true }), {
+    status: 'send_failed', notified: false, key_material_retained: true,
+  });
+
+  for (const retained of [false, undefined, 'malformed']) {
+    await assert.rejects(
+      hostedRemovalResult({ notified: true, retained }),
+      /key_material_retained|retained key material|boolean/i,
+    );
+    const f = fixture();
+    f.packet.removeContact = () => hostedRemovalResult({ notified: true, retained });
+    await assert.rejects(
+      f.service.closeRoom(ROOM_ID),
+      /key_material_retained|retained key material|boolean/i,
+    );
+    const records = await f.store.read(ROOM_ID);
+    assert.equal(byKind(records, 'close_notice_intent').length, 1);
+    assert.equal(byKind(records, 'close_notice_result').length, 0,
+      'invalid retained-key output must leave its close intent result-less');
+  }
+});
+
+function fsyncFaultStore(t) {
+  const stateDir = mkdtempSync(join(tmpdir(), 'ours-cowork-close-fsync-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const roomDir = join(stateDir, 'rooms', ROOM_ID);
+  const pathsByFd = new Map();
+  const events = [];
+  let renamedState;
+  let faultState;
+  const ops = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'openSync') return (path, ...args) => {
+        const fd = target.openSync(path, ...args);
+        pathsByFd.set(fd, String(path));
+        return fd;
+      };
+      if (property === 'closeSync') return (fd) => {
+        pathsByFd.delete(fd);
+        return target.closeSync(fd);
+      };
+      if (property === 'renameSync') return (from, to) => {
+        if (String(to).endsWith('room.json')) {
+          renamedState = JSON.parse(target.readFileSync(from, 'utf8')).state;
+          events.push(['metadata-rename', renamedState]);
+        }
+        return target.renameSync(from, to);
+      };
+      if (property === 'fsyncSync') return (fd) => {
+        const path = pathsByFd.get(fd);
+        if (path === roomDir && renamedState !== undefined) {
+          const state = renamedState;
+          renamedState = undefined;
+          if (faultState === state) {
+            faultState = undefined;
+            events.push(['metadata-directory-fsync-failed', state]);
+            throw Object.assign(new Error(`injected ${state} metadata directory fsync failure`), { code: 'EIO' });
+          }
+          events.push(['metadata-directory-fsync', state]);
+        }
+        return target.fsyncSync(fd);
+      };
+      return Reflect.get(target, property);
+    },
+  });
+  return {
+    store: new CoworkStore(stateDir, { fs: ops }),
+    events,
+    faultOn(state) { faultState = state; },
+  };
+}
+
+test('real metadata post-rename fsync ambiguity is re-barriered before close effects or success', async (t) => {
+  await t.test('closing retry barriers before remove_contact', async (t) => {
+    const durable = fsyncFaultStore(t);
+    await durable.store.create(room());
+    const packet = new FakePacket();
+    const registry = new FakeRegistry(packet);
+    const service = new RoomService(durable.store, registry, { now: () => LATER });
+    packet.beforeRemove = () => { durable.events.push(['remove_contact']); };
+
+    durable.faultOn('closing');
+    await assert.rejects(service.closeRoom(ROOM_ID), /closing metadata directory fsync failure/);
+    assert.equal((await durable.store.load(ROOM_ID)).state, 'closing', 'rename committed despite uncertain directory fsync');
+    assert.equal(packet.removeCalls.length, 0, 'no effect follows the ambiguous closing barrier');
+    assert.equal(registry.destroyCalls.length, 0);
+
+    durable.events.length = 0;
+    await service.closeRoom(ROOM_ID);
+    const barrier = durable.events.findIndex(([kind, state]) => kind === 'metadata-directory-fsync' && state === 'closing');
+    const removal = durable.events.findIndex(([kind]) => kind === 'remove_contact');
+    assert(barrier >= 0, 'retry must resave and fsync the exact closing metadata');
+    assert(removal > barrier, 'retry metadata barrier must precede remove_contact');
+  });
+
+  await t.test('closed retry barriers before successful return', async (t) => {
+    const durable = fsyncFaultStore(t);
+    await durable.store.create(room());
+    const packet = new FakePacket();
+    const registry = new FakeRegistry(packet);
+    const service = new RoomService(durable.store, registry, { now: () => LATER });
+
+    durable.faultOn('closed');
+    await assert.rejects(service.closeRoom(ROOM_ID), /closed metadata directory fsync failure/);
+    assert.equal((await durable.store.load(ROOM_ID)).state, 'closed', 'terminal rename committed before failed barrier');
+    const effects = { removals: packet.removeCalls.length, destroys: registry.destroyCalls.length };
+
+    durable.events.length = 0;
+    const closed = await service.closeRoom(ROOM_ID);
+    durable.events.push(['returned']);
+    assert.equal(closed.state, 'closed');
+    const barrier = durable.events.findIndex(([kind, state]) => kind === 'metadata-directory-fsync' && state === 'closed');
+    const returned = durable.events.findIndex(([kind]) => kind === 'returned');
+    assert(barrier >= 0, 'retry must resave and fsync the exact closed metadata');
+    assert(returned > barrier, 'closed metadata barrier must precede successful return');
+    assert.deepEqual({ removals: packet.removeCalls.length, destroys: registry.destroyCalls.length }, effects,
+      'closed retry performs no packet or contact effects');
+  });
 });
 
 async function assertConverged(f) {

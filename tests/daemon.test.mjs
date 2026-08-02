@@ -8,7 +8,7 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { acquireDaemonLock, CoworkDaemon } from '../src/daemon-runtime.ts';
-import { DaemonSupervisor } from '../src/daemon.ts';
+import { DAEMON_SHUTDOWN_TIMEOUT_MS, DaemonSupervisor } from '../src/daemon.ts';
 import {
   ensureRuntimeState,
   loadConfig,
@@ -43,7 +43,12 @@ test('supervisor entry stays SDK-free and preserves unrelated signal listeners a
   const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /\.\/adapt|\.\/packets|\.\/service|@adapt-toolkit|sdk-native/);
   assert.doesNotMatch(source, /removeAllListeners|process\.exit\(/);
+  assert.match(source, /execArgv:\s*\[\]/);
+  assert.doesNotMatch(source, /process\.execArgv|workerExecArgv/);
+  assert.match(source, /delete workerEnv\.NODE_OPTIONS/);
+  assert.equal(DAEMON_SHUTDOWN_TIMEOUT_MS, 10_000);
   for (const stage of ['pre-lock', 'post-lock', 'during-host-init', 'post-host', 'pre-pid', 'ready']) {
+    const capability = 'ab'.repeat(32);
     const signals = new EventEmitter();
     let unrelated = 0;
     const listener = () => { unrelated += 1; };
@@ -54,17 +59,191 @@ test('supervisor entry stays SDK-free and preserves unrelated signal listeners a
       send(message) { sent.push(message); },
       kill() { assert.fail('acknowledged cleanup must not be force-killed'); },
     });
-    const supervisor = new DaemonSupervisor({ child, signals, shutdownTimeoutMs: 500 });
+    const supervisor = new DaemonSupervisor({ child, signals, shutdownTimeoutMs: 500, capability });
     supervisor.start();
-    child.emit('message', { type: 'stage', stage });
+    child.emit('message', { type: 'init_ack', capability });
+    child.emit('message', { type: 'stage', stage, capability });
     signals.emit('SIGTERM');
     assert.equal(unrelated, 1);
-    assert.deepEqual(sent, [{ type: 'shutdown', signal: 'SIGTERM' }]);
-    child.emit('message', { type: 'shutdown_ack', requiresProcessExit: true });
+    assert.deepEqual(sent, [
+      { type: 'init', capability },
+      { type: 'shutdown', signal: 'SIGTERM', capability },
+    ]);
+    child.emit('message', { type: 'shutdown_ack', requiresProcessExit: true, capability });
     child.exitCode = 0;
     child.emit('exit', 0, null);
     assert.deepEqual(await supervisor.done, { code: 0, signal: null });
     assert(signals.listeners('SIGTERM').includes(listener));
+  }
+});
+
+test('supervisor strips inherited preload and execution modes from its worker', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-exec-argv-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const preload = join(dir, 'preload.cjs');
+  writeFileSync(preload, "require('node:fs').appendFileSync(process.env.COWORK_PRELOAD_MARKER, `${process.pid}\\n`);\n");
+  const daemonUrl = new URL('../src/daemon.ts', import.meta.url).href;
+  const program = `
+    const { runSupervisor } = await import(${JSON.stringify(daemonUrl)});
+    let signaled = false;
+    const code = await runSupervisor({ onStage(stage) {
+      if (!signaled && stage === 'pre-lock') {
+        signaled = true;
+        process.kill(process.pid, 'SIGTERM');
+      }
+    } });
+    process.exitCode = code;
+  `;
+  const { NODE_OPTIONS: _nodeOptions, ...baseEnv } = process.env;
+
+  for (const mode of ['cli-require', 'node-options']) {
+    const marker = join(dir, `${mode}.marker`);
+    const args = ['--input-type=module', '--eval', program];
+    if (mode === 'cli-require') args.unshift('--require', preload);
+    const child = spawn(process.execPath, args, {
+      env: {
+        ...baseEnv,
+        ...(mode === 'node-options' ? { NODE_OPTIONS: `--require=${preload}` } : {}),
+        COWORK_PRELOAD_MARKER: marker,
+        OURS_COWORK_STATE_DIR: join(dir, `${mode}-state`),
+        OURS_COWORK_BROKER_URL: 'ws://127.0.0.1:1',
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    const exited = await Promise.race([
+      new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal }))),
+      new Promise((resolve) => {
+        const timer = setTimeout(() => resolve('timeout'), 3_000);
+        timer.unref();
+      }),
+    ]);
+    if (exited === 'timeout') child.kill('SIGKILL');
+    assert.notEqual(exited, 'timeout', `${mode}: ${stderr}`);
+    assert.deepEqual(exited, { code: 0, signal: null }, `${mode}: ${stderr}`);
+    assert.equal(readFileSync(marker, 'utf8').trim().split('\n').length, 1, `${mode}: preload reached daemon worker`);
+  }
+});
+
+test('supervisor watchdog kills acknowledged and unacknowledged hangs and contains IPC failures', async () => {
+  for (const acknowledged of [true, false]) {
+    const capability = 'cd'.repeat(32);
+    const signals = new EventEmitter();
+    const killed = [];
+    const child = Object.assign(new EventEmitter(), {
+      connected: true, exitCode: null,
+      send(_message, callback) { callback?.(); },
+      kill(signal) { killed.push(signal); },
+    });
+    const supervisor = new DaemonSupervisor({ child, signals, shutdownTimeoutMs: 20, capability });
+    supervisor.start();
+    child.emit('message', { type: 'init_ack', capability });
+    signals.emit('SIGTERM');
+    if (acknowledged) child.emit('message', { type: 'shutdown_ack', requiresProcessExit: true, capability });
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    assert.deepEqual(killed, ['SIGKILL'], acknowledged ? 'ACK must not disarm exit deadline' : 'missing ACK must time out');
+    child.exitCode = 0;
+    child.emit('exit', 0, null);
+    await supervisor.done;
+  }
+
+  for (const failure of ['throw', 'callback', 'disconnect', 'error']) {
+    const capability = 'ef'.repeat(32);
+    const signals = new EventEmitter();
+    const killed = [];
+    const child = Object.assign(new EventEmitter(), {
+      connected: true, exitCode: null,
+      send(_message, callback) {
+        if (failure === 'throw') throw new Error('IPC send threw');
+        if (failure === 'callback') callback?.(new Error('IPC callback failed'));
+        else callback?.();
+      },
+      kill(signal) { killed.push(signal); },
+    });
+    const supervisor = new DaemonSupervisor({ child, signals, shutdownTimeoutMs: 20, capability });
+    supervisor.start();
+    if (failure === 'disconnect') child.emit('disconnect');
+    else if (failure === 'error') assert.doesNotThrow(() => child.emit('error', new Error('child failed')));
+    else assert.doesNotThrow(() => signals.emit('SIGINT'));
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    assert.deepEqual(killed, ['SIGKILL']);
+    child.exitCode = 1;
+    child.emit('exit', 1, null);
+    assert.equal((await supervisor.done).code, 1);
+  }
+});
+
+test('authorized worker shutdown before and during capability handshake never creates runtime state', async (t) => {
+  for (const phase of ['before-init', 'during-handshake']) {
+    const dir = mkdtempSync(join(tmpdir(), `cowork-worker-${phase}-`));
+    const capability = phase === 'before-init' ? '12'.repeat(32) : '34'.repeat(32);
+    const child = spawn(process.execPath, [new URL('../src/daemon.ts', import.meta.url).pathname], {
+      env: {
+        ...process.env,
+        OURS_COWORK_DAEMON_WORKER: '1',
+        OURS_COWORK_SUPERVISOR_PID: String(process.pid),
+        OURS_COWORK_STATE_DIR: dir,
+        OURS_COWORK_BROKER_URL: 'ws://127.0.0.1:1',
+      },
+      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); rmSync(dir, { recursive: true, force: true }); });
+    if (phase === 'before-init') {
+      child.send({ type: 'shutdown', signal: 'SIGTERM', capability });
+    } else {
+      child.send({ type: 'init', capability });
+      child.send({ type: 'shutdown', signal: 'SIGINT', capability });
+    }
+    const exited = await Promise.race([
+      new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal }))),
+      new Promise((resolve) => {
+        const timer = setTimeout(() => resolve('timeout'), 3_000);
+        timer.unref();
+      }),
+    ]);
+    assert.notEqual(exited, 'timeout', `${phase}: ${stderr}`);
+    assert.deepEqual(exited, { code: 0, signal: null }, `${phase}: ${stderr}`);
+    assert.equal(existsSync(join(dir, 'daemon.lock')), false);
+    assert.equal(existsSync(join(dir, 'daemon.pid')), false);
+    assert.equal(existsSync(join(dir, 'management.sock')), false);
+  }
+});
+
+test('ambient worker environment or mismatched live IPC fails before runtime state', async (t) => {
+  for (const scenario of ['no-ipc', 'wrong-parent']) {
+    const dir = mkdtempSync(join(tmpdir(), `cowork-unauthorized-${scenario}-`));
+    const child = spawn(process.execPath, [new URL('../src/daemon.ts', import.meta.url).pathname], {
+      env: {
+        ...process.env,
+        OURS_COWORK_DAEMON_WORKER: '1',
+        OURS_COWORK_SUPERVISOR_PID: scenario === 'no-ipc' ? String(process.pid) : String(process.pid === 1 ? 2 : 1),
+        OURS_COWORK_STATE_DIR: dir,
+        OURS_COWORK_BROKER_URL: 'ws://127.0.0.1:1',
+      },
+      stdio: scenario === 'no-ipc' ? ['ignore', 'ignore', 'pipe'] : ['ignore', 'ignore', 'pipe', 'ipc'],
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); rmSync(dir, { recursive: true, force: true }); });
+    const exited = await Promise.race([
+      new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal }))),
+      new Promise((resolve) => {
+        const timer = setTimeout(() => resolve('timeout'), 3_000);
+        timer.unref();
+      }),
+    ]);
+    assert.notEqual(exited, 'timeout', `${scenario}: unauthorized worker imported/started runtime: ${stderr}`);
+    assert.deepEqual(exited, { code: 1, signal: null });
+    assert.match(stderr, /authorized IPC|supervisor|worker/i);
+    assert.equal(existsSync(join(dir, 'daemon.lock')), false);
+    assert.equal(existsSync(join(dir, 'daemon.pid')), false);
+    assert.equal(existsSync(join(dir, 'management.sock')), false);
   }
 });
 

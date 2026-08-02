@@ -180,6 +180,7 @@ export class TransportServer {
   private startWork?: Promise<void>;
   private stopWork?: Promise<void>;
   private ownedSocket?: { dev: number; ino: number; uid: number };
+  private privateSocketPath?: string;
 
   constructor(options: TransportServerOptions) {
     this.options = options;
@@ -205,10 +206,13 @@ export class TransportServer {
     await this.prepareUnixPath();
     const unix = net.createServer((socket) => this.handleUnix(socket));
     this.unixServer = unix;
+    const privateSocketPath = `${this.options.socketPath}.private-${process.pid}-${randomBytes(6).toString('hex')}`;
+    this.privateSocketPath = privateSocketPath;
     try {
-      await listen(unix, this.options.socketPath);
-      this.fs.chmodSync(this.options.socketPath, 0o600);
-      this.ownedSocket = this.captureOwnedSocket();
+      await listen(unix, privateSocketPath);
+      this.fs.chmodSync(privateSocketPath, 0o600);
+      this.ownedSocket = this.captureOwnedSocket(privateSocketPath);
+      this.publishPrivateSocket(privateSocketPath);
       if (this.options.rest.enabled) {
         const rest = http.createServer((request, response) => this.track(this.handleRest(request, response)));
         rest.headersTimeout = HTTP_HEADERS_TIMEOUT_MS;
@@ -227,8 +231,9 @@ export class TransportServer {
         await listen(rest, this.options.rest.port, '127.0.0.1');
       }
     } catch (error) {
+      const quarantined = this.quarantinePublicPath();
       await this.closeServers();
-      this.removeOwnedSocket();
+      if (quarantined) this.releaseQuarantinedPath(quarantined);
       throw error;
     }
   }
@@ -241,6 +246,7 @@ export class TransportServer {
   private async stopUnlocked(): Promise<void> {
     this.options.dispatcher.beginShutdown();
     const httpServer = this.httpServer;
+    const quarantined = this.quarantinePublicPath();
     const closing = this.closeServers();
     for (const socket of this.sockets) socket.end();
     // Header/body readers and keep-alive sockets have not dispatched service
@@ -259,7 +265,9 @@ export class TransportServer {
     this.httpPhases.clear();
     this.activeHttpResponses.clear();
     await closing;
-    this.removeOwnedSocket();
+    if (quarantined) this.releaseQuarantinedPath(quarantined);
+    this.ownedSocket = undefined;
+    this.privateSocketPath = undefined;
   }
 
   private handleUnix(socket: net.Socket): void {
@@ -405,22 +413,8 @@ export class TransportServer {
     this.fs.unlinkSync(this.options.socketPath);
   }
 
-  private removeOwnedSocket(): void {
-    const owned = this.ownedSocket;
-    if (!owned) return;
-    try {
-      const stat = this.fs.lstatSync(this.options.socketPath);
-      if (!stat.isSocket() || stat.isSymbolicLink() || stat.dev !== owned.dev || stat.ino !== owned.ino
-        || stat.uid !== owned.uid || (stat.mode & 0o777) !== 0o600) return;
-      this.fs.unlinkSync(this.options.socketPath);
-      this.ownedSocket = undefined;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-  }
-
-  private captureOwnedSocket(): { dev: number; ino: number; uid: number } {
-    const stat = this.fs.lstatSync(this.options.socketPath);
+  private captureOwnedSocket(path: string): { dev: number; ino: number; uid: number } {
+    const stat = this.fs.lstatSync(path);
     const uid = typeof process.getuid === 'function' ? process.getuid() : stat.uid;
     if (!stat.isSocket() || stat.isSymbolicLink() || stat.uid !== uid || (stat.mode & 0o777) !== 0o600) {
       throw new Error('management socket is not an owned 0600 Unix socket');
@@ -429,95 +423,70 @@ export class TransportServer {
   }
 
   private async closeServers(): Promise<void> {
-    const guard = this.guardReplacementPath();
     await Promise.allSettled([
       closeServer(this.httpServer),
       closeServer(this.unixServer),
     ]);
-    if (guard) this.releaseReplacementGuard(guard);
     this.httpServer = undefined;
     this.unixServer = undefined;
   }
 
-  private guardReplacementPath(): {
-    placeholder: { dev: number; ino: number };
-    protectedPaths: Array<{ path: string; dev: number; ino: number }>;
-  } | undefined {
-    const owned = this.ownedSocket;
-    if (!owned) return undefined;
-    const protectedPaths: Array<{ path: string; dev: number; ino: number }> = [];
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      let present = true;
-      try { this.fs.lstatSync(this.options.socketPath); } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') present = false;
-        else throw error;
-      }
-      if (present) {
-        const protectedPath = `${this.options.socketPath}.replacement-${process.pid}-${randomBytes(6).toString('hex')}`;
-        try {
-          this.fs.renameSync(this.options.socketPath, protectedPath);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-          throw error;
-        }
-        // Stat after rename: the pathname may have been replaced after the
-        // inspection, and the moved inode is the one we must preserve.
-        const moved = this.fs.lstatSync(protectedPath);
-        protectedPaths.push({ path: protectedPath, dev: moved.dev, ino: moved.ino });
-      }
-      try {
-        this.fs.mkdirSync(this.options.socketPath, { mode: 0o700 });
-        const placeholder = this.fs.lstatSync(this.options.socketPath);
-        if (!placeholder.isDirectory() || placeholder.isSymbolicLink()) {
-          throw new Error('management socket shutdown placeholder is not a directory');
-        }
-        return {
-          placeholder: { dev: placeholder.dev, ino: placeholder.ino },
-          protectedPaths,
-        };
-      } catch (error) {
-        // If the containing state directory disappeared, there is no public
-        // pathname left for server.close() to race with or preserve.
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      }
+  private publishPrivateSocket(privateSocketPath: string): void {
+    try {
+      this.fs.lstatSync(this.options.socketPath);
+      throw new Error('management socket path was occupied before publication');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
-    throw new Error('management socket path was reoccupied repeatedly during shutdown');
+    this.fs.renameSync(privateSocketPath, this.options.socketPath);
+    const owned = this.ownedSocket;
+    const published = this.fs.lstatSync(this.options.socketPath);
+    if (!owned || published.dev !== owned.dev || published.ino !== owned.ino
+      || !published.isSocket() || published.isSymbolicLink()) {
+      throw new Error('management socket changed during private publication');
+    }
   }
 
-  private releaseReplacementGuard(guard: {
-    placeholder: { dev: number; ino: number };
-    protectedPaths: Array<{ path: string; dev: number; ino: number }>;
-  }): void {
-    for (const protectedPath of guard.protectedPaths) {
-      const protectedStat = this.fs.lstatSync(protectedPath.path);
-      if (protectedStat.dev !== protectedPath.dev || protectedStat.ino !== protectedPath.ino) {
-        throw new Error('replacement management socket changed while protected');
-      }
-    }
-    let vacant = false;
+  private quarantinePublicPath(): { path: string; dev: number; ino: number; owned: boolean } | undefined {
+    const quarantinePath = `${this.options.socketPath}.replacement-${process.pid}-${randomBytes(6).toString('hex')}`;
     try {
-      const current = this.fs.lstatSync(this.options.socketPath);
-      if (current.dev === guard.placeholder.dev && current.ino === guard.placeholder.ino
-        && current.isDirectory() && !current.isSymbolicLink()) {
-        this.fs.rmdirSync(this.options.socketPath);
-        vacant = true;
-      }
+      this.fs.renameSync(this.options.socketPath, quarantinePath);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') vacant = true;
-      else throw error;
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
     }
-    const replacements = guard.protectedPaths.filter((candidate) =>
-      candidate.dev !== this.ownedSocket?.dev || candidate.ino !== this.ownedSocket?.ino);
-    const ownedPath = guard.protectedPaths.find((candidate) =>
-      candidate.dev === this.ownedSocket?.dev && candidate.ino === this.ownedSocket?.ino);
-    if (ownedPath) this.fs.unlinkSync(ownedPath.path);
-    if (!vacant) return;
-    // The newest occupant wins the public path. Older occupants remain intact
-    // under their collision-resistant quarantine names rather than being
-    // overwritten or deleted.
-    const newest = replacements.at(-1);
-    if (newest) this.fs.renameSync(newest.path, this.options.socketPath);
+    // Inspect only after the atomic move. If the public path changed just
+    // before rename, this is the inode actually displaced by shutdown.
+    const moved = this.fs.lstatSync(quarantinePath);
+    const owned = this.ownedSocket;
+    return {
+      path: quarantinePath,
+      dev: moved.dev,
+      ino: moved.ino,
+      owned: owned !== undefined && moved.dev === owned.dev && moved.ino === owned.ino,
+    };
+  }
+
+  private releaseQuarantinedPath(quarantined: { path: string; dev: number; ino: number; owned: boolean }): void {
+    const moved = this.fs.lstatSync(quarantined.path);
+    if (moved.dev !== quarantined.dev || moved.ino !== quarantined.ino) {
+      throw new Error(`quarantined management path changed; safe residue remains at ${quarantined.path}`);
+    }
+    if (quarantined.owned) {
+      this.fs.unlinkSync(quarantined.path);
+      return;
+    }
+    try {
+      this.fs.lstatSync(this.options.socketPath);
+      throw new Error(`management path reoccupied; replacement preserved as safe residue at ${quarantined.path}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    try {
+      this.fs.renameSync(quarantined.path, this.options.socketPath);
+    } catch (error) {
+      throw new Error(`failed to restore management path; safe residue remains at ${quarantined.path}`, { cause: error });
+    }
   }
 }
 

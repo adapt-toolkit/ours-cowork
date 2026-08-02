@@ -326,39 +326,64 @@ test('shutdown never overwrites a Unix path reoccupied while a replacement is pr
   await transport.start();
   realFs.renameSync(path, `${path}.old`);
   writeFileSync(path, 'first replacement');
-  await transport.stop();
+  await assert.rejects(transport.stop(), /preserv|residue|reoccupied/i);
   assert.equal(readFileSync(path, 'utf8'), 'later occupant');
   const protectedName = readdirSync(dir).find((name) => name.includes('.replacement-'));
   assert(protectedName);
   assert.equal(readFileSync(join(dir, protectedName), 'utf8'), 'first replacement');
 });
 
-test('shutdown preserves a Unix replacement arriving after the owned-path inspection', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'cowork-socket-inspection-race-'));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const path = join(dir, 'management.sock');
-  let armed = false;
-  let injected = false;
-  const fs = new Proxy(realFs, {
-    get(target, property) {
-      if (property === 'lstatSync') return (candidate, ...args) => {
-        const stat = target.lstatSync(candidate, ...args);
-        if (armed && !injected && candidate === path && stat.isSocket()) {
-          injected = true;
-          target.renameSync(path, `${path}.owned`);
-          target.writeFileSync(path, 'inspection-race replacement');
-        }
-        return stat;
-      };
-      return target[property];
-    },
-  });
-  const transport = new TransportServer({
-    socketPath: path, rest: { enabled: false, port: 1 }, fs,
-    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
-  });
-  await transport.start();
-  armed = true;
-  await transport.stop();
-  assert.equal(readFileSync(path, 'utf8'), 'inspection-race replacement');
+test('Unix listener binds privately before publishing the management path', () => {
+  const source = readFileSync(new URL('../src/transports.ts', import.meta.url), 'utf8');
+  assert.match(source, /privateSocketPath/);
+  assert.match(source, /listen\(unix,\s*private/);
+  assert.match(source, /renameSync\([^,]*private[^,]*,\s*this\.options\.socketPath\)/s);
 });
+
+for (const kind of ['regular file', 'symlink', 'socket']) {
+  test(`shutdown preserves a final-after-inspection ${kind} replacement`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'cowork-socket-inspection-race-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const path = join(dir, 'management.sock');
+    const prepared = join(dir, 'prepared-replacement');
+    let armed = false;
+    let injected = false;
+    const fs = new Proxy(realFs, {
+      get(target, property) {
+        if (property === 'renameSync') return (source, destination) => {
+          if (armed && !injected && source === path && destination.includes('.replacement-')) {
+            injected = true;
+            target.renameSync(path, `${path}.owned`);
+            target.renameSync(prepared, path);
+          }
+          return target.renameSync(source, destination);
+        };
+        return target[property];
+      },
+    });
+    const transport = new TransportServer({
+      socketPath: path, rest: { enabled: false, port: 1 }, fs,
+      dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+    });
+    await transport.start();
+    let replacementServer;
+    if (kind === 'regular file') writeFileSync(prepared, 'inspection-race replacement');
+    else if (kind === 'symlink') symlinkSync('replacement-target', prepared);
+    else {
+      replacementServer = net.createServer();
+      await new Promise((resolve, reject) => {
+        replacementServer.once('error', reject);
+        replacementServer.listen(prepared, resolve);
+      });
+    }
+    armed = true;
+    await transport.stop();
+    const stat = lstatSync(path);
+    if (kind === 'regular file') assert.equal(readFileSync(path, 'utf8'), 'inspection-race replacement');
+    else if (kind === 'symlink') assert(stat.isSymbolicLink());
+    else {
+      assert(stat.isSocket());
+      await new Promise((resolve) => replacementServer.close(resolve));
+    }
+  });
+}

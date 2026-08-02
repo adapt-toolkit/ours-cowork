@@ -10,7 +10,7 @@ export const HTTP_HEADERS_TIMEOUT_MS = 5_000;
 export const HTTP_REQUEST_TIMEOUT_MS = 10_000;
 export const HTTP_BODY_IDLE_TIMEOUT_MS = 5_000;
 export const HTTP_KEEP_ALIVE_TIMEOUT_MS = 5_000;
-const SHUTDOWN_GRACE_MS = 250;
+type HttpSocketPhase = 'headers' | 'body' | 'response' | 'idle';
 
 const RpcIdSchema = z.union([
   z.string().min(1).max(256),
@@ -172,6 +172,8 @@ export class TransportServer {
   private readonly compare: (left: Uint8Array, right: Uint8Array) => boolean;
   private readonly sockets = new Set<net.Socket>();
   private readonly httpSockets = new Set<net.Socket>();
+  private readonly httpPhases = new Map<net.Socket, HttpSocketPhase>();
+  private readonly activeHttpResponses = new Map<net.Socket, number>();
   private readonly requests = new Set<Promise<void>>();
   private unixServer?: net.Server;
   private httpServer?: http.Server;
@@ -214,8 +216,12 @@ export class TransportServer {
         rest.keepAliveTimeout = HTTP_KEEP_ALIVE_TIMEOUT_MS;
         rest.on('connection', (socket) => {
           this.httpSockets.add(socket);
+          this.httpPhases.set(socket, 'headers');
           socket.setTimeout(HTTP_KEEP_ALIVE_TIMEOUT_MS, () => socket.destroy());
-          socket.on('close', () => this.httpSockets.delete(socket));
+          socket.on('close', () => {
+            this.httpSockets.delete(socket);
+            this.httpPhases.delete(socket);
+          });
         });
         this.httpServer = rest;
         await listen(rest, this.options.rest.port, '127.0.0.1');
@@ -237,17 +243,21 @@ export class TransportServer {
     const httpServer = this.httpServer;
     const closing = this.closeServers();
     for (const socket of this.sockets) socket.end();
-    await Promise.race([
-      Promise.allSettled([...this.requests]),
-      new Promise<void>((resolveGrace) => setTimeout(resolveGrace, SHUTDOWN_GRACE_MS)),
-    ]);
+    // Header/body readers and keep-alive sockets have not dispatched service
+    // work and can be aborted immediately. Active operations keep their
+    // connection until the complete response has been flushed.
+    for (const socket of this.httpSockets) {
+      if (!this.activeHttpResponses.has(socket)) socket.destroy();
+    }
+    await this.drainRequests();
     httpServer?.closeAllConnections?.();
     for (const socket of this.httpSockets) socket.destroy();
-    await Promise.allSettled([...this.requests]);
     await this.options.dispatcher.drain();
     for (const socket of this.sockets) socket.destroy();
     this.sockets.clear();
     this.httpSockets.clear();
+    this.httpPhases.clear();
+    this.activeHttpResponses.clear();
     await closing;
     this.removeOwnedSocket();
   }
@@ -285,33 +295,61 @@ export class TransportServer {
   }
 
   private async handleRest(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
-    if (!this.authorized(request.headers.authorization)) {
-      sendJson(response, 401, errorResponse(null, 'unauthorized', 'unauthorized'));
-      request.resume();
-      return;
+    const socket = request.socket;
+    this.httpPhases.set(socket, 'body');
+    let responseActive = false;
+    const activateResponse = (): void => {
+      if (responseActive) return;
+      responseActive = true;
+      this.activeHttpResponses.set(socket, (this.activeHttpResponses.get(socket) ?? 0) + 1);
+      this.httpPhases.set(socket, 'response');
+      socket.setTimeout(0);
+    };
+    try {
+      if (!this.authorized(request.headers.authorization)) {
+        activateResponse();
+        sendJson(response, 401, errorResponse(null, 'unauthorized', 'unauthorized'));
+        request.resume();
+        return await responseFinished(response);
+      }
+      if (request.method !== 'POST' || request.url !== '/rpc') {
+        activateResponse();
+        sendJson(response, 404, errorResponse(null, 'not_found', 'not found'));
+        request.resume();
+        return await responseFinished(response);
+      }
+      const declared = request.headers['content-length'];
+      if (declared !== undefined && (!/^[0-9]+$/.test(declared) || Number(declared) > MAX_REQUEST_BYTES)) {
+        activateResponse();
+        sendJson(response, 413, errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'));
+        request.resume();
+        return await responseFinished(response);
+      }
+      const body = await readBody(request, MAX_REQUEST_BYTES);
+      if (!body.ok) {
+        activateResponse();
+        sendJson(response, 413, errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'));
+        return await responseFinished(response);
+      }
+      activateResponse();
+      const rpc = await this.dispatchBytes(body.bytes);
+      const status = 'error' in rpc
+        ? rpc.error.code === 'method_not_found' ? 404
+          : rpc.error.code === 'internal' ? 500 : 400
+        : 200;
+      sendJson(response, status, rpc);
+      await responseFinished(response);
+    } finally {
+      if (responseActive) {
+        const remaining = (this.activeHttpResponses.get(socket) ?? 1) - 1;
+        if (remaining > 0) this.activeHttpResponses.set(socket, remaining);
+        else this.activeHttpResponses.delete(socket);
+      }
+      if (!socket.destroyed && !this.activeHttpResponses.has(socket)) {
+        this.httpPhases.set(socket, 'idle');
+        socket.setTimeout(HTTP_KEEP_ALIVE_TIMEOUT_MS);
+      }
     }
-    if (request.method !== 'POST' || request.url !== '/rpc') {
-      sendJson(response, 404, errorResponse(null, 'not_found', 'not found'));
-      request.resume();
-      return;
-    }
-    const declared = request.headers['content-length'];
-    if (declared !== undefined && (!/^[0-9]+$/.test(declared) || Number(declared) > MAX_REQUEST_BYTES)) {
-      sendJson(response, 413, errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'));
-      request.resume();
-      return;
-    }
-    const body = await readBody(request, MAX_REQUEST_BYTES);
-    if (!body.ok) {
-      sendJson(response, 413, errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'));
-      return;
-    }
-    const rpc = await this.dispatchBytes(body.bytes);
-    const status = 'error' in rpc
-      ? rpc.error.code === 'method_not_found' ? 404
-        : rpc.error.code === 'internal' ? 500 : 400
-      : 200;
-    sendJson(response, status, rpc);
   }
 
   private authorized(header: string | undefined): boolean {
@@ -342,6 +380,10 @@ export class TransportServer {
         this.options.log?.('transport request failed:', error);
       },
     );
+  }
+
+  private async drainRequests(): Promise<void> {
+    while (this.requests.size > 0) await Promise.allSettled([...this.requests]);
   }
 
   private async prepareUnixPath(): Promise<void> {
@@ -387,44 +429,95 @@ export class TransportServer {
   }
 
   private async closeServers(): Promise<void> {
-    const protectedPath = this.protectReplacementSocket();
+    const guard = this.guardReplacementPath();
     await Promise.allSettled([
       closeServer(this.httpServer),
       closeServer(this.unixServer),
     ]);
-    if (protectedPath) this.restoreReplacementSocket(protectedPath);
+    if (guard) this.releaseReplacementGuard(guard);
     this.httpServer = undefined;
     this.unixServer = undefined;
   }
 
-  private protectReplacementSocket(): { path: string; dev: number; ino: number } | undefined {
+  private guardReplacementPath(): {
+    placeholder: { dev: number; ino: number };
+    protectedPaths: Array<{ path: string; dev: number; ino: number }>;
+  } | undefined {
     const owned = this.ownedSocket;
     if (!owned) return undefined;
-    let current: nodeFs.Stats;
-    try { current = this.fs.lstatSync(this.options.socketPath); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-      throw error;
+    const protectedPaths: Array<{ path: string; dev: number; ino: number }> = [];
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      let present = true;
+      try { this.fs.lstatSync(this.options.socketPath); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') present = false;
+        else throw error;
+      }
+      if (present) {
+        const protectedPath = `${this.options.socketPath}.replacement-${process.pid}-${randomBytes(6).toString('hex')}`;
+        try {
+          this.fs.renameSync(this.options.socketPath, protectedPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+          throw error;
+        }
+        // Stat after rename: the pathname may have been replaced after the
+        // inspection, and the moved inode is the one we must preserve.
+        const moved = this.fs.lstatSync(protectedPath);
+        protectedPaths.push({ path: protectedPath, dev: moved.dev, ino: moved.ino });
+      }
+      try {
+        this.fs.mkdirSync(this.options.socketPath, { mode: 0o700 });
+        const placeholder = this.fs.lstatSync(this.options.socketPath);
+        if (!placeholder.isDirectory() || placeholder.isSymbolicLink()) {
+          throw new Error('management socket shutdown placeholder is not a directory');
+        }
+        return {
+          placeholder: { dev: placeholder.dev, ino: placeholder.ino },
+          protectedPaths,
+        };
+      } catch (error) {
+        // If the containing state directory disappeared, there is no public
+        // pathname left for server.close() to race with or preserve.
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
     }
-    if (current.dev === owned.dev && current.ino === owned.ino) return undefined;
-    if (!current.isSocket() || current.isSymbolicLink()) return undefined;
-    const protectedPath = `${this.options.socketPath}.replacement-${process.pid}-${randomBytes(6).toString('hex')}`;
-    this.fs.renameSync(this.options.socketPath, protectedPath);
-    return { path: protectedPath, dev: current.dev, ino: current.ino };
+    throw new Error('management socket path was reoccupied repeatedly during shutdown');
   }
 
-  private restoreReplacementSocket(protectedSocket: { path: string; dev: number; ino: number }): void {
-    const protectedStat = this.fs.lstatSync(protectedSocket.path);
-    if (protectedStat.dev !== protectedSocket.dev || protectedStat.ino !== protectedSocket.ino
-      || !protectedStat.isSocket() || protectedStat.isSymbolicLink()) {
-      throw new Error('replacement management socket changed while protected');
+  private releaseReplacementGuard(guard: {
+    placeholder: { dev: number; ino: number };
+    protectedPaths: Array<{ path: string; dev: number; ino: number }>;
+  }): void {
+    for (const protectedPath of guard.protectedPaths) {
+      const protectedStat = this.fs.lstatSync(protectedPath.path);
+      if (protectedStat.dev !== protectedPath.dev || protectedStat.ino !== protectedPath.ino) {
+        throw new Error('replacement management socket changed while protected');
+      }
     }
+    let vacant = false;
     try {
-      this.fs.lstatSync(this.options.socketPath);
-      throw new Error('management socket path was reoccupied during shutdown');
+      const current = this.fs.lstatSync(this.options.socketPath);
+      if (current.dev === guard.placeholder.dev && current.ino === guard.placeholder.ino
+        && current.isDirectory() && !current.isSymbolicLink()) {
+        this.fs.rmdirSync(this.options.socketPath);
+        vacant = true;
+      }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') vacant = true;
+      else throw error;
     }
-    this.fs.renameSync(protectedSocket.path, this.options.socketPath);
+    const replacements = guard.protectedPaths.filter((candidate) =>
+      candidate.dev !== this.ownedSocket?.dev || candidate.ino !== this.ownedSocket?.ino);
+    const ownedPath = guard.protectedPaths.find((candidate) =>
+      candidate.dev === this.ownedSocket?.dev && candidate.ino === this.ownedSocket?.ino);
+    if (ownedPath) this.fs.unlinkSync(ownedPath.path);
+    if (!vacant) return;
+    // The newest occupant wins the public path. Older occupants remain intact
+    // under their collision-resistant quarantine names rather than being
+    // overwritten or deleted.
+    const newest = replacements.at(-1);
+    if (newest) this.fs.renameSync(newest.path, this.options.socketPath);
   }
 }
 
@@ -541,4 +634,13 @@ function listen(server: net.Server | http.Server, ...args: unknown[]): Promise<v
 function closeServer(server: net.Server | http.Server | undefined): Promise<void> {
   if (!server?.listening) return Promise.resolve();
   return new Promise((resolveClose) => server.close(() => resolveClose()));
+}
+
+function responseFinished(response: http.ServerResponse): Promise<void> {
+  if (response.writableFinished || response.destroyed) return Promise.resolve();
+  return new Promise((resolveResponse, rejectResponse) => {
+    response.once('finish', resolveResponse);
+    response.once('close', resolveResponse);
+    response.once('error', rejectResponse);
+  });
 }

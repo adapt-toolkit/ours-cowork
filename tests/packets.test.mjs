@@ -475,9 +475,12 @@ test('PacketRegistry public lifecycle surface is standalone', () => {
   const source = readFileSync(new URL('../src/packets.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /ours-mcp|@ours\.network\/mcp/);
   const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
-  assert.match(daemon, /class CoworkDaemon/);
-  assert.match(daemon, /runDaemon/);
+  assert.match(daemon, /class DaemonSupervisor/);
+  assert.match(daemon, /runSupervisor/);
+  const runtime = readFileSync(new URL('../src/daemon-runtime.ts', import.meta.url), 'utf8');
+  assert.match(runtime, /class CoworkDaemon/);
   assert.doesNotMatch(daemon, /ours-mcp|@ours\.network\/mcp/);
+  assert.doesNotMatch(runtime, /ours-mcp|@ours\.network\/mcp/);
   const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
   assert.match(cli, /Build-only placeholder/);
   assert.doesNotMatch(cli, /ours-mcp|@ours\.network\/mcp/);
@@ -519,6 +522,22 @@ test('AdaptHost shutdown uses an explicit wrapper stop adapter and otherwise req
   nativeBoundary.wrapper = { packet_manager: {} };
   assert.deepEqual(await nativeBoundary.shutdown(), { requiresProcessExit: true });
   assert.equal(nativeBoundary.wrapper, undefined);
+});
+
+test('AdaptHost shutdown always attempts wrapper stop and aggregates packet and wrapper failures', async () => {
+  const packetFailure = new Error('packet removal failed');
+  const wrapperFailure = new Error('wrapper stop failed');
+  const host = new AdaptHost('ws://broker', () => {}, {
+    unit: { dir: '/unused', hash: 'fake', contents: new Uint8Array() },
+    shutdownWrapper: async () => { throw wrapperFailure; },
+  });
+  host.wrapper = { remove_packet() { throw packetFailure; }, packet_manager: {} };
+  host.packets.set('cid', { close() {} });
+  await assert.rejects(host.shutdown(), (error) => error instanceof AggregateError
+    && error.errors.some((nested) => nested instanceof AggregateError && nested.errors.includes(packetFailure))
+    && error.errors.includes(wrapperFailure)
+    && error.requiresProcessExit === true);
+  assert.equal(host.wrapper, undefined);
 });
 
 test('a submitted timeout terminalizes the packet without enqueueing or pairing a later result', async () => {

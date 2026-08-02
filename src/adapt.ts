@@ -4,18 +4,28 @@ import { fileURLToPath } from 'node:url';
 import { brotliCompressSync, brotliDecompressSync, constants as zlibConstants } from 'node:zlib';
 
 import type { AdaptValue } from '@adapt-toolkit/sdk/backend';
-import { AdaptObjectLifetime } from '@adapt-toolkit/sdk/common';
-import { adapt_wrapper } from '@adapt-toolkit/sdk/executables';
-import { object_to_adapt_value } from '@adapt-toolkit/sdk/wrapper';
+import type { AdaptObjectLifetime as AdaptLifetime } from '@adapt-toolkit/sdk/common';
 import type { AdaptPacketWrapper, AdaptWrapper } from '@adapt-toolkit/sdk/wrappers';
-import { PacketWrapperConfigurator } from '@adapt-toolkit/sdk/wrappers';
+
+// Value imports stay dynamic so a bundled supervisor can install signal/IPC
+// ownership and fork before the native SDK is loaded in its worker process.
+const [commonSdk, executableSdk, wrapperSdk, wrappersSdk] = await Promise.all([
+  import('@adapt-toolkit/sdk/common'),
+  import('@adapt-toolkit/sdk/executables'),
+  import('@adapt-toolkit/sdk/wrapper'),
+  import('@adapt-toolkit/sdk/wrappers'),
+]);
+const { AdaptObjectLifetime } = commonSdk;
+const { adapt_wrapper } = executableSdk;
+const { object_to_adapt_value } = wrapperSdk;
+const { PacketWrapperConfigurator } = wrappersSdk;
 
 export type { AdaptValue };
 export { AdaptObjectLifetime };
 
 export type Logger = (...parts: unknown[]) => void;
 
-export function withScope<T>(fn: (lifetime: AdaptObjectLifetime) => T): T {
+export function withScope<T>(fn: (lifetime: AdaptLifetime) => T): T {
   const lifetime = new AdaptObjectLifetime();
   try {
     return fn(lifetime);
@@ -24,7 +34,7 @@ export function withScope<T>(fn: (lifetime: AdaptObjectLifetime) => T): T {
   }
 }
 
-export async function withScopeAsync<T>(fn: (lifetime: AdaptObjectLifetime) => Promise<T>): Promise<T> {
+export async function withScopeAsync<T>(fn: (lifetime: AdaptLifetime) => Promise<T>): Promise<T> {
   const lifetime = new AdaptObjectLifetime();
   try {
     return await fn(lifetime);
@@ -105,7 +115,7 @@ export class Packet {
     if (this.closedError) throw this.closedError;
   }
 
-  readonlyTx(name: string, lifetime?: AdaptObjectLifetime): AdaptValue {
+  readonlyTx(name: string, lifetime?: AdaptLifetime): AdaptValue {
     this.assertOpen();
     const envelope = this.makeEnvelope(name, undefined);
     try {
@@ -157,7 +167,7 @@ export class Packet {
   mutatingTx(
     name: string,
     targ: unknown,
-    lifetime?: AdaptObjectLifetime,
+    lifetime?: AdaptLifetime,
     timeoutMs = 25_000,
   ): Promise<AdaptValue> {
     let envelope: AdaptValue;
@@ -179,7 +189,7 @@ export class Packet {
     );
   }
 
-  newBinary(bytes: Buffer, lifetime?: AdaptObjectLifetime): AdaptValue {
+  newBinary(bytes: Buffer, lifetime?: AdaptLifetime): AdaptValue {
     this.assertOpen();
     const value = this.pw.packet.NewBinaryFromBuffer(bytes);
     return lifetime ? value.Attach(lifetime) : value;
@@ -274,6 +284,16 @@ export interface AdaptHostOptions {
 
 export interface AdaptHostShutdownResult {
   requiresProcessExit: boolean;
+}
+
+export class AdaptHostShutdownError extends AggregateError {
+  readonly requiresProcessExit: boolean;
+
+  constructor(errors: Iterable<unknown>, requiresProcessExit: boolean) {
+    super(errors, 'AdaptHost shutdown encountered errors');
+    this.name = 'AdaptHostShutdownError';
+    this.requiresProcessExit = requiresProcessExit;
+  }
 }
 
 export interface CreatePacketOptions {
@@ -422,23 +442,34 @@ export class AdaptHost {
    */
   async shutdown(): Promise<AdaptHostShutdownResult> {
     const wrapper = this.wrapper;
-    this.close();
     if (!wrapper) return { requiresProcessExit: false };
-    if (this.shutdownWrapper) {
-      await this.shutdownWrapper(wrapper);
-      return { requiresProcessExit: false };
-    }
-    const futureWrapper = wrapper as AdaptWrapper & {
-      stop?: () => void | Promise<void>;
-      shutdown?: () => void | Promise<void>;
-      dispose?: () => void | Promise<void>;
-    };
-    const publicStop = futureWrapper.shutdown ?? futureWrapper.stop ?? futureWrapper.dispose;
-    if (typeof publicStop === 'function') {
-      await publicStop.call(wrapper);
-      return { requiresProcessExit: false };
-    }
-    return { requiresProcessExit: true };
+    const errors: unknown[] = [];
+    // Until a public stop boundary completes, process exit remains the only
+    // reliable way to terminate SDK reconnect and heartbeat resources.
+    let requiresProcessExit = true;
+    try { this.close(); } catch (error) { errors.push(error); }
+    try {
+      if (this.shutdownWrapper) {
+        await this.shutdownWrapper(wrapper);
+        requiresProcessExit = false;
+      } else {
+        const futureWrapper = wrapper as AdaptWrapper & {
+          stop?: () => void | Promise<void>;
+          shutdown?: () => void | Promise<void>;
+          dispose?: () => void | Promise<void>;
+        };
+        const publicStop = futureWrapper.shutdown ?? futureWrapper.stop ?? futureWrapper.dispose;
+        if (typeof publicStop === 'function') {
+          await publicStop.call(wrapper);
+          requiresProcessExit = false;
+        }
+      }
+    } catch (error) { errors.push(error); }
+    // Ownership is relinquished even when packet removal or wrapper shutdown
+    // fails. A second caller must never operate on a half-closed native wrapper.
+    this.wrapper = undefined;
+    if (errors.length > 0) throw new AdaptHostShutdownError(errors, requiresProcessExit);
+    return { requiresProcessExit };
   }
 }
 

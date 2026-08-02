@@ -191,6 +191,7 @@ function loadOrCreateToken(
 function assertSecureAncestors(fs: typeof nodeFs, path: string, label: string): void {
   const absolute = isAbsolute(path) ? path : resolve(path);
   const root = parse(absolute).root;
+  const rootOwner = fs.lstatSync(root).uid;
   let cursor = root;
   const components = absolute.slice(root.length).split('/').filter(Boolean);
   for (const [index, component] of components.entries()) {
@@ -202,18 +203,19 @@ function assertSecureAncestors(fs: typeof nodeFs, path: string, label: string): 
       if (index === components.length - 1) return;
       throw new CoworkConfigError(`${label} ancestor is not a directory: ${cursor}`);
     }
-    if (index < components.length - 1) assertTrustedAncestor(stat, cursor, label);
+    if (index < components.length - 1) assertTrustedAncestor(stat, rootOwner, cursor, label);
   }
 }
 
-function assertTrustedAncestor(stat: nodeFs.Stats, path: string, label: string): void {
+function assertTrustedAncestor(stat: nodeFs.Stats, rootOwner: number, path: string, label: string): void {
   const uid = typeof process.getuid === 'function' ? process.getuid() : stat.uid;
   const trustedStickyDirectory = (stat.mode & 0o1000) !== 0;
-  if (stat.uid !== uid && !trustedStickyDirectory) {
-    throw new CoworkConfigError(`${label} has a non-owned ancestor: ${path}`);
-  }
   const writableByOthers = (stat.mode & 0o022) !== 0;
-  if (writableByOthers && !trustedStickyDirectory) {
+  // In user namespaces the filesystem root can be represented by an overflow
+  // UID rather than numeric zero. Trust the owner observed through the same
+  // filesystem boundary used for every ancestor check.
+  const trustedOwner = stat.uid === uid || stat.uid === 0 || stat.uid === rootOwner;
+  if (writableByOthers && (!trustedStickyDirectory || !trustedOwner)) {
     throw new CoworkConfigError(`${label} has an unsafe writable ancestor: ${path}`);
   }
 }

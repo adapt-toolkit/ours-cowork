@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { chmodSync, lstatSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import * as realFs from 'node:fs';
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -234,6 +235,33 @@ test('shutdown closes an idle authenticated HTTP keep-alive connection', async (
   ]);
 });
 
+test('shutdown lets an already-dispatched HTTP operation finish without a response cutoff', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-http-dispatch-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const token = 'b2'.repeat(32);
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const dispatcher = new RpcDispatcher({
+    slow: { auth: true, run: async () => {
+      markStarted();
+      await new Promise((resolve) => setTimeout(resolve, 2_100));
+      return { complete: true };
+    } },
+  });
+  const server = new TransportServer({
+    socketPath: join(dir, 'management.sock'), rest: { enabled: true, port: 0 }, token, dispatcher,
+  });
+  await server.start();
+  const body = JSON.stringify({ version: 1, id: 1, method: 'slow', params: {} });
+  const response = request(server.restAddress.port, { body, authorization: `Bearer ${token}` });
+  await started;
+  const stopping = server.stop();
+  const result = await response;
+  assert.equal(result.status, 200);
+  assert.deepEqual(JSON.parse(result.body).result, { complete: true });
+  await stopping;
+});
+
 test('shutdown preserves a replacement Unix socket at the same path', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-socket-owner-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -252,4 +280,85 @@ test('shutdown preserves a replacement Unix socket at the same path', async (t) 
   await transport.stop();
   assert(lstatSync(path).isSocket());
   await new Promise((resolve) => replacement.close(resolve));
+});
+
+for (const kind of ['regular file', 'symlink']) {
+  test(`shutdown preserves a replacement ${kind} at the Unix path`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'cowork-socket-replacement-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const path = join(dir, 'management.sock');
+    const transport = new TransportServer({
+      socketPath: path, rest: { enabled: false, port: 1 },
+      dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+    });
+    await transport.start();
+    realFs.renameSync(path, `${path}.old`);
+    if (kind === 'regular file') writeFileSync(path, 'replacement');
+    else symlinkSync('replacement-target', path);
+    await transport.stop();
+    const stat = lstatSync(path);
+    if (kind === 'regular file') assert.equal(readFileSync(path, 'utf8'), 'replacement');
+    else assert(stat.isSymbolicLink());
+  });
+}
+
+test('shutdown never overwrites a Unix path reoccupied while a replacement is protected', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-socket-reoccupied-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'management.sock');
+  let injected = false;
+  const fs = new Proxy(realFs, {
+    get(target, property) {
+      if (property === 'renameSync') return (source, destination) => {
+        target.renameSync(source, destination);
+        if (!injected && source === path && destination.includes('.replacement-')) {
+          injected = true;
+          target.writeFileSync(path, 'later occupant');
+        }
+      };
+      return target[property];
+    },
+  });
+  const transport = new TransportServer({
+    socketPath: path, rest: { enabled: false, port: 1 }, fs,
+    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+  });
+  await transport.start();
+  realFs.renameSync(path, `${path}.old`);
+  writeFileSync(path, 'first replacement');
+  await transport.stop();
+  assert.equal(readFileSync(path, 'utf8'), 'later occupant');
+  const protectedName = readdirSync(dir).find((name) => name.includes('.replacement-'));
+  assert(protectedName);
+  assert.equal(readFileSync(join(dir, protectedName), 'utf8'), 'first replacement');
+});
+
+test('shutdown preserves a Unix replacement arriving after the owned-path inspection', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-socket-inspection-race-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'management.sock');
+  let armed = false;
+  let injected = false;
+  const fs = new Proxy(realFs, {
+    get(target, property) {
+      if (property === 'lstatSync') return (candidate, ...args) => {
+        const stat = target.lstatSync(candidate, ...args);
+        if (armed && !injected && candidate === path && stat.isSocket()) {
+          injected = true;
+          target.renameSync(path, `${path}.owned`);
+          target.writeFileSync(path, 'inspection-race replacement');
+        }
+        return stat;
+      };
+      return target[property];
+    },
+  });
+  const transport = new TransportServer({
+    socketPath: path, rest: { enabled: false, port: 1 }, fs,
+    dispatcher: new RpcDispatcher({ ping: { auth: true, run: async () => null } }),
+  });
+  await transport.start();
+  armed = true;
+  await transport.stop();
+  assert.equal(readFileSync(path, 'utf8'), 'inspection-race replacement');
 });

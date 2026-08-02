@@ -4,12 +4,11 @@ import * as realFs from 'node:fs';
 import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
-import {
-  acquireDaemonLock,
-  CoworkDaemon,
-} from '../src/daemon.ts';
+import { acquireDaemonLock, CoworkDaemon } from '../src/daemon-runtime.ts';
+import { DaemonSupervisor } from '../src/daemon.ts';
 import {
   ensureRuntimeState,
   loadConfig,
@@ -38,6 +37,35 @@ test('config is exact, env overrides are strict, and malformed input fails close
     }));
     assert.throws(() => loadConfig({ OURS_COWORK_CONFIG: path, OURS_COWORK_REST_PORT: '3x' }), /REST_PORT/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('supervisor entry stays SDK-free and preserves unrelated signal listeners at every worker stage', async () => {
+  const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /\.\/adapt|\.\/packets|\.\/service|@adapt-toolkit|sdk-native/);
+  assert.doesNotMatch(source, /removeAllListeners|process\.exit\(/);
+  for (const stage of ['pre-lock', 'post-lock', 'during-host-init', 'post-host', 'pre-pid', 'ready']) {
+    const signals = new EventEmitter();
+    let unrelated = 0;
+    const listener = () => { unrelated += 1; };
+    signals.on('SIGTERM', listener);
+    const sent = [];
+    const child = Object.assign(new EventEmitter(), {
+      connected: true, exitCode: null,
+      send(message) { sent.push(message); },
+      kill() { assert.fail('acknowledged cleanup must not be force-killed'); },
+    });
+    const supervisor = new DaemonSupervisor({ child, signals, shutdownTimeoutMs: 500 });
+    supervisor.start();
+    child.emit('message', { type: 'stage', stage });
+    signals.emit('SIGTERM');
+    assert.equal(unrelated, 1);
+    assert.deepEqual(sent, [{ type: 'shutdown', signal: 'SIGTERM' }]);
+    child.emit('message', { type: 'shutdown_ack', requiresProcessExit: true });
+    child.exitCode = 0;
+    child.emit('exit', 0, null);
+    assert.deepEqual(await supervisor.done, { code: 0, signal: null });
+    assert(signals.listeners('SIGTERM').includes(listener));
+  }
 });
 
 test('runtime state and token reject insecure modes and symlinks; token creation failure is fatal', () => {
@@ -102,6 +130,59 @@ test('state setup rejects a hostile writable ancestor and config validates the o
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('safe foreign ancestors are allowed, but foreign-owned sticky writable ancestors are rejected', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-ancestor-policy-'));
+  try {
+    const foreign = join(dir, 'foreign');
+    realFs.mkdirSync(foreign, { mode: 0o755 });
+    const foreignUid = (typeof process.getuid === 'function' ? process.getuid() : 0) + 10_000;
+    const fsWithAncestor = (mode) => new Proxy(realFs, {
+      get(target, property) {
+        if (property === 'lstatSync') return (path, ...args) => {
+          const stat = target.lstatSync(path, ...args);
+          if (path !== foreign) return stat;
+          return new Proxy(stat, {
+            get(value, key) {
+              if (key === 'uid') return foreignUid;
+              if (key === 'mode') return (value.mode & ~0o7777) | mode;
+              return Reflect.get(value, key, value);
+            },
+          });
+        };
+        return target[property];
+      },
+    });
+    const config = {
+      version: 1, brokerUrl: 'ws://broker', stateDir: join(foreign, 'state'),
+      rest: { enabled: false, port: 3010 },
+    };
+    ensureRuntimeState(config, { fs: fsWithAncestor(0o755) });
+    rmSync(join(foreign, 'state'), { recursive: true, force: true });
+    assert.throws(
+      () => ensureRuntimeState(config, { fs: fsWithAncestor(0o1777) }),
+      /unsafe writable ancestor/i,
+    );
+    const rootOwnedSticky = new Proxy(realFs, {
+      get(target, property) {
+        if (property === 'lstatSync') return (path, ...args) => {
+          const stat = target.lstatSync(path, ...args);
+          if (path !== foreign && path !== '/' && path !== tmpdir()) return stat;
+          return new Proxy(stat, {
+            get(value, key) {
+              if (key === 'uid') return foreignUid;
+              if (key === 'mode' && path === foreign) return (value.mode & ~0o7777) | 0o1777;
+              return Reflect.get(value, key, value);
+            },
+          });
+        };
+        return target[property];
+      },
+    });
+    ensureRuntimeState(config, { fs: rootOwnedSticky });
+    assert.equal(loadConfig({}, { home: dir }).stateDir, join(dir, '.ours-cowork'));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('single-instance lock refuses live owners, recovers stale owners, and is ownership-safe', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-lock-'));
   try {
@@ -123,13 +204,6 @@ test('single-instance lock refuses live owners, recovers stale owners, and is ow
     assert.equal(existsSync(join(dir, 'daemon.lock')), false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-
-class FakeSignals {
-  listeners = new Map();
-  on(event, listener) { this.listeners.set(event, listener); }
-  off(event, listener) { if (this.listeners.get(event) === listener) this.listeners.delete(event); }
-  emit(event) { this.listeners.get(event)?.(); }
-}
 
 class FakeHost {
   events;
@@ -220,10 +294,9 @@ test('partial boot failure rolls back transports, PID, packets, host, and lock',
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('SIGINT and SIGTERM share one idempotent shutdown and remove listeners', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'cowork-signals-'));
+test('runtime shutdown is idempotent and does not own process signal listeners', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-runtime-shutdown-'));
   const events = [];
-  const signals = new FakeSignals();
   const daemon = new CoworkDaemon({
     config: { version: 1, brokerUrl: 'ws://broker', stateDir: dir, rest: { enabled: false, port: 3010 } },
     prepare: () => ({ socketPath: join(dir, 'management.sock') }),
@@ -234,16 +307,30 @@ test('SIGINT and SIGTERM share one idempotent shutdown and remove listeners', as
     service: new FakeService(events, []),
     transports: { async start() { events.push('transports.start'); }, async stop() { events.push('transports.stop'); } },
     writePid: () => events.push('pid.write'), removePid: () => events.push('pid.remove'),
-    signals,
   });
   await daemon.boot();
-  assert.deepEqual([...signals.listeners.keys()].sort(), ['SIGINT', 'SIGTERM']);
-  signals.emit('SIGTERM');
-  signals.emit('SIGINT');
-  await daemon.shutdown();
+  await Promise.all([daemon.shutdown(), daemon.shutdown()]);
   assert.equal(events.filter((event) => event === 'transports.stop').length, 1);
   assert.equal(events.filter((event) => event === 'host.close').length, 1);
-  assert.equal(signals.listeners.size, 0);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('runtime shutdown preserves requiresProcessExit on aggregated cleanup failure', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-runtime-exit-result-'));
+  const stopFailure = Object.assign(new Error('wrapper stop failed'), { requiresProcessExit: true });
+  const events = [];
+  const daemon = new CoworkDaemon({
+    config: { version: 1, brokerUrl: 'ws://broker', stateDir: dir, rest: { enabled: false, port: 3010 } },
+    prepare: () => ({ socketPath: join(dir, 'management.sock') }),
+    lock: () => ({ release() { events.push('lock.release'); } }),
+    host: { async boot() {}, async shutdown() { throw stopFailure; }, close() {} },
+    store: { async list() { return []; } }, registry: new FakeRegistry(events), service: new FakeService(events, []),
+    transports: { async start() {}, async stop() {} }, writePid() {}, removePid() {},
+  });
+  await daemon.boot();
+  await assert.rejects(daemon.shutdown(), (error) => error instanceof AggregateError
+    && error.requiresProcessExit === true
+    && error.errors.includes(stopFailure));
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -369,5 +456,47 @@ test('real executable owns SIGINT/SIGTERM after SDK boot and exits without runti
     assert.deepEqual(exited, { code: 0, signal: null }, stderr);
     assert.equal(existsSync(socketPath), false);
     assert.equal(existsSync(pidPath), false);
+  }
+});
+
+test('real SDK-free supervisor handles signals from pre-lock through ready', async (t) => {
+  const daemonUrl = new URL('../src/daemon.ts', import.meta.url).href;
+  const stages = ['pre-lock', 'post-lock', 'during-host-init', 'post-host', 'pre-pid', 'ready'];
+  for (const [index, stage] of stages.entries()) {
+    const signal = index % 2 === 0 ? 'SIGINT' : 'SIGTERM';
+    const dir = mkdtempSync(join(tmpdir(), `cowork-stage-${stage}-`));
+    const program = [
+      `import { runSupervisor } from ${JSON.stringify(daemonUrl)};`,
+      `const target = ${JSON.stringify(stage)};`,
+      `const signal = ${JSON.stringify(signal)};`,
+      'const code = await runSupervisor({ onStage(current) {',
+      '  if (current === target) process.kill(process.pid, signal);',
+      '} });',
+      'process.exitCode = code;',
+    ].join('\n');
+    const child = spawn(process.execPath, ['--input-type=module', '--eval', program], {
+      env: {
+        ...process.env,
+        OURS_COWORK_STATE_DIR: dir,
+        OURS_COWORK_BROKER_URL: 'ws://127.0.0.1:1',
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); rmSync(dir, { recursive: true, force: true }); });
+    const exited = await Promise.race([
+      new Promise((resolve) => child.once('exit', (code, exitSignal) => resolve({ code, signal: exitSignal }))),
+      new Promise((resolve) => {
+        const timer = setTimeout(() => resolve('timeout'), 10_000);
+        timer.unref();
+      }),
+    ]);
+    assert.notEqual(exited, 'timeout', `${stage} did not converge: ${stderr}`);
+    assert.deepEqual(exited, { code: 0, signal: null }, `${stage}: ${stderr}`);
+    assert.equal(existsSync(join(dir, 'daemon.lock')), false, `${stage} retained daemon.lock`);
+    assert.equal(existsSync(join(dir, 'daemon.pid')), false, `${stage} retained daemon.pid`);
+    assert.equal(existsSync(join(dir, 'management.sock')), false, `${stage} retained management.sock`);
   }
 });

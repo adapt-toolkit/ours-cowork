@@ -21,7 +21,18 @@ const shared = {
   logLevel: 'info',
 };
 
-await build({ ...shared, entryPoints: [resolve(root, runtimeEntries[0])], outfile: resolve(dist, 'daemon.js') });
+const daemonBuild = await build({
+  ...shared,
+  entryPoints: [resolve(root, runtimeEntries[0])],
+  outfile: resolve(dist, 'daemon.js'),
+  metafile: true,
+});
+const daemonImports = Object.values(daemonBuild.metafile.outputs).flatMap((output) => output.imports);
+const eagerSdkImport = daemonImports.find(({ path, kind }) =>
+  path.startsWith('@adapt-toolkit/') && kind !== 'dynamic-import');
+if (eagerSdkImport) {
+  throw new Error(`daemon supervisor eagerly imports SDK runtime: ${eagerSdkImport.path}`);
+}
 await build({ ...shared, entryPoints: [resolve(root, runtimeEntries[1])], outfile: resolve(dist, 'cli.js') });
 
 const muflSource = resolve(root, 'mufl_code');

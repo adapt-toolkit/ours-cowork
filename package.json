@@ -20,19 +20,32 @@
     "build": "node build.mjs",
     "compile:mufl": "scripts/compile-mufl.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:web": "tsc -p web/tsconfig.json --noEmit",
     "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "test:web": "vitest run",
     "test:release": "node --test tests/static-gates.test.mjs"
   },
   "dependencies": {
     "@adapt-toolkit/sdk": "0.10.12",
     "@adapt-toolkit/sdk-native": "0.10.12",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@adapt-toolkit/broker": "0.10.12",
     "@adapt-toolkit/mufl": "0.10.12",
+    "@testing-library/jest-dom": "6.6.3",
+    "@testing-library/react": "16.1.0",
+    "@testing-library/user-event": "14.5.2",
     "@types/node": "^20.14.0",
+    "@types/react": "18.3.31",
+    "@types/react-dom": "18.3.7",
+    "@vitejs/plugin-react": "4.7.0",
     "esbuild": "^0.24.2",
-    "typescript": "^5.5.4"
+    "jsdom": "25.0.1",
+    "typescript": "^5.5.4",
+    "vite": "5.4.21",
+    "vitest": "2.1.9"
   }
 }

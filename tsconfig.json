@@ -14,5 +14,6 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*"],
+  "exclude": ["web", "tests-web", "vite.config.ts", "vitest.config.ts"]
 }

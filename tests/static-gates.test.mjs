@@ -7,13 +7,26 @@ import test from 'node:test';
 const ROOT = resolve(new URL('..', import.meta.url).pathname);
 const SOURCE_EXTENSIONS = new Set([
   '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.json', '.sh',
-  '.mu', '.mm', '.mufl', '.muflo', '.yml', '.yaml',
+  '.css', '.html', '.mu', '.mm', '.mufl', '.muflo', '.yml', '.yaml',
 ]);
 const SKIPPED_SOURCE_TREES = new Set([
   '.git', '.superpowers', 'node_modules', 'dist', 'docs', join('mufl_code', 'core'),
 ]);
 const STATIC_GATE_PATH = 'tests/static-gates.test.mjs';
 const REMOTE_PARTICIPANT_SENTENCE = 'Ordinary ours-mcp identities can join only as remote participants over the ours protocol.';
+const WEB_RELEASE_ARTIFACTS = [
+  'dist/web/index.html',
+  'dist/web/assets/app.js',
+  'dist/web/assets/app.css',
+];
+const INERT_BUNDLED_URL_PREFIXES = [
+  'http://www.w3.org/1998/Math/MathML',
+  'http://www.w3.org/1999/xhtml',
+  'http://www.w3.org/1999/xlink',
+  'http://www.w3.org/2000/svg',
+  'http://www.w3.org/XML/1998/namespace',
+  'https://reactjs.org/docs/error-decoder.html',
+];
 const DOC_NAMES = Array.from({ length: 10 }, (_, index) => `docs/${String(index + 1).padStart(2, '0')}-${[
   'prerequisites', 'installation', 'configuration', 'daemon-lifecycle', 'room-workflow',
   'invites', 'messaging-history', 'backup-restore', 'service-management', 'limitations',
@@ -28,7 +41,7 @@ function filesBelow(directory, extensions) {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) output.push(...filesBelow(path, extensions));
-    else if (extensions.has(extname(entry.name))) output.push(path);
+    else if (extensions === undefined || extensions.has(extname(entry.name))) output.push(path);
   }
   return output;
 }
@@ -68,6 +81,23 @@ function structuralTestHarnessViolations(path, source) {
   const externalProcess = /\b(?:spawn|spawnSync|exec|execFile|execFileSync|fork)\s*\([^)]{0,240}(?:ours-mcp|@ours\.network\s*\/\s*mcp)/is;
   if (actualExternalReference.test(source)) violations.push(`${path}: imports an external daemon`);
   if (externalProcess.test(source)) violations.push(`${path}: starts an external daemon`);
+  return violations;
+}
+
+function webReleaseViolations(path, source) {
+  const violations = boundaryViolations(path, source);
+  const remoteUrls = source.match(/\b(?:https?|wss?):\/\/[^\s"'`<>\\)]+/gi) ?? [];
+  for (const url of remoteUrls) {
+    if (!INERT_BUNDLED_URL_PREFIXES.some((prefix) => url.startsWith(prefix))) {
+      violations.push(`${path}: remote URL ${url}`);
+    }
+  }
+  if (/\b(?:localStorage|sessionStorage|indexedDB)\b|\bdocument\s*\.\s*cookie\b|\bcaches\s*\.\s*open\s*\(/i.test(source)) {
+    violations.push(`${path}: browser persistence could retain secret or token material`);
+  }
+  if (/\bsourceMappingURL\s*=|\bsourcesContent\b/.test(source) || extname(path) === '.map') {
+    violations.push(`${path}: source map material`);
+  }
   return violations;
 }
 
@@ -142,6 +172,18 @@ test('documentation gate permits exactly the narrow remote-participant sentence'
   assert.deepEqual(documentationViolations('docs/10-limitations.md', 'No exactly once guarantee; no key wipe or secure erase.', true), []);
 });
 
+test('web release gate detects standalone, remote URL, persistence, and source-map violations', () => {
+  assert(webReleaseViolations('web/bad.ts', "import '@ours.network/mcp'").length > 0);
+  assert(webReleaseViolations('web/bad.ts', "const endpoint = 'https://example.invalid/api'").length > 0);
+  assert(webReleaseViolations('web/bad.ts', "localStorage.setItem('invite-secret', value)").length > 0);
+  assert(webReleaseViolations('dist/web/assets/app.js', '//# sourceMappingURL=app.js.map').length > 0);
+  assert.deepEqual(webReleaseViolations('dist/web/assets/app.js', "const namespace = 'http://www.w3.org/2000/svg'"), []);
+
+  const sourceFiles = filesBelow(join(ROOT, 'web'));
+  assert.deepEqual(sourceFiles.flatMap((path) =>
+    webReleaseViolations(normalized(path), readFileSync(path, 'utf8'))), []);
+});
+
 test('recursive owned-source discovery covers configs/scripts/tests/fixtures/MUFL and excludes only pinned third-party source', () => {
   const sourceFiles = discoverOwnedSource();
   const targets = sourceFiles.map(normalized);
@@ -173,6 +215,10 @@ test('README and every operator document preserve the exact wording boundary', (
 test('built distribution remains standalone and contains one compiled packet', () => {
   const distFiles = filesBelow(join(ROOT, 'dist'), new Set(['.js', '.json']));
   assert.deepEqual(distFiles.flatMap((path) => boundaryViolations(normalized(path), readFileSync(path, 'utf8'))), []);
+  const builtWebFiles = filesBelow(join(ROOT, 'dist', 'web'));
+  assert.deepEqual(builtWebFiles.flatMap((path) =>
+    webReleaseViolations(normalized(path), readFileSync(path, 'utf8'))), []);
+  assert.deepEqual(WEB_RELEASE_ARTIFACTS.filter((path) => !builtWebFiles.map(normalized).includes(path)), []);
   const packets = filesBelow(join(ROOT, 'dist', 'mufl_code'), new Set(['.muflo']));
   assert.equal(packets.length, 1);
 });
@@ -185,7 +231,10 @@ test('npm dry-run pack list is the exact standalone release artifact', () => {
   assert.equal(paths.some((path) => path.startsWith('docs/superpowers/')), false);
   const packetPaths = paths.filter((path) => /^dist\/mufl_code\/[0-9A-F]{64}\.muflo$/.test(path));
   assert.equal(packetPaths.length, 1);
-  const expected = ['LICENSE', 'README.md', 'dist/cli.js', 'dist/daemon.js', 'package.json', ...DOC_NAMES, packetPaths[0]].sort();
+  const expected = [
+    'LICENSE', 'README.md', 'dist/cli.js', 'dist/daemon.js', 'package.json',
+    ...WEB_RELEASE_ARTIFACTS, ...DOC_NAMES, packetPaths[0],
+  ].sort();
   assert.deepEqual(paths, expected);
   assert.equal(paths.some((path) => /(?:^|\/)(?:src|tests)(?:\/|$)|secret|token|identity\.key|state_data\.bin/i.test(path)), false);
   for (const path of paths.filter((candidate) => !candidate.endsWith('.muflo'))) {

@@ -1,8 +1,9 @@
-import { build } from 'esbuild';
+import { build as esbuild } from 'esbuild';
 import { copyFile, mkdir, readdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { build as vite } from 'vite';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const dist = resolve(root, 'dist');
@@ -10,6 +11,7 @@ const runtimeEntries = ['src/daemon.ts', 'src/cli.ts', 'dist/mufl_code'];
 
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });
+await vite({ configFile: resolve(root, 'vite.config.ts') });
 
 const shared = {
   bundle: true,
@@ -21,7 +23,7 @@ const shared = {
   logLevel: 'info',
 };
 
-const daemonBuild = await build({
+const daemonBuild = await esbuild({
   ...shared,
   entryPoints: [resolve(root, runtimeEntries[0])],
   outfile: resolve(dist, 'daemon.js'),
@@ -33,7 +35,7 @@ const eagerSdkImport = daemonImports.find(({ path, kind }) =>
 if (eagerSdkImport) {
   throw new Error(`daemon supervisor eagerly imports SDK runtime: ${eagerSdkImport.path}`);
 }
-await build({ ...shared, entryPoints: [resolve(root, runtimeEntries[1])], outfile: resolve(dist, 'cli.js') });
+await esbuild({ ...shared, entryPoints: [resolve(root, runtimeEntries[1])], outfile: resolve(dist, 'cli.js') });
 
 const muflSource = resolve(root, 'mufl_code');
 if (existsSync(muflSource)) {

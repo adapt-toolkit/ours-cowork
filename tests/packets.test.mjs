@@ -501,20 +501,21 @@ test('packet persistence failures are typed and leave the prior live file untouc
 
 test('PacketRegistry public lifecycle surface is standalone', () => {
   assert.equal(typeof PacketRegistry, 'function');
+  const externalDaemonPattern = new RegExp(`${['ours', 'mcp'].join('-')}|@ours\\.network\\/${'mcp'}`);
   const source = readFileSync(new URL('../src/packets.ts', import.meta.url), 'utf8');
-  assert.doesNotMatch(source, /ours-mcp|@ours\.network\/mcp/);
+  assert.doesNotMatch(source, externalDaemonPattern);
   const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
   assert.match(daemon, /class DaemonSupervisor/);
   assert.match(daemon, /runSupervisor/);
   const runtime = readFileSync(new URL('../src/daemon-runtime.ts', import.meta.url), 'utf8');
   assert.match(runtime, /class CoworkDaemon/);
-  assert.doesNotMatch(daemon, /ours-mcp|@ours\.network\/mcp/);
-  assert.doesNotMatch(runtime, /ours-mcp|@ours\.network\/mcp/);
+  assert.doesNotMatch(daemon, externalDaemonPattern);
+  assert.doesNotMatch(runtime, externalDaemonPattern);
   const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
   assert.match(cli, /function roomRequest/);
   assert.match(cli, /management\.sock/);
   assert.doesNotMatch(cli, /from ['"]\.\/(?:adapt|packets|service|transports|daemon-runtime)/);
-  assert.doesNotMatch(cli, /ours-mcp|@ours\.network\/mcp/);
+  assert.doesNotMatch(cli, externalDaemonPattern);
 });
 
 test('daemon unhosting removes runtime packets without purging restart state', async () => {

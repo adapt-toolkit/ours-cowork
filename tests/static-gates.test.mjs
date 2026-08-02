@@ -5,11 +5,15 @@ import { basename, extname, join, relative, resolve, sep } from 'node:path';
 import test from 'node:test';
 
 const ROOT = resolve(new URL('..', import.meta.url).pathname);
-const SOURCE_EXTENSIONS = new Set(['.ts', '.js', '.mjs', '.cjs', '.json', '.sh', '.mu', '.mm', '.mufl', '.yml', '.yaml']);
+const SOURCE_EXTENSIONS = new Set([
+  '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.json', '.sh',
+  '.mu', '.mm', '.mufl', '.muflo', '.yml', '.yaml',
+]);
 const DOCUMENT_EXTENSIONS = new Set(['.md']);
 const SKIPPED_SOURCE_TREES = new Set([
-  '.git', '.superpowers', 'node_modules', 'dist', 'docs', join('mufl_code', 'core'), join('tests', 'fixtures'),
+  '.git', '.superpowers', 'node_modules', 'dist', 'docs', join('mufl_code', 'core'),
 ]);
+const STATIC_GATE_PATH = 'tests/static-gates.test.mjs';
 const REMOTE_PARTICIPANT_SENTENCE = 'Ordinary ours-mcp identities can join only as remote participants over the ours protocol.';
 const DOC_NAMES = Array.from({ length: 10 }, (_, index) => `docs/${String(index + 1).padStart(2, '0')}-${[
   'prerequisites', 'installation', 'configuration', 'daemon-lifecycle', 'room-workflow',
@@ -38,7 +42,7 @@ function discoverOwnedSource() {
       const target = normalized(path);
       if (entry.isDirectory()) {
         if (![...SKIPPED_SOURCE_TREES].some((skip) => target === skip || target.startsWith(`${skip}/`))) visit(path);
-      } else if (SOURCE_EXTENSIONS.has(extname(entry.name)) || basename(path) === '.gitmodules') {
+      } else if (target.startsWith('tests/') || SOURCE_EXTENSIONS.has(extname(entry.name)) || basename(path) === '.gitmodules') {
         output.push(path);
       }
     }
@@ -59,13 +63,20 @@ function boundaryViolations(path, source) {
   return violations;
 }
 
-function testHarnessViolations(path, source) {
+function structuralTestHarnessViolations(path, source) {
   const violations = [];
-  const actualExternalReference = /^\s*(?:import\s+(?:[^'"\n]+\s+from\s+)?|(?:const|let|var)\s+[^=\n]+?=\s*(?:await\s+)?(?:import|require)\s*\(|await\s+import\s*\()['"][^'"\n]*(?:ours-mcp|@ours\.network\s*\/\s*mcp)/im;
+  const actualExternalReference = /(?:\bimport\s*\(\s*['"`][^'"`]{0,240}(?:ours-mcp|@ours\.network\s*\/\s*mcp)[^'"`]*['"`]\s*\)|\bimport\s+(?:[^'";]{0,160}\bfrom\s*)?['"][^'"\n]{0,240}(?:ours-mcp|@ours\.network\s*\/\s*mcp)[^'"\n]*['"]|\brequire\s*\(\s*['"`][^'"`]{0,240}(?:ours-mcp|@ours\.network\s*\/\s*mcp)[^'"`]*['"`]\s*\))/is;
   const externalProcess = /\b(?:spawn|spawnSync|exec|execFile|execFileSync|fork)\s*\([^)]{0,240}(?:ours-mcp|@ours\.network\s*\/\s*mcp)/is;
   if (actualExternalReference.test(source)) violations.push(`${path}: imports an external daemon`);
   if (externalProcess.test(source)) violations.push(`${path}: starts an external daemon`);
   return violations;
+}
+
+function testHarnessViolations(path, source) {
+  // Tests, helpers, and fixture data get the same broad source boundary as
+  // production. Structural checks are defense in depth, not the mechanism
+  // that detects variable/data-fed process paths.
+  return [...boundaryViolations(path, source), ...structuralTestHarnessViolations(path, source)];
 }
 
 function documentationViolations(path, source, limitations = false) {
@@ -101,11 +112,28 @@ test('independence rules reject multiline and package/path bypasses without sema
     'Shared protocol behavior stays in ours-mufl-core libraries. This actor owns only the room inbox.',
     'The room imports generic a2a_messaging transactions without changing shared semantics.',
   ]) assert.deepEqual(boundaryViolations('synthetic.ts', source), [], source);
-  assert.equal(testHarnessViolations('tests/e2e.test.mjs', "const peer = await import('../../ours-mcp/peer.js')").length, 1);
-  assert.equal(testHarnessViolations(
+  assert(testHarnessViolations('tests/e2e.test.mjs', "const peer = await import('../../ours-mcp/peer.js')").length > 0);
+  const directModuleLoads = [
+    "import('../../ours-mcp/peer.js')",
+    "void import('@ours.network/mcp')",
+    "require('../../ours-mcp/peer.js')",
+  ];
+  for (const source of directModuleLoads) {
+    assert(structuralTestHarnessViolations('tests/fixtures/helper.mjs', source).length > 0, source);
+  }
+  for (const source of [
+    ...directModuleLoads,
+    "const executable = '../../ours-mcp/daemon.js'; spawn(process.execPath, [executable]);",
+    "export const peerDaemon = '../../ours-mcp/daemon.js';",
+  ]) assert(testHarnessViolations('tests/fixtures/helper.mjs', source).length > 0, source);
+  const directSpawn = `${'sp' + 'awn'}(process.execPath, ['../${'ours' + '-mcp'}/daemon.js'])`;
+  assert(structuralTestHarnessViolations('tests/e2e.test.mjs', directSpawn).length > 0);
+  assert(testHarnessViolations(
     'tests/e2e.test.mjs',
-    `${'sp' + 'awn'}(process.execPath, ['../${'ours' + '-mcp'}/daemon.js'])`,
-  ).length, 1);
+    directSpawn,
+  ).length > 0);
+  assert(testHarnessViolations('tests/helper.mjs', REMOTE_PARTICIPANT_SENTENCE).length > 0,
+    'the documentation-only participant wording is forbidden in executable test source');
 });
 
 test('documentation gate permits exactly the narrow remote-participant sentence', () => {
@@ -115,18 +143,20 @@ test('documentation gate permits exactly the narrow remote-participant sentence'
   assert.deepEqual(documentationViolations('docs/10-limitations.md', 'No exactly once guarantee; no key wipe or secure erase.', true), []);
 });
 
-test('recursive owned-source discovery covers configs/scripts/tests/MUFL and excludes only third-party fixtures', () => {
+test('recursive owned-source discovery covers configs/scripts/tests/fixtures/MUFL and excludes only pinned third-party source', () => {
   const sourceFiles = discoverOwnedSource();
   const targets = sourceFiles.map(normalized);
   for (const expected of [
     '.github/workflows/ci.yml', '.gitmodules', 'build.mjs', 'package.json', 'package-lock.json',
     'scripts/compile-mufl.sh', 'src/daemon.ts', 'tests/e2e.test.mjs', 'mufl_code/actor.mu', 'mufl_code/config.mufl',
-    'mufl_code/protocol_container.mm', 'tsconfig.json',
+    'mufl_code/protocol_container.mm', 'tests/fixtures/permissive-actor.mu',
+    'tests/fixtures/97473F4B9BC707583A5D699722D6DB11BF29E80222E3DDA016F09EB1208A2163.muflo', 'tsconfig.json',
   ]) assert(targets.includes(expected), `source discovery omitted ${expected}`);
-  assert(targets.every((path) => !path.startsWith('mufl_code/core/') && !path.startsWith('tests/fixtures/')));
+  assert(targets.every((path) => !path.startsWith('mufl_code/core/')));
   assert.deepEqual(sourceFiles.flatMap((path) => {
     const target = normalized(path);
     const source = readFileSync(path, 'utf8');
+    if (target === STATIC_GATE_PATH) return [];
     return target.startsWith('tests/') ? testHarnessViolations(target, source) : boundaryViolations(target, source);
   }), []);
 

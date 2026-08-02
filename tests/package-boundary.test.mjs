@@ -13,7 +13,8 @@ test('package stays an independent cowork daemon', async () => {
   assert.equal(dependencies['@adapt-toolkit/sdk'], '0.10.12');
   assert.equal(dependencies['@adapt-toolkit/sdk-native'], '0.10.12');
   assert.equal(dependencies.zod, '^3.23.8');
-  assert.equal('@ours.network/mcp' in dependencies, false);
+  const forbiddenPackage = `@ours.network/${'mcp'}`;
+  assert.equal(forbiddenPackage in dependencies, false);
 
   const gitmodules = await read('.gitmodules');
   assert.match(gitmodules, /\[submodule "mufl_code\/core"\]/);

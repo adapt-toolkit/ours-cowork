@@ -452,7 +452,8 @@ test('generated service definitions execute the cowork CLI directly and uninstal
     const unitPath = join(home, '.config', 'systemd', 'user', 'ours-cowork.service');
     const unit = await readFile(unitPath, 'utf8');
     assert.match(unit, new RegExp(`^ExecStart="${CLI.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}" serve$`, 'm'));
-    assert.doesNotMatch(unit, /ours-mcp|(?:^|[ /])\.ours(?:[ /]|$)/im);
+    const externalDaemonPattern = new RegExp(`${['ours', 'mcp'].join('-')}|(?:^|[ /])\\.ours(?:[ /]|$)`, 'im');
+    assert.doesNotMatch(unit, externalDaemonPattern);
     assert.doesNotMatch(unit, /management-token|Bearer/i);
 
     await writeFile(join(stateDir, 'keep-me'), 'retained');

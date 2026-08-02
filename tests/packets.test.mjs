@@ -21,6 +21,7 @@ import {
   PacketPersistenceError,
   PacketRegistry,
   HostedRoomPacket,
+  adaptTimeToRfc3339,
   atomicWriteFileSync,
 } from '../src/packets.ts';
 
@@ -126,6 +127,13 @@ async function settledWithin(promises, timeoutMs = 250) {
 }
 
 if (!process.argv.includes('--packet-driver')) {
+test('native ADAPT time rendering is normalized to strict RFC3339', () => {
+  assert.equal(adaptTimeToRfc3339('2026-08-02 12:34:56.123456789 (UTC+0)'), '2026-08-02T12:34:56.123Z');
+  assert.equal(adaptTimeToRfc3339('2026-08-02 14:34:56 (UTC+2)'), '2026-08-02T12:34:56.000Z');
+  assert.equal(adaptTimeToRfc3339('2026-08-02T12:34:56.123Z'), '2026-08-02T12:34:56.123Z');
+  assert.throws(() => adaptTimeToRfc3339('not a time'), /unexpected ADAPT time/);
+});
+
 test('hosted sends propagate every rejected mutation and map only explicit refusal to send_failed', async () => {
   for (const failure of [
     new Error('timed out'),

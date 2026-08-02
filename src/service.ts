@@ -290,7 +290,7 @@ export class RoomService {
    */
   async recoverInvites(roomId: string): Promise<InviteReceipt[]> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
-    return this.lock(id, async () => {
+    const receipts = await this.lock(id, async () => {
       let room = await this.reconcileUnlocked(await this.store.load(id), this.packet(id));
       this.assertMutable(room, 'recover invites for');
       const packet = this.packet(id);
@@ -357,6 +357,11 @@ export class RoomService {
       }
       return receipts;
     });
+    // Live admission uses this operator recovery boundary. Reconciliation
+    // durably creates briefing intents while holding the room lock; drain them
+    // only after releasing it because IntakePump acquires the same mutex.
+    await this.intake.resumePending(id);
+    return receipts;
   }
 
   async confirmRecoveredInvite(roomId: string, recoveryOf: string, inviteId: string): Promise<RoomInvite> {

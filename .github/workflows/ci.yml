@@ -16,8 +16,10 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
-      - run: npm run compile:mufl
+      - run: scripts/compile-mufl.sh
       - run: npm run typecheck
       - run: npm run build
-      - run: test -f dist/daemon.js && test -f dist/cli.js && test -n "$(find dist/mufl_code -name '*.muflo' -print -quit)"
+      - run: test -f dist/daemon.js && test -f dist/cli.js && test "$(find dist/mufl_code -name '*.muflo' | wc -l)" -eq 1 && test "$(find docs -maxdepth 1 -name '*.md' | wc -l)" -eq 10
       - run: npm test
+      - run: for i in 1 2 3; do node --test tests/e2e.test.mjs || exit 1; done
+      - run: npm pack --dry-run

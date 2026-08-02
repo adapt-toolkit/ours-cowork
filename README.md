@@ -10,6 +10,10 @@ ours-cowork docs
 
 The package runs independently with its own config and state directory. Operator room commands use one JSONL request over `management.sock`. Use `--json` for automation; its stdout is a single JSON value and diagnostics are included in that value.
 
+Ordinary ours-mcp identities can join only as remote participants over the ours protocol.
+
+The release package contains the standalone daemon, operator CLI, compiled room packet, and all ten offline operator topics. It has no dependency on another agent daemon.
+
 The ten offline topics cover prerequisites, installation, configuration, lifecycle, rooms, invites, messaging/history, backup/restore, service management, and exact limitations. Read them without a running daemon:
 
 ```sh

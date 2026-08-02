@@ -387,7 +387,7 @@ export class HostedRoomPacket implements RoomPacket {
       return Object.fromEntries(dictionaryEntries(value).map(([cid, origin]) => [cid, {
         via: origin.Reduce('via').Visualize(),
         invite_id: nilString(origin.Reduce('invite_id')),
-        at: origin.Reduce('at').Visualize(),
+        at: adaptTimeToRfc3339(origin.Reduce('at').Visualize()),
       }]));
     });
   }
@@ -478,7 +478,7 @@ function renderInbox(value: AdaptValue): RenderedInbox[] {
       sender_id: message.Reduce('sender_id').Visualize(),
       sender_name: message.Reduce('sender_name').Visualize(),
       text: message.Reduce('text').Visualize(),
-      date: message.Reduce('date').Visualize(),
+      date: adaptTimeToRfc3339(message.Reduce('date').Visualize()),
       status: message.Reduce('status').Visualize(),
       wire_id: message.Reduce('wire_id').Visualize(),
     });
@@ -521,6 +521,28 @@ function strictBooleanValue(value: AdaptValue, label: string): boolean {
 
 function nilString(value: AdaptValue): string {
   return value.IsNil() ? '' : value.Visualize();
+}
+
+/** Normalize the SDK's native TIME visualization into the host storage contract. */
+export function adaptTimeToRfc3339(value: string): string {
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) {
+    return value;
+  }
+  const match = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))? \(UTC(?:(\+|-)(\d{1,2}))?\)$/.exec(value);
+  if (!match) throw new Error(`unexpected ADAPT time visualization: ${value}`);
+  const [, date, time, fraction = '', sign, hours = '0'] = match;
+  const offsetHours = Number(hours);
+  if (!Number.isInteger(offsetHours) || offsetHours > 23) {
+    throw new Error(`unexpected ADAPT time visualization: ${value}`);
+  }
+  const milliseconds = fraction.slice(0, 3).padEnd(3, '0');
+  const offset = sign === undefined || offsetHours === 0
+    ? 'Z'
+    : `${sign}${String(offsetHours).padStart(2, '0')}:00`;
+  const timestamp = `${date}T${time}.${milliseconds}${offset}`;
+  const parsed = new Date(timestamp);
+  if (Number.isNaN(parsed.getTime())) throw new Error(`unexpected ADAPT time visualization: ${value}`);
+  return parsed.toISOString();
 }
 
 function inviteMode(value: string): InviteMode {

@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run compile:mufl
+      - run: npm run typecheck
+      - run: npm run build
+      - run: test -f dist/daemon.js && test -f dist/cli.js && test -n "$(find dist/mufl_code -name '*.muflo' -print -quit)"
+      - run: npm test

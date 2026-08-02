@@ -1,0 +1,35 @@
+{
+  "name": "@ours.network/cowork",
+  "version": "0.1.0",
+  "description": "Standalone daemon for durable ours mission rooms.",
+  "type": "module",
+  "license": "FSL-1.1-Apache-2.0",
+  "bin": {
+    "ours-cowork": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "docs"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "compile:mufl": "scripts/compile-mufl.sh",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@adapt-toolkit/sdk": "0.10.12",
+    "@adapt-toolkit/sdk-native": "0.10.12",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@adapt-toolkit/mufl": "0.10.12",
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.5.4"
+  }
+}

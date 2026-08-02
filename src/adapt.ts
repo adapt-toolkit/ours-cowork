@@ -67,11 +67,17 @@ type Pending = {
   callbackError?: Error;
 };
 
+export type PacketEnvelopeFactory = (name: string, targ: unknown) => AdaptValue;
+
 export type NotifyHandler = (event: string, payload: AdaptValue) => void;
 
 export class Packet {
   readonly pending: Pending[] = [];
   private lock: Promise<void> = Promise.resolve();
+  private closedError?: Error;
+  private terminalNotified = false;
+  private readonly onTerminal: (error: Error) => void;
+  private readonly makeEnvelope: PacketEnvelopeFactory;
   readonly name: string;
   readonly cid: string;
   readonly pw: AdaptPacketWrapper;
@@ -80,14 +86,28 @@ export class Packet {
     name: string,
     cid: string,
     pw: AdaptPacketWrapper,
+    onTerminal: (error: Error) => void = () => {},
+    makeEnvelope: PacketEnvelopeFactory = (transactionName, targ) =>
+      object_to_adapt_value({ name: transactionName, targ } as never) as AdaptValue,
   ) {
     this.name = name;
     this.cid = cid;
     this.pw = pw;
+    this.onTerminal = onTerminal;
+    this.makeEnvelope = makeEnvelope;
+  }
+
+  get isClosed(): boolean {
+    return this.closedError !== undefined;
+  }
+
+  private assertOpen(): void {
+    if (this.closedError) throw this.closedError;
   }
 
   readonlyTx(name: string, lifetime?: AdaptObjectLifetime): AdaptValue {
-    const envelope = object_to_adapt_value({ name, targ: undefined } as never) as AdaptValue;
+    this.assertOpen();
+    const envelope = this.makeEnvelope(name, undefined);
     try {
       const result = this.pw.packet.ExecuteTransaction(envelope);
       return lifetime ? result.Attach(lifetime) : result;
@@ -97,11 +117,13 @@ export class Packet {
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    this.assertOpen();
     const previous = this.lock;
     let release!: () => void;
     this.lock = new Promise<void>((resolveLock) => { release = resolveLock; });
     await previous;
     try {
+      this.assertOpen();
       return await fn();
     } finally {
       release();
@@ -111,12 +133,13 @@ export class Packet {
   private enqueue(envelope: AdaptValue, timeoutMs: number): Promise<AdaptValue> {
     return new Promise<AdaptValue>((resolveResult, rejectResult) => {
       const timer = setTimeout(() => {
-        const index = this.pending.findIndex((pending) => pending.timer === timer);
-        if (index >= 0) {
-          const [pending] = this.pending.splice(index, 1);
-          pending.payload?.Destroy();
-        }
-        rejectResult(new Error(`timed out waiting for transaction result on packet "${this.name}"`));
+        if (!this.pending.some((pending) => pending.timer === timer)) return;
+        // Once submitted, a timeout cannot safely release the FIFO: the SDK does
+        // not tag callbacks with a local call id, so a late result could otherwise
+        // settle the next mutation and a late SEND could escape. Terminalize the
+        // packet; AdaptHost's terminal hook removes the native packet before any
+        // queued/future mutation can submit.
+        this.close(new Error(`timed out waiting for transaction result on packet "${this.name}"`));
       }, timeoutMs);
       const pending = { resolve: resolveResult, reject: rejectResult, timer };
       this.pending.push(pending);
@@ -137,7 +160,13 @@ export class Packet {
     lifetime?: AdaptObjectLifetime,
     timeoutMs = 25_000,
   ): Promise<AdaptValue> {
-    const envelope = object_to_adapt_value({ name, targ } as never) as AdaptValue;
+    let envelope: AdaptValue;
+    try {
+      this.assertOpen();
+      envelope = this.makeEnvelope(name, targ);
+    } catch (error) {
+      return Promise.reject(asError(error));
+    }
     return this.withLock(() => this.enqueue(envelope, timeoutMs)).then(
       (payload) => {
         envelope.Destroy();
@@ -151,8 +180,24 @@ export class Packet {
   }
 
   newBinary(bytes: Buffer, lifetime?: AdaptObjectLifetime): AdaptValue {
+    this.assertOpen();
     const value = this.pw.packet.NewBinaryFromBuffer(bytes);
     return lifetime ? value.Attach(lifetime) : value;
+  }
+
+  close(error: Error = new Error(`packet "${this.name}" is closed`)): void {
+    if (this.closedError) return;
+    this.closedError = error;
+    const pending = this.pending.splice(0);
+    for (const call of pending) {
+      clearTimeout(call.timer);
+      call.payload?.Destroy();
+      call.reject(error);
+    }
+    if (!this.terminalNotified) {
+      this.terminalNotified = true;
+      this.onTerminal(error);
+    }
   }
 }
 
@@ -174,6 +219,7 @@ export function wireHandlers(
     const lifetime = new AdaptObjectLifetime();
     data.Attach(lifetime);
     try {
+      if (packet.isClosed) return;
       const kind = data.Reduce('kind').Visualize();
       if (kind === 'save_state') {
         try {
@@ -204,14 +250,15 @@ export function wireHandlers(
   };
 
   packet.pw.on_transaction_failure = (message: string) => {
-    const pending = packet.pending.shift();
-    if (!pending) {
-      log(`[${packet.name}] inbound transaction rejected:`, message);
-      return;
-    }
-    clearTimeout(pending.timer);
-    pending.payload?.Destroy();
-    pending.reject(pending.callbackError ?? new Error(message));
+    const pending = packet.pending[0];
+    const error = pending?.callbackError ?? new Error(
+      `packet "${packet.name}" transaction failure (origin ambiguous): ${message}`,
+    );
+    if (!pending) log(`[${packet.name}] inbound transaction rejected; terminalizing packet:`, message);
+    // SDK 0.10.12 does not identify whether this callback belongs to a local
+    // client transaction or inbound traffic. Shifting a local FIFO entry can
+    // therefore mispair every later result. The only safe response is terminal.
+    packet.close(error);
   };
 }
 
@@ -223,9 +270,14 @@ export interface AdaptHostOptions {
   unit?: Unit;
 }
 
+export interface CreatePacketOptions {
+  deferredExposure?: boolean;
+}
+
 export class AdaptHost {
   private wrapper?: AdaptWrapper;
   private readonly packets = new Map<string, Packet>();
+  private readonly exposedPackets = new Set<string>();
   private readonly brokerUrl: string;
   private readonly log: Logger;
   readonly unit: Unit;
@@ -257,10 +309,16 @@ export class AdaptHost {
     this.wrapper.start();
   }
 
-  createPacket(name: string, seed: string, signingSecret?: string): Promise<Packet> {
+  createPacket(
+    name: string,
+    seed: string,
+    signingSecret?: string,
+    options: CreatePacketOptions = {},
+  ): Promise<Packet> {
     const wrapper = this.wrapper;
     if (!wrapper) return Promise.reject(new Error('AdaptHost.boot() must complete before creating packets'));
     const config = new PacketWrapperConfigurator();
+    config.deferred_exposure = options.deferredExposure ?? false;
     const args = [
       '--unit_hash', this.unit.hash,
       '--seed_phrase', seed,
@@ -284,8 +342,22 @@ export class AdaptHost {
           settled = true;
           clearTimeout(timer);
           const cid = withScope((lifetime) => pw.packet.GetContainerID().Attach(lifetime).Visualize());
-          const packet = new Packet(name, cid, pw);
+          let packet!: Packet;
+          packet = new Packet(name, cid, pw, (error) => {
+            // Never dispose a wrapper while its SDK callback stack is active.
+            // Closing is synchronous (so queued/future calls are already barred);
+            // native removal follows at the next microtask boundary.
+            queueMicrotask(() => {
+              if (this.packets.get(cid) !== packet) return;
+              try {
+                this.removePacket(cid, error);
+              } catch (removeError) {
+                this.log(`[${name}] terminal packet removal failed:`, removeError);
+              }
+            });
+          });
           this.packets.set(cid, packet);
+          if (!config.deferred_exposure) this.exposedPackets.add(cid);
           resolveCreate(packet);
         }, this.unit.contents);
       } catch (error) {
@@ -297,11 +369,28 @@ export class AdaptHost {
     });
   }
 
-  removePacket(cid: string): void {
+  exposePacket(cid: string): void {
+    const wrapper = this.wrapper;
+    const packet = this.packets.get(cid);
+    if (!wrapper || !packet) throw new Error(`cannot expose unknown packet ${cid}`);
+    if (packet.isClosed) throw new Error(`cannot expose closed packet ${cid}`);
+    wrapper.expose_packet(cid);
+    this.exposedPackets.add(cid);
+  }
+
+  isPacketExposed(cid: string): boolean {
+    return this.exposedPackets.has(cid);
+  }
+
+  removePacket(cid: string, error = new Error(`packet ${cid} removed from host`)): void {
     const wrapper = this.wrapper;
     if (!wrapper) throw new Error('AdaptHost is not booted');
+    const packet = this.packets.get(cid);
+    if (!packet) return;
+    packet.close(error);
     wrapper.remove_packet(cid);
     this.packets.delete(cid);
+    this.exposedPackets.delete(cid);
   }
 
   close(): void {
@@ -309,7 +398,7 @@ export class AdaptHost {
     const errors: Error[] = [];
     for (const cid of [...this.packets.keys()]) {
       try {
-        this.removePacket(cid);
+        this.removePacket(cid, new Error('AdaptHost closed'));
       } catch (error) {
         errors.push(asError(error));
       }

@@ -80,6 +80,50 @@ function renderRawInbox(packet) {
   });
 }
 
+function fakePacket(name = 'fake') {
+  const submitted = [];
+  const pw = {
+    add_client_message(message) { submitted.push(message); },
+    packet: {},
+  };
+  const terminal = [];
+  const packet = new Packet(
+    name,
+    `${name}-cid`,
+    pw,
+    (error) => terminal.push(error),
+    () => ({ Destroy() {} }),
+  );
+  wireHandlers(packet, { onSaveState: () => {}, onNotify: () => {} }, () => {});
+  return { packet, pw, submitted, terminal };
+}
+
+function fakeReturnData(kind, payload = {}) {
+  let destroyed = false;
+  const leaf = (value) => ({
+    Visualize: () => String(value),
+    Detach() { return this; },
+    Destroy() { destroyed = true; },
+  });
+  return {
+    Attach(lifetime) { lifetime.Deposit(this); return this; },
+    Reduce(key) {
+      if (key === 'kind') return leaf(kind);
+      if (key === 'payload') return leaf(payload);
+      return leaf('');
+    },
+    Destroy() { destroyed = true; },
+    get destroyed() { return destroyed; },
+  };
+}
+
+async function settledWithin(promises, timeoutMs = 250) {
+  return Promise.race([
+    Promise.allSettled(promises),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('pending work did not settle')), timeoutMs)),
+  ]);
+}
+
 async function runPacketDriver() {
   const stateDir = mkdtempSync(join(tmpdir(), 'ours-cowork-registry-'));
   const port = await unusedPort();
@@ -101,6 +145,9 @@ async function runPacketDriver() {
     await host.boot();
 
     let failStateWrite = false;
+    let holdRestore = false;
+    let signalRestoreEntered;
+    let releaseRestore;
     const persistence = new Proxy(fs, {
       get(target, property) {
         if (property === 'writeSync') {
@@ -116,7 +163,14 @@ async function runPacketDriver() {
         return Reflect.get(target, property);
       },
     });
-    const registry = new PacketRegistry(host, stateDir, { persistence });
+    const registry = new PacketRegistry(host, stateDir, {
+      persistence,
+      beforeExpose: async (packet) => {
+        if (!holdRestore) return;
+        signalRestoreEntered(packet);
+        await new Promise((done) => { releaseRestore = done; });
+      },
+    });
     const [alpha, beta, gamma] = await Promise.all([
       registry.create('alpha'),
       registry.create('beta'),
@@ -155,15 +209,16 @@ async function runPacketDriver() {
       'peer acceptance by gamma room',
     );
 
-    failStateWrite = true;
-    await assert.rejects(
-      gamma.send(peer.cid, 'must-not-escape'),
-      (error) => error instanceof PacketPersistenceError && error.cause?.code === 'ENOSPC',
+    const alphaInvite = await alpha.mintInvite('public');
+    await withScopeAsync(async (lifetime) => {
+      await peer.mutatingTx('::a2a_messaging::add_contact', {
+        invite: peer.newBinary(unpackInvite(alphaInvite.blob), lifetime),
+      }, lifetime);
+    });
+    await waitFor(
+      () => alpha.listContacts().some((contact) => contact.container_id === peer.cid),
+      'peer acceptance by alpha room',
     );
-    await sleep(500);
-    assert.equal(renderRawInbox(peer).some((message) => message.text === 'must-not-escape'), false,
-      'SEND must stay buffered when state persistence fails');
-    failStateWrite = false;
 
     await withScopeAsync((lifetime) =>
       peer.mutatingTx('::a2a_messaging::send_message', { contact: gamma.cid, text: 'first' }, lifetime));
@@ -178,6 +233,16 @@ async function runPacketDriver() {
     assert.equal(consumed.deferred.length, 1);
     assert.deepEqual(gamma.peekInbox().map((message) => message.msg_id), consumed.deferred,
       'unexpected drained arrivals must be unread again before consume resolves');
+
+    failStateWrite = true;
+    await assert.rejects(
+      gamma.send(peer.cid, 'must-not-escape'),
+      (error) => error instanceof PacketPersistenceError && error.cause?.code === 'ENOSPC',
+    );
+    await sleep(500);
+    assert.equal(renderRawInbox(peer).some((message) => message.text === 'must-not-escape'), false,
+      'SEND must stay buffered when state persistence fails');
+    failStateWrite = false;
 
     const alphaLive = join(stateDir, 'rooms', 'alpha', 'live');
     const betaLive = join(stateDir, 'rooms', 'beta', 'live');
@@ -195,8 +260,49 @@ async function runPacketDriver() {
     fs.mkdirSync(alphaLive, { recursive: true, mode: 0o700 });
     fs.writeFileSync(join(alphaLive, 'identity.key'), secret, { mode: 0o600 });
     fs.writeFileSync(join(alphaLive, 'state_data.bin'), state, { mode: 0o600 });
-    const restored = await registry.restore('alpha');
+    holdRestore = true;
+    const restoreEntered = new Promise((done) => { signalRestoreEntered = done; });
+    const restorePromise = registry.restore('alpha');
+    const quarantined = await restoreEntered;
+    assert.equal(quarantined.cid, alphaCid);
+    assert.equal(host.isPacketExposed(alphaCid), false,
+      'restored CID must remain quarantined through import and handler wiring');
+    await withScopeAsync((lifetime) =>
+      peer.mutatingTx('::a2a_messaging::send_message', {
+        contact: alphaCid,
+        text: 'queued-before-exposure',
+      }, lifetime));
+    await sleep(300);
+    assert.equal(quarantined.peekInbox().some((message) => message.text === 'queued-before-exposure'), false,
+      'early traffic must not execute locally while the restored packet is quarantined');
+    releaseRestore();
+    const restored = await restorePromise;
+    holdRestore = false;
     assert.equal(restored.cid, alphaCid, 'restored signing secret must reproduce the CID');
+    assert.equal(host.isPacketExposed(alphaCid), true);
+    assert.equal(restored.peekInbox().some((message) => message.text === 'queued-before-exposure'), false,
+      'offline broker traffic must not have executed against pre-import packet state');
+    await withScopeAsync((lifetime) =>
+      peer.mutatingTx('::a2a_messaging::send_message', {
+        contact: alphaCid,
+        text: 'sent-after-exposure',
+      }, lifetime));
+    await waitFor(
+      () => restored.peekInbox().some((message) => message.text === 'sent-after-exposure'),
+      'traffic after imported state is exposed',
+    );
+
+    const removable = await host.createPacket('pending-removal', `pending-${Date.now()}`);
+    wireHandlers(removable, { onSaveState: () => {}, onNotify: () => {} }, () => {});
+    let removalSubmissions = 0;
+    removable.pw.add_client_message = () => { removalSubmissions += 1; };
+    const activeRemoval = removable.mutatingTx('active-removal', {});
+    const queuedRemoval = removable.mutatingTx('queued-removal', {});
+    await new Promise((done) => setImmediate(done));
+    host.removePacket(removable.cid, new Error('removed with pending work'));
+    const removalOutcomes = await settledWithin([activeRemoval, queuedRemoval]);
+    assert.deepEqual(removalOutcomes.map((outcome) => outcome.status), ['rejected', 'rejected']);
+    assert.equal(removalSubmissions, 1, 'native remove must close before queued work can submit');
 
     await registry.destroy('alpha');
     await registry.destroy('gamma');
@@ -316,6 +422,50 @@ test('PacketRegistry public lifecycle surface is standalone', () => {
     assert.match(placeholder, /Build-only placeholder/);
     assert.doesNotMatch(placeholder, /ours-mcp|@ours\.network\/mcp/);
   }
+});
+
+test('a submitted timeout terminalizes the packet without enqueueing or pairing a later result', async () => {
+  const { packet, pw, submitted, terminal } = fakePacket('timeout');
+  const first = packet.mutatingTx('first', {}, undefined, 10);
+  const second = packet.mutatingTx('second', {}, undefined, 10);
+  const outcomes = await settledWithin([first, second]);
+  assert.deepEqual(outcomes.map((outcome) => outcome.status), ['rejected', 'rejected']);
+  assert.equal(submitted.length, 1, 'queued mutation must never submit after terminal timeout');
+  assert.equal(terminal.length, 1);
+
+  // A detached return arriving after terminalization is consumed/destroyed and
+  // cannot settle the queued call or make a future mutation legal.
+  const late = fakeReturnData('return_data', { call: 'late-first' });
+  pw.on_return_data(late);
+  assert.equal(late.destroyed, true);
+  await assert.rejects(packet.mutatingTx('third', {}), /timed out|closed|terminal/i);
+  assert.equal(submitted.length, 1);
+});
+
+test('origin-ambiguous transaction failure terminalizes current and queued mutations', async () => {
+  const { packet, pw, submitted, terminal } = fakePacket('ambiguous');
+  const first = packet.mutatingTx('local-first', {});
+  const second = packet.mutatingTx('must-not-enqueue', {});
+  await new Promise((done) => setImmediate(done));
+  assert.equal(submitted.length, 1);
+  pw.on_transaction_failure('could be inbound');
+  const outcomes = await settledWithin([first, second]);
+  assert.deepEqual(outcomes.map((outcome) => outcome.status), ['rejected', 'rejected']);
+  assert.equal(submitted.length, 1);
+  assert.equal(terminal.length, 1);
+  await assert.rejects(packet.mutatingTx('future', {}), /could be inbound|closed|terminal/i);
+});
+
+test('Packet.close rejects active and queued work before another envelope is submitted', async () => {
+  const { packet, submitted } = fakePacket('close');
+  const first = packet.mutatingTx('active', {});
+  const second = packet.mutatingTx('queued', {});
+  await new Promise((done) => setImmediate(done));
+  packet.close(new Error('explicit packet teardown'));
+  const outcomes = await settledWithin([first, second]);
+  assert.deepEqual(outcomes.map((outcome) => outcome.status), ['rejected', 'rejected']);
+  assert.equal(submitted.length, 1);
+  await assert.rejects(packet.mutatingTx('future', {}), /explicit packet teardown/);
 });
 
 async function runDriverChild(t, { extraArgs = [], timeoutMs }) {

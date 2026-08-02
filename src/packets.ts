@@ -107,6 +107,7 @@ export interface PacketRegistryOptions {
   persistence?: PacketPersistenceOps;
   log?: (...parts: unknown[]) => void;
   seed?: () => string;
+  beforeExpose?: (packet: RoomPacket) => void | Promise<void>;
 }
 
 export class PacketRegistry {
@@ -117,6 +118,7 @@ export class PacketRegistry {
   private readonly persistence: PacketPersistenceOps;
   private readonly log: (...parts: unknown[]) => void;
   private readonly seed: () => string;
+  private readonly beforeExpose: (packet: RoomPacket) => void | Promise<void>;
 
   constructor(
     host: AdaptHost,
@@ -129,6 +131,7 @@ export class PacketRegistry {
     this.persistence = options.persistence ?? this.fs;
     this.log = options.log ?? (() => {});
     this.seed = options.seed ?? (() => randomBytes(24).toString('hex'));
+    this.beforeExpose = options.beforeExpose ?? (() => {});
   }
 
   get size(): number {
@@ -181,7 +184,17 @@ export class PacketRegistry {
     const stateBytes = this.fs.readFileSync(this.statePath(roomId));
     if (stateBytes.length === 0) throw new Error(`empty packet state for room "${roomId}"`);
 
-    const native = await this.host.createPacket(this.packetName(roomId), this.seed(), secret);
+    // Restore-before-exposure is an SDK 0.10.12 native facility: while this
+    // packet is quarantined it has no local routing and no broker registration.
+    // Early traffic therefore cannot execute against fresh packet state. Relay
+    // retention is broker policy (the local 0.10.12 test broker drops it), so the
+    // host makes no delivery claim for traffic sent while the CID is offline.
+    const native = await this.host.createPacket(
+      this.packetName(roomId),
+      this.seed(),
+      secret,
+      { deferredExposure: true },
+    );
     const room = new HostedRoomPacket(native, () => this.saveState(native, liveDir), this.log);
     try {
       await withScopeAsync(async (lifetime) => {
@@ -189,6 +202,8 @@ export class PacketRegistry {
         await native.mutatingTx('::actor::import_state', state, lifetime);
       });
       native.pw.refresh_identity_proof_document();
+      await this.beforeExpose(room);
+      this.host.exposePacket(native.cid);
       this.packets.set(roomId, room);
       return room;
     } catch (error) {

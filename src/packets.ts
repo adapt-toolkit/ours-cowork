@@ -221,16 +221,28 @@ export class PacketRegistry {
   async destroy(roomId: string): Promise<string[]> {
     validateRoomId(roomId);
     const room = this.packets.get(roomId);
-    if (!room) throw new Error(`room packet "${roomId}" is not hosted`);
-    this.host.removePacket(room.cid);
-    this.packets.delete(roomId);
-    const liveDir = this.liveDir(roomId);
-    try {
-      this.fs.rmSync(liveDir, { recursive: true, force: true });
-    } catch (error) {
-      this.log(`[${room.name}] live-state removal failed:`, error);
+    if (room) {
+      this.host.removePacket(room.cid);
+      this.packets.delete(roomId);
     }
-    return this.residue(roomId);
+    const liveDir = this.liveDir(roomId);
+    let removalFailure: unknown;
+    try {
+      this.assertSafeRoomDirectory(roomId);
+      this.fs.rmSync(liveDir, { recursive: true, force: true });
+      this.fsyncDirectory(this.roomDir(roomId));
+    } catch (error) {
+      this.log(`[${room?.name ?? this.packetName(roomId)}] live-state removal failed:`, error);
+      removalFailure = error;
+    }
+    const residue = this.residue(roomId);
+    if (removalFailure !== undefined && residue.length === 0) {
+      throw new PacketPersistenceError(
+        `live-state removal durability is uncertain for room "${roomId}"`,
+        { cause: removalFailure },
+      );
+    }
+    return residue;
   }
 
   private saveState(packet: Packet, liveDir: string): void {
@@ -245,14 +257,39 @@ export class PacketRegistry {
   }
 
   private residue(roomId: string): string[] {
-    const candidates = [this.identityPath(roomId), this.statePath(roomId), this.liveDir(roomId)];
-    return candidates.filter((path) => this.fs.existsSync(path));
+    const liveDir = this.liveDir(roomId);
+    try {
+      this.fs.lstatSync(liveDir);
+      return [liveDir];
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
   }
 
   private packetName(roomId: string): string { return `cowork-room-${roomId}`; }
-  private liveDir(roomId: string): string { return join(this.stateDir, 'rooms', roomId, 'live'); }
+  private roomDir(roomId: string): string { return join(this.stateDir, 'rooms', roomId); }
+  private liveDir(roomId: string): string { return join(this.roomDir(roomId), 'live'); }
   private identityPath(roomId: string): string { return join(this.liveDir(roomId), 'identity.key'); }
   private statePath(roomId: string): string { return join(this.liveDir(roomId), 'state_data.bin'); }
+
+  private assertSafeRoomDirectory(roomId: string): void {
+    const roomDir = this.roomDir(roomId);
+    const stat = this.fs.lstatSync(roomDir);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`room directory for "${roomId}" is not a safe directory`);
+    }
+  }
+
+  private fsyncDirectory(path: string): void {
+    let fd: number | undefined;
+    try {
+      fd = this.fs.openSync(path, nodeFs.constants.O_RDONLY | (nodeFs.constants.O_NOFOLLOW ?? 0));
+      this.fs.fsyncSync(fd);
+    } finally {
+      if (fd !== undefined) this.fs.closeSync(fd);
+    }
+  }
 }
 
 export class HostedRoomPacket implements RoomPacket {
@@ -366,23 +403,18 @@ export class HostedRoomPacket implements RoomPacket {
     notified: boolean;
     key_material_retained: true;
   }> {
-    try {
-      return await withScopeAsync(async (lifetime) => {
-        const result = await this.packet.mutatingTx(
-          '::a2a_messaging::remove_contact',
-          { contact: contactCid },
-          lifetime,
-        );
-        return {
-          status: 'queued' as const,
-          notified: booleanValue(result.Reduce('notified')),
-          key_material_retained: true as const,
-        };
-      });
-    } catch (error) {
-      if (error instanceof PacketPersistenceError) throw error;
-      return { status: 'send_failed', notified: false, key_material_retained: true };
-    }
+    return withScopeAsync(async (lifetime) => {
+      const result = await this.packet.mutatingTx(
+        '::a2a_messaging::remove_contact',
+        { contact: contactCid },
+        lifetime,
+      );
+      return {
+        status: 'queued' as const,
+        notified: booleanValue(result.Reduce('notified')),
+        key_material_retained: true as const,
+      };
+    });
   }
 
   async sign(canonicalJson: string): Promise<string> {

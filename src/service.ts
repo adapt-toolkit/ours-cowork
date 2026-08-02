@@ -42,13 +42,19 @@ const HistoryOptionsSchema = z.object({
   limit: z.number().int().positive().safe().optional(),
 }).strict();
 
-type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | 'append' | 'read'>;
+const DeleteRoomInputSchema = z.object({
+  confirm: z.literal(true),
+}).strict();
+
+type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | 'append' | 'read' | 'delete'>;
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
+type CloseNoticeIntentRecord = Extract<CommunicationRecord, { kind: 'close_notice_intent' }>;
 
 export interface RoomPacketRegistry {
   get(roomId: string): RoomPacket | undefined;
   create(roomId: string, identityName?: string, bio?: string): Promise<RoomPacket>;
   restore?(roomId: string, expectedCid?: string): Promise<RoomPacket>;
+  destroy(roomId: string): Promise<string[]>;
 }
 
 export interface RoomServiceOptions {
@@ -63,6 +69,13 @@ export interface InviteReceipt {
   blob: string;
   reusable: boolean;
   recovery_of?: string;
+}
+
+export interface DeleteRoomReceipt {
+  version: 1;
+  room_id: string;
+  deleted: true;
+  scope: 'this_host';
 }
 
 export class RoomServiceError extends Error {
@@ -409,6 +422,49 @@ export class RoomService {
     return this.store.read(id, page);
   }
 
+  /**
+   * Forward-only close. Every external contact mutation is preceded by a
+   * durable intent and the packet/live-state purge precedes terminal metadata.
+   */
+  async closeRoom(roomId: string): Promise<Room> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    return this.lock(id, async () => {
+      let room = await this.store.load(id);
+      if (room.state === 'closed') return room;
+      if (room.state !== 'closing') {
+        room = await this.store.save(RoomSchema.parse({ ...room, state: 'closing' }));
+      }
+      return this.closeUnlocked(room);
+    });
+  }
+
+  /** Delete only retained state belonging to this host after explicit consent. */
+  async deleteRoom(roomId: string, input: unknown): Promise<DeleteRoomReceipt> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    DeleteRoomInputSchema.parse(input);
+    return this.lock(id, async () => {
+      let room: Room | undefined;
+      try {
+        room = await this.store.load(id);
+      } catch (error) {
+        // CoworkStore.delete is itself fail-closed and recognizes only the
+        // archive-first partial stages produced by an earlier confirmed call.
+        // Let it distinguish such a resumable stage from malformed live data.
+        try {
+          await this.store.delete(id);
+        } catch {
+          throw error;
+        }
+        return this.deleteReceipt(id);
+      }
+      if (room.state !== 'closed') {
+        throw new RoomServiceError(`room "${id}" must be closed before it can be deleted`);
+      }
+      await this.store.delete(id);
+      return this.deleteReceipt(id);
+    });
+  }
+
   async postMessage(roomId: string, input: unknown): Promise<MessageRecord> {
     // Parse the caller-controlled object in full before consulting or assigning
     // any host-owned authorship fields. Strict parsing rejects every author-like
@@ -520,6 +576,129 @@ export class RoomService {
       for (const seat of newSeats) await this.ensureLateBriefing(next, seat);
     }
     return this.store.save(next);
+  }
+
+  private async closeUnlocked(room: Room): Promise<Room> {
+    const roomId = room.room_id;
+    const packet = this.packets.get(roomId);
+    if (packet) {
+      let records = await this.store.read(roomId);
+      let contacts = currentContactIdentities(packet);
+      const completed = new Set(records
+        .filter((record) => record.kind === 'close_notice_result')
+        .map((record) => record.kind === 'close_notice_result' ? record.intent_record_id : ''));
+      const pending = records.filter(
+        (record): record is CloseNoticeIntentRecord =>
+          record.kind === 'close_notice_intent' && !completed.has(record.record_id),
+      );
+
+      // A result-less intent plus an absent contact is the only durable proof
+      // available after an origin-ambiguous remove. It is explicitly recorded
+      // as uncertain, never upgraded into a successful notice claim.
+      for (const intent of pending) {
+        if (contacts.has(intent.recipient_identity)) continue;
+        await this.appendUncertainCloseResult(roomId, intent);
+        completed.add(intent.record_id);
+      }
+
+      for (const recipientIdentity of contacts) {
+        records = await this.store.read(roomId);
+        const currentCompleted = new Set(records
+          .filter((record) => record.kind === 'close_notice_result')
+          .map((record) => record.kind === 'close_notice_result' ? record.intent_record_id : ''));
+        let intent = [...records].reverse().find(
+          (record): record is CloseNoticeIntentRecord => record.kind === 'close_notice_intent'
+            && record.recipient_identity === recipientIdentity
+            && !currentCompleted.has(record.record_id),
+        );
+        if (!intent) {
+          const appended = await this.store.append(roomId, {
+            version: 1,
+            kind: 'close_notice_intent',
+            room_id: roomId,
+            at: this.now(),
+            recipient_identity: recipientIdentity,
+          });
+          if (appended.kind !== 'close_notice_intent') {
+            throw new RoomServiceError('storage returned the wrong close notice intent kind');
+          }
+          intent = appended;
+        }
+
+        // Throws are origin-ambiguous: deliberately leave the intent without
+        // a result so recovery can inspect the contact before deciding.
+        const outcome = await packet.removeContact(recipientIdentity);
+        const appended = await this.store.append(roomId, {
+          version: 1,
+          kind: 'close_notice_result',
+          room_id: roomId,
+          at: this.now(),
+          intent_record_id: intent.record_id,
+          recipient_identity: recipientIdentity,
+          status: outcome.status,
+          notified: outcome.notified,
+          key_material_retained: outcome.key_material_retained,
+        });
+        if (appended.kind !== 'close_notice_result') {
+          throw new RoomServiceError('storage returned the wrong close notice result kind');
+        }
+      }
+
+      contacts = currentContactIdentities(packet);
+      if (contacts.size > 0) {
+        throw new RoomServiceError(
+          `room "${roomId}" still has contacts after removal: ${[...contacts].join(', ')}`,
+        );
+      }
+    }
+
+    const residue = await this.packets.destroy(roomId);
+    if (this.packets.get(roomId) || residue.length > 0) {
+      throw new RoomServiceError(
+        `room "${roomId}" live-state purge left residue: ${residue.join(', ') || 'packet registry entry'}`,
+      );
+    }
+
+    // If the packet was already absent, successful bounded purge is proof
+    // that result-less contacts no longer exist locally. Preserve uncertainty.
+    const afterPurge = await this.store.read(roomId);
+    const completedAfterPurge = new Set(afterPurge
+      .filter((record) => record.kind === 'close_notice_result')
+      .map((record) => record.kind === 'close_notice_result' ? record.intent_record_id : ''));
+    for (const intent of afterPurge.filter(
+      (record): record is CloseNoticeIntentRecord =>
+        record.kind === 'close_notice_intent' && !completedAfterPurge.has(record.record_id),
+    )) {
+      await this.appendUncertainCloseResult(roomId, intent);
+      completedAfterPurge.add(intent.record_id);
+    }
+
+    return this.store.save(RoomSchema.parse({ ...room, state: 'closed', closed_at: this.now() }));
+  }
+
+  private async appendUncertainCloseResult(
+    roomId: string,
+    intent: CloseNoticeIntentRecord,
+  ): Promise<void> {
+    const appended = await this.store.append(roomId, {
+      version: 1,
+      kind: 'close_notice_result',
+      room_id: roomId,
+      at: this.now(),
+      intent_record_id: intent.record_id,
+      recipient_identity: intent.recipient_identity,
+      status: 'send_failed',
+      notified: false,
+      key_material_retained: true,
+      uncertain_after_restart: true,
+    });
+    if (appended.kind !== 'close_notice_result') {
+      throw new RoomServiceError('storage returned the wrong uncertain close notice result kind');
+    }
+  }
+
+  private deleteReceipt(roomId: string): DeleteRoomReceipt {
+    return { version: 1, room_id: roomId, deleted: true, scope: 'this_host' };
   }
 
   private async ensureActivationBriefing(room: Room, recipients: Seat[]): Promise<string> {
@@ -641,4 +820,8 @@ function generateUlid(): string {
 
 function uniqueIdentities(identities: string[]): string[] {
   return [...new Set(identities)];
+}
+
+function currentContactIdentities(packet: RoomPacket): Set<string> {
+  return new Set(packet.listContacts().map((contact) => contact.container_id));
 }

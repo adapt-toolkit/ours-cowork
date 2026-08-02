@@ -294,12 +294,26 @@ export class CoworkStore {
       if (unexpected.length > 0) {
         throw new CoworkStorageError(`room "${validRoomId}" contains live or unexpected residue: ${unexpected.join(', ')}`);
       }
-      if (this.lstatIfPresent(archivePath)) {
+      const archivePresent = this.lstatIfPresent(archivePath) !== undefined;
+      const metadataPresent = this.lstatIfPresent(metadataPath) !== undefined;
+      if (metadataPresent) {
+        const room = this.loadUnlocked(validRoomId);
+        if (room.state !== 'closed') {
+          throw new CoworkStorageError(`room "${validRoomId}" must be closed before deletion`);
+        }
+      } else if (archivePresent) {
+        // The only valid resumable order removes archive.jsonl first. Missing
+        // metadata while an archive remains is therefore not a deletion stage.
+        throw new CoworkStorageError(
+          `room "${validRoomId}" has archive residue without deletion metadata`,
+        );
+      }
+      if (archivePresent) {
         this.assertRegularFile(archivePath, 'room archive');
         this.fs.unlinkSync(archivePath);
         this.fsyncDirectory(roomDir);
       }
-      if (this.lstatIfPresent(metadataPath)) {
+      if (metadataPresent) {
         this.assertRegularFile(metadataPath, 'room metadata');
         this.fs.unlinkSync(metadataPath);
         this.fsyncDirectory(roomDir);

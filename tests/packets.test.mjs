@@ -229,6 +229,58 @@ async function runPacketDriver() {
       assert.fail('deliberate packet registry driver assertion failure');
     }
 
+    const markerFailureId = 'marker-enospc';
+    const markerFailureName = `live.staging-${'56'.repeat(16)}`;
+    const markerOpenPaths = new Map();
+    let injectMarkerEnospc = true;
+    const markerFailurePersistence = new Proxy(fs, {
+      get(target, property) {
+        if (property === 'openSync') return (path, flags, mode) => {
+          const fd = target.openSync(path, flags, mode);
+          markerOpenPaths.set(fd, String(path));
+          return fd;
+        };
+        if (property === 'closeSync') return (fd) => {
+          markerOpenPaths.delete(fd);
+          return target.closeSync(fd);
+        };
+        if (property === 'writeSync') return (fd, bytes, offset, length, position) => {
+          if (injectMarkerEnospc && markerOpenPaths.get(fd)?.includes('.cowork-provisioning-v1.tmp-')) {
+            injectMarkerEnospc = false;
+            throw Object.assign(new Error('injected native marker ENOSPC'), { code: 'ENOSPC' });
+          }
+          return target.writeSync(fd, bytes, offset, length, position);
+        };
+        return Reflect.get(target, property);
+      },
+    });
+    const markerInterrupted = new PacketRegistry(host, stateDir, {
+      persistence: markerFailurePersistence,
+      stagingName: () => markerFailureName,
+    });
+    await assert.rejects(
+      markerInterrupted.create(markerFailureId, 'Marker Retry', 'Marker retry bio'),
+      (error) => error instanceof PacketPersistenceError && error.cause?.code === 'ENOSPC',
+    );
+    const markerFailureRoom = join(stateDir, 'rooms', markerFailureId);
+    fs.writeFileSync(join(markerFailureRoom, markerFailureName, 'exact-failed-stage-byte'), 'preserve me');
+    const markerResumed = new PacketRegistry(host, stateDir);
+    const markerPacket = await markerResumed.create(markerFailureId, 'Marker Retry', 'Marker retry bio');
+    assert(markerPacket.cid, 'marker ENOSPC restart must establish a fresh packet CID');
+    assert.match(fs.readFileSync(join(markerFailureRoom, 'live', 'identity.key'), 'utf8').trim(), /^[0-9a-f]+$/i);
+    assert(fs.readFileSync(join(markerFailureRoom, 'live', 'state_data.bin')).length > 0);
+    assert.equal(
+      fs.readFileSync(join(markerFailureRoom, 'provisioning-residue', 'exact-failed-stage-byte'), 'utf8'),
+      'preserve me',
+    );
+    assert.equal(fs.existsSync(join(markerFailureRoom, '.cowork-provisioning-stage')), false);
+    assert.deepEqual(
+      fs.readdirSync(markerFailureRoom).filter((name) => name.startsWith('live.staging-')),
+      [],
+    );
+    await markerResumed.destroy(markerFailureId);
+    progress('provision-marker-enospc');
+
     for (const stage of ['mkdir', 'identity', 'state', 'identity_applied']) {
       const roomId = `crash-${stage.replace('_', '-')}`;
       fs.mkdirSync(join(stateDir, 'rooms', roomId), { recursive: true, mode: 0o700 });
@@ -681,6 +733,97 @@ test('staging collision never acquires or deletes unknown ownership and retry st
     fs.readdirSync(roomDir).filter((name) => name.startsWith('live.staging-')),
     [collisionName],
     'retry must not suffix or leak additional staging paths',
+  );
+});
+
+test('marker persistence failure quarantines the exact stage before a bounded retry', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'ours-cowork-marker-failure-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const roomDir = join(root, 'rooms', roomId);
+  const failedName = `live.staging-${'ef'.repeat(16)}`;
+  const retryName = `live.staging-${'12'.repeat(16)}`;
+  const openPaths = new Map();
+  let failMarkerWrite = true;
+  const persistence = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'openSync') return (path, flags, mode) => {
+        const fd = target.openSync(path, flags, mode);
+        openPaths.set(fd, String(path));
+        return fd;
+      };
+      if (property === 'closeSync') return (fd) => {
+        openPaths.delete(fd);
+        return target.closeSync(fd);
+      };
+      if (property === 'writeSync') return (fd, bytes, offset, length, position) => {
+        if (failMarkerWrite && openPaths.get(fd)?.includes('.cowork-provisioning-v1.tmp-')) {
+          failMarkerWrite = false;
+          throw Object.assign(new Error('injected marker ENOSPC'), { code: 'ENOSPC' });
+        }
+        return target.writeSync(fd, bytes, offset, length, position);
+      };
+      return Reflect.get(target, property);
+    },
+  });
+  let nativeCreates = 0;
+  const host = {
+    async createPacket() {
+      nativeCreates += 1;
+      throw new Error('fresh provisioning boundary reached');
+    },
+  };
+
+  const interrupted = new PacketRegistry(host, root, {
+    persistence,
+    stagingName: () => failedName,
+  });
+  await assert.rejects(
+    interrupted.create(roomId),
+    (error) => error instanceof PacketPersistenceError && error.cause?.code === 'ENOSPC',
+  );
+  assert.equal(nativeCreates, 0, 'marker failure must precede native packet creation');
+  const failedStage = join(roomDir, failedName);
+  fs.writeFileSync(join(failedStage, 'unknown-after-failure'), 'preserve exact bytes');
+
+  const retry = new PacketRegistry(host, root, { stagingName: () => retryName });
+  await assert.rejects(retry.create(roomId), /fresh provisioning boundary reached/);
+  assert.equal(nativeCreates, 1);
+  assert.equal(
+    fs.readFileSync(join(roomDir, 'provisioning-residue', 'unknown-after-failure'), 'utf8'),
+    'preserve exact bytes',
+  );
+  assert.equal(fs.readFileSync(join(roomDir, 'live', '.cowork-provisioning-v1'), 'utf8'), `${roomId}\n`);
+  assert.equal(fs.existsSync(join(roomDir, '.cowork-provisioning-stage')), false);
+  assert.deepEqual(
+    fs.readdirSync(roomDir).filter((name) => name.startsWith('live.staging-')),
+    [],
+    'restart must leave no suffix or staging leak',
+  );
+});
+
+test('marker-failure recovery preserves the journal, stage, and fixed residue on collision', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'ours-cowork-marker-residue-collision-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const roomDir = join(root, 'rooms', roomId);
+  const failedName = `live.staging-${'34'.repeat(16)}`;
+  fs.mkdirSync(join(roomDir, failedName), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(join(roomDir, failedName, 'failed-stage-byte'), 'stage');
+  fs.mkdirSync(join(roomDir, 'provisioning-residue'), { mode: 0o700 });
+  fs.writeFileSync(join(roomDir, 'provisioning-residue', 'prior-residue-byte'), 'residue');
+  fs.writeFileSync(join(roomDir, '.cowork-provisioning-stage'), `${failedName}\n`, { mode: 0o600 });
+  const registry = new PacketRegistry({
+    createPacket: () => assert.fail('residue collision must fail before native create'),
+  }, root);
+
+  await assert.rejects(registry.create(roomId), /staging.*existing provisioning residue|residue.*staging/i);
+  assert.equal(fs.readFileSync(join(roomDir, failedName, 'failed-stage-byte'), 'utf8'), 'stage');
+  assert.equal(fs.readFileSync(join(roomDir, 'provisioning-residue', 'prior-residue-byte'), 'utf8'), 'residue');
+  assert.equal(fs.readFileSync(join(roomDir, '.cowork-provisioning-stage'), 'utf8'), `${failedName}\n`);
+  assert.deepEqual(
+    fs.readdirSync(roomDir).filter((name) => name.startsWith('provisioning-residue')),
+    ['provisioning-residue'],
   );
 });
 

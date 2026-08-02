@@ -409,35 +409,72 @@ export class PacketRegistry {
 
   private cleanupOwnedStaging(roomId: string): void {
     const journal = this.stagingJournalPath(roomId);
-    let stagingName: string;
-    try { stagingName = this.fs.readFileSync(journal, 'utf8').trim(); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-      throw error;
-    }
-    if (!/^live\.staging-[0-9a-f]{32}$/.test(stagingName)) {
-      throw new PacketPersistenceError(`invalid provisioning staging journal for room "${roomId}"`);
-    }
-    const stagingDir = join(this.roomDir(roomId), stagingName);
-    if (this.fs.existsSync(stagingDir)) {
-      const stat = this.fs.lstatSync(stagingDir);
-      if (stat.isSymbolicLink() || !stat.isDirectory()) {
-        throw new PacketPersistenceError(`unsafe provisioning staging path for room "${roomId}"`);
-      }
-      let owned = false;
+    let journalFd: number | undefined;
+    try {
       try {
-        owned = this.fs.readFileSync(join(stagingDir, '.cowork-provisioning-v1'), 'utf8') === `${roomId}\n`;
-      } catch { /* an unmarked staging path has uncertain ownership */ }
-      if (!owned) {
+        journalFd = this.fs.openSync(
+          journal,
+          nodeFs.constants.O_RDONLY | (nodeFs.constants.O_NOFOLLOW ?? 0),
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        throw error;
+      }
+      const journalStat = this.fs.fstatSync(journalFd);
+      if (!journalStat.isFile() || journalStat.size > 128) {
+        throw new PacketPersistenceError(`unsafe provisioning staging journal for room "${roomId}"`);
+      }
+      const stagingName = this.fs.readFileSync(journalFd, 'utf8').trim();
+      if (!/^live\.staging-[0-9a-f]{32}$/.test(stagingName)) {
+        throw new PacketPersistenceError(`invalid provisioning staging journal for room "${roomId}"`);
+      }
+      const roomDir = this.roomDir(roomId);
+      const stagingDir = join(roomDir, stagingName);
+      if (this.fs.existsSync(stagingDir)) {
+        const stat = this.fs.lstatSync(stagingDir);
+        if (stat.isSymbolicLink() || !stat.isDirectory()) {
+          throw new PacketPersistenceError(`unsafe provisioning staging path for room "${roomId}"`);
+        }
+        let owned = false;
+        try {
+          owned = this.fs.readFileSync(join(stagingDir, '.cowork-provisioning-v1'), 'utf8') === `${roomId}\n`;
+        } catch { /* an unmarked staging path has uncertain ownership */ }
+        if (owned) {
+          this.fs.rmSync(stagingDir, { recursive: true, force: true });
+          this.fsyncDirectory(roomDir);
+        } else {
+          // The journal proves only that cowork created this staging pathname;
+          // without the exact marker its contents are an unknown outcome. Move
+          // the directory intact to the one bounded quarantine instead of ever
+          // deleting it or manufacturing suffixes.
+          const residue = this.residuePath(roomId);
+          if (this.fs.existsSync(residue)) {
+            throw new PacketPersistenceError(
+              `provisioning staging recovery for room "${roomId}" found an existing provisioning residue; preserving both`,
+            );
+          }
+          this.fs.renameSync(stagingDir, residue);
+          this.fs.chmodSync(residue, 0o700);
+          this.fsyncDirectory(roomDir);
+        }
+      }
+
+      // Keep the descriptor open across recovery and compare its inode to the
+      // pathname immediately before unlinking. A replaced journal is never
+      // cleared based on the contents of the old file we inspected.
+      const currentJournal = this.fs.lstatSync(journal);
+      if (!currentJournal.isFile()
+        || currentJournal.dev !== journalStat.dev
+        || currentJournal.ino !== journalStat.ino) {
         throw new PacketPersistenceError(
-          `provisioning staging journal references an unowned path for room "${roomId}"`,
+          `provisioning staging journal changed during recovery for room "${roomId}"; replacement preserved`,
         );
       }
-      this.fs.rmSync(stagingDir, { recursive: true, force: true });
-      this.fsyncDirectory(this.roomDir(roomId));
+      this.fs.unlinkSync(journal);
+      this.fsyncDirectory(roomDir);
+    } finally {
+      if (journalFd !== undefined) this.fs.closeSync(journalFd);
     }
-    this.fs.unlinkSync(journal);
-    this.fsyncDirectory(this.roomDir(roomId));
   }
 
   private createStagingJournal(roomId: string, stagingName: string): void {

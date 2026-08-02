@@ -14,6 +14,34 @@ import {
   loadConfig,
 } from '../src/config.ts';
 
+async function waitForChildExitOrKill(child, timeoutMs) {
+  const exited = child.exitCode !== null || child.signalCode !== null
+    ? Promise.resolve({ code: child.exitCode, signal: child.signalCode })
+    : new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
+  let watchdog;
+  const outcome = await Promise.race([
+    exited.then((result) => ({ timedOut: false, result })),
+    new Promise((resolve) => {
+      watchdog = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+      watchdog.unref();
+    }),
+  ]);
+  clearTimeout(watchdog);
+  if (!outcome.timedOut) return outcome;
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  return { timedOut: true, result: await exited };
+}
+
+test('test child watchdog kills and reaps before reporting a timeout', async () => {
+  const child = spawn(process.execPath, ['--eval', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  const outcome = await waitForChildExitOrKill(child, 50);
+  assert.equal(outcome.timedOut, true);
+  assert.deepEqual(outcome.result, { code: null, signal: 'SIGKILL' });
+  assert.equal(child.signalCode, 'SIGKILL', 'timed-out child was not reaped');
+});
+
 test('config is exact, env overrides are strict, and malformed input fails closed', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-config-'));
   try {
@@ -159,8 +187,9 @@ test('supervisor strips inherited preload and execution modes from its worker', 
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
-    const exited = await new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
-    assert.deepEqual(exited, { code: 0, signal: null }, `${mode}: ${stderr}`);
+    const outcome = await waitForChildExitOrKill(child, DAEMON_SHUTDOWN_TIMEOUT_MS * 2);
+    assert.equal(outcome.timedOut, false, `${mode} exceeded the bounded supervisor lifecycle and was reaped: ${stderr}`);
+    assert.deepEqual(outcome.result, { code: 0, signal: null }, `${mode}: ${stderr}`);
     assert.equal(readFileSync(marker, 'utf8').trim().split('\n').length, 1, `${mode}: preload reached daemon worker`);
   }
 });

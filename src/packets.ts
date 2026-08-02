@@ -110,6 +110,7 @@ export interface PacketRegistryOptions {
   beforeExpose?: (packet: RoomPacket) => void | Promise<void>;
   onNotify?: (roomId: string, event: string) => void;
   provisioningCheckpoint?: (stage: 'mkdir' | 'identity' | 'state' | 'identity_applied') => void;
+  stagingName?: () => string;
 }
 
 export class PacketRegistry {
@@ -123,6 +124,7 @@ export class PacketRegistry {
   private readonly beforeExpose: (packet: RoomPacket) => void | Promise<void>;
   private readonly onNotify: (roomId: string, event: string) => void;
   private readonly provisioningCheckpoint: NonNullable<PacketRegistryOptions['provisioningCheckpoint']>;
+  private readonly stagingName: () => string;
 
   constructor(
     host: AdaptHost,
@@ -138,6 +140,7 @@ export class PacketRegistry {
     this.beforeExpose = options.beforeExpose ?? (() => {});
     this.onNotify = options.onNotify ?? (() => {});
     this.provisioningCheckpoint = options.provisioningCheckpoint ?? (() => {});
+    this.stagingName = options.stagingName ?? (() => `live.staging-${randomBytes(16).toString('hex')}`);
   }
 
   get size(): number {
@@ -372,17 +375,25 @@ export class PacketRegistry {
       }
     }
     this.cleanupOwnedStaging(roomId);
-    const stagingName = `live.staging-${randomBytes(16).toString('hex')}`;
-    atomicWriteFileSync(
-      this.stagingJournalPath(roomId),
-      Buffer.from(`${stagingName}\n`, 'utf8'),
-      this.persistence,
-    );
-    const stagingDir = join(roomDir, stagingName);
-    if (this.fs.existsSync(stagingDir)) {
-      throw new PacketPersistenceError(`provisioning staging collision for room "${roomId}"`);
+    const stagingName = this.stagingName();
+    if (!/^live\.staging-[0-9a-f]{32}$/.test(stagingName)) {
+      throw new PacketPersistenceError(`invalid provisioning staging name for room "${roomId}"`);
     }
-    this.fs.mkdirSync(stagingDir, { recursive: false, mode: 0o700 });
+    this.createStagingJournal(roomId, stagingName);
+    const stagingDir = join(roomDir, stagingName);
+    try {
+      this.fs.mkdirSync(stagingDir, { recursive: false, mode: 0o700 });
+    } catch (error) {
+      // The exclusive journal belongs to this exact attempt. The colliding
+      // path does not, so remove only the journal and leave the path untouched.
+      try {
+        this.fs.unlinkSync(this.stagingJournalPath(roomId));
+        this.fsyncDirectory(roomDir);
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], `provisioning staging collision cleanup failed for room "${roomId}"`);
+      }
+      throw new PacketPersistenceError(`provisioning staging collision for room "${roomId}"`, { cause: error });
+    }
     this.fs.chmodSync(stagingDir, 0o700);
     atomicWriteFileSync(
       join(stagingDir, '.cowork-provisioning-v1'),
@@ -413,8 +424,56 @@ export class PacketRegistry {
       if (stat.isSymbolicLink() || !stat.isDirectory()) {
         throw new PacketPersistenceError(`unsafe provisioning staging path for room "${roomId}"`);
       }
+      let owned = false;
+      try {
+        owned = this.fs.readFileSync(join(stagingDir, '.cowork-provisioning-v1'), 'utf8') === `${roomId}\n`;
+      } catch { /* an unmarked staging path has uncertain ownership */ }
+      if (!owned) {
+        throw new PacketPersistenceError(
+          `provisioning staging journal references an unowned path for room "${roomId}"`,
+        );
+      }
       this.fs.rmSync(stagingDir, { recursive: true, force: true });
       this.fsyncDirectory(this.roomDir(roomId));
+    }
+    this.fs.unlinkSync(journal);
+    this.fsyncDirectory(this.roomDir(roomId));
+  }
+
+  private createStagingJournal(roomId: string, stagingName: string): void {
+    const journal = this.stagingJournalPath(roomId);
+    const bytes = Buffer.from(`${stagingName}\n`, 'utf8');
+    let fd: number | undefined;
+    let created = false;
+    try {
+      fd = this.persistence.openSync(
+        journal,
+        nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL | nodeFs.constants.O_WRONLY | (nodeFs.constants.O_NOFOLLOW ?? 0),
+        0o600,
+      );
+      created = true;
+      this.persistence.fchmodSync(fd, 0o600);
+      let offset = 0;
+      while (offset < bytes.byteLength) {
+        const written = this.persistence.writeSync(fd, bytes, offset, bytes.byteLength - offset, null);
+        if (written <= 0) throw new Error(`short write while persisting ${journal}`);
+        offset += written;
+      }
+      this.persistence.fsyncSync(fd);
+      this.persistence.closeSync(fd);
+      fd = undefined;
+      this.fsyncDirectory(this.roomDir(roomId));
+    } catch (error) {
+      if (fd !== undefined) {
+        try { this.persistence.closeSync(fd); } catch { /* original error is authoritative */ }
+      }
+      if (created) {
+        try {
+          this.fs.unlinkSync(journal);
+          this.fsyncDirectory(this.roomDir(roomId));
+        } catch { /* a partial exclusive journal remains a safe blocking residue */ }
+      }
+      throw new PacketPersistenceError(`failed to establish staging ownership for room "${roomId}"`, { cause: error });
     }
   }
 

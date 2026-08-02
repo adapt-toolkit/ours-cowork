@@ -168,7 +168,12 @@ export class Packet {
         pending.expired = true;
         pending.reject(new Error(`timed out waiting for transaction result on packet "${this.name}"`));
         this.expiredDrain = new Promise<void>((resolveDrain) => { this.releaseExpiredDrain = resolveDrain; });
-        pending.lateTimer = setTimeout(() => this.releaseExpired(pending), LATE_RESULT_DRAIN_MS);
+        pending.lateTimer = setTimeout(() => {
+          if (this.closedError || !pending.expired || !this.pending.includes(pending)) return;
+          this.close(new Error(
+            `packet "${this.name}" closed after a timed-out transaction produced no correlated callback`,
+          ));
+        }, LATE_RESULT_DRAIN_MS);
       }, timeoutMs);
       const pending: Pending = { resolve: resolveResult, reject: rejectResult, timer };
       this.pending.push(pending);

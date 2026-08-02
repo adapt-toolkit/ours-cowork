@@ -105,6 +105,7 @@ function fakeReturnData(kind, payload = {}) {
   let destroyed = false;
   const leaf = (value) => ({
     Visualize: () => String(value),
+    Attach(lifetime) { lifetime.Deposit(this); return this; },
     Detach() { return this; },
     Destroy() { destroyed = true; },
   });
@@ -293,7 +294,7 @@ async function runPacketDriver() {
         await new Promise((done) => { releaseRestore = done; });
       },
     });
-    const [alpha, beta, gamma] = await Promise.all([
+    let [alpha, beta, gamma] = await Promise.all([
       registry.create('alpha'),
       registry.create('beta'),
       registry.create('gamma'),
@@ -379,6 +380,13 @@ async function runPacketDriver() {
       ),
       /timed out waiting for transaction result/,
     );
+    const gammaCid = gamma.cid;
+    await waitFor(() => registry.get('gamma') === undefined, 'timed-out gamma eviction');
+    assert.equal(host.packetCount, 4, 'unknown local outcome must remove the stale native packet');
+    gamma = await registry.restore('gamma', gammaCid);
+    assert.equal(registry.get('gamma'), gamma);
+    assert.equal(host.packetCount, 5);
+    progress('timeout-restored');
     await attacker.mutatingTx('::a2a_messaging::send_file', {
       contact: gamma.cid,
       filename: 'inbound-blocked.txt',
@@ -433,7 +441,11 @@ async function runPacketDriver() {
     await sleep(500);
     assert.equal(renderRawInbox(peer).some((message) => message.text === 'must-not-escape'), false,
       'SEND must stay buffered when state persistence fails');
+    await waitFor(() => registry.get('gamma') === undefined, 'persistence-timeout gamma eviction');
     failStateWrite = false;
+    gamma = await registry.restore('gamma', gammaCid);
+    assert.equal(registry.get('gamma'), gamma);
+    assert.equal(host.packetCount, 5);
     progress('persistence-failure');
 
     const alphaLive = join(stateDir, 'rooms', 'alpha', 'live');
@@ -635,6 +647,43 @@ test('unknown live state uses one fixed quarantine and never suffixes or overwri
   assert.doesNotMatch(readFileSync(new URL('../src/packets.ts', import.meta.url), 'utf8'), /provisioning-residue-\$\{/);
 });
 
+test('staging collision never acquires or deletes unknown ownership and retry stays bounded', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'ours-cowork-staging-collision-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const roomDir = join(root, 'rooms', roomId);
+  const collisionName = `live.staging-${'ab'.repeat(16)}`;
+  const retryName = `live.staging-${'cd'.repeat(16)}`;
+  const collision = join(roomDir, collisionName);
+  fs.mkdirSync(collision, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(join(collision, 'unknown-user-byte'), 'preserve me');
+  const names = [collisionName, retryName];
+  let nativeCreates = 0;
+  const registry = new PacketRegistry({
+    async createPacket() {
+      nativeCreates += 1;
+      throw new Error('stop after staging preparation');
+    },
+  }, root, { stagingName: () => names.shift() });
+
+  await assert.rejects(registry.create(roomId), /staging collision/i);
+  assert.equal(nativeCreates, 0, 'collision must fail before native provisioning');
+  assert.equal(fs.readFileSync(join(collision, 'unknown-user-byte'), 'utf8'), 'preserve me');
+  assert.equal(fs.existsSync(join(roomDir, '.cowork-provisioning-stage')), false,
+    'failed attempt must not retain a journal claim over the collision');
+
+  await assert.rejects(registry.create(roomId), /stop after staging preparation/);
+  assert.equal(nativeCreates, 1);
+  assert.equal(fs.readFileSync(join(collision, 'unknown-user-byte'), 'utf8'), 'preserve me');
+  assert.equal(fs.existsSync(join(roomDir, '.cowork-provisioning-stage')), false);
+  assert.equal(fs.readFileSync(join(roomDir, 'live', '.cowork-provisioning-v1'), 'utf8'), `${roomId}\n`);
+  assert.deepEqual(
+    fs.readdirSync(roomDir).filter((name) => name.startsWith('live.staging-')),
+    [collisionName],
+    'retry must not suffix or leak additional staging paths',
+  );
+});
+
 test('PacketRegistry public lifecycle surface is standalone', () => {
   assert.equal(typeof PacketRegistry, 'function');
   const externalDaemonPattern = new RegExp(`${['ours', 'mcp'].join('-')}|@ours\\.network\\/${'mcp'}`);
@@ -748,23 +797,133 @@ test('failed local callback times out through a tombstone, swallows its late res
   assert.equal(terminal.length, 0);
 });
 
-test('expired tombstone releases after a bounded drain and teardown never rejects an expired call twice', async () => {
+test('expired tombstone terminalizes after a bounded drain and never submits queued work', async () => {
   const { packet, pw, submitted, terminal } = fakePacket('bounded-expiry');
   let firstRejects = 0;
+  let secondRejects = 0;
   const first = packet.mutatingTx('first', {}, undefined, 10).catch((error) => {
     firstRejects += 1;
     throw error;
   });
-  const second = packet.mutatingTx('second', {}, undefined, 200);
+  const second = packet.mutatingTx('second', {}, undefined, 200).catch((error) => {
+    secondRejects += 1;
+    throw error;
+  });
   await assert.rejects(first, /timed out/);
+  const secondRejected = assert.rejects(second, /timed-out transaction|uncorrelated callback/i);
   await sleep(80);
-  assert.equal(submitted.length, 2, 'bounded tombstone drain must release the next submission');
-  packet.close(new Error('explicit teardown'));
-  await assert.rejects(second, /explicit teardown/);
+  await secondRejected;
+  assert.equal(submitted.length, 1, 'unknown FIFO ownership must bar the next submission');
   assert.equal(firstRejects, 1);
+  assert.equal(secondRejects, 1);
   assert.equal(terminal.length, 1);
   pw.on_return_data(fakeReturnData('return_data', { call: 'late-after-close' }));
   assert.equal(firstRejects, 1);
+  assert.equal(secondRejects, 1);
+  assert.equal(submitted.length, 1);
+});
+
+test('expired registry packet is evicted and a fresh restore owns all later callbacks', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'ours-cowork-timeout-restore-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const liveDir = join(root, 'rooms', roomId, 'live');
+  fs.mkdirSync(liveDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(join(liveDir, 'identity.key'), 'aa', { mode: 0o600 });
+  fs.writeFileSync(join(liveDir, 'state_data.bin'), Buffer.from([1]), { mode: 0o600 });
+
+  let host;
+  const native = new Map();
+  const removed = [];
+  const exposed = new Set();
+  function nativeRecord(label, cid) {
+    const submitted = [];
+    const pw = {
+      add_client_message(envelope) { submitted.push(envelope); },
+      refresh_identity_proof_document() {},
+      packet: {
+        ParseValue() { return { Attach() { return this; }, Destroy() {} }; },
+      },
+    };
+    let packet;
+    packet = new Packet(label, cid, pw, (error) => {
+      queueMicrotask(() => {
+        if (native.get(cid) !== packet) return;
+        host.removePacket(cid, error);
+      });
+    }, (name, targ) => ({ name, targ, Destroy() {} }));
+    return { packet, pw, submitted };
+  }
+  const stale = nativeRecord('stale-room', 'cid-stale');
+  const fresh = nativeRecord('fresh-room', 'cid-fresh');
+  const createQueue = [stale, fresh];
+  host = {
+    async createPacket() {
+      const record = createQueue.shift();
+      assert(record, 'unexpected extra native packet creation');
+      native.set(record.packet.cid, record.packet);
+      return record.packet;
+    },
+    exposePacket(cid) { assert(native.has(cid)); exposed.add(cid); },
+    removePacket(cid, error = new Error(`removed ${cid}`)) {
+      const packet = native.get(cid);
+      if (!packet) return;
+      packet.close(error);
+      native.delete(cid);
+      exposed.delete(cid);
+      removed.push(cid);
+    },
+  };
+  const registry = new PacketRegistry(host, root);
+
+  async function restore(record) {
+    const work = registry.restore(roomId);
+    await new Promise((done) => setImmediate(done));
+    assert.equal(record.submitted.length, 1, 'restore must submit exactly one import');
+    record.pw.on_return_data(fakeReturnData('return_data', { call: 'import' }));
+    const room = await work;
+    record.submitted.length = 0;
+    return room;
+  }
+
+  const staleRoom = await restore(stale);
+  assert.equal(registry.get(roomId), staleRoom);
+  const first = stale.packet.mutatingTx('first', {}, undefined, 10);
+  let secondRejects = 0;
+  const second = stale.packet.mutatingTx('second', {}, undefined, 200).catch((error) => {
+    secondRejects += 1;
+    throw error;
+  });
+  await assert.rejects(first, /timed out/);
+  const secondRejected = assert.rejects(second, /timed-out transaction|uncorrelated callback/i);
+  await sleep(80);
+  await secondRejected;
+  assert.equal(secondRejects, 1);
+  assert.equal(stale.submitted.length, 1, 'queued call must never reach the stale native FIFO');
+  assert.equal(registry.get(roomId), undefined, 'terminal listener must synchronously evict the stale room');
+  await new Promise((done) => setImmediate(done));
+  assert.deepEqual(removed, ['cid-stale']);
+  assert.equal(native.has('cid-stale'), false);
+
+  stale.pw.on_return_data(fakeReturnData('return_data', { call: 'late-first' }));
+  assert.equal(secondRejects, 1, 'late stale callback must be ignored after terminal close');
+  assert.equal(stale.submitted.length, 1);
+
+  const freshRoom = await restore(fresh);
+  assert.equal(registry.get(roomId), freshRoom);
+  assert.equal(exposed.has('cid-fresh'), true);
+  const independent = fresh.packet.mutatingTx('independent', {}, undefined, 200);
+  await new Promise((done) => setImmediate(done));
+  assert.equal(fresh.submitted.length, 1);
+  fresh.pw.on_return_data(fakeReturnData('return_data', { call: 'independent' }));
+  assert.equal((await independent).Visualize(), '[object Object]');
+  assert.equal(fresh.submitted.length, 1, 'fresh operation must consume only its own result');
+
+  await registry.unhostAll();
+  await new Promise((done) => setImmediate(done));
+  assert.deepEqual(removed, ['cid-stale', 'cid-fresh']);
+  assert.equal(native.size, 0, 'terminal and explicit close races must not leak native packets');
+  assert.equal(registry.size, 0);
 });
 
 test('Packet.close rejects active and queued work before another envelope is submitted', async () => {

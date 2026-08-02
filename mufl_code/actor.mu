@@ -22,6 +22,7 @@ application actor loads libraries
     a2a_capabilities,
     a2a_protocol,
     a2a_messaging,
+    a2a_notifications,
     protocol_container,
     registration_proof,
     version
@@ -107,6 +108,37 @@ application actor loads libraries
                 return [].
             },
             $on_receipt_received -> fn (_: any) -> transaction::action::type[] { return []. }
+        ).
+
+        // Cowork is a notification CLIENT only. The shared library owns its
+        // registration/token state; successful confirmations persist that state.
+        // Service-side notification delivery is deliberately unsupported because
+        // room packets have no notification log or WebPush host.
+        a2a_notifications::init (
+            $_read_or_abort -> _read_or_abort,
+            $on_notification_posted -> fn (_: any) -> transaction::action::type[]
+            {
+                abort "Room packets do not provide notification service" when TRUE.
+                return [].
+            },
+            $on_notifications_marked_read -> fn (_: any) -> transaction::action::type[]
+            {
+                return [ _save_state NIL ].
+            },
+            $on_unregistered -> fn (arg: any) -> transaction::action::type[]
+            {
+                return [
+                    _notify_agent ($event -> $notification_unregistered, $recipient_cid -> arg $recipient_cid),
+                    _save_state NIL
+                ].
+            },
+            $on_notify_registration -> fn (arg: any) -> transaction::action::type[]
+            {
+                return [
+                    _notify_agent ($event -> $notification_registered, $service_cid -> arg $service_cid),
+                    _save_state NIL
+                ].
+            }
         ).
 
         // The packet implements no app capability verbs. It advertises the core
@@ -252,6 +284,7 @@ application actor loads libraries
         return (
             $app_format_version -> 1,
             $core -> a2a_messaging::export_core_state NIL,
+            $notifications -> a2a_notifications::export_notify_state NIL,
             $inbox -> inbox,
             $next_msg_seq -> next_msg_seq
         ).
@@ -264,6 +297,10 @@ application actor loads libraries
         if (data $app_format_version) != NIL { app_format -> (data $app_format_version) safe int. }
         abort "Cowork state blob is newer than this packet." when app_format > 1.
         a2a_messaging::import_core_state (data $core).
+        if (data $notifications) != NIL
+        {
+            a2a_notifications::import_notify_state (data $notifications).
+        }
         inbox -> (data $inbox) safe (message_t[]).
         next_msg_seq -> (data $next_msg_seq) safe int.
         return transaction::success [

@@ -33,10 +33,23 @@ fi
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
-cp "$src_dir/actor.mu" "$src_dir/config.mufl" "$src_dir/protocol_container.mm" "$tmp_dir/"
-mkdir "$tmp_dir/core"
-cp "$src_dir/core/config.mufl" "$src_dir/core"/*.mm "$tmp_dir/core/"
-(cd "$tmp_dir" && MUFL_STDLIB_PATH="$toolkit/mufl_stdlib" "$mufl_compile" -mp "$toolkit/meta" -mp "$toolkit/transactions" -d-c actor.mu >/dev/null)
-muflo="$(cd "$tmp_dir" && ls *.muflo)"
-rm -f "$src_dir"/*.muflo
-cp "$tmp_dir/$muflo" "$src_dir/"
+
+compile_actor() {
+  local source_file="$1"
+  local output_dir="$2"
+  local label="$3"
+  local build_dir="$tmp_dir/$label"
+
+  mkdir -p "$build_dir/core" "$output_dir"
+  cp "$source_file" "$build_dir/actor.mu"
+  cp "$src_dir/config.mufl" "$src_dir/protocol_container.mm" "$build_dir/"
+  cp "$src_dir/core/config.mufl" "$src_dir/core"/*.mm "$build_dir/core/"
+  (cd "$build_dir" && MUFL_STDLIB_PATH="$toolkit/mufl_stdlib" "$mufl_compile" -mp "$toolkit/meta" -mp "$toolkit/transactions" -d-c actor.mu >/dev/null)
+  local muflo
+  muflo="$(cd "$build_dir" && ls *.muflo)"
+  rm -f "$output_dir"/*.muflo
+  cp "$build_dir/$muflo" "$output_dir/"
+}
+
+compile_actor "$src_dir/actor.mu" "$src_dir" cowork
+compile_actor "$here/tests/fixtures/permissive-actor.mu" "$here/tests/fixtures" permissive

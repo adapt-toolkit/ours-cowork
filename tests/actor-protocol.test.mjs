@@ -9,6 +9,8 @@ import { fileURLToPath } from 'node:url';
 const THIS_FILE = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(THIS_FILE), '..');
 const UNIT_DIR = resolve(ROOT, 'mufl_code');
+const FIXTURE_UNIT_DIR = resolve(ROOT, 'tests/fixtures');
+const SUCCESS_SENTINEL = 'COWORK_PACKET_DRIVER_SUCCESS';
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 async function unusedPort() {
@@ -77,6 +79,8 @@ let driverPassed = false;
 test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180_000 }, async (t) => {
   const unitFile = readdirSync(UNIT_DIR).find((name) => name.endsWith('.muflo'));
   assert.ok(unitFile, 'compiled cowork actor missing; run scripts/compile-mufl.sh');
+  const fixtureUnitFile = readdirSync(FIXTURE_UNIT_DIR).find((name) => name.endsWith('.muflo'));
+  assert.ok(fixtureUnitFile, 'compiled permissive fixture missing; run scripts/compile-mufl.sh');
 
   const [{ adapt_wrapper }, { PacketWrapperConfigurator }, { object_to_adapt_value }] = await Promise.all([
     import('@adapt-toolkit/sdk/executables'),
@@ -92,9 +96,16 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
     stdio: ['ignore', 'ignore', 'pipe'],
   });
   broker.stderr.on('data', (chunk) => brokerErrors.push(chunk.toString()));
-  t.after(() => {
+  const packets = [];
+  let wrapper;
+  t.after(async () => {
+    for (const packet of packets) {
+      try { wrapper?.remove_packet(packet.cid); } catch { /* already removed */ }
+    }
+    const brokerExited = new Promise((done) => broker.once('exit', done));
     broker.kill('SIGKILL');
-    setTimeout(() => process.exit(driverPassed ? 0 : 1), 100);
+    await brokerExited;
+    if (driverPassed) process.stdout.write(`${SUCCESS_SENTINEL}\n`);
   });
   try {
     await waitForPort(port);
@@ -102,21 +113,31 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
     throw new Error(`${error.message}\n${brokerErrors.join('').slice(-2000)}`);
   }
 
-  const wrapper = await adapt_wrapper.start([
+  wrapper = await adapt_wrapper.start([
     '--broker_address', `ws://127.0.0.1:${port}`,
     '--test_mode',
     '--logger_config', '--level', 'WARNING', '--stdout', 'stderr', '--logger_config_end',
   ]);
   wrapper.start();
 
-  const unitHash = unitFile.slice(0, -'.muflo'.length);
-  const unit = new Uint8Array(readFileSync(resolve(UNIT_DIR, unitFile)));
-  const packets = [];
-
+  const coworkUnit = {
+    hash: unitFile.slice(0, -'.muflo'.length),
+    dir: UNIT_DIR,
+    bytes: new Uint8Array(readFileSync(resolve(UNIT_DIR, unitFile))),
+  };
+  const permissiveUnit = {
+    hash: fixtureUnitFile.slice(0, -'.muflo'.length),
+    dir: FIXTURE_UNIT_DIR,
+    bytes: new Uint8Array(readFileSync(resolve(FIXTURE_UNIT_DIR, fixtureUnitFile))),
+  };
   function wire(packet) {
     packet.pw.on_return_data = (data) => {
       const kind = data.Reduce('kind').Visualize();
-      if (kind === 'save_state' || kind === 'notify_agent') return;
+      if (kind === 'save_state') return;
+      if (kind === 'notify_agent') {
+        packet.events.push(data.Reduce('payload').Reduce('event').Visualize());
+        return;
+      }
       const pending = packet.pending.shift();
       if (!pending) return;
       clearTimeout(pending.timer);
@@ -133,12 +154,12 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
     };
   }
 
-  async function createPacket(name, seed, signingSecret) {
+  async function createPacket(name, seed, signingSecret, packetUnit = coworkUnit) {
     const config = new PacketWrapperConfigurator();
-    const args = ['--unit_hash', unitHash, '--seed_phrase', seed, '--unit_dir_path', UNIT_DIR];
+    const args = ['--unit_hash', packetUnit.hash, '--seed_phrase', seed, '--unit_dir_path', packetUnit.dir];
     if (signingSecret) args.push('--init_trn_argument', JSON.stringify(signingSecret));
     config.process_arguments(args);
-    const packet = { name, cid: '', pw: null, pending: [], rejects: [] };
+    const packet = { name, cid: '', pw: null, pending: [], rejects: [], events: [] };
     await new Promise((done, reject) => {
       const timer = setTimeout(() => reject(new Error(`${name} packet creation timed out`)), 30_000);
       wrapper.packet_manager.create_packet(config, (pw) => {
@@ -147,7 +168,7 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
         packet.cid = pw.packet.GetContainerID().Visualize();
         wire(packet);
         done();
-      }, unit);
+      }, packetUnit.bytes);
     });
     packets.push(packet);
     return packet;
@@ -194,12 +215,6 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   async function join(packet, invite) {
     await mutate(packet, '::a2a_messaging::add_contact', { invite: binary(packet, invite.blob) });
   }
-
-  t.after(() => {
-    for (const packet of packets) {
-      try { wrapper.remove_packet(packet.cid); } catch { /* already removed */ }
-    }
-  });
 
   await sleep(1_000);
 
@@ -273,16 +288,67 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   await mutate(room, '::actor::gc', {});
   assert.deepEqual(inbox(room), []);
 
-  const fileBytes = binary(charlie, Buffer.from('not accepted'));
+  const permissive = await createPacket(
+    'permissive-peer',
+    `cowork-permissive-${Date.now()}`,
+    undefined,
+    permissiveUnit,
+  );
+  await namePacket(permissive, 'Permissive peer');
+  const fixtureInvite = await mint(room, 'one_time');
+  await join(permissive, fixtureInvite);
+  await waitFor(
+    () => contacts(room).includes(permissive.cid) && contacts(permissive).includes(room.cid),
+    'permissive fixture contact acceptance',
+  );
+
+  // The fixture is an actual notification service. Registering exercises the
+  // cowork actor's client-confirm hook and leaves core-owned client state that
+  // must survive the room export/import below.
+  await mutate(permissive, '::a2a_notifications::set_vapid_public_key', { key: 'COWORK_TEST_VAPID' });
+  await mutate(room, '::a2a_notifications::notify_register', { service: permissive.cid, bindings: null });
+  await waitFor(
+    () => room.events.includes('notification_registered')
+      && readonly(room, '::actor::export_state').Reduce('notifications').Visualize().includes('COWORK_TEST_VAPID'),
+    'notification registration hook and persisted client state',
+  );
+
+  // Outgoing and incoming file rejection are distinct paths. The permissive
+  // fixture accepts files, so the first assertion can only come from cowork's
+  // sender hook. The reverse send succeeds locally and then reaches cowork's
+  // receiver hook, whose exact abort is observed as an inbound packet failure.
+  const outgoingFileBytes = binary(room, Buffer.from('outgoing blocked'));
   await assert.rejects(
-    mutate(charlie, '::a2a_messaging::send_file', {
-      contact: room.cid,
-      filename: 'blocked.txt',
+    mutate(room, '::a2a_messaging::send_file', {
+      contact: permissive.cid,
+      filename: 'outgoing-blocked.txt',
       mime: 'text/plain',
-      data: fileBytes,
+      data: outgoingFileBytes,
     }),
     /Room packets do not accept files/,
   );
+  const inboundRejectCount = room.rejects.length;
+  await mutate(permissive, '::a2a_messaging::send_file', {
+    contact: room.cid,
+    filename: 'inbound-blocked.txt',
+    mime: 'text/plain',
+    data: binary(permissive, Buffer.from('inbound blocked')),
+  });
+  await waitFor(
+    () => room.rejects.slice(inboundRejectCount).some((message) => message.includes('Room packets do not accept files')),
+    'cowork inbound file hook rejection',
+  );
+
+  // A real encrypted peer call arrives with external origin and must not reach
+  // the generic host-only signing surface.
+  const canonicalJson = '{"at":"2026-08-02T00:00:00.000Z","kind":"room_msg","version":1}';
+  const signRejectCount = room.rejects.length;
+  await mutate(permissive, '::actor::call_external_sign', { target: room.cid, canonical_json: canonicalJson });
+  await waitFor(
+    () => room.rejects.length > signRejectCount,
+    'external-origin sign_app_envelope rejection',
+  );
+  assert.match(room.rejects.at(-1), /origin/i);
 
   const removal = await mutate(room, '::a2a_messaging::remove_contact', { contact: bob.cid });
   assert.equal(bool(removal.Reduce('notified')), true);
@@ -297,14 +363,29 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
     throw error;
   }
 
-  const canonicalJson = '{"at":"2026-08-02T00:00:00.000Z","kind":"room_msg","version":1}';
   const firstSignature = await mutate(room, '::actor::sign_app_envelope', { canonical_json: canonicalJson });
   const firstSignatureBytes = Buffer.from(firstSignature.Reduce('signature').Serialize());
   const secondSignature = await mutate(room, '::actor::sign_app_envelope', { canonical_json: canonicalJson });
   const secondSignatureBytes = Buffer.from(secondSignature.Reduce('signature').Serialize());
   assert.deepEqual(secondSignatureBytes, firstSignatureBytes);
 
+  // Export with a mixed lifecycle inbox. Import must preserve both statuses,
+  // then allocate the next arrival from the exported monotonic sequence.
+  await mutate(charlie, '::a2a_messaging::send_message', { contact: room.cid, text: 'processed-before-export' });
+  await waitFor(() => inbox(room).some((message) => message.text === 'processed-before-export'), 'processed export fixture');
+  drained = await mutate(room, '::actor::get_messages', {});
+  assert.deepEqual(renderMessages(drained.Reduce('messages')).map((message) => message.text), ['processed-before-export']);
+  await mutate(permissive, '::a2a_messaging::send_message', { contact: room.cid, text: 'unread-before-export' });
+  await waitFor(() => inbox(room).some((message) => message.text === 'unread-before-export'), 'unread export fixture');
+  const beforeExportInbox = inbox(room);
+  assert.deepEqual(
+    Object.fromEntries(beforeExportInbox.map((message) => [message.text, message.status])),
+    { 'processed-before-export': 'processed', 'unread-before-export': 'unread' },
+  );
+  const maxExportedMessageId = Math.max(...beforeExportInbox.map((message) => message.msg_id));
+
   const exportedState = readonly(room, '::actor::export_state');
+  assert.match(exportedState.Reduce('notifications').Visualize(), /COWORK_TEST_VAPID/);
   const stateBytes = Buffer.from(exportedState.Serialize());
   const signingSecret = Buffer.from(readonly(room, '::actor::export_signing_secret').Serialize()).toString('hex');
   const originalCid = room.cid;
@@ -314,6 +395,15 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
   const parsedState = restored.pw.packet.ParseValue(new Uint8Array(stateBytes));
   await mutate(restored, '::actor::import_state', parsedState);
   assert.match(contacts(restored), new RegExp(charlie.cid));
+  assert.deepEqual(
+    Object.fromEntries(inbox(restored).map((message) => [message.text, message.status])),
+    { 'processed-before-export': 'processed', 'unread-before-export': 'unread' },
+  );
+  assert.match(readonly(restored, '::actor::export_state').Reduce('notifications').Visualize(), /COWORK_TEST_VAPID/);
+  await mutate(charlie, '::a2a_messaging::send_message', { contact: restored.cid, text: 'after-import-sequence' });
+  await waitFor(() => inbox(restored).some((message) => message.text === 'after-import-sequence'), 'post-import message sequence');
+  const afterImport = inbox(restored).find((message) => message.text === 'after-import-sequence');
+  assert.equal(afterImport.msg_id, maxExportedMessageId + 1);
   driverPassed = true;
 });
 } else {
@@ -323,12 +413,28 @@ test('minimal cowork actor speaks the real ours packet protocol', { timeout: 180
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const output = [];
-    child.stdout.on('data', (chunk) => output.push(chunk.toString()));
+    let sawSuccess = false;
+    child.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      output.push(text);
+      if (!sawSuccess && output.join('').includes(SUCCESS_SENTINEL)) {
+        sawSuccess = true;
+        child.kill('SIGKILL');
+      }
+    });
     child.stderr.on('data', (chunk) => output.push(chunk.toString()));
     const result = await new Promise((done, reject) => {
       child.once('error', reject);
       child.once('exit', (code, signal) => done({ code, signal }));
     });
-    assert.equal(result.code, 0, `packet driver failed (${result.signal ?? result.code})\n${output.join('').slice(-12_000)}`);
+    assert.equal(
+      sawSuccess,
+      true,
+      `packet driver exited before its success sentinel (${result.signal ?? result.code})\n${output.join('').slice(-12_000)}`,
+    );
+    assert.ok(
+      result.signal === 'SIGKILL',
+      `packet driver ended unexpectedly (${result.signal ?? result.code})\n${output.join('').slice(-12_000)}`,
+    );
   });
 }

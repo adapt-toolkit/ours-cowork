@@ -53,7 +53,7 @@ type CloseNoticeIntentRecord = Extract<CommunicationRecord, { kind: 'close_notic
 export interface RoomPacketRegistry {
   get(roomId: string): RoomPacket | undefined;
   create(roomId: string, identityName?: string, bio?: string): Promise<RoomPacket>;
-  restore?(roomId: string, expectedCid?: string): Promise<RoomPacket>;
+  restore?(roomId: string, expectedCid?: string, identityName?: string, bio?: string): Promise<RoomPacket>;
   destroy(roomId: string): Promise<string[]>;
 }
 
@@ -61,6 +61,7 @@ export interface RoomServiceOptions {
   now?: () => string;
   roomId?: () => string;
   messageId?: () => string;
+  provisioningCheckpoint?: (stage: 'metadata') => void;
 }
 
 export interface InviteReceipt {
@@ -93,6 +94,7 @@ export class RoomService {
   private readonly nextRoomId: () => string;
   private readonly nextMessageId: () => string;
   private readonly intake: IntakePump;
+  private readonly provisioningCheckpoint: NonNullable<RoomServiceOptions['provisioningCheckpoint']>;
 
   constructor(store: Store, packets: RoomPacketRegistry, options: RoomServiceOptions = {}) {
     this.store = store;
@@ -100,6 +102,7 @@ export class RoomService {
     this.nowValue = options.now ?? (() => new Date().toISOString());
     this.nextRoomId = options.roomId ?? generateUlid;
     this.nextMessageId = options.messageId ?? generateUlid;
+    this.provisioningCheckpoint = options.provisioningCheckpoint ?? (() => {});
     this.intake = new IntakePump(store, packets, {
       now: this.nowValue,
       messageId: this.nextMessageId,
@@ -134,6 +137,7 @@ export class RoomService {
         identityName,
         `ours-cowork mission room ${roomId}`,
       );
+      this.provisioningCheckpoint('metadata');
       const { status: _packetPending, ...created } = provisional;
       return this.store.save(RoomSchema.parse({ ...created, identity_cid: packet.cid }));
     });
@@ -168,7 +172,12 @@ export class RoomService {
     } else if (packetPending) {
       if (this.packets.restore) {
         try {
-          packet = await this.packets.restore(id);
+          packet = await this.packets.restore(
+            id,
+            undefined,
+            room.identity_name,
+            `ours-cowork mission room ${id}`,
+          );
         } catch { /* no live packet was durably established; provision below */ }
       }
       if (!packet) {
@@ -199,6 +208,7 @@ export class RoomService {
       }
     }
     if (packetPending) {
+      this.provisioningCheckpoint('metadata');
       const { status: _packetPending, ...established } = room;
       room = await this.store.save(RoomSchema.parse({ ...established, identity_cid: packet.cid }));
     }
@@ -368,8 +378,8 @@ export class RoomService {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const oldId = z.string().min(1).parse(recoveryOf);
     const replacementId = z.string().min(1).parse(inviteId);
-    return this.lock(id, async () => {
-      const room = await this.store.load(id);
+    const confirmed = await this.lock(id, async () => {
+      let room = await this.store.load(id);
       this.assertMutable(room, 'confirm a recovered invite for');
       const oldIndex = room.invites.findIndex((invite) => invite.invite_id === oldId);
       const replacementIndex = room.invites.findIndex((invite) => invite.invite_id === replacementId);
@@ -385,6 +395,7 @@ export class RoomService {
           || replacement.state === 'consumed'
           || replacement.state === 'replacement_required'
           || replacement.state === 'revoked')) {
+        await this.reconcileUnlocked(room, this.packet(id));
         return replacement;
       }
       if (old.state !== 'replacement_required'
@@ -411,9 +422,12 @@ export class RoomService {
       const invites = [...room.invites];
       invites[oldIndex] = { ...old, state: 'revoked' };
       invites[replacementIndex] = confirmed;
-      await this.store.save(RoomSchema.parse({ ...room, invites }));
+      room = await this.store.save(RoomSchema.parse({ ...room, invites }));
+      await this.reconcileUnlocked(room, this.packet(id));
       return confirmed;
     });
+    await this.intake.resumePending(id);
+    return confirmed;
   }
 
   async reconcileRoom(roomId: string): Promise<Room> {
@@ -421,8 +435,17 @@ export class RoomService {
     return this.lock(id, async () => this.reconcileUnlocked(await this.store.load(id), this.packet(id)));
   }
 
-  notifyRoom(roomId: string): Promise<void> {
-    return this.intake.notify(roomId);
+  async notifyRoom(roomId: string, _event = 'message_received'): Promise<void> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    // Contact acceptance and message delivery are separate core callbacks.
+    // Reconcile first under the room mutex for either callback so the first
+    // immediately-following participant message can never be drained as an
+    // unauthorized non-seat. Intake takes the same mutex only after admission.
+    await this.lock(id, async () => {
+      const room = await this.store.load(id);
+      await this.reconcileUnlocked(room, this.packet(id));
+    });
+    await this.intake.notify(id);
   }
 
   resumePending(roomId: string): Promise<void> {

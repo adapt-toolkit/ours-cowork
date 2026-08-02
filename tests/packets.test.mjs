@@ -221,6 +221,39 @@ async function runPacketDriver() {
     await waitForPort(port);
     host = new AdaptHost(`ws://127.0.0.1:${port}`, () => {});
     await host.boot();
+    if (process.argv.includes('--deliberate-driver-failure')) {
+      assert.fail('deliberate packet registry driver assertion failure');
+    }
+
+    for (const stage of ['mkdir', 'identity', 'state', 'identity_applied']) {
+      const roomId = `crash-${stage.replace('_', '-')}`;
+      fs.mkdirSync(join(stateDir, 'rooms', roomId), { recursive: true, mode: 0o700 });
+      let injected = false;
+      const interrupted = new PacketRegistry(host, stateDir, {
+        provisioningCheckpoint(observed) {
+          if (!injected && observed === stage) {
+            injected = true;
+            throw new Error(`crash at ${stage}`);
+          }
+        },
+      });
+      await assert.rejects(interrupted.create(roomId, `Exact ${stage}`, `Exact bio ${stage}`), new RegExp(stage));
+      const resumed = new PacketRegistry(host, stateDir);
+      const packet = await resumed.create(roomId, `Exact ${stage}`, `Exact bio ${stage}`);
+      assert(packet.cid, `${stage} restart must establish one packet CID`);
+      assert.equal(resumed.size, 1);
+      await resumed.destroy(roomId);
+    }
+
+    const partialId = 'partial-probe';
+    const partialLive = join(stateDir, 'rooms', partialId, 'live');
+    fs.mkdirSync(partialLive, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(join(partialLive, 'unknown-user-byte'), 'preserve me');
+    const partialRegistry = new PacketRegistry(host, stateDir);
+    await partialRegistry.create(partialId, 'Exact partial', 'Exact partial bio');
+    assert.equal(fs.readFileSync(join(stateDir, 'rooms', partialId, 'provisioning-residue', 'unknown-user-byte'), 'utf8'), 'preserve me');
+    assert.equal(fs.readdirSync(join(stateDir, 'rooms', partialId)).filter((name) => name.startsWith('provisioning-residue')).length, 1);
+    await partialRegistry.destroy(partialId);
 
     let failStateWrite = false;
     let holdRestore = false;
@@ -254,9 +287,6 @@ async function runPacketDriver() {
       registry.create('beta'),
       registry.create('gamma'),
     ]);
-    if (process.argv.includes('--deliberate-driver-failure')) {
-      assert.fail('deliberate packet registry driver assertion failure');
-    }
     assert.equal(host.packetCount, 3, 'one wrapper must host all three room packets');
     assert.equal(registry.size, 3);
 
@@ -286,6 +316,62 @@ async function runPacketDriver() {
       () => gamma.listContacts().some((contact) => contact.container_id === peer.cid),
       'peer acceptance by gamma room',
     );
+
+    const fixtureDir = join(ROOT, 'tests', 'fixtures');
+    const fixtureFile = fs.readdirSync(fixtureDir).find((name) => name.endsWith('.muflo'));
+    assert(fixtureFile, 'compile the permissive fixture before packet tests');
+    const { PacketWrapperConfigurator } = await import('@adapt-toolkit/sdk/wrappers');
+    const attackerConfig = new PacketWrapperConfigurator();
+    attackerConfig.process_arguments([
+      '--unit_hash', fixtureFile.slice(0, -'.muflo'.length),
+      '--seed_phrase', `attacker-${Date.now()}`,
+      '--unit_dir_path', fixtureDir,
+    ]);
+    const attacker = await new Promise((resolveCreated) => {
+      host.wrapper.packet_manager.create_packet(attackerConfig, (pw) => {
+        const cid = pw.packet.GetContainerID().Visualize();
+        const packet = new Packet('attacker', cid, pw);
+        host.packets.set(cid, packet);
+        host.exposedPackets.add(cid);
+        resolveCreated(packet);
+      }, new Uint8Array(fs.readFileSync(join(fixtureDir, fixtureFile))));
+    });
+    wireHandlers(attacker, { onSaveState: () => {}, onNotify: () => {} }, () => {});
+    await withScopeAsync((lifetime) =>
+      attacker.mutatingTx('::a2a_messaging::set_my_name', { name: 'Attacker' }, lifetime));
+    const attackerInvite = await gamma.mintInvite('public');
+    await withScopeAsync(async (lifetime) => {
+      await attacker.mutatingTx('::a2a_messaging::add_contact', {
+        invite: attacker.newBinary(unpackInvite(attackerInvite.blob), lifetime),
+      }, lifetime);
+    });
+    await waitFor(
+      () => gamma.listContacts().some((contact) => contact.container_id === attacker.cid),
+      'attacker acceptance by gamma room',
+    );
+
+    await assert.rejects(
+      gamma.packet.mutatingTx('::a2a_messaging::send_file', {
+        contact: attacker.cid,
+        filename: 'blocked.txt',
+        mime: 'text/plain',
+        data: gamma.packet.newBinary(Buffer.from('blocked')),
+      }),
+      /Room packets do not accept files/,
+    );
+    await attacker.mutatingTx('::a2a_messaging::send_file', {
+      contact: gamma.cid,
+      filename: 'inbound-blocked.txt',
+      mime: 'text/plain',
+      data: attacker.newBinary(Buffer.from('inbound blocked')),
+    });
+    await attacker.mutatingTx('::actor::call_external_sign', {
+      target: gamma.cid,
+      canonical_json: '{"version":1}',
+    });
+    await sleep(300);
+    assert.equal(registry.get('gamma'), gamma, 'refused inbound transactions keep the registry entry');
+    assert.equal(host.packetCount, 5, 'refused inbound transactions keep the native room packet');
 
     const alphaInvite = await alpha.mintInvite('public');
     await withScopeAsync(async (lifetime) => {
@@ -393,6 +479,7 @@ async function runPacketDriver() {
     await registry.destroy('alpha');
     await registry.destroy('gamma');
     host.removePacket(peer.cid);
+    host.removePacket(attacker.cid);
     assert.equal(host.packetCount, 0);
   } catch (error) {
     throw new Error(`${error.stack ?? error}\nbroker output:\n${brokerOutput.join('').slice(-4000)}`);
@@ -590,18 +677,26 @@ test('a submitted timeout terminalizes the packet without enqueueing or pairing 
   assert.equal(submitted.length, 1);
 });
 
-test('origin-ambiguous transaction failure terminalizes current and queued mutations', async () => {
+test('transaction failure rejects one local mutation without terminalizing healthy packet state', async () => {
   const { packet, pw, submitted, terminal } = fakePacket('ambiguous');
   const first = packet.mutatingTx('local-first', {});
-  const second = packet.mutatingTx('must-not-enqueue', {});
+  const second = packet.mutatingTx('local-second', {});
   await new Promise((done) => setImmediate(done));
   assert.equal(submitted.length, 1);
-  pw.on_transaction_failure('could be inbound');
-  const outcomes = await settledWithin([first, second]);
-  assert.deepEqual(outcomes.map((outcome) => outcome.status), ['rejected', 'rejected']);
-  assert.equal(submitted.length, 1);
-  assert.equal(terminal.length, 1);
-  await assert.rejects(packet.mutatingTx('future', {}), /could be inbound|closed|terminal/i);
+  pw.on_transaction_failure('local refusal');
+  await assert.rejects(first, /local refusal/);
+  await new Promise((done) => setImmediate(done));
+  assert.equal(submitted.length, 2);
+  pw.on_return_data(fakeReturnData('return_data', { call: 'second' }));
+  assert.equal((await second).Visualize(), '[object Object]');
+  assert.equal(terminal.length, 0);
+
+  pw.on_transaction_failure('inbound rejection with no local call');
+  const future = packet.mutatingTx('future', {});
+  await new Promise((done) => setImmediate(done));
+  pw.on_return_data(fakeReturnData('return_data', { call: 'future' }));
+  await future;
+  assert.equal(terminal.length, 0);
 });
 
 test('Packet.close rejects active and queued work before another envelope is submitted', async () => {

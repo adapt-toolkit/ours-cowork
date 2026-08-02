@@ -14,6 +14,8 @@ Ordinary ours-mcp identities can join only as remote participants over the ours 
 
 The release package contains the standalone daemon, operator CLI, compiled room packet, and all ten offline operator topics. It has no dependency on another agent daemon.
 
+Licensed under [FSL-1.1-Apache-2.0](./LICENSE).
+
 The ten offline topics cover prerequisites, installation, configuration, lifecycle, rooms, invites, messaging/history, backup/restore, service management, and exact limitations. Read them without a running daemon:
 
 ```sh

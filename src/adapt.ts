@@ -87,6 +87,7 @@ export class Packet {
   private closedError?: Error;
   private terminalNotified = false;
   private readonly onTerminal: (error: Error) => void;
+  private readonly terminalListeners = new Set<(error: Error) => void>();
   private readonly makeEnvelope: PacketEnvelopeFactory;
   readonly name: string;
   readonly cid: string;
@@ -109,6 +110,15 @@ export class Packet {
 
   get isClosed(): boolean {
     return this.closedError !== undefined;
+  }
+
+  onTerminalClose(listener: (error: Error) => void): () => void {
+    if (this.closedError) {
+      listener(this.closedError);
+      return () => {};
+    }
+    this.terminalListeners.add(listener);
+    return () => this.terminalListeners.delete(listener);
   }
 
   private assertOpen(): void {
@@ -206,6 +216,8 @@ export class Packet {
     }
     if (!this.terminalNotified) {
       this.terminalNotified = true;
+      for (const listener of this.terminalListeners) listener(error);
+      this.terminalListeners.clear();
       this.onTerminal(error);
     }
   }
@@ -261,14 +273,19 @@ export function wireHandlers(
 
   packet.pw.on_transaction_failure = (message: string) => {
     const pending = packet.pending[0];
-    const error = pending?.callbackError ?? new Error(
-      `packet "${packet.name}" transaction failure (origin ambiguous): ${message}`,
-    );
-    if (!pending) log(`[${packet.name}] inbound transaction rejected; terminalizing packet:`, message);
-    // SDK 0.10.12 does not identify whether this callback belongs to a local
-    // client transaction or inbound traffic. Shifting a local FIFO entry can
-    // therefore mispair every later result. The only safe response is terminal.
-    packet.close(error);
+    if (!pending) {
+      // The SDK reports an inbound abort through the same callback as a failed
+      // client transaction. An inbound refusal is healthy packet behavior: it
+      // must not tear down the native packet or its registry entry.
+      log(`[${packet.name}] inbound transaction rejected:`, message);
+      return;
+    }
+    packet.pending.shift();
+    clearTimeout(pending.timer);
+    pending.payload?.Destroy();
+    pending.reject(pending.callbackError ?? new Error(
+      `packet "${packet.name}" transaction failure: ${message}`,
+    ));
   };
 }
 

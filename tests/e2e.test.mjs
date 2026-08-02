@@ -276,11 +276,10 @@ if (process.argv.includes('--e2e-driver')) {
       await Promise.all([joinInvite(bob, proofPublic.blob), joinInvite(charlie, proofPublic.blob)]);
       await waitFor(() => bob.contacts().includes(publicProof.identity_cid)
         && charlie.contacts().includes(publicProof.identity_cid), 'two public invite redemptions');
-      await runCli(['room', 'recover', publicProof.room_id]);
-      const replayRefusal = await runCli(['room', 'recover', oneTimeProof.room_id], 35_000, 'internal');
-      assert.match(replayRefusal.message, /Unknown or already-redeemed invite/);
+      await waitFor(async () => (await runCli(['room', 'show', publicProof.room_id])).state === 'active',
+        'public acceptance notification activation');
+      await waitFor(() => !bob.contacts().includes(oneTimeProof.identity_cid), 'second one-time redemption refusal');
       await runCli(['restart']);
-      await runCli(['room', 'recover', oneTimeProof.room_id]);
       const oneTimeRoom = await runCli(['room', 'show', oneTimeProof.room_id]);
       const publicRoom = await runCli(['room', 'show', publicProof.room_id]);
       assert.equal(oneTimeRoom.state, 'active');
@@ -327,8 +326,10 @@ if (process.argv.includes('--e2e-driver')) {
 
       await joinInvite(alice, oneTime.blob);
       await waitFor(() => alice.contacts().includes(roomCid), 'Alice one-time contact');
-      await runCli(['room', 'recover', roomId]);
-      let room = await runCli(['room', 'show', roomId]);
+      let room = await waitFor(async () => {
+        const candidate = await runCli(['room', 'show', roomId]);
+        return candidate.seats.some((seat) => seat.identity === alice.cid) ? candidate : undefined;
+      }, 'Alice acceptance notification admission');
       assert.equal(room.state, 'provisioning', 'public min_accepts keeps the room provisioning');
       assert.deepEqual(room.seats.map(({ identity, role, invite_id }) => ({ identity, role, invite_id })), [{
         identity: alice.cid, role: 'lead', invite_id: oneTime.invite.invite_id,
@@ -337,7 +338,7 @@ if (process.argv.includes('--e2e-driver')) {
 
       await joinInvite(bob, publicInvite.blob);
       await waitFor(() => bob.contacts().includes(roomCid), 'Bob public contact');
-      await runCli(['room', 'recover', roomId]);
+      await send(bob, roomCid, 'immediate message after acceptance');
       room = await waitFor(async () => {
         const candidate = await runCli(['room', 'show', roomId]);
         return candidate.state === 'active' ? candidate : undefined;
@@ -349,6 +350,8 @@ if (process.argv.includes('--e2e-driver')) {
       ]);
       await waitFor(() => roomEnvelopes(alice).some((message) => message.kind === 'room_briefing' && message.text === created.mission.briefing), 'Alice initial briefing');
       await waitFor(() => roomEnvelopes(bob).some((message) => message.kind === 'room_briefing' && message.text === created.mission.briefing), 'Bob initial briefing');
+      await waitFor(() => roomEnvelopes(alice).some((message) => message.text === 'immediate message after acceptance'
+        && message.author.identity === bob.cid), 'immediate accepted participant message relay');
       stage('activated-and-briefed');
 
       await send(alice, roomCid, 'participant relay from Alice');
@@ -396,7 +399,6 @@ if (process.argv.includes('--e2e-driver')) {
       stage('non-seat-refused');
 
       await runCli(['room', 'recover', roomId, '--confirm', publicInvite.invite.invite_id, replacement.invite.invite_id]);
-      await runCli(['room', 'recover', roomId]);
       const seats = await runCli(['room', 'participants', roomId]);
       const charlieSeat = seats.find((seat) => seat.identity === charlie.cid);
       assert.deepEqual(

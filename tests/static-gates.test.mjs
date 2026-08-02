@@ -185,7 +185,7 @@ test('npm dry-run pack list is the exact standalone release artifact', () => {
   const paths = packs[0].files.map((file) => file.path).sort();
   const packetPaths = paths.filter((path) => /^dist\/mufl_code\/[0-9A-F]{64}\.muflo$/.test(path));
   assert.equal(packetPaths.length, 1);
-  const expected = ['README.md', 'dist/cli.js', 'dist/daemon.js', 'package.json', ...DOC_NAMES, packetPaths[0]].sort();
+  const expected = ['LICENSE', 'README.md', 'dist/cli.js', 'dist/daemon.js', 'package.json', ...DOC_NAMES, packetPaths[0]].sort();
   assert.deepEqual(paths, expected);
   assert.equal(paths.some((path) => /(?:^|\/)(?:src|tests)(?:\/|$)|secret|token|identity\.key|state_data\.bin/i.test(path)), false);
   for (const path of paths.filter((candidate) => !candidate.endsWith('.muflo'))) {

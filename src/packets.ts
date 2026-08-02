@@ -109,6 +109,7 @@ export interface PacketRegistryOptions {
   seed?: () => string;
   beforeExpose?: (packet: RoomPacket) => void | Promise<void>;
   onNotify?: (roomId: string, event: string) => void;
+  provisioningCheckpoint?: (stage: 'mkdir' | 'identity' | 'state' | 'identity_applied') => void;
 }
 
 export class PacketRegistry {
@@ -121,6 +122,7 @@ export class PacketRegistry {
   private readonly seed: () => string;
   private readonly beforeExpose: (packet: RoomPacket) => void | Promise<void>;
   private readonly onNotify: (roomId: string, event: string) => void;
+  private readonly provisioningCheckpoint: NonNullable<PacketRegistryOptions['provisioningCheckpoint']>;
 
   constructor(
     host: AdaptHost,
@@ -135,6 +137,7 @@ export class PacketRegistry {
     this.seed = options.seed ?? (() => randomBytes(24).toString('hex'));
     this.beforeExpose = options.beforeExpose ?? (() => {});
     this.onNotify = options.onNotify ?? (() => {});
+    this.provisioningCheckpoint = options.provisioningCheckpoint ?? (() => {});
   }
 
   get size(): number {
@@ -153,35 +156,52 @@ export class PacketRegistry {
     validateRoomId(roomId);
     if (this.packets.has(roomId)) throw new Error(`room packet "${roomId}" is already hosted`);
     const liveDir = this.liveDir(roomId);
-    if (this.fs.existsSync(liveDir)) throw new Error(`live packet state for room "${roomId}" already exists`);
-    this.fs.mkdirSync(liveDir, { recursive: true, mode: 0o700 });
-    this.fs.chmodSync(liveDir, 0o700);
+    if (this.hasRestorableState(roomId)) {
+      try {
+        return await this.restore(roomId, undefined, identityName, bio);
+      } catch (error) {
+        this.log(`[${this.packetName(roomId)}] pending packet restore failed; reprovisioning:`, error);
+      }
+    }
+    this.prepareProvisioningDirectory(roomId);
+    this.provisioningCheckpoint('mkdir');
 
     let native: Packet | undefined;
     try {
       native = await this.host.createPacket(this.packetName(roomId), this.seed());
-      const room = new HostedRoomPacket(
+      let room!: HostedRoomPacket;
+      room = new HostedRoomPacket(
         native,
         () => this.saveState(native!, liveDir),
         this.log,
         (event) => this.onNotify(roomId, event),
+        () => { if (this.packets.get(roomId) === room) this.packets.delete(roomId); },
       );
       atomicWriteFileSync(this.identityPath(roomId), Buffer.from(exportSigningSecret(native), 'utf8'), this.persistence);
+      this.provisioningCheckpoint('identity');
       this.saveState(native, liveDir);
+      this.provisioningCheckpoint('state');
       this.packets.set(roomId, room);
       await room.setIdentity(identityName, bio);
+      this.provisioningCheckpoint('identity_applied');
       return room;
     } catch (error) {
       if (native) {
         try { this.host.removePacket(native.cid); } catch { /* original error is authoritative */ }
       }
       this.packets.delete(roomId);
-      try { this.fs.rmSync(liveDir, { recursive: true, force: true }); } catch { /* report the create failure */ }
+      // Preserve the durable provisioning boundary. A restart can restore a
+      // complete packet, or safely replace an explicitly cowork-owned partial.
       throw error;
     }
   }
 
-  async restore(roomId: string, expectedCid?: string): Promise<RoomPacket> {
+  async restore(
+    roomId: string,
+    expectedCid?: string,
+    identityName?: string,
+    bio?: string,
+  ): Promise<RoomPacket> {
     validateRoomId(roomId);
     if (this.packets.has(roomId)) throw new Error(`room packet "${roomId}" is already hosted`);
     const liveDir = this.liveDir(roomId);
@@ -209,11 +229,13 @@ export class PacketRegistry {
         `restored room packet CID mismatch for "${roomId}": expected "${expectedCid}", found "${native.cid}"`,
       );
     }
-    const room = new HostedRoomPacket(
+    let room!: HostedRoomPacket;
+    room = new HostedRoomPacket(
       native,
       () => this.saveState(native, liveDir),
       this.log,
       (event) => this.onNotify(roomId, event),
+      () => { if (this.packets.get(roomId) === room) this.packets.delete(roomId); },
     );
     try {
       await withScopeAsync(async (lifetime) => {
@@ -221,6 +243,10 @@ export class PacketRegistry {
         await native.mutatingTx('::actor::import_state', state, lifetime);
       });
       native.pw.refresh_identity_proof_document();
+      if (identityName !== undefined && bio !== undefined) {
+        await room.setIdentity(identityName, bio);
+        this.provisioningCheckpoint('identity_applied');
+      }
       await this.beforeExpose(room);
       this.host.exposePacket(native.cid);
       this.packets.set(roomId, room);
@@ -299,6 +325,47 @@ export class PacketRegistry {
   private liveDir(roomId: string): string { return join(this.roomDir(roomId), 'live'); }
   private identityPath(roomId: string): string { return join(this.liveDir(roomId), 'identity.key'); }
   private statePath(roomId: string): string { return join(this.liveDir(roomId), 'state_data.bin'); }
+  private ownershipPath(roomId: string): string { return join(this.liveDir(roomId), '.cowork-provisioning-v1'); }
+
+  private hasRestorableState(roomId: string): boolean {
+    try {
+      const secret = this.fs.readFileSync(this.identityPath(roomId), 'utf8').trim();
+      return /^[0-9a-f]+$/i.test(secret)
+        && secret.length % 2 === 0
+        && this.fs.readFileSync(this.statePath(roomId)).length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private prepareProvisioningDirectory(roomId: string): void {
+    const roomDir = this.roomDir(roomId);
+    const liveDir = this.liveDir(roomId);
+    if (!this.fs.existsSync(roomDir)) {
+      this.fs.mkdirSync(roomDir, { recursive: true, mode: 0o700 });
+      this.fs.chmodSync(roomDir, 0o700);
+    }
+    if (this.fs.existsSync(liveDir)) {
+      let owned = false;
+      try { owned = this.fs.readFileSync(this.ownershipPath(roomId), 'utf8') === `${roomId}\n`; } catch { /* uncertain */ }
+      if (owned) {
+        this.assertSafeRoomDirectory(roomId);
+        this.fs.rmSync(liveDir, { recursive: true, force: true });
+        this.fsyncDirectory(roomDir);
+      } else {
+        this.assertSafeRoomDirectory(roomId);
+        let suffix = 0;
+        let residue = join(roomDir, 'provisioning-residue');
+        while (this.fs.existsSync(residue)) residue = join(roomDir, `provisioning-residue-${++suffix}`);
+        this.fs.renameSync(liveDir, residue);
+        this.fs.chmodSync(residue, 0o700);
+        this.fsyncDirectory(roomDir);
+      }
+    }
+    this.fs.mkdirSync(liveDir, { recursive: false, mode: 0o700 });
+    this.fs.chmodSync(liveDir, 0o700);
+    atomicWriteFileSync(this.ownershipPath(roomId), Buffer.from(`${roomId}\n`, 'utf8'), this.persistence);
+  }
 
   private assertSafeRoomDirectory(roomId: string): void {
     const roomDir = this.roomDir(roomId);
@@ -329,11 +396,13 @@ export class HostedRoomPacket implements RoomPacket {
     saveState: () => void,
     log: (...parts: unknown[]) => void,
     onNotify: (event: string) => void = () => {},
+    onTerminal: (error: Error) => void = () => {},
   ) {
     this.packet = packet;
     this.name = packet.name;
     this.cid = packet.cid;
     wireHandlers(packet, { onSaveState: saveState, onNotify: (event) => onNotify(event) }, log);
+    packet.onTerminalClose?.(onTerminal);
   }
 
   async setIdentity(identityName: string, bio: string): Promise<void> {

@@ -201,6 +201,31 @@ test('recoverRoom resumes the durable provisioning boundary with exactly one liv
   assert.equal(f.registry.createCalls.length, 2);
 });
 
+test('metadata-boundary crash resumes the already provisioned packet without duplication', async () => {
+  const f = fixture();
+  let crashed = false;
+  const interrupted = new RoomService(f.store, f.registry, {
+    roomId: () => ROOM_ID,
+    messageId: () => MESSAGE_IDS[0],
+    now: () => TIMES[0],
+    provisioningCheckpoint(stage) {
+      if (!crashed && stage === 'metadata') {
+        crashed = true;
+        throw new Error('crash at metadata');
+      }
+    },
+  });
+  await assert.rejects(
+    interrupted.createRoom({ goal: 'Ship the room', briefing: 'Read the mission.' }),
+    /crash at metadata/,
+  );
+  assert.equal(f.registry.packets.size, 1);
+  const recovered = await f.service.recoverPacket(ROOM_ID);
+  assert.equal(recovered.identity_cid, `cid-room-${ROOM_ID}`);
+  assert.equal(f.registry.packets.size, 1);
+  assert.equal(f.registry.createCalls.length, 1);
+});
+
 test('recoverRoom restores rather than creates when a packet exists behind the provisioning sentinel', async () => {
   const f = fixture();
   f.registry.failCreate = new Error('crash after metadata reservation');
@@ -559,6 +584,32 @@ test('admission uses only exact invite origins, never contact names or roles for
   }]);
   assert.deepEqual(room.invites[0].accepted_cids, ['cid-alice']);
   assert.equal(room.state, 'provisioning', 'two accepts are required');
+});
+
+test('live contact acceptance admits and activates before immediate intake without manual recovery', async () => {
+  const f = fixture();
+  await create(f);
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'reviewer', min_accepts: 1 });
+  const packet = f.registry.get(ROOM_ID);
+  packet.contacts = [{ name: 'Alice', container_id: 'cid-alice' }];
+  packet.origins = {
+    'cid-alice': { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[2] },
+  };
+
+  await Promise.all([
+    f.service.notifyRoom(ROOM_ID, 'contact_accepted'),
+    f.service.notifyRoom(ROOM_ID, 'message_received'),
+    f.service.notifyRoom(ROOM_ID, 'contact_accepted'),
+  ]);
+
+  const room = await f.service.showRoom(ROOM_ID);
+  assert.equal(room.state, 'active');
+  assert.deepEqual(room.seats.map((seat) => [seat.identity, seat.role]), [['cid-alice', 'reviewer']]);
+  assert.deepEqual(room.invites[0].accepted_cids, ['cid-alice']);
+  const records = await f.service.history(ROOM_ID);
+  assert.equal(records.filter((record) => record.kind === 'message' && record.category === 'briefing').length, 1);
+  assert.equal(records.filter((record) => record.kind === 'relay_intent').length, 1);
+  assert.equal(records.filter((record) => record.kind === 'relay_result').length, 1);
 });
 
 test('activation requires every non-revoked requirement and at least one unique seat', async () => {

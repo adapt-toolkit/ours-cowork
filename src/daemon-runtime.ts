@@ -60,7 +60,7 @@ export interface DaemonService {
   reconcileRoom(roomId: string): Promise<unknown>;
   closeRoom(roomId: string): Promise<unknown>;
   resumePending(roomId: string): Promise<void>;
-  notifyRoom?(roomId: string): Promise<void>;
+  notifyRoom?(roomId: string, event?: string): Promise<void>;
   beginShutdown(): void;
   drain(): Promise<void>;
 }
@@ -190,7 +190,9 @@ export class CoworkDaemon {
         {
           log: this.options.log,
           onNotify: (roomId, event) => {
-            if (event === 'message_received') this.handleNotification(roomId, serviceRef);
+            if (event === 'message_received' || event === 'contact_accepted') {
+              this.handleNotification(roomId, event, serviceRef);
+            }
           },
         },
       );
@@ -330,13 +332,13 @@ export class CoworkDaemon {
     if (this.cancelled) throw new DaemonBootCancelledError();
   }
 
-  private handleNotification(roomId: string, service = this.service): void {
+  private handleNotification(roomId: string, event = 'message_received', service = this.service): void {
     if (this.stopping) return;
     if (!this.ready || !service?.notifyRoom) {
       this.queuedNotifications.add(roomId);
       return;
     }
-    const work = service.notifyRoom(roomId);
+    const work = service.notifyRoom(roomId, event);
     this.notificationWork.add(work);
     void work.then(
       () => this.notificationWork.delete(work),

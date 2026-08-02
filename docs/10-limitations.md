@@ -8,4 +8,3 @@
 - Service uninstall retains data. It removes the systemd or launchd definition, not configuration, archives, room metadata, or packet state.
 - Closing and deleting are separate. First close the room explicitly with `ours-cowork room close <room-id>`. Only a closed room can then be deleted with `ours-cowork room delete <room-id> --yes`.
 - Confirmed deletion removes the retained archive and metadata from this host only. It does not claim remote purge, backup erasure, key wipe, or secure erase.
-

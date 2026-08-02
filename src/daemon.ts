@@ -174,14 +174,19 @@ export class DaemonSupervisor {
   }
 }
 
-export async function runSupervisor(options: { onStage?: (stage: WorkerStage) => void } = {}): Promise<number> {
+export async function runSupervisor(options: {
+  onStage?: (stage: WorkerStage) => void;
+  quiet?: boolean;
+} = {}): Promise<number> {
   const workerEnv = { ...process.env };
   delete workerEnv.NODE_OPTIONS;
   workerEnv.OURS_COWORK_DAEMON_WORKER = '1';
   workerEnv.OURS_COWORK_SUPERVISOR_PID = String(process.pid);
   const child = fork(fileURLToPath(import.meta.url), [], {
     env: workerEnv,
-    stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+    stdio: options.quiet
+      ? ['ignore', 'ignore', 'ignore', 'ipc']
+      : ['inherit', 'inherit', 'inherit', 'ipc'],
     execArgv: [],
     // A terminal-generated signal must reach only the SDK-free supervisor.
     // The worker is controlled exclusively over IPC and shuts down if that

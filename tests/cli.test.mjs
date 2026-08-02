@@ -3,7 +3,7 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 const ROOT = resolve(new URL('..', import.meta.url).pathname);
@@ -11,7 +11,15 @@ const CLI = join(ROOT, 'dist', 'cli.js');
 const TOKEN_PATTERN = /\b[0-9a-f]{64}\b/;
 
 async function runCli(args, options = {}) {
-  const child = spawn(process.execPath, [CLI, ...args], {
+  const cli = options.cli ?? CLI;
+  const nodeArgs = options.platform === undefined
+    ? [cli, ...args]
+    : ['--input-type=module', '--eval', `
+      Object.defineProperty(process, 'platform', { value: ${JSON.stringify(options.platform)} });
+      process.argv = [process.execPath, ${JSON.stringify(cli)}, ...${JSON.stringify(args)}];
+      await import(${JSON.stringify(new URL(`file://${cli}`).href)});
+    `];
+  const child = spawn(process.execPath, nodeArgs, {
     cwd: ROOT,
     env: { ...process.env, ...options.env },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -25,6 +33,23 @@ async function runCli(args, options = {}) {
     child.once('close', resolveCode);
   });
   return { code, stdout, stderr };
+}
+
+async function withRawRpc(handler, action) {
+  const stateDir = await mkdtemp(join(tmpdir(), 'cowork-cli-raw-'));
+  await chmod(stateDir, 0o700);
+  const socketPath = join(stateDir, 'management.sock');
+  const server = createServer(handler);
+  await new Promise((resolveListen, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, resolveListen);
+  });
+  try {
+    return await action({ OURS_COWORK_STATE_DIR: stateDir });
+  } finally {
+    await new Promise((resolveClose) => server.close(resolveClose));
+    await rm(stateDir, { recursive: true, force: true });
+  }
 }
 
 async function withRpc(response, action) {
@@ -175,6 +200,100 @@ test('delete requires --yes and message author-spoof flags are rejected locally'
   }
 });
 
+test('option values beginning -- are unambiguous and global --json never steals inline data', async () => {
+  for (const value of ['--help', '--json']) {
+    await withRpc({ result: { accepted: true } }, async (rpc) => {
+      const result = await runCli(['--json', 'room', 'message', 'room1', `--text=${value}`], { env: rpc.env });
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.stderr, '');
+      assert.equal(rpc.requests.length, 1);
+      assert.equal(rpc.requests[0].params.text, value);
+      assert.deepEqual(JSON.parse(result.stdout), { ok: true, result: { accepted: true } });
+    });
+  }
+  const local = await runCli(['room', 'message', 'room1', '--text=hello', '--author=mallory']);
+  assert.equal(local.code, 2);
+  assert.match(local.stderr, /unknown|not allowed/i);
+});
+
+test('malformed, incomplete, and oversized RPC replies fail fast without a lingering timeout', async () => {
+  const cases = [
+    (socket) => socket.end('{not-json}\n'),
+    (socket) => socket.end('{"version":1'),
+    (socket) => socket.end(`${'x'.repeat(1024 * 1024 + 1)}\n`),
+  ];
+  for (const handler of cases) {
+    await withRawRpc((socket) => {
+      socket.once('data', () => handler(socket));
+    }, async (env) => {
+      const before = Date.now();
+      const result = await runCli(['room', 'list', '--json'], { env });
+      const elapsed = Date.now() - before;
+      assert.equal(result.code, 7);
+      assert.equal(result.stderr, '');
+      assert(elapsed < 2_000, `protocol failure kept the CLI alive for ${elapsed}ms`);
+      assert.equal(JSON.parse(result.stdout).ok, false);
+    });
+  }
+});
+
+test('status, stop, and restart never claim or signal an unrelated PID and listener', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'cowork-cli-owner-'));
+  await chmod(stateDir, 0o700);
+  const unrelated = spawn('sleep', ['30']);
+  assert(unrelated.pid);
+  await writeFile(join(stateDir, 'daemon.pid'), `${unrelated.pid}\n`, { mode: 0o600 });
+  const listener = createServer((socket) => socket.end());
+  await new Promise((resolveListen, reject) => {
+    listener.once('error', reject);
+    listener.listen(join(stateDir, 'management.sock'), resolveListen);
+  });
+  const env = { OURS_COWORK_STATE_DIR: stateDir };
+  try {
+    const status = await runCli(['status', '--json'], { env });
+    assert.equal(status.code, 6);
+    assert.equal(JSON.parse(status.stdout).error.code, 'daemon_unavailable');
+
+    const stop = await runCli(['stop', '--json'], { env });
+    assert.equal(stop.code, 0);
+    assert.deepEqual(JSON.parse(stop.stdout).result, { stopped: false });
+    assert.equal(unrelated.exitCode, null, 'stop killed an unrelated process');
+
+    const restart = await runCli(['restart', '--json'], { env });
+    assert.equal(restart.code, 4);
+    assert.equal(unrelated.exitCode, null, 'restart killed an unrelated process');
+  } finally {
+    await new Promise((resolveClose) => listener.close(resolveClose));
+    if (unrelated.exitCode === null) unrelated.kill('SIGTERM');
+    await new Promise((resolveClose) => unrelated.once('close', resolveClose));
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('--json serve emits exactly one JSON value and suppresses supervised diagnostics', async () => {
+  for (const behavior of ['clean', 'nonzero', 'throw']) {
+    const directory = await mkdtemp(join(tmpdir(), 'cowork serve copy '));
+    const cli = join(directory, 'cli.js');
+    await writeFile(cli, await readFile(CLI));
+    await chmod(cli, 0o700);
+    const daemon = behavior === 'throw'
+      ? `export async function runSupervisor(options) { if (!options?.quiet) console.error('worker diagnostic'); throw new Error('supervisor failed'); }\n`
+      : `export async function runSupervisor(options) { if (!options?.quiet) console.error('worker diagnostic'); return ${behavior === 'clean' ? 0 : 1}; }\n`;
+    await writeFile(join(directory, 'daemon.js'), daemon);
+    try {
+      const result = await runCli(['--json', 'serve'], { cli });
+      assert.equal(result.code, behavior === 'clean' ? 0 : 7);
+      assert.equal(result.stderr, '');
+      assert.equal(result.stdout.trim().split('\n').length, 1);
+      const json = JSON.parse(result.stdout);
+      assert.equal(json.ok, behavior === 'clean');
+      if (behavior === 'clean') assert.deepEqual(json.result, { served: true, exit_code: 0 });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test('offline docs cover operations and exact limitations without exposing a management token', async () => {
   const result = await runCli(['docs', 'limitations'], {
     env: { OURS_COWORK_STATE_DIR: join(tmpdir(), 'does-not-exist'), HTTP_PROXY: 'http://127.0.0.1:1', HTTPS_PROXY: 'http://127.0.0.1:1' },
@@ -224,7 +343,7 @@ test('generated service definitions execute the cowork CLI directly and uninstal
     assert.equal(installed.code, 0, installed.stderr);
     const unitPath = join(home, '.config', 'systemd', 'user', 'ours-cowork.service');
     const unit = await readFile(unitPath, 'utf8');
-    assert.match(unit, new RegExp(`^ExecStart=${CLI.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} serve$`, 'm'));
+    assert.match(unit, new RegExp(`^ExecStart="${CLI.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}" serve$`, 'm'));
     assert.doesNotMatch(unit, /ours-mcp|(?:^|[ /])\.ours(?:[ /]|$)/im);
     assert.doesNotMatch(unit, /management-token|Bearer/i);
 
@@ -232,6 +351,67 @@ test('generated service definitions execute the cowork CLI directly and uninstal
     const uninstalled = await runCli(['uninstall-service'], { env });
     assert.equal(uninstalled.code, 0, uninstalled.stderr);
     assert.equal(await readFile(join(stateDir, 'keep-me'), 'utf8'), 'retained');
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('failed systemd and launchd unloads retain their service definitions and report failure', async () => {
+  for (const platform of ['linux', 'darwin']) {
+    const home = await mkdtemp(join(tmpdir(), `cowork-${platform}-uninstall-`));
+    const binDir = join(home, 'bin');
+    await mkdir(binDir, { mode: 0o700 });
+    const command = platform === 'linux' ? 'systemctl' : 'launchctl';
+    const tool = join(binDir, command);
+    await writeFile(tool, '#!/bin/sh\nexit 19\n', { mode: 0o700 });
+    await chmod(tool, 0o700);
+    const definition = platform === 'linux'
+      ? join(home, '.config', 'systemd', 'user', 'ours-cowork.service')
+      : join(home, 'Library', 'LaunchAgents', 'network.ours.cowork.plist');
+    await mkdir(resolve(definition, '..'), { recursive: true, mode: 0o700 });
+    await writeFile(definition, 'must remain');
+    try {
+      const result = await runCli(['uninstall-service', '--json'], {
+        platform,
+        env: { HOME: home, PATH: `${binDir}:${process.env.PATH}`, OURS_COWORK_STATE_DIR: join(home, 'state') },
+      });
+      assert.equal(result.code, 7, `${platform}: ${result.stdout} ${result.stderr}`);
+      assert.equal(result.stderr, '');
+      assert.equal(await readFile(definition, 'utf8'), 'must remain');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+});
+
+test('systemd ExecStart quotes a cowork CLI path containing spaces and special characters', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'cowork-systemd-quote-'));
+  const unusual = join(home, 'cowork path % $');
+  const copiedCli = join(unusual, 'cli.js');
+  const binDir = join(home, 'bin');
+  const stateDir = join(home, 'state');
+  await mkdir(unusual, { recursive: true, mode: 0o700 });
+  await mkdir(binDir, { mode: 0o700 });
+  await mkdir(stateDir, { mode: 0o700 });
+  await writeFile(copiedCli, await readFile(CLI));
+  await chmod(copiedCli, 0o700);
+  for (const name of ['systemctl', 'loginctl']) {
+    await writeFile(join(binDir, name), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+    await chmod(join(binDir, name), 0o700);
+  }
+  try {
+    const result = await runCli(['install-service'], {
+      cli: copiedCli,
+      env: { HOME: home, PATH: `${binDir}:${process.env.PATH}`, OURS_COWORK_STATE_DIR: stateDir },
+    });
+    assert.equal(result.code, 0, result.stderr);
+    const unitPath = join(home, '.config', 'systemd', 'user', 'ours-cowork.service');
+    const unit = await readFile(unitPath, 'utf8');
+    assert.match(unit, /^ExecStart="(?:[^"\\]|\\.)+" serve$/m);
+    if (spawnSync('systemd-analyze', ['--version']).status === 0) {
+      const verified = spawnSync('systemd-analyze', ['verify', unitPath], { encoding: 'utf8' });
+      assert.equal(verified.status, 0, verified.stderr);
+    }
   } finally {
     await rm(home, { recursive: true, force: true });
   }

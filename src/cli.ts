@@ -491,16 +491,52 @@ function openBrowser(url: string): void {
 
 function httpGetReady(url: string, timeoutMs: number): Promise<boolean> {
   return new Promise((resolveReady) => {
-    const request = http.get(url, (response) => {
-      const ready = response.statusCode === 200;
-      response.resume();
-      response.once('end', () => resolveReady(ready));
-    });
-    request.setTimeout(timeoutMs, () => {
-      request.destroy();
-      resolveReady(false);
-    });
-    request.once('error', () => resolveReady(false));
+    let response: http.IncomingMessage | undefined;
+    let settled = false;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const settle = (ready: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (deadline) clearTimeout(deadline);
+      deadline = undefined;
+      request.removeListener('response', onResponse);
+      request.removeListener('error', onRequestError);
+      request.removeListener('timeout', onRequestTimeout);
+      request.removeListener('close', onRequestClose);
+      request.setTimeout(0);
+      if (response) {
+        response.removeListener('end', onResponseEnd);
+        response.removeListener('error', onResponseError);
+        response.removeListener('aborted', onResponseAborted);
+        response.removeListener('close', onResponseClose);
+        if (!response.destroyed) response.destroy();
+      }
+      if (!request.destroyed) request.destroy();
+      resolveReady(ready);
+    };
+    const onRequestError = (): void => settle(false);
+    const onRequestTimeout = (): void => settle(false);
+    const onRequestClose = (): void => { if (!response) settle(false); };
+    const onResponseEnd = (): void => settle(response?.complete === true && response.statusCode === 200);
+    const onResponseError = (): void => settle(false);
+    const onResponseAborted = (): void => settle(false);
+    const onResponseClose = (): void => settle(response?.complete === true && response.statusCode === 200);
+    const onResponse = (incoming: http.IncomingMessage): void => {
+      if (settled) { incoming.destroy(); return; }
+      response = incoming;
+      incoming.once('end', onResponseEnd);
+      incoming.once('error', onResponseError);
+      incoming.once('aborted', onResponseAborted);
+      incoming.once('close', onResponseClose);
+      incoming.resume();
+    };
+    const request = http.get(url);
+    request.once('response', onResponse);
+    request.once('error', onRequestError);
+    request.once('timeout', onRequestTimeout);
+    request.once('close', onRequestClose);
+    request.setTimeout(timeoutMs);
+    deadline = setTimeout(() => settle(false), timeoutMs);
   });
 }
 

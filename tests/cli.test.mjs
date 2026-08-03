@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -12,6 +13,7 @@ import {
   openWebConsole,
   rpcCall,
   rpcTimeoutForMethod,
+  waitForHttpReadiness,
 } from '../src/cli.ts';
 
 const ROOT = resolve(new URL('..', import.meta.url).pathname);
@@ -178,6 +180,42 @@ test('web disabled, readiness timeout, and JSON mode preserve exact side-effect 
   });
   assert.deepEqual(result, { url: 'http://127.0.0.1:3052/', opened: false });
   assert.equal(opened, 0);
+});
+
+test('web readiness enforces an absolute deadline after headers, incomplete close, and response trickle', { timeout: 5_000 }, async () => {
+  for (const behavior of ['incomplete-close', 'trickle']) {
+    const server = createHttpServer((_request, response) => {
+      if (behavior === 'incomplete-close') {
+        response.writeHead(200, { 'content-length': '8' });
+        response.flushHeaders();
+        response.write('x');
+        setImmediate(() => response.destroy());
+        return;
+      }
+      response.writeHead(200, { 'content-type': 'text/plain' });
+      response.flushHeaders();
+      const interval = setInterval(() => response.write('x'), 20);
+      response.once('close', () => clearInterval(interval));
+    });
+    await new Promise((resolveListen, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolveListen);
+    });
+    const address = server.address();
+    assert(address && typeof address !== 'string');
+    const started = Date.now();
+    try {
+      const outcome = await Promise.race([
+        waitForHttpReadiness(`http://127.0.0.1:${address.port}/`, 120),
+        new Promise((resolveHung) => setTimeout(() => resolveHung('hung'), 600)),
+      ]);
+      assert.equal(outcome, false, `${behavior} readiness did not settle false`);
+      assert(Date.now() - started < 500, `${behavior} exceeded its absolute readiness deadline`);
+    } finally {
+      server.closeAllConnections();
+      await new Promise((resolveClose) => server.close(resolveClose));
+    }
+  }
 });
 
 test('web browser opener selects the platform-native command without a shell', () => {

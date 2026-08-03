@@ -269,3 +269,14 @@ test('CI repeats E2E and invokes the asserted release gate', () => {
   assert.equal(manifest.scripts['test:release'], 'node --test tests/static-gates.test.mjs');
   assert.equal(manifest.scripts['test:browser'], 'node --test tests/browser-smoke.test.mjs');
 });
+
+test('browser smoke wrapper is Node 20 JavaScript and explicitly bundles its TypeScript entry', () => {
+  const wrapper = readFileSync(join(ROOT, 'tests', 'browser-smoke.test.mjs'), 'utf8');
+  assert.doesNotMatch(wrapper, /(?:from\s*|import\s*\()\s*['"][^'"]+\.ts['"]/);
+  assert.match(wrapper, /from ['"]esbuild['"]/);
+  assert.match(wrapper, /browser-smoke-entry\.ts/);
+  assert.match(wrapper, /node_modules['"],\s*['"]\.cache/);
+  assert.match(wrapper, /target:\s*['"]node20['"]/);
+  assert.match(wrapper, /external:\s*\[['"]playwright-core['"]\]/);
+  assert.match(wrapper, /await import\(pathToFileURL\(output\)\.href\)/);
+});

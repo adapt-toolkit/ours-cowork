@@ -6,8 +6,9 @@ export interface RoomRailProps {
   selectedRoomId?: string;
   connected: boolean | null;
   open: boolean;
+  sheet: boolean;
   onClose(): void;
-  onCreate(): void;
+  onCreate(trigger: HTMLButtonElement): void;
   onSelect(roomId: string): void;
 }
 
@@ -25,20 +26,21 @@ export function roomTitle(room: Pick<RoomDto, 'room_id' | 'mission'>): string {
 }
 
 export function RoomRail({
-  rooms, selectedRoomId, connected, open, onClose, onCreate, onSelect,
+  rooms, selectedRoomId, connected, open, sheet, onClose, onCreate, onSelect,
 }: RoomRailProps) {
   const openRooms = rooms.filter((room) => room.state !== 'closed');
   const closedRooms = rooms.filter((room) => room.state === 'closed');
+  const hidden = sheet && !open;
 
   return (
-    <aside className={`room-rail${open ? ' room-rail--open' : ''}`} aria-label="Mission rooms">
+    <aside className={`room-rail${open ? ' room-rail--open' : ''}`} aria-label="Mission rooms" aria-hidden={hidden || undefined} hidden={hidden}>
       <div className="rail-brand">
         <div className="brand-mark" aria-hidden="true">O</div>
         <div><strong>ours cowork</strong><span>operations console</span></div>
         <button className="icon-button rail-close" type="button" onClick={onClose} aria-label="Close rooms">×</button>
       </div>
 
-      <button className="primary-button create-button" type="button" onClick={onCreate} disabled={connected !== true}>
+      <button className="primary-button create-button" type="button" onClick={(event) => onCreate(event.currentTarget)} disabled={connected !== true}>
         <span aria-hidden="true">＋</span> Create room
       </button>
 

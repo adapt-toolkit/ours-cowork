@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import React from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -49,7 +49,9 @@ describe('create and settings dialogs', () => {
     await user.type(screen.getByLabelText('Goal'), '  Release coordination  ');
     await user.clear(screen.getByLabelText('Briefing'));
     await user.type(screen.getByLabelText('Briefing'), '  Keep deploy owners aligned  ');
-    await user.click(screen.getByRole('button', { name: 'Create mission room' }));
+    const invoker = screen.getByRole('button', { name: 'Create room' });
+    const submit = screen.getByRole('button', { name: 'Create mission room' });
+    await user.click(submit);
 
     expect(call).toHaveBeenCalledWith('room.create', {
       goal: 'Release coordination', briefing: 'Keep deploy owners aligned',
@@ -57,8 +59,15 @@ describe('create and settings dialogs', () => {
     expect(call.mock.calls.filter(([method]) => method === 'room.create')).toHaveLength(1);
     expect(screen.getByRole('button', { name: 'Creating room…' })).toBeDisabled();
 
+    await user.tab();
+    expect(screen.getByLabelText('Goal')).toHaveFocus();
+    invoker.focus();
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true });
+    expect(screen.getByLabelText('Briefing')).toHaveFocus();
+
     pending.resolve(createdRoom());
     await act(async () => pending.promise);
+    expect(invoker).toHaveFocus();
   });
 
   it('retains fields after an unknown outcome, then selects a confirmed room and opens Invite', async () => {
@@ -110,5 +119,57 @@ describe('create and settings dialogs', () => {
     await user.click(screen.getByRole('button', { name: 'Save settings' }));
 
     expect(call).toHaveBeenCalledWith('room.settings', { room_id: 'new-room', status: 'ready' });
+  });
+
+  it('preserves persisted whitespace and submits only the exact changed setting', async () => {
+    const target = {
+      ...createdRoom(),
+      mission: { goal: '  Release coordination  ', briefing: '\nKeep deploy owners aligned\n' },
+      status: '  staged  ',
+    };
+    const call = vi.fn(async (method: string) => {
+      if (method === 'room.list') return [target];
+      if (method === 'room.show') return target;
+      if (method === 'room.settings') return target;
+      throw new Error(`unexpected ${method}`);
+    });
+    const user = userEvent.setup();
+    location.hash = '#/rooms/new-room';
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Room settings' }));
+    expect(screen.getByLabelText('Goal')).toHaveValue('  Release coordination  ');
+    expect(screen.getByLabelText('Briefing')).toHaveValue('\nKeep deploy owners aligned\n');
+    expect(screen.getByLabelText('Status (optional)')).toHaveValue('  staged  ');
+    expect(screen.getByText('24 / 262144 bytes')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText('Status (optional)'), { target: { value: '  ready now  ' } });
+    await user.click(screen.getByRole('button', { name: 'Save settings' }));
+    expect(call).toHaveBeenCalledWith('room.settings', { room_id: 'new-room', status: '  ready now  ' });
+  });
+
+  it('discards canceled settings drafts and reopens from the latest room DTO', async () => {
+    let target = createdRoom();
+    const call = vi.fn(async (method: string) => {
+      if (method === 'room.list' || method === 'room.show') return method === 'room.list' ? [target] : target;
+      throw new Error(`unexpected ${method}`);
+    });
+    const user = userEvent.setup();
+    location.hash = '#/rooms/new-room';
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+
+    const settings = await screen.findByRole('button', { name: 'Room settings' });
+    await user.click(settings);
+    await user.clear(screen.getByLabelText('Goal'));
+    await user.type(screen.getByLabelText('Goal'), 'Canceled draft');
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    target = { ...target, mission: { ...target.mission, goal: 'Server-refreshed goal' } };
+    fireEvent(document, new Event('visibilitychange'));
+    await screen.findByRole('heading', { name: 'Server-refreshed goal' });
+    await user.click(settings);
+    expect(screen.getByLabelText('Goal')).toHaveValue('Server-refreshed goal');
+    expect(within(screen.getByRole('dialog', { name: 'Room settings' })).getByRole('button', { name: 'Save settings' })).toBeDisabled();
   });
 });

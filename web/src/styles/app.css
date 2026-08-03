@@ -1,5 +1,6 @@
 .cowork-app { min-height: 100vh; display: grid; grid-template-columns: 280px minmax(420px, 1fr) 320px; overflow: hidden; background: radial-gradient(circle at 48% 0, rgb(124 231 176 / 3%), transparent 28%), var(--bg); }
 .room-rail, .room-context { height: 100vh; overflow-y: auto; background: var(--panel); z-index: 5; }
+.room-rail[hidden], .room-context[hidden] { display: none; visibility: hidden; pointer-events: none; }
 .room-rail { display: flex; flex-direction: column; border-right: 1px solid var(--line); padding: 18px 14px 14px; }
 .rail-brand { display: flex; align-items: center; gap: 10px; min-height: 42px; padding: 0 5px 16px; }
 .brand-mark { display: grid; place-items: center; width: 32px; height: 32px; border: 1px solid var(--mint-dim); border-radius: 50%; color: var(--mint); font: 700 15px/1 Georgia, serif; box-shadow: var(--shadow-mint); }

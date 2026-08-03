@@ -5,8 +5,9 @@ import type { RoomDto } from '../api/types';
 
 const MAX_MISSION_BYTES = 262_144;
 
-export function CreateRoomDialog({ open, onClose, onCreate }: {
+export function CreateRoomDialog({ open, restoreFocus, onClose, onCreate }: {
   open: boolean;
+  restoreFocus?: HTMLElement;
   onClose(): void;
   onCreate(goal: string, briefing: string): Promise<void>;
 }) {
@@ -41,11 +42,11 @@ export function CreateRoomDialog({ open, onClose, onCreate }: {
   }
 
   return (
-    <Modal title="Create mission room" open={open} onClose={onClose} locked={submitting}>
+    <Modal title="Create mission room" open={open} restoreFocus={restoreFocus} onClose={onClose} locked={submitting}>
       <form className="dialog-form" onSubmit={submit}>
         <p className="dialog-intro">Define the shared objective. Invitation requirements are added after the room is created.</p>
-        <MissionField label="Goal" value={goal} onChange={setGoal} error={goalError} rows={3} autoFocus />
-        <MissionField label="Briefing" value={briefing} onChange={setBriefing} error={briefingError} rows={6} />
+        <MissionField label="Goal" value={goal} onChange={setGoal} error={goalError} rows={3} autoFocus trimForBytes />
+        <MissionField label="Briefing" value={briefing} onChange={setBriefing} error={briefingError} rows={6} trimForBytes />
         {error && <p className="form-error" role="alert">{error}</p>}
         <div className="dialog-actions">
           <button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>Cancel</button>
@@ -56,9 +57,10 @@ export function CreateRoomDialog({ open, onClose, onCreate }: {
   );
 }
 
-export function SettingsDialog({ room, open, onClose, onSave }: {
+export function SettingsDialog({ room, open, restoreFocus, onClose, onSave }: {
   room: RoomDto;
   open: boolean;
+  restoreFocus?: HTMLElement;
   onClose(): void;
   onSave(changes: { goal?: string; briefing?: string; status?: string }): Promise<void>;
 }) {
@@ -68,15 +70,22 @@ export function SettingsDialog({ room, open, onClose, onSave }: {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string>();
   const submittingRef = useRef(false);
+  useEffect(() => {
+    if (!open) return;
+    setGoal(room.mission.goal);
+    setBriefing(room.mission.briefing);
+    setStatus(room.status ?? '');
+    setError(undefined);
+  }, [open, room.mission.briefing, room.mission.goal, room.room_id, room.status]);
   if (!open) return null;
 
-  const goalError = missionError('Goal', goal);
-  const briefingError = missionError('Briefing', briefing);
-  const statusError = room.status && !status.trim() ? 'An existing status cannot be cleared.' : undefined;
+  const goalError = exactMissionError('Goal', goal);
+  const briefingError = exactMissionError('Briefing', briefing);
+  const statusError = room.status && !status ? 'An existing status cannot be cleared.' : undefined;
   const changes: { goal?: string; briefing?: string; status?: string } = {};
-  if (goal.trim() !== room.mission.goal) changes.goal = goal.trim();
-  if (briefing.trim() !== room.mission.briefing) changes.briefing = briefing.trim();
-  if (status.trim() !== (room.status ?? '')) changes.status = status.trim();
+  if (goal !== room.mission.goal) changes.goal = goal;
+  if (briefing !== room.mission.briefing) changes.briefing = briefing;
+  if (status !== (room.status ?? '')) changes.status = status;
   const dirty = Object.keys(changes).length > 0;
 
   async function submit(event: FormEvent) {
@@ -95,7 +104,7 @@ export function SettingsDialog({ room, open, onClose, onSave }: {
   }
 
   return (
-    <Modal title="Room settings" open={open} onClose={onClose} locked={submitting}>
+    <Modal title="Room settings" open={open} restoreFocus={restoreFocus} onClose={onClose} locked={submitting}>
       <form className="dialog-form" onSubmit={submit}>
         <MissionField label="Goal" value={goal} onChange={setGoal} error={goalError} rows={3} autoFocus />
         <MissionField label="Briefing" value={briefing} onChange={setBriefing} error={briefingError} rows={5} />
@@ -110,12 +119,12 @@ export function SettingsDialog({ room, open, onClose, onSave }: {
   );
 }
 
-function MissionField({ label, value, onChange, error, rows, autoFocus = false }: {
-  label: string; value: string; onChange(value: string): void; error?: string; rows: number; autoFocus?: boolean;
+function MissionField({ label, value, onChange, error, rows, autoFocus = false, trimForBytes = false }: {
+  label: string; value: string; onChange(value: string): void; error?: string; rows: number; autoFocus?: boolean; trimForBytes?: boolean;
 }) {
   const id = useId();
   const errorId = `${id}-error`;
-  return <div className="field"><label htmlFor={id}>{label}</label><textarea id={id} value={value} rows={rows} onChange={(event) => onChange(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? errorId : undefined} autoFocus={autoFocus} data-autofocus={autoFocus ? 'true' : undefined} />{error ? <small id={errorId} className="field-error">{error}</small> : <small>{byteLength(value.trim())} / {MAX_MISSION_BYTES} bytes</small>}</div>;
+  return <div className="field"><label htmlFor={id}>{label}</label><textarea id={id} value={value} rows={rows} onChange={(event) => onChange(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? errorId : undefined} autoFocus={autoFocus} data-autofocus={autoFocus ? 'true' : undefined} />{error ? <small id={errorId} className="field-error">{error}</small> : <small>{byteLength(trimForBytes ? value.trim() : value)} / {MAX_MISSION_BYTES} bytes</small>}</div>;
 }
 
 function TextField({ label, value, onChange, error }: { label: string; value: string; onChange(value: string): void; error?: string }) {
@@ -124,7 +133,7 @@ function TextField({ label, value, onChange, error }: { label: string; value: st
   return <div className="field"><label htmlFor={id}>{label}</label><input id={id} value={value} onChange={(event) => onChange(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? errorId : undefined} />{error && <small id={errorId} className="field-error">{error}</small>}</div>;
 }
 
-function Modal({ title, open, onClose, locked, children }: { title: string; open: boolean; onClose(): void; locked: boolean; children: ReactNode }) {
+function Modal({ title, open, restoreFocus, onClose, locked, children }: { title: string; open: boolean; restoreFocus?: HTMLElement; onClose(): void; locked: boolean; children: ReactNode }) {
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
@@ -133,7 +142,7 @@ function Modal({ title, open, onClose, locked, children }: { title: string; open
   lockedRef.current = locked;
   useEffect(() => {
     if (!open) return;
-    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previous = restoreFocus ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
     const panel = panelRef.current;
     const focusable = () => [...(panel?.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])') ?? [])];
     (focusable().find((element) => element.dataset.autofocus === 'true') ?? focusable()[0])?.focus();
@@ -144,12 +153,17 @@ function Modal({ title, open, onClose, locked, children }: { title: string; open
       if (!targets.length) return;
       const first = targets[0]!;
       const last = targets[targets.length - 1]!;
+      if (!targets.includes(document.activeElement as HTMLElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+        return;
+      }
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
     document.addEventListener('keydown', keydown);
-    return () => { document.removeEventListener('keydown', keydown); previous?.focus(); };
-  }, [open]);
+    return () => { document.removeEventListener('keydown', keydown); if (previous?.isConnected) previous.focus(); };
+  }, [open, restoreFocus]);
 
   return <div className="modal-backdrop" onMouseDown={(event) => { if (!locked && event.target === event.currentTarget) onClose(); }}><div ref={panelRef} className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId}><header><h2 id={titleId}>{title}</h2><button className="icon-button" type="button" onClick={onClose} disabled={locked} aria-label={`Close ${title}`}>×</button></header>{children}</div></div>;
 }
@@ -158,6 +172,12 @@ function missionError(label: string, value: string): string | undefined {
   const trimmed = value.trim();
   if (!trimmed) return `${label} is required.`;
   if (byteLength(trimmed) > MAX_MISSION_BYTES) return `${label} must be at most ${MAX_MISSION_BYTES} UTF-8 bytes.`;
+  return undefined;
+}
+
+function exactMissionError(label: string, value: string): string | undefined {
+  if (byteLength(value) < 1) return `${label} is required.`;
+  if (byteLength(value) > MAX_MISSION_BYTES) return `${label} must be at most ${MAX_MISSION_BYTES} UTF-8 bytes.`;
   return undefined;
 }
 

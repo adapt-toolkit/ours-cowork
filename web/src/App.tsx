@@ -32,9 +32,13 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   const [railOpen, setRailOpen] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
   const [selectedRefresh, setSelectedRefresh] = useState(0);
+  const contextDrawer = useMediaQuery('(max-width: 999px)');
+  const roomSheet = useMediaQuery('(max-width: 759px)');
   const listPoller = useRef<Poller>();
   const selectionGeneration = useRef(0);
   const selectedRoomIdRef = useRef(selectedRoomId);
+  const createTrigger = useRef<HTMLButtonElement>();
+  const settingsTrigger = useRef<HTMLButtonElement>();
 
   const visible = useCallback(() => !document.hidden, []);
   const reportFailure = useCallback((failure: unknown, action?: string) => {
@@ -173,17 +177,17 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
 
   return (
     <div className="cowork-app">
-      <RoomRail rooms={rooms} selectedRoomId={selectedRoomId} connected={connected} open={railOpen} onClose={() => setRailOpen(false)} onCreate={() => setCreateOpen(true)} onSelect={selectRoom} />
-      <RoomWorkspace room={activeRoom} connected={connected === true} onOpenRooms={() => setRailOpen(true)} onOpenContext={() => setContextOpen(true)} onSettings={() => setSettingsOpen(true)} />
-      <RoomContext room={activeRoom} tab={contextTab} open={contextOpen} onTab={setContextTab} onClose={() => setContextOpen(false)} />
-      {(railOpen || contextOpen) && <button className="responsive-scrim" type="button" aria-label="Close open panel" onClick={() => { setRailOpen(false); setContextOpen(false); }} />}
+      <RoomRail rooms={rooms} selectedRoomId={selectedRoomId} connected={connected} open={railOpen} sheet={roomSheet} onClose={() => setRailOpen(false)} onCreate={(trigger) => { createTrigger.current = trigger; setCreateOpen(true); }} onSelect={selectRoom} />
+      <RoomWorkspace room={activeRoom} connected={connected === true} onOpenRooms={() => setRailOpen(true)} onOpenContext={() => setContextOpen(true)} onSettings={(trigger) => { settingsTrigger.current = trigger; setSettingsOpen(true); }} />
+      <RoomContext room={activeRoom} tab={contextTab} open={contextOpen} drawer={contextDrawer} onTab={setContextTab} onClose={() => setContextOpen(false)} />
+      {((roomSheet && railOpen) || (contextDrawer && contextOpen)) && <button className="responsive-scrim" type="button" aria-label="Close open panel" onClick={() => { setRailOpen(false); setContextOpen(false); }} />}
 
       {connected === false && <div className="disconnect-banner" role="status"><strong>Disconnected</strong><span>Loaded data remains visible. Mutations are disabled until the daemon answers.</span></div>}
       {banner && <div className="error-banner" role="alert"><span>{banner}</span><button type="button" onClick={() => setBanner(undefined)} aria-label="Dismiss error">×</button></div>}
       {notice && <div className="notice-banner" role="status"><span>{notice}</span><button type="button" onClick={() => setNotice(undefined)} aria-label="Dismiss notice">×</button></div>}
 
-      <CreateRoomDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreate={createRoom} />
-      {activeRoom && <SettingsDialog key={activeRoom.room_id} room={activeRoom} open={settingsOpen} onClose={() => setSettingsOpen(false)} onSave={saveSettings} />}
+      <CreateRoomDialog open={createOpen} restoreFocus={createTrigger.current} onClose={() => setCreateOpen(false)} onCreate={createRoom} />
+      {activeRoom && settingsOpen && <SettingsDialog key={activeRoom.room_id} room={activeRoom} open restoreFocus={settingsTrigger.current} onClose={() => setSettingsOpen(false)} onSave={saveSettings} />}
     </div>
   );
 }
@@ -192,4 +196,17 @@ function roomIdFromHash(hash: string): string | undefined {
   const match = /^#\/rooms\/([^/?#]+)$/.exec(hash);
   if (!match?.[1]) return undefined;
   try { return decodeURIComponent(match[1]); } catch { return undefined; }
+}
+
+function useMediaQuery(query: string): boolean {
+  const media = useMemo(() => typeof window.matchMedia === 'function' ? window.matchMedia(query) : undefined, [query]);
+  const [matches, setMatches] = useState(() => media?.matches ?? false);
+  useEffect(() => {
+    if (!media) return;
+    const update = (event: MediaQueryListEvent) => setMatches(event.matches);
+    setMatches(media.matches);
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, [media]);
+  return matches;
 }

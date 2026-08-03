@@ -44,6 +44,49 @@ describe('CoworkApp room orchestration', () => {
     location.hash = '';
     vi.useFakeTimers({ shouldAdvanceTime: true });
   });
+
+  it('removes closed responsive drawers from accessibility and tab order while keeping desktop context available', async () => {
+    vi.useRealTimers();
+    const release = room('r1', 'Release coordination', 'active');
+    const call = vi.fn(async (method: string) => method === 'room.list' ? [release] : release);
+    const user = userEvent.setup();
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = matchMediaAt(700);
+    try {
+      const { container, unmount } = render(<CoworkApp rpc={{ call } as RpcClient} />);
+      await screen.findByText('Release coordination');
+      const rail = container.querySelector('.room-rail');
+      const context = container.querySelector('.room-context');
+      expect(rail).toHaveAttribute('aria-hidden', 'true');
+      expect(rail).toHaveAttribute('hidden');
+      expect(context).toHaveAttribute('aria-hidden', 'true');
+      expect(context).toHaveAttribute('hidden');
+      expect(within(rail as HTMLElement).getByRole('button', { name: 'Create room', hidden: true })).not.toBeVisible();
+      const roomSheetTrigger = screen.getByRole('button', { name: 'Open rooms' });
+      roomSheetTrigger.focus();
+      await user.tab();
+      expect(rail).not.toContainElement(document.activeElement as HTMLElement);
+      expect(context).not.toContainElement(document.activeElement as HTMLElement);
+
+      await user.click(roomSheetTrigger);
+      expect(rail).not.toHaveAttribute('hidden');
+      await user.click(screen.getByText('Release coordination'));
+      expect(rail).toHaveAttribute('hidden');
+      await user.click(await screen.findByRole('button', { name: 'Context' }));
+      expect(context).not.toHaveAttribute('hidden');
+      expect(screen.getByRole('tab', { name: 'State' })).toBeVisible();
+      unmount();
+
+      window.matchMedia = matchMediaAt(1_200);
+      const desktop = render(<CoworkApp rpc={{ call } as RpcClient} />);
+      const desktopContext = desktop.container.querySelector('.room-context');
+      expect(desktopContext).not.toHaveAttribute('aria-hidden');
+      expect(desktopContext).not.toHaveAttribute('hidden');
+    } finally {
+      window.matchMedia = originalMatchMedia;
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+    }
+  });
   afterEach(() => vi.useRealTimers());
 
   it('groups rooms, hash-routes selection, and refreshes the list every five seconds', async () => {
@@ -117,3 +160,20 @@ describe('CoworkApp room orchestration', () => {
     expect(screen.queryByRole('heading', { name: 'First mission' })).not.toBeInTheDocument();
   });
 });
+
+function matchMediaAt(width: number): typeof window.matchMedia {
+  return vi.fn((query: string) => {
+    const maximum = /max-width:\s*(\d+)px/.exec(query);
+    const matches = maximum ? width <= Number(maximum[1]) : false;
+    return {
+      matches,
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(() => true),
+    } as MediaQueryList;
+  });
+}

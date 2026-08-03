@@ -11,7 +11,7 @@ export function RoomWorkspace({ room, connected, onOpenRooms, onOpenContext, onS
   connected: boolean;
   onOpenRooms(): void;
   onOpenContext(): void;
-  onSettings(): void;
+  onSettings(trigger: HTMLButtonElement): void;
 }) {
   const [tab, setTab] = useState<WorkspaceTab>('communication');
 
@@ -45,7 +45,7 @@ export function RoomWorkspace({ room, connected, onOpenRooms, onOpenContext, onS
 
       <div className="mission-strip">
         <span>Goal</span><p>{room.mission.goal}</p>
-        <button className="quiet-button" type="button" onClick={onSettings} disabled={!capabilities.canEditSettings}>Room settings</button>
+        <button className="quiet-button" type="button" onClick={(event) => onSettings(event.currentTarget)} disabled={!capabilities.canEditSettings}>Room settings</button>
       </div>
 
       <nav className="workspace-tabs" aria-label="Room workspace">

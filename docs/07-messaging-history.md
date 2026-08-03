@@ -18,3 +18,7 @@ ours-cowork room history <room-id> --after 40 --limit 20
 ```
 
 Participant messages are accepted only from durable seats in an active room. History records include messages and the durable relay intent/result trail used for restart recovery.
+
+The web console projects participant and room-authored messages plus the briefing into Communication. Relay, recovery, close, and failure records are excluded from chat and shown in Events; Archive retains the complete ordered record stream. Messages appear only after the authoritative history refresh observes them.
+
+Version one polls rather than receiving pushed updates: the room list refreshes every five seconds, while the selected room, participants, and history refresh every two seconds. Polling pauses in a hidden tab, coalesces overlap, and refreshes after confirmed mutations. CLI history remains the fallback when a browser is unavailable.

@@ -60,6 +60,7 @@ test('static web handler serves only the startup allowlist with hardened headers
   assert.equal(index.statusCode, 200);
   assert.match(index.body, /<div id="root">/);
   assert.match(index.headers['content-security-policy'], /default-src 'self'/);
+  assert.match(index.headers['content-security-policy'], /img-src 'self' data:/);
   assert.match(index.headers['content-security-policy'], /object-src 'none'/);
   assert.match(index.headers['content-security-policy'], /frame-ancestors 'none'/);
   assert.equal(index.headers['x-content-type-options'], 'nosniff');

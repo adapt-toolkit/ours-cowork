@@ -23,6 +23,7 @@
     "typecheck:web": "tsc -p web/tsconfig.json --noEmit",
     "test": "node --test --test-concurrency=1 tests/*.test.mjs",
     "test:web": "vitest run",
+    "test:browser": "node --test tests/browser-smoke.test.mjs",
     "test:release": "node --test tests/static-gates.test.mjs"
   },
   "dependencies": {
@@ -44,6 +45,7 @@
     "@vitejs/plugin-react": "4.7.0",
     "esbuild": "0.25.0",
     "jsdom": "25.0.1",
+    "playwright-core": "1.60.0",
     "typescript": "^5.5.4",
     "vite": "6.4.3",
     "vitest": "3.2.6"

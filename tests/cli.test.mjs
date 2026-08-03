@@ -6,7 +6,13 @@ import { join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 
-import { NATIVE_RPC_TIMEOUT_MS, rpcCall, rpcTimeoutForMethod } from '../src/cli.ts';
+import {
+  NATIVE_RPC_TIMEOUT_MS,
+  browserOpenCommand,
+  openWebConsole,
+  rpcCall,
+  rpcTimeoutForMethod,
+} from '../src/cli.ts';
 
 const ROOT = resolve(new URL('..', import.meta.url).pathname);
 const CLI = join(ROOT, 'dist', 'cli.js');
@@ -100,11 +106,105 @@ test('usage errors exit 2 before touching the daemon', async () => {
     ['room', 'show'],
     ['room', 'create', '--goal', 'g'],
     ['docs', 'not-a-topic'],
+    ['web', 'extra'],
   ]) {
     const result = await runCli(args, { env: { OURS_COWORK_STATE_DIR: join(tmpdir(), 'absent-cowork-cli') } });
     assert.equal(result.code, 2, args.join(' '));
     assert.equal(result.stdout, '');
     assert.match(result.stderr, /usage|unknown|requires/i);
+  }
+});
+
+test('web uses the safe daemon start path, waits on GET readiness, and opens once', async () => {
+  for (const lifecycle of [
+    { started: true, alreadyRunning: false },
+    { started: false, alreadyRunning: true },
+  ]) {
+    const calls = [];
+    const config = {
+      version: 1,
+      brokerUrl: 'wss://broker.example.invalid',
+      stateDir: '/tmp/cowork-web-test',
+      rest: { enabled: true, port: 4312 },
+    };
+    const result = await openWebConsole(config, false, {
+      ensureDaemon: async (observed) => { calls.push(['daemon', observed]); return lifecycle; },
+      waitForHttpReady: async (url) => { calls.push(['ready', url]); return true; },
+      openBrowser: (url) => { calls.push(['open', url]); },
+    });
+    assert.deepEqual(result, { url: 'http://127.0.0.1:4312/', opened: true });
+    assert.deepEqual(calls, [
+      ['daemon', config],
+      ['ready', 'http://127.0.0.1:4312/'],
+      ['open', 'http://127.0.0.1:4312/'],
+    ]);
+  }
+});
+
+test('web disabled, readiness timeout, and JSON mode preserve exact side-effect boundaries', async () => {
+  const disabled = {
+    version: 1,
+    brokerUrl: 'wss://broker.example.invalid',
+    stateDir: '/tmp/cowork-web-test',
+    rest: { enabled: false, port: 3052 },
+  };
+  let lifecycleCalls = 0;
+  await assert.rejects(
+    openWebConsole(disabled, false, {
+      ensureDaemon: async () => { lifecycleCalls += 1; return { started: true, alreadyRunning: false }; },
+      waitForHttpReady: async () => true,
+      openBrowser: () => assert.fail('disabled web command opened a browser'),
+    }),
+    (error) => error?.exitCode === 1
+      && error?.message === 'web console is disabled (rest.enabled=false); enable it in cowork configuration and restart the daemon',
+  );
+  assert.equal(lifecycleCalls, 0);
+
+  const enabled = { ...disabled, rest: { enabled: true, port: 3052 } };
+  await assert.rejects(
+    openWebConsole(enabled, false, {
+      ensureDaemon: async () => ({ started: false, alreadyRunning: true }),
+      waitForHttpReady: async () => false,
+      openBrowser: () => assert.fail('unready web command opened a browser'),
+    }),
+    (error) => error?.exitCode === 7 && /web console did not become ready at http:\/\/127\.0\.0\.1:3052\//.test(error?.message),
+  );
+
+  let opened = 0;
+  const result = await openWebConsole(enabled, true, {
+    ensureDaemon: async () => ({ started: false, alreadyRunning: true }),
+    waitForHttpReady: async () => true,
+    openBrowser: () => { opened += 1; },
+  });
+  assert.deepEqual(result, { url: 'http://127.0.0.1:3052/', opened: false });
+  assert.equal(opened, 0);
+});
+
+test('web browser opener selects the platform-native command without a shell', () => {
+  const url = 'http://127.0.0.1:3052/';
+  assert.deepEqual(browserOpenCommand(url, 'linux'), { command: 'xdg-open', args: [url] });
+  assert.deepEqual(browserOpenCommand(url, 'darwin'), { command: 'open', args: [url] });
+  assert.deepEqual(browserOpenCommand(url, 'win32'), { command: 'cmd.exe', args: ['/c', 'start', '', url] });
+  assert.throws(() => browserOpenCommand(url, 'freebsd'), /unsupported/);
+});
+
+test('web CLI exits 1 with the exact disabled message', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'cowork-cli-web-disabled-'));
+  await chmod(stateDir, 0o700);
+  const configPath = join(stateDir, 'config.json');
+  await writeFile(configPath, JSON.stringify({
+    version: 1,
+    brokerUrl: 'ws://127.0.0.1:1',
+    stateDir,
+    rest: { enabled: false, port: 3052 },
+  }), { mode: 0o600 });
+  try {
+    const result = await runCli(['web'], { env: { OURS_COWORK_CONFIG: configPath } });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, 'ours-cowork: web console is disabled (rest.enabled=false); enable it in cowork configuration and restart the daemon\n');
+  } finally {
+    await rm(stateDir, { recursive: true, force: true });
   }
 });
 
@@ -467,11 +567,19 @@ test('offline docs cover operations and exact limitations without exposing a man
     '01-prerequisites.md', '02-installation.md', '03-configuration.md',
     '04-daemon-lifecycle.md', '05-room-workflow.md', '06-invites.md',
     '07-messaging-history.md', '08-backup-restore.md',
-    '09-service-management.md', '10-limitations.md',
+    '09-service-management.md', '10-limitations.md', '11-web-console.md',
   ];
   const docs = await Promise.all(docNames.map((name) => readFile(join(ROOT, 'docs', name), 'utf8')));
-  assert.equal(docs.length, 10);
+  assert.equal(docs.length, 11);
   assert.doesNotMatch(docs.join('\n'), TOKEN_PATTERN);
+  assert.doesNotMatch(docs.join('\n'), /management-token/i);
+
+  const web = await runCli(['docs', 'web'], {
+    env: { OURS_COWORK_STATE_DIR: join(tmpdir(), 'does-not-exist') },
+  });
+  assert.equal(web.code, 0, web.stderr);
+  assert.match(web.stdout, /ours-cowork web/);
+  assert.match(web.stdout, /http:\/\/127\.0\.0\.1:3052\//);
 });
 
 test('generated service definitions execute the cowork CLI directly and uninstall retains state', async () => {

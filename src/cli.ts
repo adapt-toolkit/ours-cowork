@@ -2,6 +2,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as http from 'node:http';
 import { connect } from 'node:net';
 import { homedir, userInfo } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -11,6 +12,7 @@ import { ensureRuntimeState, loadConfig, type CoworkConfig } from './config.ts';
 
 const EXIT = {
   success: 0,
+  webDisabled: 1,
   usage: 2,
   notFound: 3,
   invalidState: 4,
@@ -21,6 +23,7 @@ const EXIT = {
 const RPC_TIMEOUT_MS = 10_000;
 export const NATIVE_RPC_TIMEOUT_MS = 120_000;
 const START_TIMEOUT_MS = 30_000;
+const WEB_READY_TIMEOUT_MS = 30_000;
 const STOP_TIMEOUT_MS = 12_000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const SELF = fileURLToPath(import.meta.url);
@@ -107,7 +110,7 @@ function usage(): string {
   return `ours-cowork — standalone mission-room daemon
 
 Usage:
-  ours-cowork [--json] start|stop|restart|status|serve
+  ours-cowork [--json] start|stop|restart|status|serve|web
   ours-cowork [--json] install-service|uninstall-service
   ours-cowork [--json] room <command> [arguments]
   ours-cowork [--json] docs [topic]
@@ -465,6 +468,78 @@ async function startDaemon(config: CoworkConfig): Promise<{ started: boolean; al
   return { started: true, alreadyRunning: false };
 }
 
+interface WebCommandDependencies {
+  ensureDaemon(config: CoworkConfig): Promise<{ started: boolean; alreadyRunning: boolean }>;
+  waitForHttpReady(url: string): Promise<boolean>;
+  openBrowser(url: string): void;
+}
+
+export function browserOpenCommand(url: string, platform = process.platform): { command: string; args: string[] } {
+  if (platform === 'linux') return { command: 'xdg-open', args: [url] };
+  if (platform === 'darwin') return { command: 'open', args: [url] };
+  if (platform === 'win32') return { command: 'cmd.exe', args: ['/c', 'start', '', url] };
+  throw new CliError(EXIT.internal, 'internal', `opening the web console is unsupported on ${platform}`);
+}
+
+function openBrowser(url: string): void {
+  const { command, args } = browserOpenCommand(url);
+  const result = spawnSync(command, args, { stdio: 'ignore' });
+  if (result.error || result.status !== 0) {
+    throw new CliError(EXIT.internal, 'internal', `failed to open the web console with ${command}`, { cause: result.error });
+  }
+}
+
+function httpGetReady(url: string, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolveReady) => {
+    const request = http.get(url, (response) => {
+      const ready = response.statusCode === 200;
+      response.resume();
+      response.once('end', () => resolveReady(ready));
+    });
+    request.setTimeout(timeoutMs, () => {
+      request.destroy();
+      resolveReady(false);
+    });
+    request.once('error', () => resolveReady(false));
+  });
+}
+
+export async function waitForHttpReadiness(url: string, timeoutMs = WEB_READY_TIMEOUT_MS): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const remaining = Math.max(1, deadline - Date.now());
+    if (await httpGetReady(url, Math.min(500, remaining))) return true;
+    await sleep(Math.min(200, Math.max(1, deadline - Date.now())));
+  }
+  return false;
+}
+
+export async function openWebConsole(
+  config: CoworkConfig,
+  json: boolean,
+  dependencies: WebCommandDependencies = {
+    ensureDaemon: startDaemon,
+    waitForHttpReady: waitForHttpReadiness,
+    openBrowser,
+  },
+): Promise<{ url: string; opened: boolean }> {
+  if (!config.rest.enabled) {
+    throw new CliError(
+      EXIT.webDisabled,
+      'web_disabled',
+      'web console is disabled (rest.enabled=false); enable it in cowork configuration and restart the daemon',
+    );
+  }
+  const url = `http://127.0.0.1:${config.rest.port}/`;
+  await dependencies.ensureDaemon(config);
+  if (!await dependencies.waitForHttpReady(url)) {
+    throw new CliError(EXIT.internal, 'internal', `web console did not become ready at ${url}`);
+  }
+  if (json) return { url, opened: false };
+  dependencies.openBrowser(url);
+  return { url, opened: true };
+}
+
 async function stopDaemon(config: CoworkConfig): Promise<{ stopped: boolean }> {
   const socketPath = join(config.stateDir, 'management.sock');
   const initial = await probeDaemon(config);
@@ -663,6 +738,7 @@ const DOC_TOPICS: Readonly<Record<string, string>> = Object.freeze({
   'backup-restore': '08-backup-restore.md',
   services: '09-service-management.md',
   limitations: '10-limitations.md',
+  web: '11-web-console.md',
 });
 
 function readDocs(topic: string | undefined): { topic: string; text: string } {
@@ -736,6 +812,11 @@ async function execute(args: string[], output: Output): Promise<void> {
         throw new CliError(EXIT.daemonUnavailable, 'daemon_unavailable', 'ours-cowork is stopped');
       }
       output.success({ running: true }, 'ours-cowork is running');
+      return;
+    }
+    case 'web': {
+      const result = await openWebConsole(config, output.json);
+      output.success(result, `opened web console at ${result.url}`);
       return;
     }
     case 'install-service': {

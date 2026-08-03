@@ -27,9 +27,9 @@ const INERT_BUNDLED_URL_PREFIXES = [
   'http://www.w3.org/XML/1998/namespace',
   'https://reactjs.org/docs/error-decoder.html',
 ];
-const DOC_NAMES = Array.from({ length: 10 }, (_, index) => `docs/${String(index + 1).padStart(2, '0')}-${[
+const DOC_NAMES = Array.from({ length: 11 }, (_, index) => `docs/${String(index + 1).padStart(2, '0')}-${[
   'prerequisites', 'installation', 'configuration', 'daemon-lifecycle', 'room-workflow',
-  'invites', 'messaging-history', 'backup-restore', 'service-management', 'limitations',
+  'invites', 'messaging-history', 'backup-restore', 'service-management', 'limitations', 'web-console',
 ][index]}.md`);
 
 function normalized(path) {
@@ -97,6 +97,9 @@ function webReleaseViolations(path, source) {
   }
   if (/\bsourceMappingURL\s*=|\bsourcesContent\b/.test(source) || extname(path) === '.map') {
     violations.push(`${path}: source map material`);
+  }
+  if (/management-token|authorization\s*:\s*["'`]?(?:bearer|basic)\b/i.test(source)) {
+    violations.push(`${path}: management credential reference`);
   }
   return violations;
 }
@@ -177,6 +180,7 @@ test('web release gate detects standalone, remote URL, persistence, and source-m
   assert(webReleaseViolations('web/bad.ts', "const endpoint = 'https://example.invalid/api'").length > 0);
   assert(webReleaseViolations('web/bad.ts', "localStorage.setItem('invite-secret', value)").length > 0);
   assert(webReleaseViolations('dist/web/assets/app.js', '//# sourceMappingURL=app.js.map').length > 0);
+  assert(webReleaseViolations('dist/web/assets/app.js', "const path = 'management-token'").length > 0);
   assert.deepEqual(webReleaseViolations('dist/web/assets/app.js', "const namespace = 'http://www.w3.org/2000/svg'"), []);
 
   const sourceFiles = filesBelow(join(ROOT, 'web'));
@@ -210,11 +214,13 @@ test('README and every operator document preserve the exact wording boundary', (
   assert.deepEqual(documentationFiles.flatMap((path) => documentationViolations(
     normalized(path), readFileSync(path, 'utf8'), normalized(path) === 'docs/10-limitations.md',
   )), []);
+  assert.doesNotMatch(documentationFiles.map((path) => readFileSync(path, 'utf8')).join('\n'), /management-token/i);
 });
 
 test('built distribution remains standalone and contains one compiled packet', () => {
   const distFiles = filesBelow(join(ROOT, 'dist'), new Set(['.js', '.json']));
   assert.deepEqual(distFiles.flatMap((path) => boundaryViolations(normalized(path), readFileSync(path, 'utf8'))), []);
+  assert.doesNotMatch(distFiles.map((path) => readFileSync(path, 'utf8')).join('\n'), /management-token/i);
   const builtWebFiles = filesBelow(join(ROOT, 'dist', 'web'));
   assert.deepEqual(builtWebFiles.flatMap((path) =>
     webReleaseViolations(normalized(path), readFileSync(path, 'utf8'))), []);
@@ -231,6 +237,8 @@ test('npm dry-run pack list is the exact standalone release artifact', () => {
   assert.equal(paths.some((path) => path.startsWith('docs/superpowers/')), false);
   const packetPaths = paths.filter((path) => /^dist\/mufl_code\/[0-9A-F]{64}\.muflo$/.test(path));
   assert.equal(packetPaths.length, 1);
+  for (const required of WEB_RELEASE_ARTIFACTS) assert(paths.includes(required), `package omitted ${required}`);
+  assert.equal(paths.filter((path) => path.endsWith('.muflo')).length, 1);
   const expected = [
     'LICENSE', 'README.md', 'dist/cli.js', 'dist/daemon.js', 'package.json',
     ...WEB_RELEASE_ARTIFACTS, ...DOC_NAMES, packetPaths[0],
@@ -251,7 +259,13 @@ test('CI repeats E2E and invokes the asserted release gate', () => {
   const workflow = readFileSync(join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
   assert.match(workflow, /for i in 1 2 3; do node --test tests\/e2e\.test\.mjs \|\| exit 1; done/);
   assert.match(workflow, /npm run test:release/);
+  assert.match(workflow, /COWORK_CHROME_PATH:\s*\/usr\/bin\/google-chrome/);
+  for (const command of ['npm run typecheck:web', 'npm run test:web', 'npm run test:browser']) {
+    assert(workflow.includes(command), `${command} missing from CI`);
+  }
+  assert(workflow.indexOf('npm run test:browser') < workflow.indexOf('for i in 1 2 3;'));
   const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
   assert.equal(manifest.scripts.test, 'node --test --test-concurrency=1 tests/*.test.mjs');
   assert.equal(manifest.scripts['test:release'], 'node --test tests/static-gates.test.mjs');
+  assert.equal(manifest.scripts['test:browser'], 'node --test tests/browser-smoke.test.mjs');
 });

@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { rpcCall } from './api/rpc';
-import { isParticipantListDto, isRoomDto, isRoomListDto, validateConfirmedRecoveryInvite, validateCreatedInviteReceipt, validateRecoveryInviteReceipts, type InviteMode, type InviteReceiptDto, type ParticipantDto, type RoomDto } from './api/types';
+import { isCommunicationRecordDto, isDeleteRoomReceiptDto, isHistoryDto, isParticipantListDto, isRoomDto, isRoomListDto, validateConfirmedRecoveryInvite, validateCreatedInviteReceipt, validateRecoveryInviteReceipts, type CommunicationRecordDto, type InviteMode, type InviteReceiptDto, type ParticipantDto, type RoomDto } from './api/types';
 import { InviteReceiptDialog, type InviteReceiptVault } from './components/InviteManager';
-import { CreateRoomDialog, SettingsDialog } from './components/RoomDialogs';
+import { CloseRoomDialog, CreateRoomDialog, DeleteRoomDialog, SettingsDialog } from './components/RoomDialogs';
 import { RoomContext, type ContextTab } from './components/RoomContext';
 import { RoomRail } from './components/RoomRail';
 import { RoomWorkspace } from './components/RoomWorkspace';
 import { createPoller, type PollClock, type Poller } from './state/poller';
+import { mergeRecords } from './state/roomModel';
 
 export interface RpcClient {
   call<T = unknown>(method: string, params: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<T>;
@@ -25,23 +26,30 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   const [selectedRoomId, setSelectedRoomId] = useState<string | undefined>(() => roomIdFromHash(location.hash));
   const [selectedRoom, setSelectedRoom] = useState<RoomDto>();
   const [participants, setParticipants] = useState<ParticipantDto[]>([]);
+  const [historyByRoom, setHistoryByRoom] = useState<Record<string, CommunicationRecordDto[]>>({});
+  const [historyReadyByRoom, setHistoryReadyByRoom] = useState<Record<string, boolean>>({});
   const [connected, setConnected] = useState<boolean | null>(null);
   const [notice, setNotice] = useState<string>();
   const [banner, setBanner] = useState<string>();
   const [createOpen, setCreateOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [closeOpen, setCloseOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
   const [inviteReceiptVaults, setInviteReceiptVaults] = useState<InviteReceiptVault[]>([]);
   const [contextTab, setContextTab] = useState<ContextTab>('state');
   const [railOpen, setRailOpen] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
-  const [selectedRefresh, setSelectedRefresh] = useState(0);
   const contextDrawer = useMediaQuery('(max-width: 999px)');
   const roomSheet = useMediaQuery('(max-width: 759px)');
   const listPoller = useRef<Poller>();
+  const selectedPoller = useRef<Poller>();
   const selectionGeneration = useRef(0);
+  const historyByRoomRef = useRef<Record<string, CommunicationRecordDto[]>>({});
   const selectedRoomIdRef = useRef(selectedRoomId);
   const createTrigger = useRef<HTMLButtonElement>();
   const settingsTrigger = useRef<HTMLButtonElement>();
+  const closeTrigger = useRef<HTMLButtonElement>();
+  const deleteTrigger = useRef<HTMLButtonElement>();
   const contextPanel = useRef<HTMLElement>(null);
 
   const visible = useCallback(() => !document.hidden, []);
@@ -117,9 +125,10 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
       clock,
       run: async (signal) => {
         try {
-          const [roomOutcome, participantOutcome] = await Promise.allSettled([
+          const [roomOutcome, participantOutcome, historyOutcome] = await Promise.allSettled([
             rpc.call('room.show', { room_id: selectedRoomId }, { signal }),
             rpc.call('room.participants', { room_id: selectedRoomId }, { signal }),
+            loadHistoryPages(selectedRoomId, generation, signal),
           ]);
           if (roomOutcome.status === 'rejected') throw roomOutcome.reason;
           const result = roomOutcome.value;
@@ -130,6 +139,12 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
             const nextParticipants = participantOutcome.value;
             setParticipants((current) => sameParticipants(current, nextParticipants) ? current : nextParticipants);
           }
+          if (participantOutcome.status === 'fulfilled' && !isParticipantListDto(participantOutcome.value)) {
+            reportFailure(new Error('daemon returned invalid participant details'), 'Participant refresh failed');
+          } else if (participantOutcome.status === 'rejected' && !signal.aborted) {
+            reportFailure(participantOutcome.reason, 'Participant refresh failed');
+          }
+          if (historyOutcome.status === 'rejected' && !signal.aborted) reportFailure(historyOutcome.reason, 'History refresh failed');
           setRooms((current) => current.map((room) => room.room_id === result.room_id ? result : room));
           setConnected(true);
         } catch (failure) {
@@ -139,18 +154,47 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
         }
       },
     });
+    selectedPoller.current = poller;
     poller.start();
     void poller.refresh();
     const visibility = () => { if (!document.hidden) void poller.refresh(); };
     document.addEventListener('visibilitychange', visibility);
-    return () => { document.removeEventListener('visibilitychange', visibility); poller.stop(); };
-  }, [clock, reportFailure, rooms.find((room) => room.room_id === selectedRoomId)?.room_id, rpc, selectedRefresh, selectedRoomId, visible]);
+    return () => { document.removeEventListener('visibilitychange', visibility); if (selectedPoller.current === poller) selectedPoller.current = undefined; poller.stop(); };
+
+    async function loadHistoryPages(roomId: string, expectedGeneration: number, signal: AbortSignal): Promise<void> {
+      let records = historyByRoomRef.current[roomId] ?? [];
+      let after = records.at(-1)?.seq ?? 0;
+      while (!signal.aborted && selectionGeneration.current === expectedGeneration) {
+        const result = await rpc.call('room.history', { room_id: roomId, after, limit: 200 }, { signal });
+        if (!isHistoryDto(result)
+          || result.some((record) => record.room_id !== roomId)) {
+          throw new Error('daemon returned an invalid history page');
+        }
+        if (signal.aborted || selectionGeneration.current !== expectedGeneration) return;
+        const merged = mergeRecords(records, result);
+        if (merged !== records) {
+          records = merged;
+          historyByRoomRef.current = { ...historyByRoomRef.current, [roomId]: merged };
+          setHistoryByRoom(historyByRoomRef.current);
+        }
+        if (result.length < 200) {
+          setHistoryReadyByRoom((current) => current[roomId] ? current : { ...current, [roomId]: true });
+          return;
+        }
+        const nextAfter = merged.at(-1)?.seq ?? after;
+        if (nextAfter <= after) throw new Error('daemon returned a non-progressing history page');
+        after = nextAfter;
+      }
+    }
+  }, [clock, reportFailure, rpc, selectedRoomId, visible]);
 
   const selectRoom = useCallback((roomId: string) => {
     selectedRoomIdRef.current = roomId;
     setSelectedRoomId(roomId);
     setParticipants([]);
     setNotice(undefined);
+    setCloseOpen(false);
+    setDeleteOpen(false);
     setRailOpen(false);
     const nextHash = `#/rooms/${encodeURIComponent(roomId)}`;
     if (location.hash !== nextHash) location.hash = nextHash;
@@ -158,7 +202,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
 
   const refreshAfterMutation = useCallback(() => {
     void listPoller.current?.refresh();
-    setSelectedRefresh((value) => value + 1);
+    void selectedPoller.current?.refresh();
   }, []);
 
   const createRoom = useCallback(async (goal: string, briefing: string) => {
@@ -232,11 +276,65 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
     catch (failure) { reportFailure(failure, 'Confirm recovery failed'); throw failure; }
   }, [refreshAfterMutation, reportFailure, rpc]);
 
+  const sendMessage = useCallback(async (text: string): Promise<void> => {
+    const requestedRoom = activeRoom;
+    if (!requestedRoom || requestedRoom.state !== 'active') throw new Error('The selected room is not active.');
+    try {
+      const result = await rpc.call('room.message', { room_id: requestedRoom.room_id, text });
+      if (!isCommunicationRecordDto(result)
+        || result.kind !== 'message'
+        || result.room_id !== requestedRoom.room_id
+        || result.category !== 'chat'
+        || result.text !== text
+        || result.author.identity !== requestedRoom.identity_cid
+        || result.author.role !== 'room') throw new Error('daemon returned invalid message confirmation');
+      void selectedPoller.current?.refresh();
+    } catch (failure) { reportFailure(failure, 'Send message failed'); throw failure; }
+  }, [activeRoom, reportFailure, rpc]);
+
+  const closeRoom = useCallback(async (): Promise<void> => {
+    const requestedRoom = activeRoom;
+    if (!requestedRoom || (requestedRoom.state !== 'active' && requestedRoom.state !== 'provisioning')) throw new Error('This room cannot be closed from its current state.');
+    try {
+      const result = await rpc.call('room.close', { room_id: requestedRoom.room_id });
+      if (!isRoomDto(result) || result.room_id !== requestedRoom.room_id || result.state !== 'closed') {
+        throw new Error('daemon returned invalid closed room details');
+      }
+      setSelectedRoom(result);
+      setRooms((current) => current.map((room) => room.room_id === result.room_id ? result : room));
+      setCloseOpen(false);
+      refreshAfterMutation();
+    } catch (failure) { reportFailure(failure, 'Close room failed'); throw failure; }
+  }, [activeRoom, refreshAfterMutation, reportFailure, rpc]);
+
+  const deleteRoom = useCallback(async (): Promise<void> => {
+    const requestedRoom = activeRoom;
+    if (!requestedRoom || requestedRoom.state !== 'closed') throw new Error('Only a closed room can be deleted.');
+    try {
+      const result = await rpc.call('room.delete', { room_id: requestedRoom.room_id, confirm: true });
+      if (!isDeleteRoomReceiptDto(result) || result.room_id !== requestedRoom.room_id) throw new Error('daemon returned invalid deletion confirmation');
+      const roomId = requestedRoom.room_id;
+      setRooms((current) => current.filter((room) => room.room_id !== roomId));
+      setSelectedRoom(undefined);
+      setSelectedRoomId(undefined);
+      selectedRoomIdRef.current = undefined;
+      setParticipants([]);
+      historyByRoomRef.current = Object.fromEntries(Object.entries(historyByRoomRef.current).filter(([key]) => key !== roomId));
+      setHistoryByRoom(historyByRoomRef.current);
+      setHistoryReadyByRoom((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== roomId)));
+      setDeleteOpen(false);
+      setContextOpen(false);
+      setNotice(`Room “${roomId}” was deleted from this host. Remote copies and backups were not purged.`);
+      history.replaceState(null, '', `${location.pathname}${location.search}#/`);
+      void listPoller.current?.refresh();
+    } catch (failure) { reportFailure(failure, 'Delete room failed'); throw failure; }
+  }, [activeRoom, reportFailure, rpc]);
+
   return (
     <div className="cowork-app">
       <RoomRail rooms={rooms} selectedRoomId={selectedRoomId} connected={connected} open={railOpen} sheet={roomSheet} onClose={() => setRailOpen(false)} onCreate={(trigger) => { createTrigger.current = trigger; setCreateOpen(true); }} onSelect={selectRoom} />
-      <RoomWorkspace room={activeRoom} connected={connected === true} onOpenRooms={() => setRailOpen(true)} onOpenContext={() => setContextOpen(true)} onSettings={(trigger) => { settingsTrigger.current = trigger; setSettingsOpen(true); }} />
-      <RoomContext room={activeRoom} participants={participants} connected={connected === true} tab={contextTab} open={contextOpen} drawer={contextDrawer} panelRef={contextPanel} onTab={setContextTab} onClose={() => setContextOpen(false)} onCreateInvite={createInvite} onRevokeInvite={revokeInvite} onRecoverInvites={recoverInvites} />
+      <RoomWorkspace room={activeRoom} records={activeRoom ? historyByRoom[activeRoom.room_id] ?? [] : []} historyReady={Boolean(activeRoom && historyReadyByRoom[activeRoom.room_id])} connected={connected === true} visible={!document.hidden} onOpenRooms={() => setRailOpen(true)} onOpenContext={() => setContextOpen(true)} onSettings={(trigger) => { settingsTrigger.current = trigger; setSettingsOpen(true); }} onSendMessage={sendMessage} />
+      <RoomContext room={activeRoom} participants={participants} archiveCount={activeRoom ? historyByRoom[activeRoom.room_id]?.length ?? 0 : 0} connected={connected === true} tab={contextTab} open={contextOpen} drawer={contextDrawer} panelRef={contextPanel} onTab={setContextTab} onClose={() => setContextOpen(false)} onCreateInvite={createInvite} onRevokeInvite={revokeInvite} onRecoverInvites={recoverInvites} onRequestClose={(trigger) => { closeTrigger.current = trigger; setCloseOpen(true); }} onRequestDelete={(trigger) => { deleteTrigger.current = trigger; setDeleteOpen(true); }} />
       {((roomSheet && railOpen) || (contextDrawer && contextOpen)) && <button className="responsive-scrim" type="button" aria-label="Close open panel" onClick={() => { setRailOpen(false); setContextOpen(false); }} />}
 
       {connected === false && <div className="disconnect-banner" role="status"><strong>Disconnected</strong><span>Loaded data remains visible. Mutations are disabled until the daemon answers.</span></div>}
@@ -245,6 +343,8 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
 
       <CreateRoomDialog open={createOpen} restoreFocus={createTrigger.current} fallbackFocus={focusContextPanel} onClose={() => setCreateOpen(false)} onCreate={createRoom} />
       {activeRoom && settingsOpen && <SettingsDialog key={activeRoom.room_id} room={activeRoom} open restoreFocus={settingsTrigger.current} onClose={() => setSettingsOpen(false)} onSave={saveSettings} />}
+      {activeRoom && closeOpen && <CloseRoomDialog key={`close:${activeRoom.room_id}`} room={activeRoom} open restoreFocus={closeTrigger.current} onClose={() => setCloseOpen(false)} onConfirm={closeRoom} />}
+      {activeRoom && deleteOpen && <DeleteRoomDialog key={`delete:${activeRoom.room_id}`} room={activeRoom} open restoreFocus={deleteTrigger.current} onClose={() => setDeleteOpen(false)} onConfirm={deleteRoom} />}
       {inviteReceiptVaults[0] && <InviteReceiptDialog vault={inviteReceiptVaults[0]} onClose={() => setInviteReceiptVaults((current) => current.slice(1))} onConfirm={confirmRecovery} />}
     </div>
   );

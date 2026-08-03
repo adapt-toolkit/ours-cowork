@@ -46,3 +46,39 @@
 .receipt pre { overflow-wrap: anywhere; white-space: pre-wrap; user-select: all; padding: 10px; border: 1px solid var(--line-strong); background: var(--bg); color: var(--mint); font-size: 11px; }
 .danger-button { min-height: 36px; padding: 0 14px; border: 1px solid var(--danger); border-radius: var(--radius-sm); background: rgb(255 130 124 / 8%); color: var(--danger); cursor: pointer; }
 .danger-button:disabled { cursor: not-allowed; opacity: .42; }
+.lifecycle-separator { margin: 14px 0; padding: 8px 12px; border: 1px solid var(--line); border-radius: 999px; color: var(--text-muted); text-align: center; font-size: 10px; letter-spacing: .03em; }
+.lifecycle-separator--provisioning, .lifecycle-separator--closing { border-color: rgb(240 198 108 / 25%); color: var(--warning); }
+.lifecycle-separator--closed { border-color: rgb(255 130 124 / 22%); color: var(--danger); }
+.chat-timeline { display: grid; gap: 12px; margin-top: 16px; }
+.chat-list, .record-list { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.chat-row { width: min(82%, 610px); padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.chat-row--room { justify-self: end; border-color: var(--mint-dim); background: rgb(124 231 176 / 5%); }
+.chat-row--briefing { width: 100%; border-left: 2px solid var(--mint); background: var(--panel-soft); }
+.chat-row__meta { display: flex; align-items: baseline; gap: 8px; color: var(--text-faint); font-size: 9px; }
+.chat-row__meta strong { color: var(--text); font-size: 11px; }
+.chat-row--room .chat-row__meta strong, .chat-row--briefing .chat-row__meta strong { color: var(--mint); }
+.chat-row__meta code { margin-left: auto; }
+.chat-row__text { margin: 8px 0 0; color: #d2d9d7; font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; }
+.timeline-empty { margin: 20px 0; color: var(--text-faint); text-align: center; font-size: 11px; }
+.show-earlier { justify-self: center; }
+.room-composer { position: sticky; bottom: -28px; display: grid; gap: 8px; margin: 18px -4px -28px; padding: 14px 4px 28px; border-top: 1px solid var(--line); background: linear-gradient(to bottom, rgb(8 11 12 / 92%), var(--bg) 35%); }
+.room-composer textarea { width: 100%; resize: vertical; padding: 11px 12px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--panel); color: var(--text); line-height: 1.45; }
+.room-composer textarea:focus { border-color: var(--mint-dim); }
+.room-composer textarea:disabled { cursor: not-allowed; opacity: .55; }
+.composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.composer-footer small { color: var(--text-faint); font-size: 10px; }
+.composer-footer .primary-button { min-width: 112px; padding: 0 13px; }
+.record-list { max-width: 900px; margin: 0 auto; }
+.record-row { overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.record-row header { display: flex; align-items: center; gap: 9px; padding: 10px 12px; border-bottom: 1px solid var(--line); font-size: 10px; }
+.record-row header code { color: var(--mint); }
+.record-row header strong { text-transform: capitalize; }
+.record-row header time { margin-left: auto; color: var(--text-faint); }
+.record-status { padding: 2px 5px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--text-muted); }
+.record-status--send_failed { border-color: rgb(255 130 124 / 30%); color: var(--danger); }
+.record-row > p { margin: 0; padding: 11px 12px 0; font-size: 12px; white-space: pre-wrap; }
+.record-row pre { max-height: 240px; overflow: auto; margin: 0; padding: 11px 12px; color: var(--text-muted); font-size: 10px; line-height: 1.5; white-space: pre-wrap; }
+.management-actions { display: grid; gap: 8px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.destructive-target { margin: 0; color: var(--text-muted); font-size: 11px; line-height: 1.55; }
+.destructive-target code { overflow-wrap: anywhere; color: var(--danger); }
+.visually-hidden { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }

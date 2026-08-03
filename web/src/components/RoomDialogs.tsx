@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 
 import { RpcError } from '../api/rpc';
 import type { RoomDto } from '../api/types';
+import { roomTitle } from './RoomRail';
 
 const MAX_MISSION_BYTES = 262_144;
 
@@ -121,6 +122,83 @@ export function SettingsDialog({ room, open, restoreFocus, onClose, onSave }: {
   );
 }
 
+export function CloseRoomDialog({ room, open, restoreFocus, onClose, onConfirm }: {
+  room: RoomDto;
+  open: boolean;
+  restoreFocus?: HTMLElement;
+  onClose(): void;
+  onConfirm(): Promise<void>;
+}) {
+  const [confirmation, setConfirmation] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string>();
+  const submittingRef = useRef(false);
+  if (!open) return null;
+  const title = roomTitle(room);
+  const confirmed = confirmation === title || confirmation === room.room_id;
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!confirmed || submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    setError(undefined);
+    try { await onConfirm(); }
+    catch (failure) { setError(mutationError(failure, 'close', 'Your confirmation is retained.')); }
+    finally { submittingRef.current = false; setSubmitting(false); }
+  }
+
+  return (
+    <Modal title="Close room" open={open} restoreFocus={restoreFocus} onClose={onClose} locked={submitting}>
+      <form className="dialog-form" onSubmit={submit}>
+        <p className="dialog-intro">Closing is forward-only. Live packet state is removed, while the plaintext local archive remains readable on this host.</p>
+        <p className="destructive-target">Type <strong>{title}</strong> or the exact room ID <code>{room.room_id}</code> to continue.</p>
+        <TextField label="Type room title or ID to close" value={confirmation} onChange={setConfirmation} />
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>Cancel</button><button className="danger-button" type="submit" disabled={!confirmed || submitting}>{submitting ? 'Closing room…' : 'Close room permanently'}</button></div>
+      </form>
+    </Modal>
+  );
+}
+
+export function DeleteRoomDialog({ room, open, restoreFocus, onClose, onConfirm }: {
+  room: RoomDto;
+  open: boolean;
+  restoreFocus?: HTMLElement;
+  onClose(): void;
+  onConfirm(): Promise<void>;
+}) {
+  const [confirmation, setConfirmation] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string>();
+  const submittingRef = useRef(false);
+  if (!open) return null;
+  const confirmed = confirmation === room.room_id;
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!confirmed || submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    setError(undefined);
+    try { await onConfirm(); }
+    catch (failure) { setError(mutationError(failure, 'delete', 'Your confirmation is retained.')); }
+    finally { submittingRef.current = false; setSubmitting(false); }
+  }
+
+  return (
+    <Modal title="Delete room" open={open} restoreFocus={restoreFocus} onClose={onClose} locked={submitting}>
+      <form className="dialog-form" onSubmit={submit}>
+        <p className="dialog-intro">This deletes the plaintext local archive and room metadata from this host. It does not purge remote copies or backups and does not securely erase storage or keys.</p>
+        <p className="destructive-target">Type the exact room ID <code>{room.room_id}</code> to continue.</p>
+        <TextField label="Type exact room ID to delete" value={confirmation} onChange={setConfirmation} />
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>Cancel</button><button className="danger-button" type="submit" disabled={!confirmed || submitting}>{submitting ? 'Deleting room…' : 'Delete local archive'}</button></div>
+      </form>
+    </Modal>
+  );
+}
+
 function MissionField({ label, value, onChange, error, rows, autoFocus = false, trimForBytes = false }: {
   label: string; value: string; onChange(value: string): void; error?: string; rows: number; autoFocus?: boolean; trimForBytes?: boolean;
 }) {
@@ -193,4 +271,11 @@ function visibleRestoreTarget(element: HTMLElement | null | undefined): element 
   return Boolean(element?.isConnected
     && !element.matches(':disabled, [aria-disabled="true"]')
     && !element.closest('[hidden], [aria-hidden="true"]'));
+}
+
+function mutationError(failure: unknown, action: string, retained: string): string {
+  if (failure instanceof RpcError && failure.outcomeUnknown) {
+    return `The ${action} request did not receive a confirmation, so its outcome is unknown. ${retained} ${failure.message}`;
+  }
+  return failure instanceof Error ? failure.message : `Room ${action} failed.`;
 }

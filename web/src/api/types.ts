@@ -51,6 +51,13 @@ export interface InviteReceiptDto {
   recovery_of?: string;
 }
 
+export interface DeleteRoomReceiptDto {
+  version: 1;
+  room_id: string;
+  deleted: true;
+  scope: 'this_host';
+}
+
 export interface CreateInviteRequestDto {
   room_id: string;
   mode: InviteMode;
@@ -263,6 +270,15 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
 
 export function isHistoryDto(value: unknown): value is CommunicationRecordDto[] {
   return Array.isArray(value) && value.every(isCommunicationRecordDto);
+}
+
+export function isDeleteRoomReceiptDto(value: unknown): value is DeleteRoomReceiptDto {
+  return isRecord(value)
+    && Object.keys(value).length === 4
+    && value.version === 1
+    && isString(value.room_id)
+    && value.deleted === true
+    && value.scope === 'this_host';
 }
 
 function isMission(value: unknown): value is MissionDto {

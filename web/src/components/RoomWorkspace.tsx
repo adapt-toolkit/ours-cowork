@@ -1,17 +1,24 @@
 import { useState } from 'react';
 
-import type { RoomDto } from '../api/types';
+import type { CommunicationRecordDto, RoomDto } from '../api/types';
 import { roomCapabilities } from '../state/roomModel';
+import { ArchiveView } from './ArchiveView';
+import { ChatTimeline } from './ChatTimeline';
+import { RoomComposer } from './RoomComposer';
 import { roomTitle } from './RoomRail';
 
 type WorkspaceTab = 'communication' | 'events' | 'archive';
 
-export function RoomWorkspace({ room, connected, onOpenRooms, onOpenContext, onSettings }: {
+export function RoomWorkspace({ room, records = [], historyReady = false, connected, visible = true, onOpenRooms, onOpenContext, onSettings, onSendMessage = unavailable }: {
   room?: RoomDto;
+  records?: readonly CommunicationRecordDto[];
+  historyReady?: boolean;
   connected: boolean;
+  visible?: boolean;
   onOpenRooms(): void;
   onOpenContext(): void;
   onSettings(trigger: HTMLButtonElement): void;
+  onSendMessage?(text: string): Promise<void>;
 }) {
   const [tab, setTab] = useState<WorkspaceTab>('communication');
 
@@ -57,32 +64,25 @@ export function RoomWorkspace({ room, connected, onOpenRooms, onOpenContext, onS
       </nav>
 
       <section className="workspace-content" aria-label={`${tab} panel`}>
-        {tab === 'communication' && <CommunicationShell room={room} />}
-        {tab === 'events' && <Placeholder title="Operational events" copy="Relay, close, and recovery events will appear here as the room runs." />}
-        {tab === 'archive' && <Placeholder title="Durable archive" copy="The complete ordered room record stream will appear here." />}
+        {tab === 'communication' && <CommunicationShell room={room} records={records} historyReady={historyReady} connected={connected} visible={visible} onSendMessage={onSendMessage} />}
+        {tab === 'events' && <ArchiveView records={records} mode="events" />}
+        {tab === 'archive' && <ArchiveView records={records} mode="archive" />}
       </section>
     </main>
   );
 }
 
-function CommunicationShell({ room }: { room: RoomDto }) {
-  const stateCopy = room.state === 'provisioning'
-    ? { title: 'Room setup in progress', copy: 'Add invitation requirements and wait for the required participants to accept.' }
-    : room.state === 'active'
-      ? { title: 'Communication ready', copy: 'The group timeline and room composer are added in the communication stage.' }
-      : room.state === 'closing'
-        ? { title: 'Room closure in progress', copy: 'Mutations are disabled while durable close work completes.' }
-        : { title: 'Read-only archive', copy: 'The closed room no longer accepts mutations; its local archive remains available.' };
+function CommunicationShell({ room, records, historyReady, connected, visible, onSendMessage }: { room: RoomDto; records: readonly CommunicationRecordDto[]; historyReady: boolean; connected: boolean; visible: boolean; onSendMessage(text: string): Promise<void> }) {
+  const archivedBriefing = records.some((record) => record.kind === 'message' && record.category === 'briefing');
   return (
     <div className="communication-shell">
-      <article className="briefing-card">
+      {!archivedBriefing && <article className="briefing-card">
         <p className="eyebrow">Mission briefing</p>
         <p>{room.mission.briefing}</p>
-      </article>
-      <Placeholder
-        title={stateCopy.title}
-        copy={stateCopy.copy}
-      />
+      </article>}
+      {room.state !== 'active' && <p className={`lifecycle-separator lifecycle-separator--${room.state}`}>{room.state === 'provisioning' ? 'Room setup in progress · messaging begins after activation' : room.state === 'closing' ? 'Room closure in progress · mutations are disabled' : 'Room closed · read-only local archive'}</p>}
+      <ChatTimeline roomId={room.room_id} records={records} historyReady={historyReady} visible={visible} />
+      <RoomComposer key={room.room_id} roomState={room.state} connected={connected} onSend={onSendMessage} />
     </div>
   );
 }
@@ -94,3 +94,5 @@ function Placeholder({ title, copy }: { title: string; copy: string }) {
 function lifecycleLabel(state: RoomDto['state']): string {
   return state === 'provisioning' ? 'Provisioning' : state[0].toUpperCase() + state.slice(1);
 }
+
+async function unavailable(): Promise<never> { throw new Error('Room messaging is unavailable.'); }

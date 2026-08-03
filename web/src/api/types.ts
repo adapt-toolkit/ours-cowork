@@ -51,6 +51,13 @@ export interface InviteReceiptDto {
   recovery_of?: string;
 }
 
+export interface CreateInviteRequestDto {
+  room_id: string;
+  mode: InviteMode;
+  role: string;
+  min_accepts: number;
+}
+
 export interface AuthorDto {
   identity: string;
   display_name: string;
@@ -154,6 +161,71 @@ export function isInviteReceiptDto(value: unknown): value is InviteReceiptDto {
 
 export function isInviteReceiptListDto(value: unknown): value is InviteReceiptDto[] {
   return Array.isArray(value) && value.every(isInviteReceiptDto);
+}
+
+export function validateCreatedInviteReceipt(value: unknown, request: CreateInviteRequestDto): InviteReceiptDto {
+  if (!isInviteReceiptDto(value)
+    || value.room_id !== request.room_id
+    || value.invite.mode !== request.mode
+    || value.invite.role !== request.role
+    || value.invite.min_accepts !== request.min_accepts
+    || value.invite.accepted_cids.length !== 0
+    || value.invite.state !== 'live'
+    || value.invite.recovery_of !== undefined
+    || value.invite.recovery_confirmed !== undefined
+    || value.recovery_of !== undefined
+    || value.reusable !== (request.mode === 'public')) {
+    throw new Error('daemon returned an invalid invite receipt for this create request');
+  }
+  return value;
+}
+
+export function validateRecoveryInviteReceipts(value: unknown, room: RoomDto): InviteReceiptDto[] {
+  if (!isInviteReceiptListDto(value)) invalidRecoveryReceipt();
+  const inviteIds = new Set<string>();
+  const sources = new Set<string>();
+  for (const receipt of value) {
+    const source = room.invites.find((invite) => invite.invite_id === receipt.recovery_of);
+    if (receipt.room_id !== room.room_id
+      || receipt.recovery_of === undefined
+      || receipt.invite.recovery_of !== receipt.recovery_of
+      || receipt.invite.state !== 'receipt_pending'
+      || receipt.invite.recovery_confirmed !== false
+      || receipt.invite.accepted_cids.length !== 0
+      || receipt.reusable !== (receipt.invite.mode === 'public')
+      || !source
+      || source.state !== 'replacement_required'
+      || source.mode !== receipt.invite.mode
+      || source.role !== receipt.invite.role
+      || source.min_accepts !== receipt.invite.min_accepts
+      || source.invite_id === receipt.invite.invite_id
+      || room.invites.some((invite) => invite.invite_id === receipt.invite.invite_id)
+      || inviteIds.has(receipt.invite.invite_id)
+      || sources.has(receipt.recovery_of)) invalidRecoveryReceipt();
+    inviteIds.add(receipt.invite.invite_id);
+    sources.add(receipt.recovery_of);
+  }
+  return value;
+}
+
+export function validateConfirmedRecoveryInvite(value: unknown, receipt: InviteReceiptDto): RoomInviteDto {
+  if (!isRoomInvite(value)
+    || receipt.recovery_of === undefined
+    || value.invite_id !== receipt.invite.invite_id
+    || value.recovery_of !== receipt.recovery_of
+    || value.recovery_confirmed !== true
+    || value.state !== 'live'
+    || value.mode !== receipt.invite.mode
+    || value.role !== receipt.invite.role
+    || value.min_accepts !== receipt.invite.min_accepts
+    || value.accepted_cids.length !== 0) {
+    throw new Error('daemon returned an invalid recovery confirmation for the displayed old/new pointer');
+  }
+  return value;
+}
+
+function invalidRecoveryReceipt(): never {
+  throw new Error('daemon returned an invalid recovery receipt for this room state');
 }
 
 export function isCommunicationRecordDto(value: unknown): value is CommunicationRecordDto {

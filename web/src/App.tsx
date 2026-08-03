@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { rpcCall } from './api/rpc';
-import { isInviteReceiptDto, isInviteReceiptListDto, isParticipantListDto, isRoomDto, isRoomListDto, type InviteMode, type InviteReceiptDto, type ParticipantDto, type RoomDto } from './api/types';
+import { isParticipantListDto, isRoomDto, isRoomListDto, validateConfirmedRecoveryInvite, validateCreatedInviteReceipt, validateRecoveryInviteReceipts, type InviteMode, type InviteReceiptDto, type ParticipantDto, type RoomDto } from './api/types';
+import { InviteReceiptDialog, type InviteReceiptVault } from './components/InviteManager';
 import { CreateRoomDialog, SettingsDialog } from './components/RoomDialogs';
 import { RoomContext, type ContextTab } from './components/RoomContext';
 import { RoomRail } from './components/RoomRail';
@@ -29,6 +30,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   const [banner, setBanner] = useState<string>();
   const [createOpen, setCreateOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [inviteReceiptVaults, setInviteReceiptVaults] = useState<InviteReceiptVault[]>([]);
   const [contextTab, setContextTab] = useState<ContextTab>('state');
   const [railOpen, setRailOpen] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
@@ -187,12 +189,18 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
     }
   }, [refreshAfterMutation, reportFailure, rpc, selectedRoomId]);
 
-  const createInvite = useCallback(async (input: { mode: InviteMode; role: string; min_accepts: number }): Promise<InviteReceiptDto> => {
-    if (!selectedRoomId) throw new Error('No room selected.');
+  const activeRoom = useMemo(() => selectedRoom?.room_id === selectedRoomId
+    ? selectedRoom : rooms.find((room) => room.room_id === selectedRoomId), [rooms, selectedRoom, selectedRoomId]);
+
+  const createInvite = useCallback(async (input: { mode: InviteMode; role: string; min_accepts: number }): Promise<void> => {
+    const requestedRoomId = selectedRoomId;
+    if (!requestedRoomId) throw new Error('No room selected.');
     try {
-      const result = await rpc.call('room.invite', { room_id: selectedRoomId, ...input });
-      if (!isInviteReceiptDto(result)) throw new Error('daemon returned an invalid invite receipt');
-      refreshAfterMutation(); return result;
+      const request = { room_id: requestedRoomId, ...input };
+      const result = await rpc.call('room.invite', request);
+      const receipt = validateCreatedInviteReceipt(result, request);
+      setInviteReceiptVaults((current) => [...current, { room_id: requestedRoomId, receipts: [receipt] }]);
+      refreshAfterMutation();
     } catch (failure) { reportFailure(failure, 'Create invite failed'); throw failure; }
   }, [refreshAfterMutation, reportFailure, rpc, selectedRoomId]);
 
@@ -202,26 +210,33 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
     catch (failure) { reportFailure(failure, 'Revoke invite failed'); throw failure; }
   }, [refreshAfterMutation, reportFailure, rpc, selectedRoomId]);
 
-  const recoverInvites = useCallback(async (): Promise<InviteReceiptDto[]> => {
-    if (!selectedRoomId) throw new Error('No room selected.');
-    try { const result = await rpc.call('room.recover', { room_id: selectedRoomId }); if (!isInviteReceiptListDto(result)) throw new Error('daemon returned invalid recovery receipts'); refreshAfterMutation(); return result; }
+  const recoverInvites = useCallback(async (): Promise<void> => {
+    const requestedRoom = activeRoom;
+    if (!requestedRoom) throw new Error('No room selected.');
+    try {
+      const result = await rpc.call('room.recover', { room_id: requestedRoom.room_id });
+      const receipts = validateRecoveryInviteReceipts(result, requestedRoom);
+      if (receipts.length > 0) setInviteReceiptVaults((current) => [...current, { room_id: requestedRoom.room_id, receipts }]);
+      refreshAfterMutation();
+    }
     catch (failure) { reportFailure(failure, 'Recover invites failed'); throw failure; }
-  }, [refreshAfterMutation, reportFailure, rpc, selectedRoomId]);
+  }, [activeRoom, refreshAfterMutation, reportFailure, rpc]);
 
-  const confirmRecovery = useCallback(async (oldId: string, newId: string) => {
-    if (!selectedRoomId) throw new Error('No room selected.');
-    try { const result = await rpc.call('room.recover.confirm', { room_id: selectedRoomId, recovery_of: oldId, invite_id: newId }); refreshAfterMutation(); return result; }
+  const confirmRecovery = useCallback(async (receipt: InviteReceiptDto): Promise<void> => {
+    if (!receipt.recovery_of) throw new Error('Recovery receipt has no old invite pointer.');
+    try {
+      const result = await rpc.call('room.recover.confirm', { room_id: receipt.room_id, recovery_of: receipt.recovery_of, invite_id: receipt.invite.invite_id });
+      validateConfirmedRecoveryInvite(result, receipt);
+      refreshAfterMutation();
+    }
     catch (failure) { reportFailure(failure, 'Confirm recovery failed'); throw failure; }
-  }, [refreshAfterMutation, reportFailure, rpc, selectedRoomId]);
-
-  const activeRoom = useMemo(() => selectedRoom?.room_id === selectedRoomId
-    ? selectedRoom : rooms.find((room) => room.room_id === selectedRoomId), [rooms, selectedRoom, selectedRoomId]);
+  }, [refreshAfterMutation, reportFailure, rpc]);
 
   return (
     <div className="cowork-app">
       <RoomRail rooms={rooms} selectedRoomId={selectedRoomId} connected={connected} open={railOpen} sheet={roomSheet} onClose={() => setRailOpen(false)} onCreate={(trigger) => { createTrigger.current = trigger; setCreateOpen(true); }} onSelect={selectRoom} />
       <RoomWorkspace room={activeRoom} connected={connected === true} onOpenRooms={() => setRailOpen(true)} onOpenContext={() => setContextOpen(true)} onSettings={(trigger) => { settingsTrigger.current = trigger; setSettingsOpen(true); }} />
-      <RoomContext room={activeRoom} participants={participants} connected={connected === true} tab={contextTab} open={contextOpen} drawer={contextDrawer} panelRef={contextPanel} onTab={setContextTab} onClose={() => setContextOpen(false)} onCreateInvite={createInvite} onRevokeInvite={revokeInvite} onRecoverInvites={recoverInvites} onConfirmRecovery={confirmRecovery} />
+      <RoomContext room={activeRoom} participants={participants} connected={connected === true} tab={contextTab} open={contextOpen} drawer={contextDrawer} panelRef={contextPanel} onTab={setContextTab} onClose={() => setContextOpen(false)} onCreateInvite={createInvite} onRevokeInvite={revokeInvite} onRecoverInvites={recoverInvites} />
       {((roomSheet && railOpen) || (contextDrawer && contextOpen)) && <button className="responsive-scrim" type="button" aria-label="Close open panel" onClick={() => { setRailOpen(false); setContextOpen(false); }} />}
 
       {connected === false && <div className="disconnect-banner" role="status"><strong>Disconnected</strong><span>Loaded data remains visible. Mutations are disabled until the daemon answers.</span></div>}
@@ -230,6 +245,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
 
       <CreateRoomDialog open={createOpen} restoreFocus={createTrigger.current} fallbackFocus={focusContextPanel} onClose={() => setCreateOpen(false)} onCreate={createRoom} />
       {activeRoom && settingsOpen && <SettingsDialog key={activeRoom.room_id} room={activeRoom} open restoreFocus={settingsTrigger.current} onClose={() => setSettingsOpen(false)} onSave={saveSettings} />}
+      {inviteReceiptVaults[0] && <InviteReceiptDialog vault={inviteReceiptVaults[0]} onClose={() => setInviteReceiptVaults((current) => current.slice(1))} onConfirm={confirmRecovery} />}
     </div>
   );
 }

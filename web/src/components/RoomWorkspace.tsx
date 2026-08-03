@@ -40,7 +40,7 @@ export function RoomWorkspace({ room, connected, onOpenRooms, onOpenContext, onS
           <p className="mono identity-name">{room.identity_name}</p>
         </div>
         <span className={`lifecycle-badge lifecycle-badge--${room.state}`}>{lifecycleLabel(room.state)}</span>
-        <button className="secondary-button context-toggle" type="button" onClick={onOpenContext}>Context</button>
+        <button className="secondary-button context-toggle" type="button" onClick={onOpenContext} data-modal-fallback="true">Context</button>
       </header>
 
       <div className="mission-strip">

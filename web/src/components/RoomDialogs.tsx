@@ -1,4 +1,5 @@
 import { type FormEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 import { RpcError } from '../api/rpc';
 import type { RoomDto } from '../api/types';
@@ -165,12 +166,12 @@ export function Modal({ title, open, restoreFocus, fallbackFocus, onClose, locke
     document.addEventListener('keydown', keydown);
     return () => {
       document.removeEventListener('keydown', keydown);
-      const target = visibleRestoreTarget(previous) ? previous : fallbackFocus?.();
+      const target = visibleRestoreTarget(previous) ? previous : fallbackFocus?.() ?? document.querySelector<HTMLElement>('[data-modal-fallback="true"]');
       if (visibleRestoreTarget(target)) target.focus();
     };
   }, [fallbackFocus, open, restoreFocus]);
 
-  return <div className="modal-backdrop" onMouseDown={(event) => { if (!locked && event.target === event.currentTarget) onClose(); }}><div ref={panelRef} className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId}><header><h2 id={titleId}>{title}</h2><button className="icon-button" type="button" onClick={onClose} disabled={locked} aria-label={`Close ${title}`}>×</button></header>{children}</div></div>;
+  return createPortal(<div className="modal-backdrop" onMouseDown={(event) => { if (!locked && event.target === event.currentTarget) onClose(); }}><div ref={panelRef} className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId}><header><h2 id={titleId}>{title}</h2><button className="icon-button" type="button" onClick={onClose} disabled={locked} aria-label={`Close ${title}`}>×</button></header>{children}</div></div>, document.body);
 }
 
 function missionError(label: string, value: string): string | undefined {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { rpcCall } from './api/rpc';
-import { isRoomDto, isRoomListDto, type RoomDto } from './api/types';
+import { isInviteReceiptDto, isInviteReceiptListDto, isParticipantListDto, isRoomDto, isRoomListDto, type InviteMode, type InviteReceiptDto, type ParticipantDto, type RoomDto } from './api/types';
 import { CreateRoomDialog, SettingsDialog } from './components/RoomDialogs';
 import { RoomContext, type ContextTab } from './components/RoomContext';
 import { RoomRail } from './components/RoomRail';
@@ -23,6 +23,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   const [rooms, setRooms] = useState<RoomDto[]>([]);
   const [selectedRoomId, setSelectedRoomId] = useState<string | undefined>(() => roomIdFromHash(location.hash));
   const [selectedRoom, setSelectedRoom] = useState<RoomDto>();
+  const [participants, setParticipants] = useState<ParticipantDto[]>([]);
   const [connected, setConnected] = useState<boolean | null>(null);
   const [notice, setNotice] = useState<string>();
   const [banner, setBanner] = useState<string>();
@@ -67,6 +68,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
             selectedRoomIdRef.current = undefined;
             setSelectedRoomId(undefined);
             setSelectedRoom(undefined);
+            setParticipants([]);
             setNotice(`Room “${selectedAtStart}” is no longer available. No local data was changed.`);
             if (location.hash) history.replaceState(null, '', `${location.pathname}${location.search}#/`);
           }
@@ -95,6 +97,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
       const roomId = roomIdFromHash(location.hash);
       selectedRoomIdRef.current = roomId;
       setSelectedRoomId(roomId);
+      setParticipants([]);
     };
     window.addEventListener('hashchange', routeChanged);
     return () => window.removeEventListener('hashchange', routeChanged);
@@ -102,7 +105,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
 
   useEffect(() => {
     const generation = ++selectionGeneration.current;
-    if (!selectedRoomId) { setSelectedRoom(undefined); return; }
+    if (!selectedRoomId) { setSelectedRoom(undefined); setParticipants([]); return; }
     const cached = rooms.find((room) => room.room_id === selectedRoomId);
     if (cached) setSelectedRoom(cached);
 
@@ -112,10 +115,19 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
       clock,
       run: async (signal) => {
         try {
-          const result = await rpc.call('room.show', { room_id: selectedRoomId }, { signal });
+          const [roomOutcome, participantOutcome] = await Promise.allSettled([
+            rpc.call('room.show', { room_id: selectedRoomId }, { signal }),
+            rpc.call('room.participants', { room_id: selectedRoomId }, { signal }),
+          ]);
+          if (roomOutcome.status === 'rejected') throw roomOutcome.reason;
+          const result = roomOutcome.value;
           if (!isRoomDto(result)) throw new Error('daemon returned invalid room details');
           if (selectionGeneration.current !== generation || result.room_id !== selectedRoomId) return;
           setSelectedRoom(result);
+          if (participantOutcome.status === 'fulfilled' && isParticipantListDto(participantOutcome.value)) {
+            const nextParticipants = participantOutcome.value;
+            setParticipants((current) => sameParticipants(current, nextParticipants) ? current : nextParticipants);
+          }
           setRooms((current) => current.map((room) => room.room_id === result.room_id ? result : room));
           setConnected(true);
         } catch (failure) {
@@ -135,6 +147,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   const selectRoom = useCallback((roomId: string) => {
     selectedRoomIdRef.current = roomId;
     setSelectedRoomId(roomId);
+    setParticipants([]);
     setNotice(undefined);
     setRailOpen(false);
     const nextHash = `#/rooms/${encodeURIComponent(roomId)}`;
@@ -174,6 +187,33 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
     }
   }, [refreshAfterMutation, reportFailure, rpc, selectedRoomId]);
 
+  const createInvite = useCallback(async (input: { mode: InviteMode; role: string; min_accepts: number }): Promise<InviteReceiptDto> => {
+    if (!selectedRoomId) throw new Error('No room selected.');
+    try {
+      const result = await rpc.call('room.invite', { room_id: selectedRoomId, ...input });
+      if (!isInviteReceiptDto(result)) throw new Error('daemon returned an invalid invite receipt');
+      refreshAfterMutation(); return result;
+    } catch (failure) { reportFailure(failure, 'Create invite failed'); throw failure; }
+  }, [refreshAfterMutation, reportFailure, rpc, selectedRoomId]);
+
+  const revokeInvite = useCallback(async (inviteId: string) => {
+    if (!selectedRoomId) throw new Error('No room selected.');
+    try { const result = await rpc.call('room.revoke', { room_id: selectedRoomId, invite_id: inviteId }); refreshAfterMutation(); return result; }
+    catch (failure) { reportFailure(failure, 'Revoke invite failed'); throw failure; }
+  }, [refreshAfterMutation, reportFailure, rpc, selectedRoomId]);
+
+  const recoverInvites = useCallback(async (): Promise<InviteReceiptDto[]> => {
+    if (!selectedRoomId) throw new Error('No room selected.');
+    try { const result = await rpc.call('room.recover', { room_id: selectedRoomId }); if (!isInviteReceiptListDto(result)) throw new Error('daemon returned invalid recovery receipts'); refreshAfterMutation(); return result; }
+    catch (failure) { reportFailure(failure, 'Recover invites failed'); throw failure; }
+  }, [refreshAfterMutation, reportFailure, rpc, selectedRoomId]);
+
+  const confirmRecovery = useCallback(async (oldId: string, newId: string) => {
+    if (!selectedRoomId) throw new Error('No room selected.');
+    try { const result = await rpc.call('room.recover.confirm', { room_id: selectedRoomId, recovery_of: oldId, invite_id: newId }); refreshAfterMutation(); return result; }
+    catch (failure) { reportFailure(failure, 'Confirm recovery failed'); throw failure; }
+  }, [refreshAfterMutation, reportFailure, rpc, selectedRoomId]);
+
   const activeRoom = useMemo(() => selectedRoom?.room_id === selectedRoomId
     ? selectedRoom : rooms.find((room) => room.room_id === selectedRoomId), [rooms, selectedRoom, selectedRoomId]);
 
@@ -181,7 +221,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
     <div className="cowork-app">
       <RoomRail rooms={rooms} selectedRoomId={selectedRoomId} connected={connected} open={railOpen} sheet={roomSheet} onClose={() => setRailOpen(false)} onCreate={(trigger) => { createTrigger.current = trigger; setCreateOpen(true); }} onSelect={selectRoom} />
       <RoomWorkspace room={activeRoom} connected={connected === true} onOpenRooms={() => setRailOpen(true)} onOpenContext={() => setContextOpen(true)} onSettings={(trigger) => { settingsTrigger.current = trigger; setSettingsOpen(true); }} />
-      <RoomContext room={activeRoom} tab={contextTab} open={contextOpen} drawer={contextDrawer} panelRef={contextPanel} onTab={setContextTab} onClose={() => setContextOpen(false)} />
+      <RoomContext room={activeRoom} participants={participants} connected={connected === true} tab={contextTab} open={contextOpen} drawer={contextDrawer} panelRef={contextPanel} onTab={setContextTab} onClose={() => setContextOpen(false)} onCreateInvite={createInvite} onRevokeInvite={revokeInvite} onRecoverInvites={recoverInvites} onConfirmRecovery={confirmRecovery} />
       {((roomSheet && railOpen) || (contextDrawer && contextOpen)) && <button className="responsive-scrim" type="button" aria-label="Close open panel" onClick={() => { setRailOpen(false); setContextOpen(false); }} />}
 
       {connected === false && <div className="disconnect-banner" role="status"><strong>Disconnected</strong><span>Loaded data remains visible. Mutations are disabled until the daemon answers.</span></div>}
@@ -198,6 +238,10 @@ function roomIdFromHash(hash: string): string | undefined {
   const match = /^#\/rooms\/([^/?#]+)$/.exec(hash);
   if (!match?.[1]) return undefined;
   try { return decodeURIComponent(match[1]); } catch { return undefined; }
+}
+
+function sameParticipants(left: ParticipantDto[], right: ParticipantDto[]): boolean {
+  return left.length === right.length && left.every((participant, index) => JSON.stringify(participant) === JSON.stringify(right[index]));
 }
 
 function useMediaQuery(query: string): boolean {

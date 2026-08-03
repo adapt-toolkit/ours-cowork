@@ -1,73 +1,33 @@
 import type { Ref } from 'react';
 
-import type { RoomDto } from '../api/types';
+import type { InviteMode, InviteReceiptDto, ParticipantDto, RoomDto } from '../api/types';
 import { unmetInviteCount } from '../state/roomModel';
+import { InviteManager } from './InviteManager';
 
-export type ContextTab = 'state' | 'invite';
+export type ContextTab = 'state' | 'participants' | 'invite';
 
-export function RoomContext({ room, tab, open, drawer, panelRef, onTab, onClose }: {
-  room?: RoomDto;
-  tab: ContextTab;
-  open: boolean;
-  drawer: boolean;
-  panelRef?: Ref<HTMLElement>;
-  onTab(tab: ContextTab): void;
-  onClose(): void;
+export function RoomContext({ room, participants = [], connected = false, tab, open, drawer, panelRef, onTab, onClose, onCreateInvite = unavailable, onRevokeInvite = unavailable, onRecoverInvites = unavailableList, onConfirmRecovery = unavailable }: {
+  room?: RoomDto; participants?: ParticipantDto[]; connected?: boolean; tab: ContextTab; open: boolean; drawer: boolean; panelRef?: Ref<HTMLElement>;
+  onTab(tab: ContextTab): void; onClose(): void;
+  onCreateInvite?(input: { mode: InviteMode; role: string; min_accepts: number }): Promise<InviteReceiptDto>;
+  onRevokeInvite?(inviteId: string): Promise<unknown>;
+  onRecoverInvites?(): Promise<InviteReceiptDto[]>;
+  onConfirmRecovery?(oldId: string, newId: string): Promise<unknown>;
 }) {
   const hidden = drawer && !open;
-  return (
-    <aside ref={panelRef} className={`room-context${open ? ' room-context--open' : ''}`} aria-label="Room context" aria-hidden={hidden || undefined} hidden={hidden} tabIndex={-1}>
-      <header className="context-header">
-        <div><p className="eyebrow">Room context</p><h2>{room ? 'Mission details' : 'No room selected'}</h2></div>
-        <button className="icon-button context-close" type="button" onClick={onClose} aria-label="Close context">×</button>
-      </header>
-      {room && <>
-        <div className="context-tabs" role="tablist" aria-label="Room context views">
-          <button type="button" role="tab" aria-selected={tab === 'state'} onClick={() => onTab('state')}>State</button>
-          <button type="button" role="tab" aria-selected={tab === 'invite'} onClick={() => onTab('invite')}>Invite</button>
-        </div>
-        {tab === 'state' ? <StatePanel room={room} /> : <InvitePanel room={room} />}
-      </>}
-    </aside>
-  );
+  return <aside ref={panelRef} className={`room-context${open ? ' room-context--open' : ''}`} aria-label="Room context" aria-hidden={hidden || undefined} hidden={hidden} tabIndex={-1}>
+    <header className="context-header"><div><p className="eyebrow">Room context</p><h2>{room ? 'Mission details' : 'No room selected'}</h2></div><button className="icon-button context-close" type="button" onClick={onClose} aria-label="Close context">×</button></header>
+    {room && <><div className="context-tabs" role="tablist" aria-label="Room context views"><button type="button" role="tab" aria-selected={tab === 'state'} onClick={() => onTab('state')}>State</button><button type="button" role="tab" aria-selected={tab === 'participants'} onClick={() => onTab('participants')}>Participants</button><button type="button" role="tab" aria-selected={tab === 'invite'} onClick={() => onTab('invite')}>Invite</button></div>
+      {tab === 'state' ? <StatePanel room={room} /> : tab === 'participants' ? <ParticipantsPanel room={room} participants={participants} /> : <div className="context-body" role="tabpanel" aria-label="Invites"><div className="setup-callout"><span aria-hidden="true">↗</span><div><h3>Build the room roster</h3><p>Add invitation requirements one at a time. Each confirmed requirement is durable and can be retried independently.</p></div></div><dl className="state-grid state-grid--compact"><div><dt>Requirements</dt><dd>{room.invites.length}</dd></div><div><dt>Still needed</dt><dd>{unmetInviteCount(room)}</dd></div></dl><InviteManager key={room.room_id} room={room} connected={connected} onCreate={onCreateInvite} onRevoke={onRevokeInvite} onRecover={onRecoverInvites} onConfirm={onConfirmRecovery} /></div>}
+    </>}
+  </aside>;
 }
 
-function StatePanel({ room }: { room: RoomDto }) {
-  return (
-    <div className="context-body" role="tabpanel" aria-label="State">
-      <dl className="state-grid">
-        <div><dt>Lifecycle</dt><dd className={`state-text state-text--${room.state}`}>{room.state}</dd></div>
-        <div><dt>Accepted seats</dt><dd>{room.seats.length}</dd></div>
-        <div><dt>Unmet requirements</dt><dd>{unmetInviteCount(room)}</dd></div>
-        <div><dt>Archive</dt><dd>Not loaded</dd></div>
-      </dl>
-      {room.status && <Detail label="Status" value={room.status} />}
-      <Detail label="Room ID" value={room.room_id} mono />
-      <Detail label="Identity CID" value={room.identity_cid || 'Pending'} mono />
-      <Detail label="Created" value={formatDate(room.created_at)} />
-      {room.closed_at && <Detail label="Closed" value={formatDate(room.closed_at)} />}
-    </div>
-  );
-}
+function StatePanel({ room }: { room: RoomDto }) { return <div className="context-body" role="tabpanel" aria-label="State"><dl className="state-grid"><div><dt>Lifecycle</dt><dd className={`state-text state-text--${room.state}`}>{title(room.state)}</dd></div><div><dt>Accepted seats</dt><dd>{room.seats.length}</dd></div><div><dt>Unmet requirements</dt><dd>{unmetInviteCount(room)}</dd></div><div><dt>Archive</dt><dd>Not loaded</dd></div></dl>{room.status && <Detail label="Status" value={room.status} />}<Detail label="Room ID" value={room.room_id} mono /><Detail label="Identity CID" value={room.identity_cid || 'Pending'} mono /><Detail label="Created" value={formatDate(room.created_at)} />{room.closed_at && <Detail label="Closed" value={formatDate(room.closed_at)} />}</div>; }
 
-function InvitePanel({ room }: { room: RoomDto }) {
-  return (
-    <div className="context-body" role="tabpanel" aria-label="Invite">
-      <div className="setup-callout"><span aria-hidden="true">↗</span><div><h3>Build the room roster</h3><p>Add invitation requirements one at a time. Each confirmed requirement is durable and can be retried independently.</p></div></div>
-      <dl className="state-grid state-grid--compact">
-        <div><dt>Requirements</dt><dd>{room.invites.length}</dd></div>
-        <div><dt>Still needed</dt><dd>{unmetInviteCount(room)}</dd></div>
-      </dl>
-      <p className="context-note">Invitation creation, receipt handling, revocation, and recovery arrive in the next management stage.</p>
-    </div>
-  );
-}
-
-function Detail({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
-  return <div className="detail-row"><span>{label}</span><strong className={mono ? 'mono' : undefined}>{value}</strong></div>;
-}
-
-function formatDate(value: string): string {
-  const date = new Date(value);
-  return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
-}
+function ParticipantsPanel({ room, participants }: { room: RoomDto; participants: ParticipantDto[] }) { return <div className="context-body" role="tabpanel" aria-label="Participants"><p className={`state-text state-text--${room.state}`}>{title(room.state)}</p><p>{participants.length} {participants.length === 1 ? 'seat' : 'seats'}</p>{room.invites.map((invite) => <p key={invite.invite_id}><strong>{invite.role}</strong>: {invite.accepted_cids.length} of {invite.min_accepts} accepted</p>)}<div className="participant-list">{participants.map((participant) => <article className="participant-card" key={participant.identity}><strong>{participant.display_name}</strong><span>{participant.role}</span><code className="mono">{participant.identity}</code><small>via {participant.invite_id} · {formatDate(participant.accepted_at)}</small></article>)}{participants.length === 0 && <p className="context-note">No participants admitted yet.</p>}</div></div>; }
+function Detail({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) { return <div className="detail-row"><span>{label}</span><strong className={mono ? 'mono' : undefined}>{value}</strong></div>; }
+function formatDate(value: string) { const date = new Date(value); return Number.isNaN(date.valueOf()) ? value : date.toLocaleString(); }
+function title(value: string) { return `${value.charAt(0).toUpperCase()}${value.slice(1).replaceAll('_', ' ')}`; }
+async function unavailable(): Promise<never> { throw new Error('Invite management is unavailable.'); }
+async function unavailableList(): Promise<never> { throw new Error('Invite management is unavailable.'); }

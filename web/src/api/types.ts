@@ -43,6 +43,14 @@ export interface RoomDto {
   closed_at?: string;
 }
 
+export interface InviteReceiptDto {
+  room_id: string;
+  invite: RoomInviteDto;
+  blob: string;
+  reusable: boolean;
+  recovery_of?: string;
+}
+
 export interface AuthorDto {
   identity: string;
   display_name: string;
@@ -138,6 +146,16 @@ export function isParticipantListDto(value: unknown): value is ParticipantDto[] 
   return Array.isArray(value) && value.every(isParticipant);
 }
 
+export function isInviteReceiptDto(value: unknown): value is InviteReceiptDto {
+  return isRecord(value) && isString(value.room_id) && isRoomInvite(value.invite)
+    && isString(value.blob) && typeof value.reusable === 'boolean'
+    && optionalString(value.recovery_of);
+}
+
+export function isInviteReceiptListDto(value: unknown): value is InviteReceiptDto[] {
+  return Array.isArray(value) && value.every(isInviteReceiptDto);
+}
+
 export function isCommunicationRecordDto(value: unknown): value is CommunicationRecordDto {
   if (!hasRecordCommon(value)) return false;
   switch (value.kind) {
@@ -190,6 +208,7 @@ function isParticipant(value: unknown): value is ParticipantDto {
 
 function isRoomInvite(value: unknown): value is RoomInviteDto {
   return isRecord(value)
+    && !('blob' in value)
     && isString(value.invite_id)
     && INVITE_MODES.has(value.mode)
     && isString(value.role)

@@ -134,7 +134,7 @@ function TextField({ label, value, onChange, error }: { label: string; value: st
   return <div className="field"><label htmlFor={id}>{label}</label><input id={id} value={value} onChange={(event) => onChange(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? errorId : undefined} />{error && <small id={errorId} className="field-error">{error}</small>}</div>;
 }
 
-function Modal({ title, open, restoreFocus, fallbackFocus, onClose, locked, children }: { title: string; open: boolean; restoreFocus?: HTMLElement; fallbackFocus?(): HTMLElement | undefined; onClose(): void; locked: boolean; children: ReactNode }) {
+export function Modal({ title, open, restoreFocus, fallbackFocus, onClose, locked, children }: { title: string; open: boolean; restoreFocus?: HTMLElement; fallbackFocus?(): HTMLElement | undefined; onClose(): void; locked: boolean; children: ReactNode }) {
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);

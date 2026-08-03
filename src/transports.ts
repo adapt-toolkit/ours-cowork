@@ -402,8 +402,9 @@ export class TransportServer {
   }
 
   private safeRestOrigin(request: http.IncomingMessage): boolean {
-    const authority = `127.0.0.1:${this.restAddress.port}`;
-    if (request.headers.host !== authority) return false;
+    const port = this.restAddress.port;
+    const authority = request.headers.host;
+    if (authority !== `127.0.0.1:${port}` && authority !== `localhost:${port}`) return false;
     const origin = request.headers.origin;
     if (origin !== undefined && origin !== `http://${authority}`) return false;
     return request.headers['sec-fetch-site']?.toLowerCase() !== 'cross-site';

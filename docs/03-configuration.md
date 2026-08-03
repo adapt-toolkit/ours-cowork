@@ -15,4 +15,4 @@ Environment overrides are `OURS_COWORK_CONFIG`, `OURS_COWORK_BROKER_URL`, `OURS_
 
 CLI room commands always use `management.sock`; they do not switch to REST.
 
-The HTTP listener is unauthenticated and restricted to `127.0.0.1`. Do not expose it through port forwarding, a reverse proxy, or a non-loopback bind.
+The HTTP listener is unauthenticated and restricted to the `127.0.0.1` interface. The console works through both `http://127.0.0.1:<port>` and `http://localhost:<port>`. Do not expose it through port forwarding, a reverse proxy, or a non-loopback bind.

@@ -180,7 +180,7 @@ test('REST preserves correlated service errors over their actual non-2xx statuse
   }
 });
 
-test('REST RPC requires POST, JSON, the exact bound Host, a same origin, and non-cross-site fetch metadata', async (t) => {
+test('REST RPC requires POST, JSON, a local Host, its same origin, and non-cross-site fetch metadata', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-origin-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   let calls = 0;
@@ -203,10 +203,24 @@ test('REST RPC requires POST, JSON, the exact bound Host, a same origin, and non
   assert.deepEqual(accepted.json.result, { pong: true });
   assert.equal(accepted.headers['access-control-allow-origin'], undefined);
 
+  const localhostAuthority = `localhost:${port}`;
+  const acceptedLocalhost = await request(port, {
+    body,
+    host: localhostAuthority,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      origin: `http://${localhostAuthority}`,
+      'sec-fetch-site': 'same-origin',
+    },
+  });
+  assert.equal(acceptedLocalhost.statusCode, 200);
+  assert.deepEqual(acceptedLocalhost.json.result, { pong: true });
+  assert.equal(acceptedLocalhost.headers['access-control-allow-origin'], undefined);
+
   for (const options of [
     { method: 'GET' },
     { headers: { 'content-type': 'text/plain' } },
-    { host: `localhost:${port}` },
+    { host: `localhost:${port}`, headers: { 'content-type': 'application/json', origin: `http://${authority}` } },
     { headers: { 'content-type': 'application/json', origin: `http://localhost:${port}` } },
     { headers: { 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' } },
   ]) {
@@ -214,7 +228,7 @@ test('REST RPC requires POST, JSON, the exact bound Host, a same origin, and non
     assert.notEqual(rejected.statusCode, 200);
     assert.equal(rejected.headers['access-control-allow-origin'], undefined);
   }
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
 });
 
 test('REST and Unix reject oversized streaming/chunked bodies before dispatch', async (t) => {

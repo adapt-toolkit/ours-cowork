@@ -1,19 +1,22 @@
+import type { Ref } from 'react';
+
 import type { RoomDto } from '../api/types';
 import { unmetInviteCount } from '../state/roomModel';
 
 export type ContextTab = 'state' | 'invite';
 
-export function RoomContext({ room, tab, open, drawer, onTab, onClose }: {
+export function RoomContext({ room, tab, open, drawer, panelRef, onTab, onClose }: {
   room?: RoomDto;
   tab: ContextTab;
   open: boolean;
   drawer: boolean;
+  panelRef?: Ref<HTMLElement>;
   onTab(tab: ContextTab): void;
   onClose(): void;
 }) {
   const hidden = drawer && !open;
   return (
-    <aside className={`room-context${open ? ' room-context--open' : ''}`} aria-label="Room context" aria-hidden={hidden || undefined} hidden={hidden}>
+    <aside ref={panelRef} className={`room-context${open ? ' room-context--open' : ''}`} aria-label="Room context" aria-hidden={hidden || undefined} hidden={hidden} tabIndex={-1}>
       <header className="context-header">
         <div><p className="eyebrow">Room context</p><h2>{room ? 'Mission details' : 'No room selected'}</h2></div>
         <button className="icon-button context-close" type="button" onClick={onClose} aria-label="Close context">×</button>

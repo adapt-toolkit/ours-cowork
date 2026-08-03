@@ -5,9 +5,10 @@ import type { RoomDto } from '../api/types';
 
 const MAX_MISSION_BYTES = 262_144;
 
-export function CreateRoomDialog({ open, restoreFocus, onClose, onCreate }: {
+export function CreateRoomDialog({ open, restoreFocus, fallbackFocus, onClose, onCreate }: {
   open: boolean;
   restoreFocus?: HTMLElement;
+  fallbackFocus?(): HTMLElement | undefined;
   onClose(): void;
   onCreate(goal: string, briefing: string): Promise<void>;
 }) {
@@ -42,7 +43,7 @@ export function CreateRoomDialog({ open, restoreFocus, onClose, onCreate }: {
   }
 
   return (
-    <Modal title="Create mission room" open={open} restoreFocus={restoreFocus} onClose={onClose} locked={submitting}>
+    <Modal title="Create mission room" open={open} restoreFocus={restoreFocus} fallbackFocus={fallbackFocus} onClose={onClose} locked={submitting}>
       <form className="dialog-form" onSubmit={submit}>
         <p className="dialog-intro">Define the shared objective. Invitation requirements are added after the room is created.</p>
         <MissionField label="Goal" value={goal} onChange={setGoal} error={goalError} rows={3} autoFocus trimForBytes />
@@ -133,7 +134,7 @@ function TextField({ label, value, onChange, error }: { label: string; value: st
   return <div className="field"><label htmlFor={id}>{label}</label><input id={id} value={value} onChange={(event) => onChange(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? errorId : undefined} />{error && <small id={errorId} className="field-error">{error}</small>}</div>;
 }
 
-function Modal({ title, open, restoreFocus, onClose, locked, children }: { title: string; open: boolean; restoreFocus?: HTMLElement; onClose(): void; locked: boolean; children: ReactNode }) {
+function Modal({ title, open, restoreFocus, fallbackFocus, onClose, locked, children }: { title: string; open: boolean; restoreFocus?: HTMLElement; fallbackFocus?(): HTMLElement | undefined; onClose(): void; locked: boolean; children: ReactNode }) {
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
@@ -162,8 +163,12 @@ function Modal({ title, open, restoreFocus, onClose, locked, children }: { title
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
     document.addEventListener('keydown', keydown);
-    return () => { document.removeEventListener('keydown', keydown); if (previous?.isConnected) previous.focus(); };
-  }, [open, restoreFocus]);
+    return () => {
+      document.removeEventListener('keydown', keydown);
+      const target = visibleRestoreTarget(previous) ? previous : fallbackFocus?.();
+      if (visibleRestoreTarget(target)) target.focus();
+    };
+  }, [fallbackFocus, open, restoreFocus]);
 
   return <div className="modal-backdrop" onMouseDown={(event) => { if (!locked && event.target === event.currentTarget) onClose(); }}><div ref={panelRef} className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId}><header><h2 id={titleId}>{title}</h2><button className="icon-button" type="button" onClick={onClose} disabled={locked} aria-label={`Close ${title}`}>×</button></header>{children}</div></div>;
 }
@@ -182,3 +187,9 @@ function exactMissionError(label: string, value: string): string | undefined {
 }
 
 function byteLength(value: string): number { return new TextEncoder().encode(value).byteLength; }
+
+function visibleRestoreTarget(element: HTMLElement | null | undefined): element is HTMLElement {
+  return Boolean(element?.isConnected
+    && !element.matches(':disabled, [aria-disabled="true"]')
+    && !element.closest('[hidden], [aria-hidden="true"]'));
+}

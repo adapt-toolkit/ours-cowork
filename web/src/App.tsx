@@ -39,8 +39,10 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   const selectedRoomIdRef = useRef(selectedRoomId);
   const createTrigger = useRef<HTMLButtonElement>();
   const settingsTrigger = useRef<HTMLButtonElement>();
+  const contextPanel = useRef<HTMLElement>(null);
 
   const visible = useCallback(() => !document.hidden, []);
+  const focusContextPanel = useCallback(() => contextPanel.current ?? undefined, []);
   const reportFailure = useCallback((failure: unknown, action?: string) => {
     const message = failure instanceof Error ? failure.message : 'Unexpected daemon error.';
     setBanner(action ? `${action}: ${message}` : message);
@@ -179,14 +181,14 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
     <div className="cowork-app">
       <RoomRail rooms={rooms} selectedRoomId={selectedRoomId} connected={connected} open={railOpen} sheet={roomSheet} onClose={() => setRailOpen(false)} onCreate={(trigger) => { createTrigger.current = trigger; setCreateOpen(true); }} onSelect={selectRoom} />
       <RoomWorkspace room={activeRoom} connected={connected === true} onOpenRooms={() => setRailOpen(true)} onOpenContext={() => setContextOpen(true)} onSettings={(trigger) => { settingsTrigger.current = trigger; setSettingsOpen(true); }} />
-      <RoomContext room={activeRoom} tab={contextTab} open={contextOpen} drawer={contextDrawer} onTab={setContextTab} onClose={() => setContextOpen(false)} />
+      <RoomContext room={activeRoom} tab={contextTab} open={contextOpen} drawer={contextDrawer} panelRef={contextPanel} onTab={setContextTab} onClose={() => setContextOpen(false)} />
       {((roomSheet && railOpen) || (contextDrawer && contextOpen)) && <button className="responsive-scrim" type="button" aria-label="Close open panel" onClick={() => { setRailOpen(false); setContextOpen(false); }} />}
 
       {connected === false && <div className="disconnect-banner" role="status"><strong>Disconnected</strong><span>Loaded data remains visible. Mutations are disabled until the daemon answers.</span></div>}
       {banner && <div className="error-banner" role="alert"><span>{banner}</span><button type="button" onClick={() => setBanner(undefined)} aria-label="Dismiss error">×</button></div>}
       {notice && <div className="notice-banner" role="status"><span>{notice}</span><button type="button" onClick={() => setNotice(undefined)} aria-label="Dismiss notice">×</button></div>}
 
-      <CreateRoomDialog open={createOpen} restoreFocus={createTrigger.current} onClose={() => setCreateOpen(false)} onCreate={createRoom} />
+      <CreateRoomDialog open={createOpen} restoreFocus={createTrigger.current} fallbackFocus={focusContextPanel} onClose={() => setCreateOpen(false)} onCreate={createRoom} />
       {activeRoom && settingsOpen && <SettingsDialog key={activeRoom.room_id} room={activeRoom} open restoreFocus={settingsTrigger.current} onClose={() => setSettingsOpen(false)} onSave={saveSettings} />}
     </div>
   );

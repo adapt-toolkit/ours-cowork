@@ -102,6 +102,44 @@ describe('create and settings dialogs', () => {
     expect(call.mock.calls.filter(([method]) => method === 'room.create')).toHaveLength(2);
   });
 
+  it('hands confirmed mobile create focus to visible Invite context while cancel restores the open sheet trigger', async () => {
+    const target = createdRoom();
+    let created = false;
+    const call = vi.fn(async (method: string) => {
+      if (method === 'room.list') return created ? [target] : [];
+      if (method === 'room.create') { created = true; return target; }
+      if (method === 'room.show') return target;
+      throw new Error(`unexpected ${method}`);
+    });
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = matchMediaAt(700);
+    try {
+      const user = userEvent.setup();
+      const { container } = render(<CoworkApp rpc={{ call } as RpcClient} />);
+      await user.click(await screen.findByRole('button', { name: 'Open rooms' }));
+      const create = screen.getByRole('button', { name: 'Create room' });
+
+      await user.click(create);
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+      expect(create).toHaveFocus();
+      expect(container.querySelector('.room-rail')).not.toHaveAttribute('hidden');
+
+      await user.click(create);
+      await user.type(screen.getByLabelText('Goal'), 'Release coordination');
+      await user.type(screen.getByLabelText('Briefing'), 'Keep deploy owners aligned');
+      await user.click(screen.getByRole('button', { name: 'Create mission room' }));
+
+      expect(await screen.findByRole('tab', { name: 'Invite', selected: true })).toBeVisible();
+      const context = container.querySelector('.room-context') as HTMLElement;
+      expect(context).not.toHaveAttribute('hidden');
+      expect(context).toHaveFocus();
+      expect(create).not.toHaveFocus();
+      expect(document.body).not.toHaveFocus();
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
+  });
+
   it('sends only dirty settings fields', async () => {
     const target = createdRoom();
     const call = vi.fn(async (method: string) => {
@@ -173,3 +211,19 @@ describe('create and settings dialogs', () => {
     expect(within(screen.getByRole('dialog', { name: 'Room settings' })).getByRole('button', { name: 'Save settings' })).toBeDisabled();
   });
 });
+
+function matchMediaAt(width: number): typeof window.matchMedia {
+  return vi.fn((query: string) => {
+    const maximum = /max-width:\s*(\d+)px/.exec(query);
+    return {
+      matches: maximum ? width <= Number(maximum[1]) : false,
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(() => true),
+    } as MediaQueryList;
+  });
+}

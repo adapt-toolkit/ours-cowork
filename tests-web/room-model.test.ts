@@ -21,16 +21,18 @@ import {
 } from '../web/src/state/roomModel';
 
 const AT = '2026-08-03T00:00:00.000Z';
+const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x70';
+const MESSAGE_ID = '01jz6y7n8p9q0r1s2t3v4w5x71';
 
 function message(seq: number, overrides: Partial<MessageRecordDto> = {}): MessageRecordDto {
   return {
     version: 1,
-    room_id: 'room-1',
+    room_id: ROOM_ID,
     seq,
-    record_id: `room-1:${seq}`,
+    record_id: `${ROOM_ID}:${seq}`,
     at: AT,
     kind: 'message',
-    message_id: `message-${seq}`,
+    message_id: MESSAGE_ID,
     author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' },
     category: 'chat',
     text: `message ${seq}`,
@@ -42,12 +44,12 @@ function message(seq: number, overrides: Partial<MessageRecordDto> = {}): Messag
 function event(seq: number): CommunicationRecordDto {
   return {
     version: 1,
-    room_id: 'room-1',
+    room_id: ROOM_ID,
     seq,
-    record_id: `room-1:${seq}`,
+    record_id: `${ROOM_ID}:${seq}`,
     at: AT,
     kind: 'relay_intent',
-    message_id: `message-${seq}`,
+    message_id: MESSAGE_ID,
     recipient_identity: 'cid-alice',
   };
 }
@@ -68,8 +70,8 @@ function invite(overrides: Partial<RoomInviteDto> = {}): RoomInviteDto {
 function room(overrides: Partial<RoomDto> = {}): RoomDto {
   return {
     version: 1,
-    room_id: 'room-1',
-    identity_name: 'cowork-room-room-1',
+    room_id: ROOM_ID,
+    identity_name: 'cowork-room-operations',
     identity_cid: 'cid-room',
     mission: { goal: 'Ship it', briefing: 'Build carefully' },
     state: 'active',
@@ -96,6 +98,29 @@ describe('room DTO guards', () => {
     expect(isHistoryDto([message(1), event(2)])).toBe(true);
     expect(isRoomDto({ ...validRoom, mission: { goal: 42, briefing: 'no' } })).toBe(false);
     expect(isHistoryDto([{ ...message(1), seq: '1' }])).toBe(false);
+  });
+
+  it('strictly mirrors archive record keys, identifiers, timestamps, record IDs, and union fields', () => {
+    const valid = message(1);
+    expect(isHistoryDto([valid])).toBe(true);
+    for (const invalid of [
+      { ...valid, extra: true },
+      { ...valid, room_id: 'room-1', record_id: 'room-1:1' },
+      { ...valid, message_id: 'message-1' },
+      { ...valid, at: '2026-08-03' },
+      { ...valid, record_id: `${ROOM_ID}:2` },
+      { ...valid, author: { ...valid.author, extra: true } },
+      { ...valid, recipient_identities: ['cid-a', 'cid-a'] },
+      { ...valid, source_msg_id: -1 },
+      { ...valid, source_wire_id: '' },
+      { ...event(2), notified: true },
+    ]) expect(isHistoryDto([invalid])).toBe(false);
+
+    expect(isHistoryDto([{
+      version: 1, room_id: ROOM_ID, seq: 2, record_id: `${ROOM_ID}:2`, at: AT,
+      kind: 'close_notice_result', intent_record_id: 'intent-2', recipient_identity: 'cid-a',
+      status: 'queued', notified: false, key_material_retained: true, uncertain_after_restart: true,
+    }])).toBe(true);
   });
 });
 

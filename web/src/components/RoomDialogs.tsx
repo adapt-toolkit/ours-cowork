@@ -122,9 +122,11 @@ export function SettingsDialog({ room, open, restoreFocus, onClose, onSave }: {
   );
 }
 
-export function CloseRoomDialog({ room, open, restoreFocus, onClose, onConfirm }: {
+export function CloseRoomDialog({ room, open, connected, capable, restoreFocus, onClose, onConfirm }: {
   room: RoomDto;
   open: boolean;
+  connected: boolean;
+  capable: boolean;
   restoreFocus?: HTMLElement;
   onClose(): void;
   onConfirm(): Promise<void>;
@@ -136,10 +138,11 @@ export function CloseRoomDialog({ room, open, restoreFocus, onClose, onConfirm }
   if (!open) return null;
   const title = roomTitle(room);
   const confirmed = confirmation === title || confirmation === room.room_id;
+  const canSubmit = confirmed && connected && capable;
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (!confirmed || submittingRef.current) return;
+    if (!canSubmit || submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
     setError(undefined);
@@ -154,16 +157,19 @@ export function CloseRoomDialog({ room, open, restoreFocus, onClose, onConfirm }
         <p className="dialog-intro">Closing is forward-only. Live packet state is removed, while the plaintext local archive remains readable on this host.</p>
         <p className="destructive-target">Type <strong>{title}</strong> or the exact room ID <code>{room.room_id}</code> to continue.</p>
         <TextField label="Type room title or ID to close" value={confirmation} onChange={setConfirmation} />
+        {(!connected || !capable) && <p className="form-error" role="status">Close is unavailable because the connection or room lifecycle changed. No request was sent.</p>}
         {error && <p className="form-error" role="alert">{error}</p>}
-        <div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>Cancel</button><button className="danger-button" type="submit" disabled={!confirmed || submitting}>{submitting ? 'Closing room…' : 'Close room permanently'}</button></div>
+        <div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>Cancel</button><button className="danger-button" type="submit" disabled={!canSubmit || submitting}>{submitting ? 'Closing room…' : 'Close room permanently'}</button></div>
       </form>
     </Modal>
   );
 }
 
-export function DeleteRoomDialog({ room, open, restoreFocus, onClose, onConfirm }: {
+export function DeleteRoomDialog({ room, open, connected, capable, restoreFocus, onClose, onConfirm }: {
   room: RoomDto;
   open: boolean;
+  connected: boolean;
+  capable: boolean;
   restoreFocus?: HTMLElement;
   onClose(): void;
   onConfirm(): Promise<void>;
@@ -174,10 +180,11 @@ export function DeleteRoomDialog({ room, open, restoreFocus, onClose, onConfirm 
   const submittingRef = useRef(false);
   if (!open) return null;
   const confirmed = confirmation === room.room_id;
+  const canSubmit = confirmed && connected && capable;
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (!confirmed || submittingRef.current) return;
+    if (!canSubmit || submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
     setError(undefined);
@@ -192,8 +199,9 @@ export function DeleteRoomDialog({ room, open, restoreFocus, onClose, onConfirm 
         <p className="dialog-intro">This deletes the plaintext local archive and room metadata from this host. It does not purge remote copies or backups and does not securely erase storage or keys.</p>
         <p className="destructive-target">Type the exact room ID <code>{room.room_id}</code> to continue.</p>
         <TextField label="Type exact room ID to delete" value={confirmation} onChange={setConfirmation} />
+        {(!connected || !capable) && <p className="form-error" role="status">Delete is unavailable because the connection or room lifecycle changed. No request was sent.</p>}
         {error && <p className="form-error" role="alert">{error}</p>}
-        <div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>Cancel</button><button className="danger-button" type="submit" disabled={!confirmed || submitting}>{submitting ? 'Deleting room…' : 'Delete local archive'}</button></div>
+        <div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>Cancel</button><button className="danger-button" type="submit" disabled={!canSubmit || submitting}>{submitting ? 'Deleting room…' : 'Delete local archive'}</button></div>
       </form>
     </Modal>
   );

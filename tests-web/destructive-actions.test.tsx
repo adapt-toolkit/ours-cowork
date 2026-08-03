@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import React from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -77,6 +77,58 @@ describe('close and delete actions', () => {
     expect(call.mock.calls.filter(([method]) => method === 'room.close')).toHaveLength(1);
   });
 
+  it('disables an open close confirmation after disconnect and performs no mutation', async () => {
+    const active = room('active');
+    let disconnected = false;
+    const call = vi.fn(async (method: string) => {
+      if (disconnected && (method === 'room.list' || method === 'room.show')) throw new Error('offline');
+      if (method === 'room.list') return [active];
+      if (method === 'room.show') return active;
+      if (method === 'room.participants' || method === 'room.history') return [];
+      if (method === 'room.close') return room('closed');
+      throw new Error(`unexpected ${method}`);
+    });
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    await user.click(await screen.findByRole('button', { name: 'Close room' }));
+    const confirmation = screen.getByLabelText('Type room title or ID to close');
+    await user.type(confirmation, ROOM_ID);
+
+    disconnected = true;
+    fireEvent(document, new Event('visibilitychange'));
+    expect(await screen.findByText(/Loaded data remains visible/)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Close room permanently' })).toBeDisabled();
+    fireEvent.submit(confirmation.closest('form')!);
+    expect(call.mock.calls.filter(([method]) => method === 'room.close')).toHaveLength(0);
+    expect(screen.getByRole('dialog', { name: 'Close room' })).toBeVisible();
+    expect(confirmation).toHaveValue(ROOM_ID);
+  });
+
+  it('disables an open close confirmation when the room lifecycle advances', async () => {
+    let current = room('active');
+    const call = vi.fn(async (method: string) => {
+      if (method === 'room.list') return [current];
+      if (method === 'room.show') return current;
+      if (method === 'room.participants' || method === 'room.history') return [];
+      if (method === 'room.close') return room('closed');
+      throw new Error(`unexpected ${method}`);
+    });
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    await user.click(await screen.findByRole('button', { name: 'Close room' }));
+    const confirmation = screen.getByLabelText('Type room title or ID to close');
+    await user.type(confirmation, ROOM_ID);
+
+    current = { ...current, state: 'closing' };
+    fireEvent(document, new Event('visibilitychange'));
+    expect(await screen.findByText(/Close is unavailable because the connection or room lifecycle changed/)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Close room permanently' })).toBeDisabled();
+    fireEvent.submit(confirmation.closest('form')!);
+    expect(call.mock.calls.filter(([method]) => method === 'room.close')).toHaveLength(0);
+    expect(screen.getByRole('dialog', { name: 'Close room' })).toBeVisible();
+    expect(confirmation).toHaveValue(ROOM_ID);
+  });
+
   it('offers delete only when closed, requires the exact ID, states scope precisely, and navigates only after a confirmed receipt', async () => {
     const closed = room('closed');
     let deleted = false;
@@ -131,5 +183,32 @@ describe('close and delete actions', () => {
     expect(screen.getByRole('heading', { name: 'Release coordination' })).toBeVisible();
     expect(location.hash).toBe(`#/rooms/${ROOM_ID}`);
     expect(call.mock.calls.filter(([method]) => method === 'room.delete')).toHaveLength(1);
+  });
+
+  it('disables an open delete confirmation after disconnect and performs no mutation', async () => {
+    const closed = room('closed');
+    let disconnected = false;
+    const call = vi.fn(async (method: string) => {
+      if (disconnected && (method === 'room.list' || method === 'room.show')) throw new Error('offline');
+      if (method === 'room.list') return [closed];
+      if (method === 'room.show') return closed;
+      if (method === 'room.participants' || method === 'room.history') return [];
+      if (method === 'room.delete') return { version: 1, room_id: ROOM_ID, deleted: true, scope: 'this_host' };
+      throw new Error(`unexpected ${method}`);
+    });
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    await user.click(await screen.findByRole('button', { name: 'Delete room' }));
+    const confirmation = screen.getByLabelText('Type exact room ID to delete');
+    await user.type(confirmation, ROOM_ID);
+
+    disconnected = true;
+    fireEvent(document, new Event('visibilitychange'));
+    expect(await screen.findByText(/Loaded data remains visible/)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Delete local archive' })).toBeDisabled();
+    fireEvent.submit(confirmation.closest('form')!);
+    expect(call.mock.calls.filter(([method]) => method === 'room.delete')).toHaveLength(0);
+    expect(screen.getByRole('dialog', { name: 'Delete room' })).toBeVisible();
+    expect(confirmation).toHaveValue(ROOM_ID);
   });
 });

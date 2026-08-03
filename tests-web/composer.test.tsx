@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import React from 'react';
 import { describe, expect, it, vi } from 'vitest';
@@ -9,6 +9,8 @@ import type { MessageRecordDto, RoomDto } from '../web/src/api/types';
 import { RoomComposer } from '../web/src/components/RoomComposer';
 
 const AT = '2026-08-03T00:00:00.000Z';
+const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x70';
+const MESSAGE_ID = '01jz6y7n8p9q0r1s2t3v4w5x71';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -71,13 +73,13 @@ describe('authoritative room composer', () => {
 
   it('posts once without an optimistic row, then refreshes history immediately after authoritative confirmation', async () => {
     const target: RoomDto = {
-      version: 1, room_id: 'room-1', identity_name: 'cowork-room-room-1', identity_cid: 'cid-room',
+      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-room-1', identity_cid: 'cid-room',
       mission: { goal: 'Release coordination', briefing: 'Coordinate carefully' }, state: 'active',
       invites: [], seats: [], created_at: AT,
     };
     const confirmed: MessageRecordDto = {
-      version: 1, room_id: 'room-1', seq: 1, record_id: 'room-1:1', at: AT,
-      kind: 'message', message_id: 'message-1', author: { identity: 'cid-room', display_name: 'cowork-room-room-1', role: 'room' },
+      version: 1, room_id: ROOM_ID, seq: 1, record_id: `${ROOM_ID}:1`, at: AT,
+      kind: 'message', message_id: MESSAGE_ID, author: { identity: 'cid-room', display_name: 'cowork-room-room-1', role: 'room' },
       category: 'chat', text: 'Publish only from history', recipient_identities: [],
     };
     const pending = deferred<MessageRecordDto>();
@@ -90,7 +92,7 @@ describe('authoritative room composer', () => {
       if (method === 'room.message') return pending.promise.then((record) => { sent = true; return record; });
       return Promise.reject(new Error(`unexpected ${method}`));
     });
-    location.hash = '#/rooms/room-1';
+    location.hash = `#/rooms/${ROOM_ID}`;
     const user = userEvent.setup();
     render(<CoworkApp rpc={{ call } as RpcClient} />);
     const input = await screen.findByLabelText('Message the room');
@@ -98,12 +100,106 @@ describe('authoritative room composer', () => {
     await user.click(screen.getByRole('button', { name: 'Send message' }));
 
     expect(call.mock.calls.filter(([method]) => method === 'room.message')).toEqual([
-      ['room.message', { room_id: 'room-1', text: confirmed.text }],
+      ['room.message', { room_id: ROOM_ID, text: confirmed.text }],
     ]);
     expect(screen.queryByText(confirmed.text, { selector: '.chat-row__text' })).not.toBeInTheDocument();
     pending.resolve(confirmed);
     expect(await screen.findByText(confirmed.text, { selector: '.chat-row__text' })).toBeVisible();
     expect(input).toHaveValue('');
     expect(call.mock.calls.filter(([method]) => method === 'room.history').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it.each([
+    ['extra key', (record: MessageRecordDto) => ({ ...record, injected: true })],
+    ['bad message ULID', (record: MessageRecordDto) => ({ ...record, message_id: 'message-1' })],
+    ['bad timestamp', (record: MessageRecordDto) => ({ ...record, at: '2026-08-03' })],
+    ['bad record ID', (record: MessageRecordDto) => ({ ...record, record_id: `${ROOM_ID}:2` })],
+    ['foreign union field', (record: MessageRecordDto) => ({ ...record, notified: true })],
+  ])('retains the draft when message confirmation has a %s', async (_label, corrupt) => {
+    const target: RoomDto = {
+      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-room-1', identity_cid: 'cid-room',
+      mission: { goal: 'Release coordination', briefing: 'Coordinate carefully' }, state: 'active',
+      invites: [], seats: [], created_at: AT,
+    };
+    const confirmed: MessageRecordDto = {
+      version: 1, room_id: ROOM_ID, seq: 1, record_id: `${ROOM_ID}:1`, at: AT,
+      kind: 'message', message_id: MESSAGE_ID, author: { identity: 'cid-room', display_name: 'cowork-room-room-1', role: 'room' },
+      category: 'chat', text: 'Keep this draft', recipient_identities: [],
+    };
+    const call = vi.fn(async (method: string) => {
+      if (method === 'room.list') return [target];
+      if (method === 'room.show') return target;
+      if (method === 'room.participants' || method === 'room.history') return [];
+      if (method === 'room.message') return corrupt(confirmed);
+      throw new Error(`unexpected ${method}`);
+    });
+    location.hash = `#/rooms/${ROOM_ID}`;
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    const input = await screen.findByLabelText('Message the room');
+    await user.type(input, confirmed.text);
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+
+    expect(await within(input.closest('form')!).findByRole('alert')).toHaveTextContent(/invalid message confirmation/i);
+    expect(input).toHaveValue(confirmed.text);
+    expect(call.mock.calls.filter(([method]) => method === 'room.message')).toHaveLength(1);
+  });
+
+  it('does not submit a retained draft after the selected room disconnects', async () => {
+    const target: RoomDto = {
+      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-room-1', identity_cid: 'cid-room',
+      mission: { goal: 'Release coordination', briefing: 'Coordinate carefully' }, state: 'active',
+      invites: [], seats: [], created_at: AT,
+    };
+    let disconnected = false;
+    const call = vi.fn(async (method: string) => {
+      if (disconnected && (method === 'room.list' || method === 'room.show')) throw new Error('offline');
+      if (method === 'room.list') return [target];
+      if (method === 'room.show') return target;
+      if (method === 'room.participants' || method === 'room.history') return [];
+      if (method === 'room.message') return {};
+      throw new Error(`unexpected ${method}`);
+    });
+    location.hash = `#/rooms/${ROOM_ID}`;
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    const input = await screen.findByLabelText('Message the room');
+    await user.type(input, 'Retain while offline');
+    disconnected = true;
+    fireEvent(document, new Event('visibilitychange'));
+    expect(await screen.findByText(/Loaded data remains visible/)).toBeVisible();
+    expect(input).toBeDisabled();
+    fireEvent.submit(input.closest('form')!);
+
+    expect(call.mock.calls.filter(([method]) => method === 'room.message')).toHaveLength(0);
+    expect(input).toHaveValue('Retain while offline');
+  });
+
+  it('does not submit a retained draft after the selected room leaves active state', async () => {
+    let target: RoomDto = {
+      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-room-1', identity_cid: 'cid-room',
+      mission: { goal: 'Release coordination', briefing: 'Coordinate carefully' }, state: 'active',
+      invites: [], seats: [], created_at: AT,
+    };
+    const call = vi.fn(async (method: string) => {
+      if (method === 'room.list') return [target];
+      if (method === 'room.show') return target;
+      if (method === 'room.participants' || method === 'room.history') return [];
+      if (method === 'room.message') return {};
+      throw new Error(`unexpected ${method}`);
+    });
+    location.hash = `#/rooms/${ROOM_ID}`;
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    const input = await screen.findByLabelText('Message the room');
+    await user.type(input, 'Retain while closing');
+    target = { ...target, state: 'closing' };
+    fireEvent(document, new Event('visibilitychange'));
+    expect(await screen.findByText(/Room closure in progress/)).toBeVisible();
+    expect(input).toBeDisabled();
+    fireEvent.submit(input.closest('form')!);
+
+    expect(call.mock.calls.filter(([method]) => method === 'room.message')).toHaveLength(0);
+    expect(input).toHaveValue('Retain while closing');
   });
 });

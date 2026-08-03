@@ -132,6 +132,10 @@ const ROOM_STATES = new Set<unknown>(['provisioning', 'active', 'closing', 'clos
 const INVITE_MODES = new Set<unknown>(['one_time', 'public']);
 const INVITE_STATES = new Set<unknown>(['live', 'consumed', 'revoked', 'replacement_required', 'receipt_pending']);
 const RELAY_STATUSES = new Set<unknown>(['queued', 'send_failed']);
+const LOWER_CROCKFORD_ULID = /^[0-7][0-9a-hjkmnp-tv-z]{25}$/;
+const MAX_TEXT_BYTES = 262_144;
+const MAX_ROLE_BYTES = 256;
+const RECORD_COMMON_KEYS = ['version', 'room_id', 'seq', 'record_id', 'at', 'kind'] as const;
 
 export function isRoomDto(value: unknown): value is RoomDto {
   if (!isRecord(value)
@@ -239,25 +243,31 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
   if (!hasRecordCommon(value)) return false;
   switch (value.kind) {
     case 'message':
-      return isString(value.message_id)
+      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'message_id', 'author', 'category', 'text', 'recipient_identities'], ['source_msg_id', 'source_wire_id'])
+        && isLowerCrockfordUlid(value.message_id)
         && isAuthor(value.author)
         && (value.category === 'briefing' || value.category === 'chat')
-        && isString(value.text)
-        && isStringArray(value.recipient_identities)
+        && isUtf8Bounded(value.text, MAX_TEXT_BYTES)
+        && isUniqueStringArray(value.recipient_identities)
         && (value.source_msg_id === undefined || isNonNegativeSafeInteger(value.source_msg_id))
         && optionalString(value.source_wire_id);
     case 'relay_intent':
-      return isString(value.message_id) && isString(value.recipient_identity);
+      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'message_id', 'recipient_identity'])
+        && isLowerCrockfordUlid(value.message_id)
+        && isString(value.recipient_identity);
     case 'relay_result':
-      return isString(value.intent_record_id)
-        && isString(value.message_id)
+      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'intent_record_id', 'message_id', 'recipient_identity', 'status'], ['wire_id'])
+        && isString(value.intent_record_id)
+        && isLowerCrockfordUlid(value.message_id)
         && isString(value.recipient_identity)
         && RELAY_STATUSES.has(value.status)
         && optionalString(value.wire_id);
     case 'close_notice_intent':
-      return isString(value.recipient_identity);
+      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'recipient_identity'])
+        && isString(value.recipient_identity);
     case 'close_notice_result':
-      return isString(value.intent_record_id)
+      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'intent_record_id', 'recipient_identity', 'status', 'notified', 'key_material_retained'], ['uncertain_after_restart'])
+        && isString(value.intent_record_id)
         && isString(value.recipient_identity)
         && RELAY_STATUSES.has(value.status)
         && typeof value.notified === 'boolean'
@@ -310,18 +320,60 @@ function isRoomInvite(value: unknown): value is RoomInviteDto {
 
 function isAuthor(value: unknown): value is AuthorDto {
   return isRecord(value)
+    && hasExactKeys(value, ['identity', 'display_name', 'role'])
     && isString(value.identity)
     && isString(value.display_name)
-    && isString(value.role);
+    && isUtf8Bounded(value.role, MAX_ROLE_BYTES);
 }
 
 function hasRecordCommon(value: unknown): value is Record<string, unknown> & RecordCommonDto {
   return isRecord(value)
     && value.version === 1
-    && isString(value.room_id)
+    && isLowerCrockfordUlid(value.room_id)
     && isPositiveSafeInteger(value.seq)
-    && isString(value.record_id)
-    && isString(value.at);
+    && value.record_id === `${value.room_id}:${value.seq}`
+    && isStrictRfc3339(value.at)
+    && typeof value.kind === 'string';
+}
+
+function hasExactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+  const allowed = new Set([...required, ...optional]);
+  const keys = Object.keys(value);
+  return required.every((key) => Object.hasOwn(value, key))
+    && keys.every((key) => allowed.has(key));
+}
+
+function isLowerCrockfordUlid(value: unknown): value is string {
+  return typeof value === 'string' && LOWER_CROCKFORD_ULID.test(value);
+}
+
+function isUtf8Bounded(value: unknown, maximumBytes: number): value is string {
+  return typeof value === 'string'
+    && new TextEncoder().encode(value).byteLength >= 1
+    && new TextEncoder().encode(value).byteLength <= maximumBytes;
+}
+
+function isUniqueStringArray(value: unknown): value is string[] {
+  return isStringArray(value) && new Set(value).size === value.length;
+}
+
+function isStrictRfc3339(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/.exec(value);
+  if (!match) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, offsetHourText, offsetMinuteText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const offsetHour = offsetHourText === undefined ? 0 : Number(offsetHourText);
+  const offsetMinute = offsetMinuteText === undefined ? 0 : Number(offsetMinuteText);
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59 || offsetHour > 23 || offsetMinute > 59) return false;
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day >= 1 && day <= days[month - 1]!;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

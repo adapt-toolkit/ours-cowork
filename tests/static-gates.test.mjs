@@ -27,6 +27,7 @@ const INERT_BUNDLED_URL_PREFIXES = [
   'http://www.w3.org/XML/1998/namespace',
   'https://reactjs.org/docs/error-decoder.html',
 ];
+const MAIN_TEST_SCRIPT = 'node --import tsx --test --test-concurrency=1 tests/*.test.mjs';
 const DOC_NAMES = Array.from({ length: 11 }, (_, index) => `docs/${String(index + 1).padStart(2, '0')}-${[
   'prerequisites', 'installation', 'configuration', 'daemon-lifecycle', 'room-workflow',
   'invites', 'messaging-history', 'backup-restore', 'service-management', 'limitations', 'web-console',
@@ -34,6 +35,23 @@ const DOC_NAMES = Array.from({ length: 11 }, (_, index) => `docs/${String(index 
 
 function normalized(path) {
   return relative(ROOT, path).split(sep).join('/');
+}
+
+function mainTestRunnerViolations(script, devDependencies) {
+  const args = script.trim().split(/\s+/);
+  const violations = [];
+  if (script !== MAIN_TEST_SCRIPT) violations.push('main test command must preserve the exact Node 20 multi-file runner');
+  const importIndex = args.indexOf('--import');
+  if (args[0] !== 'node' || importIndex < 0 || !args[importIndex + 1]) {
+    violations.push('main test command must declare a Node --import loader');
+  } else if (!Object.hasOwn(devDependencies, args[importIndex + 1])) {
+    violations.push('main test loader must be a declared direct dev dependency');
+  }
+  if (args.some((arg) => arg === '--loader' || arg.startsWith('--loader=') ||
+    arg === '--experimental-loader' || arg.startsWith('--experimental-loader='))) {
+    violations.push('main test command must not use an experimental loader flag');
+  }
+  return violations;
 }
 
 function filesBelow(directory, extensions) {
@@ -265,9 +283,56 @@ test('CI repeats E2E and invokes the asserted release gate', () => {
   }
   assert(workflow.indexOf('npm run test:browser') < workflow.indexOf('for i in 1 2 3;'));
   const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
-  assert.equal(manifest.scripts.test, 'node --test --test-concurrency=1 tests/*.test.mjs');
+  assert.equal(manifest.scripts.test, MAIN_TEST_SCRIPT);
+  assert.equal(manifest.devDependencies.tsx, '4.23.1');
+  assert.equal(manifest.engines.node, '>=20');
+  assert.deepEqual(mainTestRunnerViolations(manifest.scripts.test, manifest.devDependencies), []);
   assert.equal(manifest.scripts['test:release'], 'node --test tests/static-gates.test.mjs');
   assert.equal(manifest.scripts['test:browser'], 'node --test tests/browser-smoke.test.mjs');
+  assert.match(workflow, /node-version:\s*20/);
+});
+
+test('main runner rejects loaderless Node and undeclared direct loaders while covering every native suite', () => {
+  assert.match(mainTestRunnerViolations(
+    'node --test --test-concurrency=1 tests/*.test.mjs',
+    { tsx: '4.23.1' },
+  ).join('\n'), /--import loader/);
+  assert.match(mainTestRunnerViolations(
+    'node --import unlisted-loader --test --test-concurrency=1 tests/*.test.mjs',
+    { tsx: '4.23.1' },
+  ).join('\n'), /declared direct dev dependency/);
+
+  const suites = readdirSync(join(ROOT, 'tests'))
+    .filter((name) => name.endsWith('.test.mjs'))
+    .sort();
+  assert(suites.length >= 16, `main runner discovered only ${suites.length} native suites`);
+  for (const representative of [
+    'actor-protocol.test.mjs',
+    'browser-smoke.test.mjs',
+    'intake.test.mjs',
+    'static-gates.test.mjs',
+    'web-server.test.mjs',
+  ]) {
+    assert(suites.includes(representative), `main runner omitted ${representative}`);
+  }
+  assert.match(MAIN_TEST_SCRIPT, /tests\/\*\.test\.mjs$/);
+});
+
+test('declared tsx loader has one semver-required esbuild installation', () => {
+  const lock = JSON.parse(readFileSync(join(ROOT, 'package-lock.json'), 'utf8'));
+  assert.equal(lock.packages['node_modules/tsx'].version, '4.23.1');
+  assert.equal(lock.packages['node_modules/tsx'].dependencies.esbuild, '~0.28.0');
+  assert.equal(lock.packages['node_modules/tsx/node_modules/esbuild'].version, '0.28.1');
+  assert.equal(lock.packages['node_modules/esbuild'].version, '0.25.0');
+
+  const installations = execFileSync('npm', ['ls', '--parseable', '--all', 'esbuild'], {
+    cwd: ROOT,
+    encoding: 'utf8',
+  }).trim().split('\n').map((path) => normalized(path)).sort();
+  assert.deepEqual(installations, [
+    'node_modules/esbuild',
+    'node_modules/tsx/node_modules/esbuild',
+  ]);
 });
 
 test('browser smoke wrapper is Node 20 JavaScript and explicitly bundles its TypeScript entry', () => {

@@ -4,6 +4,7 @@ import * as realFs from 'node:fs';
 import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
@@ -13,6 +14,9 @@ import {
   ensureRuntimeState,
   loadConfig,
 } from '../src/config.ts';
+
+const DAEMON_EXECUTABLE = fileURLToPath(new URL('../dist/daemon.js', import.meta.url));
+const DAEMON_EXECUTABLE_URL = new URL('../dist/daemon.js', import.meta.url).href;
 
 async function waitForChildExitOrKill(child, timeoutMs) {
   const exited = child.exitCode !== null || child.signalCode !== null
@@ -159,7 +163,7 @@ test('supervisor strips inherited preload and execution modes from its worker', 
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const preload = join(dir, 'preload.cjs');
   writeFileSync(preload, "require('node:fs').appendFileSync(process.env.COWORK_PRELOAD_MARKER, `${process.pid}\\n`);\n");
-  const daemonUrl = new URL('../src/daemon.ts', import.meta.url).href;
+  const daemonUrl = DAEMON_EXECUTABLE_URL;
   const program = `
     const { runSupervisor } = await import(${JSON.stringify(daemonUrl)});
     const done = runSupervisor({ quiet: true });
@@ -298,7 +302,7 @@ test('authorized worker shutdown before and during capability handshake never cr
   for (const phase of ['before-init', 'during-handshake']) {
     const dir = mkdtempSync(join(tmpdir(), `cowork-worker-${phase}-`));
     const capability = phase === 'before-init' ? '12'.repeat(32) : '34'.repeat(32);
-    const child = spawn(process.execPath, [new URL('../src/daemon.ts', import.meta.url).pathname], {
+    const child = spawn(process.execPath, [DAEMON_EXECUTABLE], {
       env: {
         ...process.env,
         OURS_COWORK_DAEMON_WORKER: '1',
@@ -336,7 +340,7 @@ test('authorized worker shutdown before and during capability handshake never cr
 test('ambient worker environment or mismatched live IPC fails before runtime state', async (t) => {
   for (const scenario of ['no-ipc', 'wrong-parent']) {
     const dir = mkdtempSync(join(tmpdir(), `cowork-unauthorized-${scenario}-`));
-    const child = spawn(process.execPath, [new URL('../src/daemon.ts', import.meta.url).pathname], {
+    const child = spawn(process.execPath, [DAEMON_EXECUTABLE], {
       env: {
         ...process.env,
         OURS_COWORK_DAEMON_WORKER: '1',
@@ -720,7 +724,7 @@ test('real executable owns SIGINT/SIGTERM after SDK boot and exits without runti
       stateDir: dir,
       rest: { enabled: false, port: 3052 },
     }), { mode: 0o600 });
-    const child = spawn(process.execPath, [new URL('../src/daemon.ts', import.meta.url).pathname], {
+    const child = spawn(process.execPath, [DAEMON_EXECUTABLE], {
       env: {
         ...process.env,
         OURS_COWORK_CONFIG: configPath,
@@ -755,7 +759,7 @@ test('real executable owns SIGINT/SIGTERM after SDK boot and exits without runti
 });
 
 test('real SDK-free supervisor handles signals from pre-lock through ready', async (t) => {
-  const daemonUrl = new URL('../src/daemon.ts', import.meta.url).href;
+  const daemonUrl = DAEMON_EXECUTABLE_URL;
   const stages = ['pre-lock', 'post-lock', 'during-host-init', 'post-host', 'pre-pid', 'ready'];
   for (const [index, stage] of stages.entries()) {
     const signal = index % 2 === 0 ? 'SIGINT' : 'SIGTERM';

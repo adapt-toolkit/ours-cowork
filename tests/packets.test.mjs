@@ -1082,7 +1082,7 @@ test('Packet.close rejects active and queued work before another envelope is sub
 });
 
 async function runDriverChild(t, { extraArgs = [], timeoutMs, afterReadyTimeoutMs }) {
-  const child = spawn(process.execPath, [THIS_FILE, '--packet-driver', ...extraArgs], {
+  const child = spawn(process.execPath, ['--import', 'tsx', THIS_FILE, '--packet-driver', ...extraArgs], {
     cwd: ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
   });

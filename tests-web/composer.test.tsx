@@ -162,6 +162,71 @@ describe('authoritative room composer', () => {
     expect(screen.getByLabelText('Message the room')).toHaveValue('');
   });
 
+  it('allows one concurrent pending send per room and isolates their completion state', async () => {
+    const secondRoomId = '01jz6y7n8p9q0r1s2t3v4w5x72';
+    const first: RoomDto = {
+      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-one', identity_cid: 'cid-one',
+      mission: { goal: 'First concurrent mission', briefing: 'First concurrent briefing' }, state: 'active',
+      invites: [], seats: [], created_at: AT,
+    };
+    const second: RoomDto = {
+      ...first, room_id: secondRoomId, identity_name: 'cowork-room-two', identity_cid: 'cid-two',
+      mission: { goal: 'Second concurrent mission', briefing: 'Second concurrent briefing' },
+    };
+    const firstText = 'First room pending text';
+    const secondText = 'Second room pending text';
+    const firstPending = deferred<MessageRecordDto>();
+    const secondPending = deferred<MessageRecordDto>();
+    const firstConfirmation: MessageRecordDto = {
+      version: 1, room_id: ROOM_ID, seq: 1, record_id: `${ROOM_ID}:1`, at: AT,
+      kind: 'message', message_id: MESSAGE_ID,
+      author: { identity: first.identity_cid, display_name: first.identity_name, role: 'room' },
+      category: 'chat', text: firstText, recipient_identities: [],
+    };
+    const call = vi.fn((method: string, params: Record<string, unknown>) => {
+      if (method === 'room.list') return Promise.resolve([first, second]);
+      if (method === 'room.show') return Promise.resolve(params.room_id === ROOM_ID ? first : second);
+      if (method === 'room.participants' || method === 'room.history') return Promise.resolve([]);
+      if (method === 'room.message') return params.room_id === ROOM_ID ? firstPending.promise : secondPending.promise;
+      return Promise.reject(new Error(`unexpected ${method}`));
+    });
+    location.hash = `#/rooms/${ROOM_ID}`;
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+
+    await user.type(await screen.findByLabelText('Message the room'), firstText);
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    await user.click(screen.getByText('Second concurrent mission'));
+    await user.type(await screen.findByLabelText('Message the room'), secondText);
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+
+    expect(call.mock.calls.filter(([method]) => method === 'room.message').map(([, params]) => params)).toEqual([
+      { room_id: ROOM_ID, text: firstText },
+      { room_id: secondRoomId, text: secondText },
+    ]);
+    expect(screen.getByLabelText('Message the room')).toBeDisabled();
+    expect(screen.getByLabelText('Message the room')).toHaveValue(secondText);
+    await user.click(screen.getByText('First concurrent mission'));
+    expect(await screen.findByLabelText('Message the room')).toBeDisabled();
+    expect(screen.getByLabelText('Message the room')).toHaveValue(firstText);
+
+    await user.click(screen.getByText('Second concurrent mission'));
+    secondPending.reject(new Error('second room rejected independently'));
+    await act(async () => { try { await secondPending.promise; } catch { /* asserted below */ } });
+    expect(await screen.findByRole('alert')).toHaveTextContent('second room rejected independently');
+    expect(screen.getByLabelText('Message the room')).toHaveValue(secondText);
+
+    await user.click(screen.getByText('First concurrent mission'));
+    firstPending.resolve(firstConfirmation);
+    await act(async () => firstPending.promise);
+    expect(await screen.findByLabelText('Message the room')).toHaveValue('');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    await user.click(screen.getByText('Second concurrent mission'));
+    expect(await screen.findByLabelText('Message the room')).toHaveValue(secondText);
+    expect(screen.getByRole('alert')).toHaveTextContent('second room rejected independently');
+    expect(call.mock.calls.filter(([method]) => method === 'room.message')).toHaveLength(2);
+  });
+
   it.each([
     ['confirmed failure', new Error('room rejected the message'), /room rejected the message/i],
     ['unknown outcome', new RpcError('timeout', 'deadline elapsed', true), /outcome is unknown/i],

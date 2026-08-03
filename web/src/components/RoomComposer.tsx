@@ -1,4 +1,4 @@
-import { type FormEvent, type KeyboardEvent, useRef } from 'react';
+import type { FormEvent, KeyboardEvent } from 'react';
 
 import type { RoomState } from '../api/types';
 
@@ -17,7 +17,6 @@ export function RoomComposer({ roomState, connected, state, onDraftChange, onSen
   onDraftChange(value: string): void;
   onSend(text: string): Promise<void>;
 }) {
-  const pendingRef = useRef(false);
   const { draft, pending, error } = state;
   const enabled = roomState === 'active' && connected;
   const draftError = byteLength(draft) > MAX_MESSAGE_BYTES ? `Message must be at most ${MAX_MESSAGE_BYTES} UTF-8 bytes.` : undefined;
@@ -25,11 +24,8 @@ export function RoomComposer({ roomState, connected, state, onDraftChange, onSen
 
   async function submit(event?: FormEvent) {
     event?.preventDefault();
-    if (!canSend || pendingRef.current) return;
-    const submitted = draft;
-    pendingRef.current = true;
-    try { await onSend(submitted); }
-    finally { pendingRef.current = false; }
+    if (!canSend) return;
+    await onSend(draft);
   }
 
   function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) {

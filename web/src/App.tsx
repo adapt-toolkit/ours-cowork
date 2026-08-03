@@ -60,9 +60,18 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   const contextPanel = useRef<HTMLElement>(null);
 
   const updateConnected = useCallback((value: boolean) => { connectedRef.current = value; setConnected(value); }, []);
-  const updateSelectedRoom = useCallback((value: RoomDto | undefined) => { selectedRoomRef.current = value; setSelectedRoom(value); }, []);
-  const replaceRooms = useCallback((value: RoomDto[]) => { roomsRef.current = value; setRooms(value); }, []);
+  const updateSelectedRoom = useCallback((value: RoomDto | undefined) => {
+    if (value && deletedRoomIdsRef.current.has(value.room_id)) return;
+    selectedRoomRef.current = value;
+    setSelectedRoom(value);
+  }, []);
+  const replaceRooms = useCallback((value: RoomDto[]) => {
+    const next = value.filter((room) => !deletedRoomIdsRef.current.has(room.room_id));
+    roomsRef.current = next;
+    setRooms(next);
+  }, []);
   const replaceRoom = useCallback((value: RoomDto) => {
+    if (deletedRoomIdsRef.current.has(value.room_id)) return;
     const next = roomsRef.current.some((room) => room.room_id === value.room_id)
       ? roomsRef.current.map((room) => room.room_id === value.room_id ? value : room)
       : [...roomsRef.current, value];
@@ -84,24 +93,30 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   }, []);
 
   const loadHistoryPages = useCallback(async (roomId: string, options: { signal?: AbortSignal; generation?: number } = {}): Promise<void> => {
+    if (deletedRoomIdsRef.current.has(roomId)) return;
     let records = historyByRoomRef.current[roomId] ?? [];
     let after = records.at(-1)?.seq ?? 0;
     const current = () => !options.signal?.aborted
+      && !deletedRoomIdsRef.current.has(roomId)
       && (options.generation === undefined || selectionGeneration.current === options.generation);
     while (current()) {
       const result = await rpc.call('room.history', { room_id: roomId, after, limit: 200 }, options.signal ? { signal: options.signal } : undefined);
+      if (!current()) return;
       if (!isHistoryDto(result)
         || result.some((record, index) => record.room_id !== roomId || record.seq !== after + index + 1)) {
         throw new Error('daemon returned an invalid history page');
       }
-      if (!current()) return;
       if (result.length > 0) {
+        if (!current()) return;
         records = mergeRecords(historyByRoomRef.current[roomId] ?? records, result);
         historyByRoomRef.current = { ...historyByRoomRef.current, [roomId]: records };
         setHistoryByRoom(historyByRoomRef.current);
       }
       if (result.length < 200) {
-        setHistoryReadyByRoom((ready) => ready[roomId] ? ready : { ...ready, [roomId]: true });
+        if (!current()) return;
+        setHistoryReadyByRoom((ready) => deletedRoomIdsRef.current.has(roomId) || ready[roomId]
+          ? ready
+          : { ...ready, [roomId]: true });
         return;
       }
       after += result.length;
@@ -118,12 +133,13 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
         try {
           const result = await rpc.call('room.list', {}, { signal });
           if (!isRoomListDto(result)) throw new Error('daemon returned an invalid room list');
-          replaceRooms(result);
+          const availableRooms = result.filter((room) => !deletedRoomIdsRef.current.has(room.room_id));
+          replaceRooms(availableRooms);
           updateConnected(true);
           setBanner((current) => current?.startsWith('Disconnected:') ? undefined : current);
           if (selectedAtStart
             && selectedRoomIdRef.current === selectedAtStart
-            && !result.some((room) => room.room_id === selectedAtStart)) {
+            && !availableRooms.some((room) => room.room_id === selectedAtStart)) {
             selectedRoomIdRef.current = undefined;
             setSelectedRoomId(undefined);
             updateSelectedRoom(undefined);
@@ -153,10 +169,12 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
 
   useEffect(() => {
     const routeChanged = () => {
-      const roomId = roomIdFromHash(location.hash);
+      const requestedRoomId = roomIdFromHash(location.hash);
+      const roomId = requestedRoomId && !deletedRoomIdsRef.current.has(requestedRoomId) ? requestedRoomId : undefined;
       selectedRoomIdRef.current = roomId;
       setSelectedRoomId(roomId);
       setParticipants([]);
+      if (requestedRoomId && !roomId) history.replaceState(null, '', `${location.pathname}${location.search}#/`);
     };
     window.addEventListener('hashchange', routeChanged);
     return () => window.removeEventListener('hashchange', routeChanged);
@@ -165,6 +183,14 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   useEffect(() => {
     const generation = ++selectionGeneration.current;
     if (!selectedRoomId) { updateSelectedRoom(undefined); setParticipants([]); return; }
+    if (deletedRoomIdsRef.current.has(selectedRoomId)) {
+      selectedRoomIdRef.current = undefined;
+      setSelectedRoomId(undefined);
+      updateSelectedRoom(undefined);
+      setParticipants([]);
+      if (location.hash) history.replaceState(null, '', `${location.pathname}${location.search}#/`);
+      return;
+    }
     const cached = rooms.find((room) => room.room_id === selectedRoomId);
     if (cached) updateSelectedRoom(cached);
 
@@ -179,14 +205,19 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
             rpc.call('room.participants', { room_id: selectedRoomId }, { signal }),
             loadHistoryPages(selectedRoomId, { generation, signal }),
           ]);
+          if (signal.aborted || selectionGeneration.current !== generation || deletedRoomIdsRef.current.has(selectedRoomId)) return;
           if (roomOutcome.status === 'rejected') throw roomOutcome.reason;
           const result = roomOutcome.value;
           if (!isRoomDto(result)) throw new Error('daemon returned invalid room details');
-          if (selectionGeneration.current !== generation || result.room_id !== selectedRoomId) return;
+          if (selectionGeneration.current !== generation || deletedRoomIdsRef.current.has(selectedRoomId) || result.room_id !== selectedRoomId) return;
           updateSelectedRoom(result);
           if (participantOutcome.status === 'fulfilled' && isParticipantListDto(participantOutcome.value)) {
             const nextParticipants = participantOutcome.value;
-            setParticipants((current) => sameParticipants(current, nextParticipants) ? current : nextParticipants);
+            setParticipants((current) => deletedRoomIdsRef.current.has(selectedRoomId)
+              || selectionGeneration.current !== generation
+              || sameParticipants(current, nextParticipants)
+              ? current
+              : nextParticipants);
           }
           if (participantOutcome.status === 'fulfilled' && !isParticipantListDto(participantOutcome.value)) {
             reportFailure(new Error('daemon returned invalid participant details'), 'Participant refresh failed');
@@ -213,6 +244,14 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   }, [clock, loadHistoryPages, replaceRoom, reportFailure, rpc, selectedRoomId, updateConnected, updateSelectedRoom, visible]);
 
   const selectRoom = useCallback((roomId: string) => {
+    if (deletedRoomIdsRef.current.has(roomId)) {
+      selectedRoomIdRef.current = undefined;
+      setSelectedRoomId(undefined);
+      updateSelectedRoom(undefined);
+      setParticipants([]);
+      history.replaceState(null, '', `${location.pathname}${location.search}#/`);
+      return;
+    }
     selectedRoomIdRef.current = roomId;
     setSelectedRoomId(roomId);
     setParticipants([]);
@@ -222,7 +261,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
     setRailOpen(false);
     const nextHash = `#/rooms/${encodeURIComponent(roomId)}`;
     if (location.hash !== nextHash) location.hash = nextHash;
-  }, []);
+  }, [updateSelectedRoom]);
 
   const refreshAfterMutation = useCallback(() => {
     void listPoller.current?.refresh();
@@ -373,6 +412,8 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
       const result = await rpc.call('room.delete', { room_id: roomId, confirm: true });
       if (!isDeleteRoomReceiptDto(result) || result.room_id !== roomId) throw new Error('daemon returned invalid deletion confirmation');
       deletedRoomIdsRef.current.add(roomId);
+      selectionGeneration.current += 1;
+      selectedPoller.current?.stop();
       replaceRooms(roomsRef.current.filter((room) => room.room_id !== roomId));
       updateSelectedRoom(undefined);
       setSelectedRoomId(undefined);

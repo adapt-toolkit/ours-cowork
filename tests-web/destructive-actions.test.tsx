@@ -1,14 +1,21 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import React from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { CoworkApp, type RpcClient } from '../web/src/App';
 import { RpcError } from '../web/src/api/rpc';
-import type { RoomDto } from '../web/src/api/types';
+import type { CommunicationRecordDto, ParticipantDto, RoomDto } from '../web/src/api/types';
 
 const AT = '2026-08-03T00:00:00.000Z';
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x70';
+const MESSAGE_ID = '01jz6y7n8p9q0r1s2t3v4w5x71';
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
 
 function room(state: RoomDto['state']): RoomDto {
   return {
@@ -160,6 +167,64 @@ describe('close and delete actions', () => {
     expect(location.hash).toBe('#/');
     expect(await screen.findByRole('heading', { name: 'Select a room' })).toBeVisible();
     expect(screen.getByRole('status')).toHaveTextContent(/deleted from this host/i);
+  });
+
+  it('never resurrects a confirmed deletion from late or future room reads', async () => {
+    const closed = room('closed');
+    const lateList = deferred<RoomDto[]>();
+    const lateShow = deferred<RoomDto>();
+    const lateParticipants = deferred<ParticipantDto[]>();
+    const lateHistory = deferred<CommunicationRecordDto[]>();
+    const participant: ParticipantDto = {
+      identity: 'cid-late', display_name: 'Late Participant', role: 'builder',
+      invite_id: 'invite-late', accepted_at: AT,
+    };
+    const record: CommunicationRecordDto = {
+      version: 1, room_id: ROOM_ID, seq: 1, record_id: `${ROOM_ID}:1`, at: AT,
+      kind: 'message', message_id: MESSAGE_ID,
+      author: { identity: closed.identity_cid, display_name: closed.identity_name, role: 'room' },
+      category: 'chat', text: 'Late deleted archive record', recipient_identities: [],
+    };
+    let listCalls = 0;
+    const call = vi.fn((method: string) => {
+      if (method === 'room.list') return ++listCalls === 1 ? Promise.resolve([closed]) : listCalls === 2 ? lateList.promise : Promise.resolve([closed]);
+      if (method === 'room.show') return lateShow.promise;
+      if (method === 'room.participants') return lateParticipants.promise;
+      if (method === 'room.history') return lateHistory.promise;
+      if (method === 'room.delete') return Promise.resolve({ version: 1, room_id: ROOM_ID, deleted: true, scope: 'this_host' });
+      return Promise.reject(new Error(`unexpected ${method}`));
+    });
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    await screen.findByRole('button', { name: 'Delete room' });
+    await vi.waitFor(() => expect(call.mock.calls.some(([method]) => method === 'room.show')).toBe(true));
+    fireEvent(document, new Event('visibilitychange'));
+    await vi.waitFor(() => expect(call.mock.calls.filter(([method]) => method === 'room.list')).toHaveLength(2));
+
+    await user.click(screen.getByRole('button', { name: 'Delete room' }));
+    await user.type(screen.getByLabelText('Type exact room ID to delete'), ROOM_ID);
+    await user.click(screen.getByRole('button', { name: 'Delete local archive' }));
+    expect(await screen.findByRole('heading', { name: 'Select a room' })).toBeVisible();
+    expect(location.hash).toBe('#/');
+
+    lateList.resolve([closed]);
+    lateShow.resolve(closed);
+    lateParticipants.resolve([participant]);
+    lateHistory.resolve([record]);
+    await act(async () => Promise.all([lateList.promise, lateShow.promise, lateParticipants.promise, lateHistory.promise]));
+
+    expect(screen.getByRole('heading', { name: 'Select a room' })).toBeVisible();
+    expect(location.hash).toBe('#/');
+    expect(screen.queryByText('Release coordination')).not.toBeInTheDocument();
+    expect(screen.queryByText('Late Participant')).not.toBeInTheDocument();
+    expect(screen.queryByText('Late deleted archive record')).not.toBeInTheDocument();
+
+    const listCallsBeforeFuturePoll = call.mock.calls.filter(([method]) => method === 'room.list').length;
+    fireEvent(document, new Event('visibilitychange'));
+    await vi.waitFor(() => expect(call.mock.calls.filter(([method]) => method === 'room.list').length).toBeGreaterThan(listCallsBeforeFuturePoll));
+    expect(screen.queryByText('Release coordination')).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Select a room' })).toBeVisible();
+    expect(location.hash).toBe('#/');
   });
 
   it('retains the closed-room view and exact confirmation after an outcome-unknown delete without retrying', async () => {

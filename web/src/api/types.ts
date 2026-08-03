@@ -209,16 +209,16 @@ export function validateRecoveryInviteReceipts(value: unknown, room: RoomDto): I
 }
 
 export function validateConfirmedRecoveryInvite(value: unknown, receipt: InviteReceiptDto): RoomInviteDto {
+  const replayStates = new Set<InviteState>(['live', 'consumed', 'replacement_required', 'revoked']);
   if (!isRoomInvite(value)
     || receipt.recovery_of === undefined
     || value.invite_id !== receipt.invite.invite_id
     || value.recovery_of !== receipt.recovery_of
     || value.recovery_confirmed !== true
-    || value.state !== 'live'
+    || !replayStates.has(value.state)
     || value.mode !== receipt.invite.mode
     || value.role !== receipt.invite.role
-    || value.min_accepts !== receipt.invite.min_accepts
-    || value.accepted_cids.length !== 0) {
+    || value.min_accepts !== receipt.invite.min_accepts) {
     throw new Error('daemon returned an invalid recovery confirmation for the displayed old/new pointer');
   }
   return value;

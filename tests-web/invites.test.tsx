@@ -103,6 +103,21 @@ describe('invite management', () => {
     expect(() => validateConfirmedRecoveryInvite({ ...validRecovery.invite, state: 'live', recovery_confirmed: true, recovery_of: 'wrong-old' }, validRecovery)).toThrow(/invalid recovery confirmation/i);
   });
 
+  it('accepts every exact idempotent confirmation replay state and nonzero accepted CIDs', () => {
+    const pending: InviteReceiptDto = { room_id: base.room_id, invite: { invite_id: 'new-replay', mode: 'public', role: 'reviewer', min_accepts: 2, accepted_cids: [], state: 'receipt_pending', recovery_of: 'old-replay', recovery_confirmed: false, created_at: base.created_at }, blob: 'REPLAY-SECRET', reusable: true, recovery_of: 'old-replay' };
+    for (const state of ['live', 'consumed', 'replacement_required', 'revoked'] as const) {
+      const confirmed = { ...pending.invite, state, recovery_confirmed: true, accepted_cids: ['cid-alice'] };
+      expect(validateConfirmedRecoveryInvite(confirmed, pending)).toEqual(confirmed);
+    }
+    for (const rejected of [
+      { ...pending.invite },
+      { ...pending.invite, state: 'live', recovery_confirmed: false },
+      { ...pending.invite, state: 'live', recovery_confirmed: true, recovery_of: 'wrong' },
+      { ...pending.invite, state: 'live', recovery_confirmed: true, invite_id: 'wrong' },
+      { ...pending.invite, state: 'live', recovery_confirmed: true, role: 'wrong' },
+    ]) expect(() => validateConfirmedRecoveryInvite(rejected, pending)).toThrow(/invalid recovery confirmation/i);
+  });
+
   it('keeps malformed create results out of the receipt UI and reports an action-local error', async () => {
     location.hash = '#/rooms/room-1';
     const user = userEvent.setup();
@@ -158,6 +173,7 @@ describe('invite management', () => {
     expect(confirm).not.toHaveBeenCalled();
     await user.click(screen.getByRole('button', { name: /Confirm old-one.*new-0/ }));
     expect(confirm).toHaveBeenCalledWith('old-one', 'new-0');
+    expect(screen.getByText('SECRET-0')).toBeVisible();
   });
 });
 

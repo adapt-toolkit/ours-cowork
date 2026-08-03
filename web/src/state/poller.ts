@@ -4,10 +4,16 @@ export interface Poller {
   stop(): void;
 }
 
+export interface PollClock {
+  setInterval(callback: () => void, intervalMs: number): ReturnType<typeof setInterval>;
+  clearInterval(handle: ReturnType<typeof setInterval>): void;
+}
+
 export function createPoller(options: {
   intervalMs: number;
   visible: () => boolean;
   run: (signal: AbortSignal) => Promise<void>;
+  clock?: PollClock;
 }): Poller {
   if (!Number.isFinite(options.intervalMs) || options.intervalMs <= 0) {
     throw new TypeError('poll interval must be positive');
@@ -22,6 +28,10 @@ export function createPoller(options: {
 
   let started = false;
   let generation = 0;
+  const clock: PollClock = options.clock ?? {
+    setInterval: globalThis.setInterval.bind(globalThis),
+    clearInterval: globalThis.clearInterval.bind(globalThis),
+  };
   let timer: ReturnType<typeof setInterval> | undefined;
   let active: ActiveRun | undefined;
 
@@ -67,7 +77,7 @@ export function createPoller(options: {
       if (started) return;
       started = true;
       const currentGeneration = ++generation;
-      timer = setInterval(() => {
+      timer = clock.setInterval(() => {
         void request(currentGeneration).catch(() => undefined);
       }, options.intervalMs);
     },
@@ -78,7 +88,7 @@ export function createPoller(options: {
       if (!started) return;
       started = false;
       generation += 1;
-      if (timer !== undefined) clearInterval(timer);
+      if (timer !== undefined) clock.clearInterval(timer);
       timer = undefined;
       const stoppedRun = active;
       active = undefined;

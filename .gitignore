@@ -3,3 +3,5 @@ dist/
 mufl_code/*.muflo
 tests/fixtures/*.muflo
 coverage/
+.superpowers/
+docs/superpowers/

@@ -14,6 +14,8 @@ declare const __COWORK_BROWSER_TEST_ROOT__: string;
 
 const ROOT = __COWORK_BROWSER_TEST_ROOT__;
 const CREATED_AT = '2026-08-03T12:00:00.000Z';
+const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x70';
+const MESSAGE_ID = '01jz6y7n8p9q0r1s2t3v4w5x71';
 
 function resolveChromeExecutable() {
   const configured = process.env.COWORK_CHROME_PATH;
@@ -38,7 +40,7 @@ function resolveChromeExecutable() {
 function makeRoom() {
   return {
     version: 1,
-    room_id: 'browser-room-1',
+    room_id: ROOM_ID,
     identity_name: 'Browser Room',
     identity_cid: 'browser-room-cid',
     mission: { goal: 'Browser release proof', briefing: 'Exercise the shipped console.' },
@@ -105,10 +107,10 @@ function fakeService() {
         version: 1,
         room_id: roomId,
         seq: records.length + 1,
-        record_id: `browser-record-${records.length + 1}`,
+        record_id: `${roomId}:${records.length + 1}`,
         at: CREATED_AT,
         kind: 'message',
-        message_id: '01h00000000000000000000000',
+        message_id: MESSAGE_ID,
         author: { identity: rooms[0].identity_cid, display_name: rooms[0].identity_name, role: 'room' },
         category: 'chat',
         text: input.text,
@@ -157,7 +159,7 @@ test('shipped web console creates, selects, invites, and sends through the real 
 
   await assertProjection(page, async () => {
     await page.getByRole('heading', { name: 'Browser release proof' }).waitFor();
-    await page.waitForURL(/#\/rooms\/browser-room-1$/);
+    await page.waitForURL(new RegExp(`#\\/rooms\\/${ROOM_ID}$`));
     await page.getByRole('tabpanel', { name: 'Invites' }).waitFor();
   }, runtimeErrors);
   assert(service.calls.some(([method]) => method === 'room.show'), 'created room was not selected through its hash route');
@@ -173,7 +175,10 @@ test('shipped web console creates, selects, invites, and sends through the real 
   await page.getByLabel('Message the room').fill('Hello from the production bundle');
   await page.getByRole('button', { name: 'Send message' }).click();
   await assertProjection(page, async () => {
-    await page.getByText('Hello from the production bundle').waitFor();
+    await page.locator('section.workspace-content[aria-label="communication panel"]')
+      .getByRole('list', { name: 'Room communication' })
+      .getByText('Hello from the production bundle', { exact: true })
+      .waitFor();
   }, runtimeErrors);
 
   assert.equal(service.calls.filter(([method]) => method === 'room.create').length, 1);
@@ -185,11 +190,11 @@ test('shipped web console creates, selects, invites, and sends through the real 
   ]);
   assert.deepEqual(service.calls.find(([method]) => method === 'room.invite'), [
     'room.invite',
-    { roomId: 'browser-room-1', input: { mode: 'one_time', role: 'reviewer', min_accepts: 1 } },
+    { roomId: ROOM_ID, input: { mode: 'one_time', role: 'reviewer', min_accepts: 1 } },
   ]);
   assert.deepEqual(service.calls.find(([method]) => method === 'room.message'), [
     'room.message',
-    { roomId: 'browser-room-1', input: { text: 'Hello from the production bundle' } },
+    { roomId: ROOM_ID, input: { text: 'Hello from the production bundle' } },
   ]);
   assert.deepEqual(runtimeErrors, []);
 });

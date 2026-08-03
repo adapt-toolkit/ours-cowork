@@ -95,6 +95,7 @@ describe('room DTO guards', () => {
     expect(isRoomDto(validRoom)).toBe(true);
     expect(isRoomListDto([validRoom])).toBe(true);
     expect(isParticipantListDto(validRoom.seats)).toBe(true);
+    expect(isParticipantListDto([validRoom.seats[0]!, { ...validRoom.seats[0]!, display_name: 'Duplicate' }])).toBe(false);
     expect(isHistoryDto([message(1), event(2)])).toBe(true);
     expect(isRoomDto({ ...validRoom, mission: { goal: 42, briefing: 'no' } })).toBe(false);
     expect(isHistoryDto([{ ...message(1), seq: '1' }])).toBe(false);
@@ -121,6 +122,59 @@ describe('room DTO guards', () => {
       kind: 'close_notice_result', intent_record_id: 'intent-2', recipient_identity: 'cid-a',
       status: 'queued', notified: false, key_material_retained: true, uncertain_after_restart: true,
     }])).toBe(true);
+  });
+
+  it('rejects adversarial room descriptors that violate native shape and durable invariants', () => {
+    const source = invite({ invite_id: 'invite-source', state: 'replacement_required' });
+    const pending = invite({
+      invite_id: 'invite-new', state: 'receipt_pending', recovery_of: source.invite_id,
+      recovery_confirmed: false, accepted_cids: [],
+    });
+    const valid = room({
+      invites: [source, pending],
+      seats: [{ identity: 'cid-alice', display_name: 'Alice', role: 'builder', invite_id: source.invite_id, accepted_at: AT }],
+    });
+    expect(isRoomDto(valid)).toBe(true);
+
+    const invalid = [
+      { ...valid, extra: true },
+      { ...valid, room_id: 'room-1' },
+      { ...valid, created_at: '2026-02-29T00:00:00Z' },
+      { ...valid, activated_at: 'not-a-time' },
+      { ...valid, closed_at: '' },
+      { ...valid, status: '' },
+      { ...valid, mission: { ...valid.mission, extra: true } },
+      { ...valid, mission: { ...valid.mission, goal: '' } },
+      { ...valid, mission: { ...valid.mission, briefing: '🤖'.repeat(65_537) } },
+      { ...valid, seats: [{ ...valid.seats[0]!, extra: true }] },
+      { ...valid, seats: [{ ...valid.seats[0]!, accepted_at: '2026-08-03' }] },
+      { ...valid, seats: [{ ...valid.seats[0]!, role: '' }] },
+      { ...valid, seats: [valid.seats[0]!, { ...valid.seats[0]!, display_name: 'Duplicate' }] },
+      { ...valid, invites: [{ ...source, blob: 'must never be durable' }, pending] },
+      { ...valid, invites: [{ ...source, extra: true }, pending] },
+      { ...valid, invites: [{ ...source, role: '' }, pending] },
+      { ...valid, invites: [{ ...source, accepted_cids: ['cid-a', 'cid-a'] }, pending] },
+      { ...valid, invites: [{ ...source, mode: 'one_time', min_accepts: 2 }, pending] },
+      { ...valid, invites: [source, { ...pending, recovery_confirmed: undefined }] },
+      { ...valid, invites: [source, { ...pending, accepted_cids: ['cid-a'] }] },
+      { ...valid, invites: [{ ...source, state: 'live' }, pending] },
+      { ...valid, invites: [source, { ...pending, role: 'different' }] },
+      { ...valid, invites: [source, pending, { ...pending, invite_id: 'invite-another' }] },
+      { ...valid, invites: [source, { ...pending, recovery_of: pending.invite_id }] },
+      { ...valid, invites: [source, { ...source }] },
+      { ...valid, invites: [
+        { ...source, invite_id: 'cycle-a', state: 'revoked', recovery_of: 'cycle-b', recovery_confirmed: true },
+        { ...source, invite_id: 'cycle-b', state: 'revoked', recovery_of: 'cycle-a', recovery_confirmed: true },
+      ] },
+      room({ identity_cid: '', status: 'packet_pending', identity_name: 'wrong' }),
+      room({ identity_cid: '', status: 'packet_pending', invites: [invite()] }),
+      room({ status: 'packet_pending' }),
+    ];
+    for (const descriptor of invalid) expect(isRoomDto(descriptor)).toBe(false);
+
+    expect(isRoomDto(room({
+      identity_cid: '', identity_name: `cowork-room-${ROOM_ID}`, status: 'packet_pending', state: 'provisioning',
+    }))).toBe(true);
   });
 });
 

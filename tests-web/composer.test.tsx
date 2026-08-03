@@ -14,17 +14,18 @@ const MESSAGE_ID = '01jz6y7n8p9q0r1s2t3v4w5x71';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 describe('authoritative room composer', () => {
   it('is active-only and disconnected-safe', () => {
-    const { rerender } = render(<RoomComposer roomState="provisioning" connected onSend={vi.fn()} />);
+    const { rerender } = render(<ControlledComposer roomState="provisioning" connected onSend={vi.fn()} />);
     expect(screen.getByLabelText('Message the room')).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
 
-    rerender(<RoomComposer roomState="active" connected={false} onSend={vi.fn()} />);
+    rerender(<ControlledComposer roomState="active" connected={false} onSend={vi.fn()} />);
     expect(screen.getByLabelText('Message the room')).toBeDisabled();
   });
 
@@ -32,7 +33,7 @@ describe('authoritative room composer', () => {
     const pending = deferred<void>();
     const onSend = vi.fn(() => pending.promise);
     const user = userEvent.setup();
-    render(<RoomComposer roomState="active" connected onSend={onSend} />);
+    render(<ControlledComposer roomState="active" connected onSend={onSend} />);
     const input = screen.getByLabelText('Message the room');
     await user.type(input, 'Authoritative update');
     fireEvent.keyDown(input, { key: 'Enter' });
@@ -53,7 +54,7 @@ describe('authoritative room composer', () => {
       .mockRejectedValueOnce(new Error('room rejected the message'))
       .mockRejectedValueOnce(new RpcError('timeout', 'deadline elapsed', true));
     const user = userEvent.setup();
-    render(<RoomComposer roomState="active" connected onSend={onSend} />);
+    render(<ControlledComposer roomState="active" connected onSend={onSend} />);
     const input = screen.getByLabelText('Message the room');
 
     await user.type(input, 'line one');
@@ -107,6 +108,141 @@ describe('authoritative room composer', () => {
     expect(await screen.findByText(confirmed.text, { selector: '.chat-row__text' })).toBeVisible();
     expect(input).toHaveValue('');
     expect(call.mock.calls.filter(([method]) => method === 'room.history').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('keeps a pending send with its source room and refreshes only that room after navigation', async () => {
+    const secondRoomId = '01jz6y7n8p9q0r1s2t3v4w5x72';
+    const first = {
+      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-one', identity_cid: 'cid-one',
+      mission: { goal: 'First mission', briefing: 'First briefing' }, state: 'active' as const,
+      invites: [], seats: [], created_at: AT,
+    };
+    const second = {
+      ...first, room_id: secondRoomId, identity_name: 'cowork-room-two', identity_cid: 'cid-two',
+      mission: { goal: 'Second mission', briefing: 'Second briefing' },
+    };
+    const text = 'Source-room authoritative update';
+    const confirmed: MessageRecordDto = {
+      version: 1, room_id: ROOM_ID, seq: 1, record_id: `${ROOM_ID}:1`, at: AT,
+      kind: 'message', message_id: MESSAGE_ID, author: { identity: first.identity_cid, display_name: first.identity_name, role: 'room' },
+      category: 'chat', text, recipient_identities: [],
+    };
+    const pending = deferred<MessageRecordDto>();
+    let confirmedReady = false;
+    const call = vi.fn((method: string, params: Record<string, unknown>) => {
+      if (method === 'room.list') return Promise.resolve([first, second]);
+      if (method === 'room.show') return Promise.resolve(params.room_id === ROOM_ID ? first : second);
+      if (method === 'room.participants') return Promise.resolve([]);
+      if (method === 'room.history') return Promise.resolve(params.room_id === ROOM_ID && confirmedReady ? [confirmed] : []);
+      if (method === 'room.message') return pending.promise.then((record) => { confirmedReady = true; return record; });
+      return Promise.reject(new Error(`unexpected ${method}`));
+    });
+    location.hash = `#/rooms/${ROOM_ID}`;
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    const firstInput = await screen.findByLabelText('Message the room');
+    await user.type(firstInput, text);
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    await user.click(screen.getByText('Second mission'));
+    const secondInput = await screen.findByLabelText('Message the room');
+    expect(secondInput).toHaveValue('');
+    await user.type(secondInput, 'Second-room draft');
+    const secondHistoryBefore = call.mock.calls.filter(([method, params]) => method === 'room.history' && params.room_id === secondRoomId).length;
+    const firstHistoryBefore = call.mock.calls.filter(([method, params]) => method === 'room.history' && params.room_id === ROOM_ID).length;
+
+    pending.resolve(confirmed);
+    await act(async () => pending.promise);
+    await vi.waitFor(() => expect(call.mock.calls.filter(([method, params]) => method === 'room.history' && params.room_id === ROOM_ID).length).toBeGreaterThan(firstHistoryBefore));
+    expect(call.mock.calls.filter(([method, params]) => method === 'room.history' && params.room_id === secondRoomId)).toHaveLength(secondHistoryBefore);
+    expect(secondInput).toHaveValue('Second-room draft');
+    expect(screen.queryByText(text, { selector: '.chat-row__text' })).not.toBeInTheDocument();
+
+    await user.click(screen.getByText('First mission'));
+    expect(await screen.findByText(text, { selector: '.chat-row__text' })).toBeVisible();
+    expect(screen.getByLabelText('Message the room')).toHaveValue('');
+  });
+
+  it.each([
+    ['confirmed failure', new Error('room rejected the message'), /room rejected the message/i],
+    ['unknown outcome', new RpcError('timeout', 'deadline elapsed', true), /outcome is unknown/i],
+  ])('isolates a deferred %s draft and error across room switches', async (_label, failure, expectedError) => {
+    const secondRoomId = '01jz6y7n8p9q0r1s2t3v4w5x72';
+    const first: RoomDto = {
+      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-one', identity_cid: 'cid-one',
+      mission: { goal: 'First mission', briefing: 'First briefing' }, state: 'active', invites: [], seats: [], created_at: AT,
+    };
+    const second: RoomDto = {
+      ...first, room_id: secondRoomId, identity_name: 'cowork-room-two', identity_cid: 'cid-two',
+      mission: { goal: 'Second mission', briefing: 'Second briefing' },
+    };
+    const pending = deferred<MessageRecordDto>();
+    const call = vi.fn((method: string, params: Record<string, unknown>) => {
+      if (method === 'room.list') return Promise.resolve([first, second]);
+      if (method === 'room.show') return Promise.resolve(params.room_id === ROOM_ID ? first : second);
+      if (method === 'room.participants' || method === 'room.history') return Promise.resolve([]);
+      if (method === 'room.message') return pending.promise;
+      return Promise.reject(new Error(`unexpected ${method}`));
+    });
+    location.hash = `#/rooms/${ROOM_ID}`;
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    await user.type(await screen.findByLabelText('Message the room'), 'First-room retained draft');
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    await user.click(screen.getByText('Second mission'));
+    await user.type(await screen.findByLabelText('Message the room'), 'Second-room retained draft');
+    await user.click(screen.getByText('First mission'));
+    expect(await screen.findByLabelText('Message the room')).toHaveValue('First-room retained draft');
+    expect(screen.getByLabelText('Message the room')).toBeDisabled();
+    await user.click(screen.getByText('Second mission'));
+
+    pending.reject(failure);
+    await act(async () => { try { await pending.promise; } catch { /* asserted in UI */ } });
+    expect(screen.getByLabelText('Message the room')).toHaveValue('Second-room retained draft');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    await user.click(screen.getByText('First mission'));
+    expect(await screen.findByRole('alert')).toHaveTextContent(expectedError);
+    expect(screen.getByLabelText('Message the room')).toHaveValue('First-room retained draft');
+    expect(call.mock.calls.filter(([method]) => method === 'room.message')).toHaveLength(1);
+  });
+
+  it('drops pending composer state safely when its room is deleted before the send resolves', async () => {
+    let current: RoomDto | undefined = {
+      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-one', identity_cid: 'cid-one',
+      mission: { goal: 'Deletion race', briefing: 'Deletion briefing' }, state: 'active', invites: [], seats: [], created_at: AT,
+    };
+    const requestedRoom = current;
+    const confirmed: MessageRecordDto = {
+      version: 1, room_id: ROOM_ID, seq: 1, record_id: `${ROOM_ID}:1`, at: AT,
+      kind: 'message', message_id: MESSAGE_ID, author: { identity: requestedRoom.identity_cid, display_name: requestedRoom.identity_name, role: 'room' },
+      category: 'chat', text: 'Pending through delete', recipient_identities: [],
+    };
+    const pending = deferred<MessageRecordDto>();
+    const call = vi.fn((method: string) => {
+      if (method === 'room.list') return Promise.resolve(current ? [current] : []);
+      if (method === 'room.show') return current ? Promise.resolve(current) : Promise.reject(new Error('missing'));
+      if (method === 'room.participants' || method === 'room.history') return Promise.resolve([]);
+      if (method === 'room.message') return pending.promise;
+      if (method === 'room.delete') { current = undefined; return Promise.resolve({ version: 1, room_id: ROOM_ID, deleted: true, scope: 'this_host' }); }
+      return Promise.reject(new Error(`unexpected ${method}`));
+    });
+    location.hash = `#/rooms/${ROOM_ID}`;
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    await user.type(await screen.findByLabelText('Message the room'), confirmed.text);
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+
+    current = { ...requestedRoom, state: 'closed', closed_at: AT };
+    fireEvent(document, new Event('visibilitychange'));
+    await user.click(await screen.findByRole('button', { name: 'Delete room' }));
+    await user.type(screen.getByLabelText('Type exact room ID to delete'), ROOM_ID);
+    await user.click(screen.getByRole('button', { name: 'Delete local archive' }));
+    expect(await screen.findByRole('heading', { name: 'Select a room' })).toBeVisible();
+    const targetHistoryBefore = call.mock.calls.filter(([method]) => method === 'room.history').length;
+
+    pending.resolve(confirmed);
+    await act(async () => pending.promise);
+    expect(screen.getByRole('heading', { name: 'Select a room' })).toBeVisible();
+    expect(call.mock.calls.filter(([method]) => method === 'room.history')).toHaveLength(targetHistoryBefore);
   });
 
   it.each([
@@ -203,3 +339,21 @@ describe('authoritative room composer', () => {
     expect(input).toHaveValue('Retain while closing');
   });
 });
+
+function ControlledComposer({ roomState, connected, onSend }: {
+  roomState: RoomDto['state']; connected: boolean; onSend(text: string): Promise<void>;
+}) {
+  const [state, setState] = React.useState({ draft: '', pending: false, error: undefined as string | undefined });
+  return <RoomComposer roomState={roomState} connected={connected} state={state} onDraftChange={(draft) => setState((current) => ({ ...current, draft }))} onSend={async (text) => {
+    setState((current) => ({ ...current, pending: true, error: undefined }));
+    try {
+      await onSend(text);
+      setState((current) => ({ draft: current.draft === text ? '' : current.draft, pending: false, error: undefined }));
+    } catch (failure) {
+      const error = failure instanceof RpcError && failure.outcomeUnknown
+        ? `The message request did not receive a confirmation, so its outcome is unknown. Your draft is retained. ${failure.message}`
+        : failure instanceof Error ? failure.message : 'Message send failed.';
+      setState((current) => ({ ...current, pending: false, error }));
+    }
+  }} />;
+}

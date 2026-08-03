@@ -4,17 +4,19 @@ import type { CommunicationRecordDto, RoomDto } from '../api/types';
 import { roomCapabilities } from '../state/roomModel';
 import { ArchiveView } from './ArchiveView';
 import { ChatTimeline } from './ChatTimeline';
-import { RoomComposer } from './RoomComposer';
+import { RoomComposer, type RoomComposerState } from './RoomComposer';
 import { roomTitle } from './RoomRail';
 
 type WorkspaceTab = 'communication' | 'events' | 'archive';
 
-export function RoomWorkspace({ room, records = [], historyReady = false, connected, visible = true, onOpenRooms, onOpenContext, onSettings, onSendMessage = unavailable }: {
+export function RoomWorkspace({ room, records = [], historyReady = false, connected, visible = true, composerState, onComposerDraft, onOpenRooms, onOpenContext, onSettings, onSendMessage = unavailable }: {
   room?: RoomDto;
   records?: readonly CommunicationRecordDto[];
   historyReady?: boolean;
   connected: boolean;
   visible?: boolean;
+  composerState?: RoomComposerState;
+  onComposerDraft?(value: string): void;
   onOpenRooms(): void;
   onOpenContext(): void;
   onSettings(trigger: HTMLButtonElement): void;
@@ -64,7 +66,7 @@ export function RoomWorkspace({ room, records = [], historyReady = false, connec
       </nav>
 
       <section className="workspace-content" aria-label={`${tab} panel`}>
-        {tab === 'communication' && <CommunicationShell room={room} records={records} historyReady={historyReady} connected={connected} visible={visible} onSendMessage={onSendMessage} />}
+        {tab === 'communication' && <CommunicationShell room={room} records={records} historyReady={historyReady} connected={connected} visible={visible} composerState={composerState ?? EMPTY_COMPOSER} onComposerDraft={onComposerDraft ?? noopDraft} onSendMessage={onSendMessage} />}
         {tab === 'events' && <ArchiveView records={records} mode="events" />}
         {tab === 'archive' && <ArchiveView records={records} mode="archive" />}
       </section>
@@ -72,7 +74,7 @@ export function RoomWorkspace({ room, records = [], historyReady = false, connec
   );
 }
 
-function CommunicationShell({ room, records, historyReady, connected, visible, onSendMessage }: { room: RoomDto; records: readonly CommunicationRecordDto[]; historyReady: boolean; connected: boolean; visible: boolean; onSendMessage(text: string): Promise<void> }) {
+function CommunicationShell({ room, records, historyReady, connected, visible, composerState, onComposerDraft, onSendMessage }: { room: RoomDto; records: readonly CommunicationRecordDto[]; historyReady: boolean; connected: boolean; visible: boolean; composerState: RoomComposerState; onComposerDraft(value: string): void; onSendMessage(text: string): Promise<void> }) {
   const archivedBriefing = records.some((record) => record.kind === 'message' && record.category === 'briefing');
   return (
     <div className="communication-shell">
@@ -82,7 +84,7 @@ function CommunicationShell({ room, records, historyReady, connected, visible, o
       </article>}
       {room.state !== 'active' && <p className={`lifecycle-separator lifecycle-separator--${room.state}`}>{room.state === 'provisioning' ? 'Room setup in progress · messaging begins after activation' : room.state === 'closing' ? 'Room closure in progress · mutations are disabled' : 'Room closed · read-only local archive'}</p>}
       <ChatTimeline roomId={room.room_id} records={records} historyReady={historyReady} visible={visible} />
-      <RoomComposer key={room.room_id} roomState={room.state} connected={connected} onSend={onSendMessage} />
+      <RoomComposer roomState={room.state} connected={connected} state={composerState} onDraftChange={onComposerDraft} onSend={onSendMessage} />
     </div>
   );
 }
@@ -96,3 +98,5 @@ function lifecycleLabel(state: RoomDto['state']): string {
 }
 
 async function unavailable(): Promise<never> { throw new Error('Room messaging is unavailable.'); }
+const EMPTY_COMPOSER: RoomComposerState = { draft: '', pending: false };
+function noopDraft(): void {}

@@ -68,10 +68,6 @@ export async function rpcCall<T>(
       body: JSON.stringify({ version: 1, id: requestId, method, params }),
       signal: controller.signal,
     });
-    if (!response.ok) {
-      throw new RpcError('http_error', `RPC request failed with HTTP ${response.status}`, outcomeUnknown);
-    }
-
     let payload: unknown;
     try {
       payload = await response.json();
@@ -83,6 +79,9 @@ export async function rpcCall<T>(
     }
     if ('error' in payload) {
       throw new RpcError(payload.error.code, payload.error.message, false);
+    }
+    if (!response.ok) {
+      throw new RpcError('invalid_response', `daemon returned a result envelope with HTTP ${response.status}`, outcomeUnknown);
     }
     return payload.result as T;
   } catch (error) {

@@ -10,6 +10,15 @@ function rpcResponse(request: RequestInit, value: Record<string, unknown>) {
   } as Response);
 }
 
+function rpcHttpResponse(request: RequestInit, status: number, value: Record<string, unknown>) {
+  const id = JSON.parse(String(request.body)).id as string;
+  return Promise.resolve({
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => ({ version: 1, id, ...value }),
+  } as Response);
+}
+
 function abortedRequest(): Promise<Response> {
   return Promise.reject(new DOMException('aborted', 'AbortError'));
 }
@@ -65,6 +74,40 @@ describe('rpcCall', () => {
       message: 'room is closed',
       outcomeUnknown: false,
     }));
+  });
+
+  it.each([
+    [400, 'invalid_params', 'invalid room message parameters'],
+    [400, 'invalid_state', 'room is closed'],
+    [404, 'method_not_found', 'method not found'],
+  ])('preserves a correlated daemon error carried by HTTP %i', async (status, code, message) => {
+    const fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
+      rpcHttpResponse(init!, status, { error: { code, message } }));
+
+    await expect(rpcCall('room.message', { room_id: 'r1', text: 'hello' }, { fetch })).rejects.toMatchObject({
+      name: 'RpcError', code, message, outcomeUnknown: false,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['malformed JSON', async () => { throw new SyntaxError('not JSON'); }],
+    ['a mismatched ID', async () => ({ version: 1, id: 'web-another-call', error: { code: 'invalid_state', message: 'room is closed' } })],
+  ])('keeps a mutation outcome unknown for HTTP 400 with %s', async (_label, json) => {
+    const fetch = vi.fn(async () => ({ ok: false, status: 400, json } as Response));
+
+    await expect(rpcCall('room.message', { room_id: 'r1', text: 'hello' }, { fetch })).rejects.toMatchObject({
+      name: 'RpcError', code: 'invalid_response', outcomeUnknown: true,
+    });
+  });
+
+  it('rejects a result envelope carried by a non-2xx response as malformed and unknown', async () => {
+    const fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
+      rpcHttpResponse(init!, 400, { result: { accepted: true } }));
+
+    await expect(rpcCall('room.message', { room_id: 'r1', text: 'hello' }, { fetch })).rejects.toMatchObject({
+      name: 'RpcError', code: 'invalid_response', outcomeUnknown: true,
+    });
   });
 
   it('aborts at the deadline and reports a mutation outcome as unknown without retrying', async () => {

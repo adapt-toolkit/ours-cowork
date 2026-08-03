@@ -7,6 +7,8 @@ import { CoworkApp, type RpcClient } from '../web/src/App';
 import type { RoomDto } from '../web/src/api/types';
 
 const AT = '2026-08-03T00:00:00.000Z';
+const ROOM_ONE = '01jz6y7n8p9q0r1s2t3v4w5x70';
+const ROOM_TWO = '01jz6y7n8p9q0r1s2t3v4w5x71';
 
 function room(roomId: string, goal: string, state: RoomDto['state']): RoomDto {
   return {
@@ -47,7 +49,7 @@ describe('CoworkApp room orchestration', () => {
 
   it('removes closed responsive drawers from accessibility and tab order while keeping desktop context available', async () => {
     vi.useRealTimers();
-    const release = room('r1', 'Release coordination', 'active');
+    const release = room(ROOM_ONE, 'Release coordination', 'active');
     const call = vi.fn(async (method: string) => method === 'room.list' ? [release] : release);
     const user = userEvent.setup();
     const originalMatchMedia = window.matchMedia;
@@ -90,11 +92,11 @@ describe('CoworkApp room orchestration', () => {
   afterEach(() => vi.useRealTimers());
 
   it('groups rooms, hash-routes selection, and refreshes the list every five seconds', async () => {
-    const release = room('r1', 'Release coordination', 'active');
-    const archive = room('r2', 'Finished migration', 'closed');
+    const release = room(ROOM_ONE, 'Release coordination', 'active');
+    const archive = room(ROOM_TWO, 'Finished migration', 'closed');
     const call = vi.fn(async (method: string, params: Record<string, unknown>) => {
       if (method === 'room.list') return [release, archive];
-      if (method === 'room.show' && params.room_id === 'r1') return release;
+      if (method === 'room.show' && params.room_id === ROOM_ONE) return release;
       throw new Error(`unexpected ${method}`);
     });
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
@@ -107,7 +109,7 @@ describe('CoworkApp room orchestration', () => {
     expect(screen.getByText('1 accepted · 1 needed')).toBeVisible();
 
     await user.click(screen.getByText('Release coordination'));
-    expect(location.hash).toBe('#/rooms/r1');
+    expect(location.hash).toBe(`#/rooms/${ROOM_ONE}`);
     expect(await screen.findByRole('heading', { name: 'Release coordination' })).toBeVisible();
 
     const before = call.mock.calls.filter(([method]) => method === 'room.list').length;
@@ -116,7 +118,7 @@ describe('CoworkApp room orchestration', () => {
   });
 
   it('preserves loaded room data and disables mutations when list polling disconnects', async () => {
-    const release = room('r1', 'Release coordination', 'active');
+    const release = room(ROOM_ONE, 'Release coordination', 'active');
     let listCalls = 0;
     const call = vi.fn(async (method: string) => {
       if (method === 'room.list') {
@@ -138,13 +140,13 @@ describe('CoworkApp room orchestration', () => {
   });
 
   it('ignores a previous room response that resolves after the current selection', async () => {
-    const first = room('r1', 'First mission', 'active');
-    const second = room('r2', 'Second mission', 'provisioning');
+    const first = room(ROOM_ONE, 'First mission', 'active');
+    const second = room(ROOM_TWO, 'Second mission', 'provisioning');
     const lateFirst = deferred<RoomDto>();
     const call = vi.fn((method: string, params: Record<string, unknown>) => {
       if (method === 'room.list') return Promise.resolve([first, second]);
-      if (method === 'room.show' && params.room_id === 'r1') return lateFirst.promise;
-      if (method === 'room.show' && params.room_id === 'r2') return Promise.resolve(second);
+      if (method === 'room.show' && params.room_id === ROOM_ONE) return lateFirst.promise;
+      if (method === 'room.show' && params.room_id === ROOM_TWO) return Promise.resolve(second);
       return Promise.reject(new Error(`unexpected ${method}`));
     });
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });

@@ -137,6 +137,49 @@ test('REST is unauthenticated, loopback-only, emits no CORS, and excludes daemon
   }
 });
 
+test('REST preserves correlated service errors over their actual non-2xx statuses', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-rest-errors-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const invalidState = new Error('room is closed');
+  invalidState.name = 'RoomServiceError';
+  const service = {
+    createRoom: async () => null,
+    updateRoom: async () => null,
+    createInvite: async () => null,
+    revokeInvite: async () => null,
+    recoverInvites: async () => null,
+    confirmRecoveredInvite: async () => null,
+    listRooms: async () => [],
+    showRoom: async () => null,
+    participants: async () => [],
+    history: async () => [],
+    postMessage: async () => { throw invalidState; },
+    closeRoom: async () => null,
+    deleteRoom: async () => null,
+  };
+  const dispatcher = new RpcDispatcher(createServiceRoutes(service));
+  const server = new TransportServer({
+    socketPath: join(dir, 'management.sock'), rest: { enabled: true, port: 0 }, ...dispatchers(dispatcher),
+  });
+  await server.start();
+  t.after(() => server.stop());
+
+  for (const [id, method, params, status, code, message] of [
+    ['params', 'room.message', { room_id: 'room', unexpected: true }, 400, 'invalid_params', 'Unrecognized key'],
+    ['state', 'room.message', { room_id: 'room', text: 'hello' }, 400, 'invalid_state', 'room is closed'],
+    ['method', 'room.missing', {}, 404, 'method_not_found', 'method not found'],
+  ]) {
+    const response = await request(server.restAddress.port, {
+      body: JSON.stringify({ version: 1, id, method, params }),
+    });
+    assert.equal(response.statusCode, status);
+    assert.equal(response.json.version, 1);
+    assert.equal(response.json.id, id);
+    assert.equal(response.json.error.code, code);
+    assert.match(response.json.error.message, new RegExp(message, 'i'));
+  }
+});
+
 test('REST RPC requires POST, JSON, the exact bound Host, a same origin, and non-cross-site fetch metadata', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-origin-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

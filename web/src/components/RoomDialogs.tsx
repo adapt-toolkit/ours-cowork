@@ -7,8 +7,9 @@ import { roomTitle } from './RoomRail';
 
 const MAX_MISSION_BYTES = 262_144;
 
-export function CreateRoomDialog({ open, restoreFocus, fallbackFocus, onClose, onCreate }: {
+export function CreateRoomDialog({ open, connected, restoreFocus, fallbackFocus, onClose, onCreate }: {
   open: boolean;
+  connected: boolean;
   restoreFocus?: HTMLElement;
   fallbackFocus?(): HTMLElement | undefined;
   onClose(): void;
@@ -26,7 +27,7 @@ export function CreateRoomDialog({ open, restoreFocus, fallbackFocus, onClose, o
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (goalError || briefingError || submittingRef.current) return;
+    if (!connected || goalError || briefingError || submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
     setError(undefined);
@@ -50,19 +51,22 @@ export function CreateRoomDialog({ open, restoreFocus, fallbackFocus, onClose, o
         <p className="dialog-intro">Define the shared objective. Invitation requirements are added after the room is created.</p>
         <MissionField label="Goal" value={goal} onChange={setGoal} error={goalError} rows={3} autoFocus trimForBytes />
         <MissionField label="Briefing" value={briefing} onChange={setBriefing} error={briefingError} rows={6} trimForBytes />
+        {!connected && <p className="form-error" role="status">Create is unavailable because the daemon disconnected. Your fields are retained and no request was sent.</p>}
         {error && <p className="form-error" role="alert">{error}</p>}
         <div className="dialog-actions">
           <button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>Cancel</button>
-          <button className="primary-button" type="submit" disabled={submitting || Boolean(goalError || briefingError)}>{submitting ? 'Creating room…' : 'Create mission room'}</button>
+          <button className="primary-button" type="submit" disabled={!connected || submitting || Boolean(goalError || briefingError)}>{submitting ? 'Creating room…' : 'Create mission room'}</button>
         </div>
       </form>
     </Modal>
   );
 }
 
-export function SettingsDialog({ room, open, restoreFocus, onClose, onSave }: {
+export function SettingsDialog({ room, open, connected, capable, restoreFocus, onClose, onSave }: {
   room: RoomDto;
   open: boolean;
+  connected: boolean;
+  capable: boolean;
   restoreFocus?: HTMLElement;
   onClose(): void;
   onSave(changes: { goal?: string; briefing?: string; status?: string }): Promise<void>;
@@ -93,7 +97,7 @@ export function SettingsDialog({ room, open, restoreFocus, onClose, onSave }: {
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (!dirty || goalError || briefingError || statusError || submittingRef.current) return;
+    if (!connected || !capable || !dirty || goalError || briefingError || statusError || submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
     setError(undefined);
@@ -112,10 +116,11 @@ export function SettingsDialog({ room, open, restoreFocus, onClose, onSave }: {
         <MissionField label="Goal" value={goal} onChange={setGoal} error={goalError} rows={3} autoFocus />
         <MissionField label="Briefing" value={briefing} onChange={setBriefing} error={briefingError} rows={5} />
         <TextField label="Status (optional)" value={status} onChange={setStatus} error={statusError} />
+        {(!connected || !capable) && <p className="form-error" role="status">Settings are unavailable because the connection or room lifecycle changed. Your fields are retained and no request was sent.</p>}
         {error && <p className="form-error" role="alert">{error}</p>}
         <div className="dialog-actions">
           <button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>Cancel</button>
-          <button className="primary-button" type="submit" disabled={submitting || !dirty || Boolean(goalError || briefingError || statusError)}>{submitting ? 'Saving…' : 'Save settings'}</button>
+          <button className="primary-button" type="submit" disabled={!connected || !capable || submitting || !dirty || Boolean(goalError || briefingError || statusError)}>{submitting ? 'Saving…' : 'Save settings'}</button>
         </div>
       </form>
     </Modal>

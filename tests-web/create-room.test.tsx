@@ -8,12 +8,13 @@ import { RpcError } from '../web/src/api/rpc';
 import type { RoomDto } from '../web/src/api/types';
 
 const AT = '2026-08-03T00:00:00.000Z';
+const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x70';
 
 function createdRoom(): RoomDto {
   return {
     version: 1,
-    room_id: 'new-room',
-    identity_name: 'cowork-room-new-room',
+    room_id: ROOM_ID,
+    identity_name: `cowork-room-${ROOM_ID}`,
     identity_cid: 'cid-new-room',
     mission: { goal: 'Release coordination', briefing: 'Keep deploy owners aligned' },
     state: 'provisioning',
@@ -98,8 +99,33 @@ describe('create and settings dialogs', () => {
     await user.click(screen.getByRole('button', { name: 'Create mission room' }));
     expect(await screen.findByRole('tab', { name: 'Invite', selected: true })).toBeVisible();
     expect(screen.getByText(/Add invitation requirements one at a time/)).toBeVisible();
-    expect(location.hash).toBe('#/rooms/new-room');
+    expect(location.hash).toBe(`#/rooms/${ROOM_ID}`);
     expect(call.mock.calls.filter(([method]) => method === 'room.create')).toHaveLength(2);
+  });
+
+  it('keeps an open create form and issues no RPC when the daemon disconnects', async () => {
+    let disconnected = false;
+    const call = vi.fn(async (method: string) => {
+      if (method === 'room.list' && disconnected) throw new Error('offline');
+      if (method === 'room.list') return [];
+      if (method === 'room.create') return createdRoom();
+      throw new Error(`unexpected ${method}`);
+    });
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    await user.click(await screen.findByRole('button', { name: 'Create room' }));
+    await user.type(screen.getByLabelText('Goal'), 'Retained create goal');
+    await user.type(screen.getByLabelText('Briefing'), 'Retained create briefing');
+
+    disconnected = true;
+    fireEvent(document, new Event('visibilitychange'));
+    expect(await screen.findByText(/Create is unavailable because the daemon disconnected/)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Create mission room' })).toBeDisabled();
+    fireEvent.submit(screen.getByLabelText('Goal').closest('form')!);
+    expect(call.mock.calls.filter(([method]) => method === 'room.create')).toHaveLength(0);
+    expect(screen.getByLabelText('Goal')).toHaveValue('Retained create goal');
+    expect(screen.getByLabelText('Briefing')).toHaveValue('Retained create briefing');
+    expect(screen.getByRole('dialog', { name: 'Create mission room' })).toBeVisible();
   });
 
   it('hands confirmed mobile create focus to visible Invite context while cancel restores the open sheet trigger', async () => {
@@ -149,14 +175,14 @@ describe('create and settings dialogs', () => {
       throw new Error(`unexpected ${method}`);
     });
     const user = userEvent.setup();
-    location.hash = '#/rooms/new-room';
+    location.hash = `#/rooms/${ROOM_ID}`;
     render(<CoworkApp rpc={{ call } as RpcClient} />);
 
     await user.click(await screen.findByRole('button', { name: 'Room settings' }));
     await user.type(screen.getByLabelText('Status (optional)'), 'ready');
     await user.click(screen.getByRole('button', { name: 'Save settings' }));
 
-    expect(call).toHaveBeenCalledWith('room.settings', { room_id: 'new-room', status: 'ready' });
+    expect(call).toHaveBeenCalledWith('room.settings', { room_id: ROOM_ID, status: 'ready' });
   });
 
   it('preserves persisted whitespace and submits only the exact changed setting', async () => {
@@ -172,7 +198,7 @@ describe('create and settings dialogs', () => {
       throw new Error(`unexpected ${method}`);
     });
     const user = userEvent.setup();
-    location.hash = '#/rooms/new-room';
+    location.hash = `#/rooms/${ROOM_ID}`;
     render(<CoworkApp rpc={{ call } as RpcClient} />);
 
     await user.click(await screen.findByRole('button', { name: 'Room settings' }));
@@ -184,7 +210,7 @@ describe('create and settings dialogs', () => {
 
     fireEvent.change(screen.getByLabelText('Status (optional)'), { target: { value: '  ready now  ' } });
     await user.click(screen.getByRole('button', { name: 'Save settings' }));
-    expect(call).toHaveBeenCalledWith('room.settings', { room_id: 'new-room', status: '  ready now  ' });
+    expect(call).toHaveBeenCalledWith('room.settings', { room_id: ROOM_ID, status: '  ready now  ' });
   });
 
   it('discards canceled settings drafts and reopens from the latest room DTO', async () => {
@@ -194,7 +220,7 @@ describe('create and settings dialogs', () => {
       throw new Error(`unexpected ${method}`);
     });
     const user = userEvent.setup();
-    location.hash = '#/rooms/new-room';
+    location.hash = `#/rooms/${ROOM_ID}`;
     render(<CoworkApp rpc={{ call } as RpcClient} />);
 
     const settings = await screen.findByRole('button', { name: 'Room settings' });
@@ -209,6 +235,34 @@ describe('create and settings dialogs', () => {
     await user.click(settings);
     expect(screen.getByLabelText('Goal')).toHaveValue('Server-refreshed goal');
     expect(within(screen.getByRole('dialog', { name: 'Room settings' })).getByRole('button', { name: 'Save settings' })).toBeDisabled();
+  });
+
+  it.each(['disconnect', 'lifecycle'] as const)('retains an open settings form and issues no RPC after a %s capability change', async (change) => {
+    let target: RoomDto = { ...createdRoom(), state: 'active' };
+    let disconnected = false;
+    const call = vi.fn(async (method: string) => {
+      if (disconnected && (method === 'room.list' || method === 'room.show')) throw new Error('offline');
+      if (method === 'room.list') return [target];
+      if (method === 'room.show') return target;
+      if (method === 'room.participants' || method === 'room.history') return [];
+      if (method === 'room.settings') return target;
+      throw new Error(`unexpected ${method}`);
+    });
+    const user = userEvent.setup();
+    location.hash = `#/rooms/${ROOM_ID}`;
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    await user.click(await screen.findByRole('button', { name: 'Room settings' }));
+    await user.type(screen.getByLabelText('Status (optional)'), 'retained status');
+
+    if (change === 'disconnect') disconnected = true;
+    else target = { ...target, state: 'closing' };
+    fireEvent(document, new Event('visibilitychange'));
+    expect(await screen.findByText(/Settings are unavailable because the connection or room lifecycle changed/)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled();
+    fireEvent.submit(screen.getByLabelText('Goal').closest('form')!);
+    expect(call.mock.calls.filter(([method]) => method === 'room.settings')).toHaveLength(0);
+    expect(screen.getByLabelText('Status (optional)')).toHaveValue('retained status');
+    expect(screen.getByRole('dialog', { name: 'Room settings' })).toBeVisible();
   });
 });
 

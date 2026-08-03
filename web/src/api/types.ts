@@ -136,11 +136,13 @@ const LOWER_CROCKFORD_ULID = /^[0-7][0-9a-hjkmnp-tv-z]{25}$/;
 const MAX_TEXT_BYTES = 262_144;
 const MAX_ROLE_BYTES = 256;
 const RECORD_COMMON_KEYS = ['version', 'room_id', 'seq', 'record_id', 'at', 'kind'] as const;
+const ROOM_KEYS = ['version', 'room_id', 'identity_name', 'identity_cid', 'mission', 'state', 'invites', 'seats', 'created_at'] as const;
 
 export function isRoomDto(value: unknown): value is RoomDto {
   if (!isRecord(value)
+    || !hasExactKeys(value, ROOM_KEYS, ['status', 'activated_at', 'closed_at'])
     || value.version !== 1
-    || !isString(value.room_id)
+    || !isLowerCrockfordUlid(value.room_id)
     || !isString(value.identity_name)
     || typeof value.identity_cid !== 'string'
     || !isMission(value.mission)
@@ -150,9 +152,59 @@ export function isRoomDto(value: unknown): value is RoomDto {
     || !value.invites.every(isRoomInvite)
     || !Array.isArray(value.seats)
     || !value.seats.every(isParticipant)
-    || !isString(value.created_at)
-    || !optionalString(value.activated_at)
-    || !optionalString(value.closed_at)) return false;
+    || !isStrictRfc3339(value.created_at)
+    || !optionalStrictRfc3339(value.activated_at)
+    || !optionalStrictRfc3339(value.closed_at)) return false;
+
+  const inviteIds = new Set(value.invites.map((invite) => invite.invite_id));
+  if (inviteIds.size !== value.invites.length
+    || new Set(value.seats.map((seat) => seat.identity)).size !== value.seats.length) return false;
+
+  const exactPacketPending = value.state === 'provisioning'
+    && value.status === 'packet_pending'
+    && value.identity_name === `cowork-room-${value.room_id}`
+    && value.invites.length === 0
+    && value.seats.length === 0
+    && value.activated_at === undefined
+    && value.closed_at === undefined;
+  if ((value.identity_cid === '' && !exactPacketPending)
+    || (value.identity_cid !== '' && value.status === 'packet_pending')) return false;
+
+  const pendingByRecovery = new Set<string>();
+  for (const invite of value.invites) {
+    if (invite.recovery_of === undefined) continue;
+    const source = value.invites.find((candidate) => candidate.invite_id === invite.recovery_of);
+    const validSourceState = invite.state === 'receipt_pending'
+      ? source?.state === 'replacement_required'
+      : invite.state === 'live' || invite.state === 'consumed' || invite.state === 'replacement_required'
+        ? source?.state === 'revoked'
+        : invite.state === 'revoked'
+          ? invite.recovery_confirmed === true
+            ? source?.state === 'revoked'
+            : source?.state === 'replacement_required' || source?.state === 'revoked'
+          : false;
+    if (!source
+      || source.invite_id === invite.invite_id
+      || !validSourceState
+      || source.mode !== invite.mode
+      || source.role !== invite.role
+      || source.min_accepts !== invite.min_accepts) return false;
+    if (invite.state === 'receipt_pending') {
+      if (pendingByRecovery.has(invite.recovery_of)) return false;
+      pendingByRecovery.add(invite.recovery_of);
+    }
+  }
+  for (const invite of value.invites) {
+    const lineage = new Set([invite.invite_id]);
+    let cursor = invite;
+    while (cursor.recovery_of !== undefined) {
+      if (lineage.has(cursor.recovery_of)) return false;
+      lineage.add(cursor.recovery_of);
+      const source = value.invites.find((candidate) => candidate.invite_id === cursor.recovery_of);
+      if (!source) return false;
+      cursor = source;
+    }
+  }
   return true;
 }
 
@@ -161,7 +213,9 @@ export function isRoomListDto(value: unknown): value is RoomDto[] {
 }
 
 export function isParticipantListDto(value: unknown): value is ParticipantDto[] {
-  return Array.isArray(value) && value.every(isParticipant);
+  return Array.isArray(value)
+    && value.every(isParticipant)
+    && new Set(value.map((participant) => participant.identity)).size === value.length;
 }
 
 export function isInviteReceiptDto(value: unknown): value is InviteReceiptDto {
@@ -292,30 +346,44 @@ export function isDeleteRoomReceiptDto(value: unknown): value is DeleteRoomRecei
 }
 
 function isMission(value: unknown): value is MissionDto {
-  return isRecord(value) && isString(value.goal) && isString(value.briefing);
+  return isRecord(value)
+    && hasExactKeys(value, ['goal', 'briefing'])
+    && isUtf8Bounded(value.goal, MAX_TEXT_BYTES)
+    && isUtf8Bounded(value.briefing, MAX_TEXT_BYTES);
 }
 
 function isParticipant(value: unknown): value is ParticipantDto {
   return isRecord(value)
+    && hasExactKeys(value, ['identity', 'display_name', 'role', 'invite_id', 'accepted_at'])
     && isString(value.identity)
     && isString(value.display_name)
-    && isString(value.role)
+    && isUtf8Bounded(value.role, MAX_ROLE_BYTES)
     && isString(value.invite_id)
-    && isString(value.accepted_at);
+    && isStrictRfc3339(value.accepted_at);
 }
 
 function isRoomInvite(value: unknown): value is RoomInviteDto {
-  return isRecord(value)
-    && !('blob' in value)
-    && isString(value.invite_id)
-    && INVITE_MODES.has(value.mode)
-    && isString(value.role)
-    && isPositiveSafeInteger(value.min_accepts)
-    && isStringArray(value.accepted_cids)
-    && INVITE_STATES.has(value.state)
-    && optionalString(value.recovery_of)
-    && (value.recovery_confirmed === undefined || typeof value.recovery_confirmed === 'boolean')
-    && isString(value.created_at);
+  if (!isRecord(value)
+    || !hasExactKeys(value, ['invite_id', 'mode', 'role', 'min_accepts', 'accepted_cids', 'state', 'created_at'], ['recovery_of', 'recovery_confirmed'])
+    || !isString(value.invite_id)
+    || !INVITE_MODES.has(value.mode)
+    || !isUtf8Bounded(value.role, MAX_ROLE_BYTES)
+    || !isPositiveSafeInteger(value.min_accepts)
+    || !isUniqueStringArray(value.accepted_cids)
+    || !INVITE_STATES.has(value.state)
+    || !optionalString(value.recovery_of)
+    || (value.recovery_confirmed !== undefined && typeof value.recovery_confirmed !== 'boolean')
+    || !isStrictRfc3339(value.created_at)) return false;
+  const invite = value as unknown as RoomInviteDto;
+  if (invite.mode === 'one_time' && invite.min_accepts !== 1) return false;
+  if (invite.recovery_of === undefined && invite.recovery_confirmed !== undefined) return false;
+  if (invite.recovery_of !== undefined && invite.recovery_confirmed === undefined) return false;
+  if (invite.state === 'receipt_pending'
+    && (invite.recovery_of === undefined || invite.recovery_confirmed !== false || invite.accepted_cids.length > 0)) return false;
+  if (invite.recovery_of !== undefined
+    && (invite.state === 'live' || invite.state === 'consumed' || invite.state === 'replacement_required')
+    && invite.recovery_confirmed !== true) return false;
+  return true;
 }
 
 function isAuthor(value: unknown): value is AuthorDto {
@@ -374,6 +442,10 @@ function isStrictRfc3339(value: unknown): value is string {
   const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
   const days = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
   return day >= 1 && day <= days[month - 1]!;
+}
+
+function optionalStrictRfc3339(value: unknown): value is string | undefined {
+  return value === undefined || isStrictRfc3339(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

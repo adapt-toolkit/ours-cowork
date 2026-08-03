@@ -1,4 +1,4 @@
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import React from 'react';
 import { describe, expect, it, vi } from 'vitest';
@@ -7,12 +7,14 @@ import { InviteManager, InviteReceiptDialog, type InviteReceiptVault } from '../
 import { CoworkApp, type RpcClient } from '../web/src/App';
 import { validateConfirmedRecoveryInvite, validateCreatedInviteReceipt, validateRecoveryInviteReceipts, type InviteReceiptDto, type RoomDto } from '../web/src/api/types';
 
-const base: RoomDto = { version: 1, room_id: 'room-1', identity_name: 'cowork-room', identity_cid: 'cid-room', mission: { goal: 'Ship', briefing: 'Brief' }, state: 'provisioning', invites: [], seats: [], created_at: '2026-08-03T00:00:00Z' };
+const ROOM_ONE = '01jz6y7n8p9q0r1s2t3v4w5x70';
+const ROOM_TWO = '01jz6y7n8p9q0r1s2t3v4w5x71';
+const base: RoomDto = { version: 1, room_id: ROOM_ONE, identity_name: 'cowork-room', identity_cid: 'cid-room', mission: { goal: 'Ship', briefing: 'Brief' }, state: 'provisioning', invites: [], seats: [], created_at: '2026-08-03T00:00:00Z' };
 
 describe('invite management', () => {
   it('submits once and forgets a copied create secret on close', async () => {
     const user = userEvent.setup();
-    const receipt: InviteReceiptDto = { room_id: 'room-1', invite: { invite_id: 'invite-new', mode: 'one_time', role: 'builder', min_accepts: 1, accepted_cids: [], state: 'live', created_at: base.created_at }, blob: 'SECRET-INVITE-BLOB', reusable: false };
+    const receipt: InviteReceiptDto = { room_id: ROOM_ONE, invite: { invite_id: 'invite-new', mode: 'one_time', role: 'builder', min_accepts: 1, accepted_cids: [], state: 'live', created_at: base.created_at }, blob: 'SECRET-INVITE-BLOB', reusable: false };
     const create = vi.fn(async () => receipt);
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn(async () => undefined) } });
     render(<InviteHarness room={base} create={create} recover={vi.fn()} confirm={vi.fn()} />);
@@ -27,7 +29,7 @@ describe('invite management', () => {
   });
 
   it('delivers a deferred create receipt after its manager tab unmounts and clears it exactly once', async () => {
-    location.hash = '#/rooms/room-1';
+    location.hash = `#/rooms/${ROOM_ONE}`;
     const user = userEvent.setup();
     const pending = deferred<InviteReceiptDto>();
     const receipt = createdReceipt();
@@ -47,17 +49,17 @@ describe('invite management', () => {
     await act(async () => pending.promise);
     expect(await screen.findByText(receipt.blob)).toBeVisible();
     expect(screen.getAllByText(receipt.blob)).toHaveLength(1);
-    expect(screen.getByRole('dialog', { name: 'Invite receipt' })).toHaveTextContent('Room room-1');
+    expect(screen.getByRole('dialog', { name: 'Invite receipt' })).toHaveTextContent(`Room ${ROOM_ONE}`);
     await user.click(screen.getByRole('button', { name: 'Done' }));
     expect(screen.queryByText(receipt.blob)).not.toBeInTheDocument();
   });
 
   it('delivers deferred recovery receipts after room navigation and confirms their original room pointers', async () => {
-    location.hash = '#/rooms/room-1';
+    location.hash = `#/rooms/${ROOM_ONE}`;
     const user = userEvent.setup();
     const stale = { invite_id: 'old-one', mode: 'one_time' as const, role: 'reviewer', min_accepts: 1, accepted_cids: [], state: 'replacement_required' as const, created_at: base.created_at };
     const first = { ...base, invites: [stale] };
-    const second = { ...base, room_id: 'room-2', mission: { ...base.mission, goal: 'Other' } };
+    const second = { ...base, room_id: ROOM_TWO, mission: { ...base.mission, goal: 'Other' } };
     const pending = deferred<InviteReceiptDto[]>();
     const recovered: InviteReceiptDto = { room_id: first.room_id, invite: { ...stale, invite_id: 'new-one', state: 'receipt_pending', recovery_of: stale.invite_id, recovery_confirmed: false }, blob: 'RECOVERY-SECRET', reusable: false, recovery_of: stale.invite_id };
     const call = vi.fn((method: string, params: Record<string, unknown>) => {
@@ -76,7 +78,7 @@ describe('invite management', () => {
     await act(async () => pending.promise);
     expect(await screen.findByText('RECOVERY-SECRET')).toBeVisible();
     await user.click(screen.getByRole('button', { name: 'Confirm old-one to new-one' }));
-    expect(call).toHaveBeenCalledWith('room.recover.confirm', { room_id: 'room-1', recovery_of: 'old-one', invite_id: 'new-one' });
+    expect(call).toHaveBeenCalledWith('room.recover.confirm', { room_id: ROOM_ONE, recovery_of: 'old-one', invite_id: 'new-one' });
   });
 
   it('rejects adversarial create and recovery receipts before exposing secrets', () => {
@@ -119,7 +121,7 @@ describe('invite management', () => {
   });
 
   it('keeps malformed create results out of the receipt UI and reports an action-local error', async () => {
-    location.hash = '#/rooms/room-1';
+    location.hash = `#/rooms/${ROOM_ONE}`;
     const user = userEvent.setup();
     const malformed = { ...createdReceipt(), room_id: 'attacker-room', blob: 'MUST-NOT-RENDER' };
     const call = vi.fn(async (method: string) => {
@@ -138,6 +140,95 @@ describe('invite management', () => {
     expect(screen.queryByRole('dialog', { name: /receipt/i })).not.toBeInTheDocument();
   });
 
+  it.each(['disconnect', 'lifecycle'] as const)('retains invite fields and sends no create/recovery RPC after a %s capability change', async (change) => {
+    const source = { invite_id: 'old-capability', mode: 'one_time' as const, role: 'reviewer', min_accepts: 1, accepted_cids: [], state: 'replacement_required' as const, created_at: base.created_at };
+    let current: RoomDto = { ...base, invites: [source] };
+    let disconnected = false;
+    const call = vi.fn(async (method: string) => {
+      if (disconnected && (method === 'room.list' || method === 'room.show')) throw new Error('offline');
+      if (method === 'room.list') return [current];
+      if (method === 'room.show') return current;
+      if (method === 'room.participants' || method === 'room.history') return [];
+      if (method === 'room.invite' || method === 'room.recover') throw new Error('mutation must not dispatch');
+      throw new Error(`unexpected ${method}`);
+    });
+    location.hash = `#/rooms/${ROOM_ONE}`;
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    await user.click(await screen.findByRole('tab', { name: 'Invite' }));
+    await user.type(screen.getByLabelText('Role'), 'retained builder');
+
+    if (change === 'disconnect') disconnected = true;
+    else current = { ...current, state: 'closing' };
+    fireEvent(document, new Event('visibilitychange'));
+    await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Create invite' })).toBeDisabled());
+    expect(screen.getByRole('button', { name: 'Recover missing invites' })).toBeDisabled();
+    fireEvent.submit(screen.getByLabelText('Role').closest('form')!);
+    fireEvent.click(screen.getByRole('button', { name: 'Recover missing invites' }));
+    expect(call.mock.calls.filter(([method]) => method === 'room.invite' || method === 'room.recover')).toHaveLength(0);
+    expect(screen.getByLabelText('Role')).toHaveValue('retained builder');
+  });
+
+  it('retains an open revoke confirmation and sends no RPC after lifecycle change', async () => {
+    const liveInvite = { invite_id: 'live-capability', mode: 'public' as const, role: 'builder', min_accepts: 1, accepted_cids: [], state: 'live' as const, created_at: base.created_at };
+    let current: RoomDto = { ...base, invites: [liveInvite] };
+    const call = vi.fn(async (method: string) => {
+      if (method === 'room.list') return [current];
+      if (method === 'room.show') return current;
+      if (method === 'room.participants' || method === 'room.history') return [];
+      if (method === 'room.revoke') throw new Error('mutation must not dispatch');
+      throw new Error(`unexpected ${method}`);
+    });
+    location.hash = `#/rooms/${ROOM_ONE}`;
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    await user.click(await screen.findByRole('tab', { name: 'Invite' }));
+    await user.click(screen.getByRole('button', { name: 'Revoke' }));
+    current = { ...current, state: 'closing' };
+    fireEvent(document, new Event('visibilitychange'));
+    expect(await screen.findByText(/Revocation is unavailable because the connection or room lifecycle changed/)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Revoke invite' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke invite' }));
+    expect(call.mock.calls.filter(([method]) => method === 'room.revoke')).toHaveLength(0);
+    expect(screen.getByRole('dialog', { name: 'Revoke invite' })).toBeVisible();
+  });
+
+  it.each(['disconnect', 'lifecycle', 'lineage'] as const)('retains a recovery receipt and sends no confirmation after a %s change', async (change) => {
+    const source = { invite_id: 'old-confirm', mode: 'one_time' as const, role: 'reviewer', min_accepts: 1, accepted_cids: [], state: 'replacement_required' as const, created_at: base.created_at };
+    let current: RoomDto = { ...base, invites: [source] };
+    const receipt: InviteReceiptDto = {
+      room_id: ROOM_ONE,
+      invite: { ...source, invite_id: 'new-confirm', state: 'receipt_pending', recovery_of: source.invite_id, recovery_confirmed: false },
+      blob: 'CAPABILITY-RECOVERY-SECRET', reusable: false, recovery_of: source.invite_id,
+    };
+    let disconnected = false;
+    const call = vi.fn(async (method: string) => {
+      if (disconnected && (method === 'room.list' || method === 'room.show')) throw new Error('offline');
+      if (method === 'room.list') return [current];
+      if (method === 'room.show') return current;
+      if (method === 'room.participants' || method === 'room.history') return [];
+      if (method === 'room.recover') return [receipt];
+      if (method === 'room.recover.confirm') throw new Error('mutation must not dispatch');
+      throw new Error(`unexpected ${method}`);
+    });
+    location.hash = `#/rooms/${ROOM_ONE}`;
+    const user = userEvent.setup();
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    await user.click(await screen.findByRole('tab', { name: 'Invite' }));
+    await user.click(screen.getByRole('button', { name: 'Recover missing invites' }));
+    expect(await screen.findByText(receipt.blob)).toBeVisible();
+
+    if (change === 'disconnect') disconnected = true;
+    else if (change === 'lifecycle') current = { ...current, state: 'closing' };
+    else current = { ...current, invites: [{ ...source, state: 'revoked' }] };
+    fireEvent(document, new Event('visibilitychange'));
+    const confirm = screen.getByRole('button', { name: /Confirm old-confirm.*new-confirm/ });
+    await vi.waitFor(() => expect(confirm).toBeDisabled());
+    expect(screen.getByText(receipt.blob)).toBeVisible();
+    fireEvent.click(confirm);
+    expect(call.mock.calls.filter(([method]) => method === 'room.recover.confirm')).toHaveLength(0);
+  });
+
   it('keeps a revoke modal visible and closable when context becomes a hidden responsive drawer', async () => {
     const user = userEvent.setup();
     const original = window.matchMedia;
@@ -146,7 +237,7 @@ describe('invite management', () => {
     const live = { ...base, invites: [{ invite_id: 'long-live-invite-id', mode: 'public' as const, role: 'builder', min_accepts: 1, accepted_cids: [], state: 'live' as const, created_at: base.created_at }] };
     const call = vi.fn(async (method: string) => method === 'room.list' ? [live] : method === 'room.participants' ? [] : live);
     try {
-      location.hash = '#/rooms/room-1';
+      location.hash = `#/rooms/${ROOM_ONE}`;
       render(<CoworkApp rpc={{ call } as RpcClient} />);
       await user.click(await screen.findByRole('tab', { name: 'Invite' }));
       await user.click(screen.getByRole('button', { name: 'Revoke' }));

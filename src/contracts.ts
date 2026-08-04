@@ -491,12 +491,15 @@ const RelayIntentShape = {
   recipient_identity: NonEmptyStringSchema,
 } as const;
 
+/** A relay intent may terminate without a send when its seat was removed (§5.3). */
+export const RelayResultStatusSchema = z.enum(['queued', 'send_failed', 'skipped_removed']);
+
 const RelayResultShape = {
   kind: z.literal('relay_result'),
   intent_record_id: NonEmptyStringSchema,
   message_id: LowerCrockfordUlidSchema,
   recipient_identity: NonEmptyStringSchema,
-  status: RelayStatusSchema,
+  status: RelayResultStatusSchema,
   wire_id: NonEmptyStringSchema.optional(),
 } as const;
 

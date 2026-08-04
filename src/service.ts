@@ -13,6 +13,8 @@ import {
   RoomSchema,
   UpdateRoomInputSchema,
   type CommunicationRecord,
+  type InviteMode,
+  type RelayStatus,
   type Room,
   type RoomInvite,
   type Seat,
@@ -70,9 +72,22 @@ const DeleteRoomInputSchema = z.object({
   confirm: z.literal(true),
 }).strict();
 
+const RemoveParticipantInputSchema = z.object({
+  participant: z.string().min(1),
+  notify: z.boolean().optional(),
+}).strict();
+
+const ReplaceParticipantInputSchema = z.object({
+  participant: z.string().min(1),
+  notify: z.boolean().optional(),
+  mode: InviteModeSchema.optional(),
+  min_accepts: z.number().int().positive().safe().optional(),
+}).strict();
+
 type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | 'append' | 'read' | 'delete'>;
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 type CloseNoticeIntentRecord = Extract<CommunicationRecord, { kind: 'close_notice_intent' }>;
+type MembershipIntentRecord = Extract<CommunicationRecord, { kind: 'membership_intent' }>;
 
 export interface RoomPacketRegistry {
   get(roomId: string): RoomPacket | undefined;
@@ -101,6 +116,20 @@ export interface DeleteRoomReceipt {
   room_id: string;
   deleted: true;
   scope: 'this_host';
+}
+
+/** Honest per-removal outcome, mirroring the close-notice honesty rules. */
+export interface RemovalReceipt {
+  room_id: string;
+  participant_id: string;
+  epoch: number;
+  status: RelayStatus;
+  notified: boolean;
+  key_material_retained: true;
+}
+
+export interface ReplacementReceipt extends InviteReceipt {
+  removal: RemovalReceipt;
 }
 
 export class RoomServiceError extends Error {
@@ -324,33 +353,235 @@ export class RoomService {
     return this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'create an invite for');
-      const packet = this.packet(id);
-      const minted = await packet.mintInvite(request.mode);
-      const invite = RoomInviteSchema.parse({
-        invite_id: minted.invite_id,
+      return this.mintInviteUnlocked(room, {
         mode: request.mode,
         role: request.role ?? DEFAULT_ROLE,
         min_accepts: request.min_accepts,
-        accepted_cids: [],
-        state: 'live',
-        created_at: this.now(),
       });
-      try {
-        await this.store.save(RoomSchema.parse({ ...room, invites: [...room.invites, invite] }));
-      } catch (error) {
-        // This closes failures observable in-process. A hard crash at the same
-        // boundary is handled by exact-ID admission (the unrecorded invite can
-        // never admit a seat), but its blob cannot be reconstructed.
-        try { await packet.revokeInvite(minted.invite_id); } catch { /* original save failure wins */ }
-        throw error;
-      }
-      return {
-        room_id: id,
-        invite,
-        blob: minted.blob,
-        reusable: minted.reusable,
-      };
     });
+  }
+
+  private async mintInviteUnlocked(
+    room: Room,
+    request: { mode: InviteMode; role: string; min_accepts: number; replaces_seat?: string },
+  ): Promise<InviteReceipt> {
+    const packet = this.packet(room.room_id);
+    const minted = await packet.mintInvite(request.mode);
+    const invite = RoomInviteSchema.parse({
+      invite_id: minted.invite_id,
+      mode: request.mode,
+      role: request.role,
+      min_accepts: request.min_accepts,
+      accepted_cids: [],
+      state: 'live',
+      created_at: this.now(),
+      ...(request.replaces_seat === undefined ? {} : { replaces_seat: request.replaces_seat }),
+    });
+    try {
+      await this.store.save(RoomSchema.parse({ ...room, invites: [...room.invites, invite] }));
+    } catch (error) {
+      // This closes failures observable in-process. A hard crash at the same
+      // boundary is handled by exact-ID admission (the unrecorded invite can
+      // never admit a seat), but its blob cannot be reconstructed.
+      try { await packet.revokeInvite(minted.invite_id); } catch { /* original save failure wins */ }
+      throw error;
+    }
+    return {
+      room_id: room.room_id,
+      invite,
+      blob: minted.blob,
+      reusable: minted.reusable,
+    };
+  }
+
+  /**
+   * Operator-only removal (spec §5.2): archive-before-act membership intent,
+   * seat state flip + epoch bump, core 0.13 bilateral sever with an honest
+   * receipt, and an alias-form announcement unless the room or call is quiet.
+   */
+  async removeParticipant(roomId: string, input: unknown): Promise<RemovalReceipt> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = RemoveParticipantInputSchema.parse(input);
+    const receipt = await this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'remove a participant from');
+      const seat = this.findActiveSeat(room, request.participant);
+      const notify = (request.notify ?? true) && !room.quiet_membership;
+      return this.beginRemovalUnlocked(room, seat, notify);
+    });
+    await this.intake.resumePending(id);
+    return receipt;
+  }
+
+  /**
+   * Removal plus a same-role invite stamped with the seat lineage (spec §5.3).
+   * Owner override OC-2/OC-6: in an anonymous room the flow is unconditionally
+   * silent — the successor inherits the alias and other members see nothing.
+   */
+  async replaceParticipant(roomId: string, input: unknown): Promise<ReplacementReceipt> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = ReplaceParticipantInputSchema.parse(input);
+    const receipt = await this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'replace a participant in');
+      const seat = this.findActiveSeat(room, request.participant);
+      const notify = room.anonymous
+        ? false
+        : (request.notify ?? true) && !room.quiet_membership;
+      const removal = await this.beginRemovalUnlocked(room, seat, notify);
+      const current = await this.store.load(id);
+      const invite = await this.mintInviteUnlocked(current, {
+        mode: request.mode ?? 'one_time',
+        role: seat.role,
+        min_accepts: request.min_accepts ?? 1,
+        replaces_seat: seat.participant_id,
+      });
+      return { ...invite, removal };
+    });
+    await this.intake.resumePending(id);
+    return receipt;
+  }
+
+  private findActiveSeat(room: Room, participant: string): Seat {
+    const seat = room.seats.find((candidate) => candidate.state === 'active'
+      && (candidate.identity === participant || candidate.participant_id === participant));
+    if (!seat) {
+      throw new RoomServiceError(`"${participant}" is not an active participant of room "${room.room_id}"`);
+    }
+    return seat;
+  }
+
+  private async beginRemovalUnlocked(room: Room, seat: Seat, notify: boolean): Promise<RemovalReceipt> {
+    const intent = await this.store.append(room.room_id, {
+      version: 1,
+      kind: 'membership_intent',
+      room_id: room.room_id,
+      at: this.now(),
+      action: 'remove',
+      participant_id: seat.participant_id,
+      recipient_identity: seat.identity,
+      role: seat.role,
+      // The participant-visible label: the alias in anonymous rooms, the
+      // contact display name otherwise (INV-R3 holds either way).
+      alias: seat.alias ?? seat.display_name,
+      epoch: room.membership_epoch + 1,
+      notify,
+    });
+    if (intent.kind !== 'membership_intent') {
+      throw new RoomServiceError('storage returned the wrong membership intent kind');
+    }
+    const { receipt } = await this.completeRemovalUnlocked(room, intent);
+    return receipt;
+  }
+
+  /**
+   * Idempotent completion of a durable removal intent: each step re-checks the
+   * archive/state it would produce, so a crash anywhere re-drives cleanly
+   * (INV-R5; the 0.13 sever is replay-safe by design).
+   */
+  private async completeRemovalUnlocked(
+    room: Room,
+    intent: MembershipIntentRecord,
+  ): Promise<{ room: Room; receipt: RemovalReceipt }> {
+    let current = room;
+    const index = current.seats.findIndex(
+      (candidate) => candidate.participant_id === intent.participant_id,
+    );
+    if (index < 0) {
+      throw new RoomServiceError(
+        `membership intent ${intent.record_id} references an unknown seat in room "${current.room_id}"`,
+      );
+    }
+    if (current.seats[index]!.state !== 'removed') {
+      const seats = [...current.seats];
+      seats[index] = {
+        ...seats[index]!,
+        state: 'removed',
+        removed_at: intent.at,
+        removed_epoch: intent.epoch,
+      };
+      current = await this.store.save(RoomSchema.parse({
+        ...current,
+        seats,
+        membership_epoch: Math.max(current.membership_epoch, intent.epoch),
+      }));
+    }
+    const records = await this.store.read(current.room_id);
+    const existing = records.find((record) =>
+      record.kind === 'membership_result' && record.intent_record_id === intent.record_id);
+    let outcome: { status: RelayStatus; notified: boolean; key_material_retained: true };
+    if (existing !== undefined && existing.kind === 'membership_result') {
+      outcome = {
+        status: existing.status,
+        notified: existing.notified,
+        key_material_retained: true,
+      };
+    } else {
+      outcome = await this.packet(current.room_id).removeContact(intent.recipient_identity);
+      const result = await this.store.append(current.room_id, {
+        version: 1,
+        kind: 'membership_result',
+        room_id: current.room_id,
+        at: this.now(),
+        intent_record_id: intent.record_id,
+        participant_id: intent.participant_id,
+        status: outcome.status,
+        notified: outcome.notified,
+        key_material_retained: true,
+      });
+      if (result.kind !== 'membership_result') {
+        throw new RoomServiceError('storage returned the wrong membership result kind');
+      }
+    }
+    if (intent.notify) await this.ensureMembershipNotice(current, intent);
+    return {
+      room: current,
+      receipt: {
+        room_id: current.room_id,
+        participant_id: intent.participant_id,
+        epoch: intent.epoch,
+        status: outcome.status,
+        notified: outcome.notified,
+        key_material_retained: true,
+      },
+    };
+  }
+
+  private async ensureMembershipNotice(room: Room, intent: MembershipIntentRecord): Promise<void> {
+    const records = await this.store.read(room.room_id);
+    const already = records.some((record) => record.kind === 'message'
+      && record.category === 'membership'
+      && record.membership?.action === 'remove'
+      && record.membership.epoch === intent.epoch);
+    if (already) return;
+    const remaining = activeSeats(room);
+    if (remaining.length === 0) return;
+    const label = intent.alias ?? intent.role;
+    const appended = await this.store.append(room.room_id, {
+      version: 1,
+      kind: 'message',
+      room_id: room.room_id,
+      at: this.now(),
+      message_id: LowerCrockfordUlidSchema.parse(this.nextMessageId()),
+      author: { identity: room.identity_cid, display_name: room.identity_name, role: ROOM_ROLE },
+      category: 'membership',
+      text: `${label} left the room · epoch ${intent.epoch}`,
+      membership: { action: 'remove', alias: label, role: intent.role, epoch: intent.epoch },
+      recipient_identities: uniqueIdentities(remaining.map((seat) => seat.identity)),
+    });
+    if (appended.kind !== 'message') {
+      throw new RoomServiceError('storage returned the wrong membership notice kind');
+    }
+    for (const recipientIdentity of appended.recipient_identities) {
+      await this.store.append(room.room_id, {
+        version: 1,
+        kind: 'relay_intent',
+        room_id: room.room_id,
+        at: this.now(),
+        message_id: appended.message_id,
+        recipient_identity: recipientIdentity,
+      });
+    }
   }
 
   async revokeInvite(roomId: string, inviteId: string): Promise<RoomInvite> {
@@ -689,7 +920,19 @@ export class RoomService {
     }
     const origins = packet.listContactOrigins();
     const inviteById = new Map(room.invites.map((invite) => [invite.invite_id, invite]));
-    const existingCids = new Set(room.seats.map((seat) => seat.identity));
+    const existingCids = new Set(room.seats
+      .filter((seat) => seat.state === 'active')
+      .map((seat) => seat.identity));
+    // A cid whose seats are all removed re-admits only through an invite
+    // minted after its latest removal — a deliberate operator re-invite (§5.3).
+    const lastRemovedAt = new Map<string, string>();
+    for (const seat of room.seats) {
+      if (seat.state !== 'removed' || seat.removed_at === undefined) continue;
+      const previous = lastRemovedAt.get(seat.identity);
+      if (previous === undefined || seat.removed_at > previous) {
+        lastRemovedAt.set(seat.identity, seat.removed_at);
+      }
+    }
     const newSeats: Seat[] = [];
 
     for (const [cid, displayName] of contactsByCid) {
@@ -700,6 +943,8 @@ export class RoomService {
       if (!invite
         || invite.state === 'receipt_pending'
         || (invite.recovery_of !== undefined && invite.recovery_confirmed !== true)) continue;
+      const removedAt = lastRemovedAt.get(cid);
+      if (removedAt !== undefined && invite.created_at <= removedAt) continue;
       const seated = [...room.seats, ...newSeats];
       const predecessor = invite.replaces_seat === undefined
         ? undefined
@@ -758,6 +1003,17 @@ export class RoomService {
       invites,
       membership_epoch: room.membership_epoch + newSeats.length,
     });
+    // Re-drive any removal whose intent has no terminal result (INV-R5).
+    const journal = await this.store.read(next.room_id);
+    const completedIntents = new Set(journal
+      .filter((record) => record.kind === 'membership_result')
+      .map((record) => record.kind === 'membership_result' ? record.intent_record_id : ''));
+    for (const intent of journal.filter(
+      (record): record is MembershipIntentRecord => record.kind === 'membership_intent',
+    )) {
+      if (completedIntents.has(intent.record_id)) continue;
+      ({ room: next } = await this.completeRemovalUnlocked(next, intent));
+    }
     const requirementsMet = invites
       .filter((invite) => invite.state !== 'revoked')
       .every((invite) => invite.accepted_cids.length >= invite.min_accepts);

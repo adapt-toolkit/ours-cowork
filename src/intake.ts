@@ -3,13 +3,15 @@ import { z } from 'zod';
 import {
   LowerCrockfordUlidSchema,
   Rfc3339Schema,
+  RoomSchema,
   type CommunicationRecord,
+  type Room,
 } from './contracts.ts';
 import type { InboxItem, RoomPacket } from './packets.ts';
 import type { CoworkStore, RoomMutex } from './storage.ts';
 import { generateUlid } from './ulid.ts';
 
-type IntakeStore = Pick<CoworkStore, 'mutex' | 'load' | 'append' | 'read'>;
+type IntakeStore = Pick<CoworkStore, 'mutex' | 'load' | 'save' | 'append' | 'read'>;
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 type RelayIntentRecord = Extract<CommunicationRecord, { kind: 'relay_intent' }>;
 
@@ -149,6 +151,7 @@ export class IntakePump {
       // Inbox entries are ordinary packet state, not an authorization source.
       // Refused entries are deliberately drained without creating an archive
       // message, intent, signature, or result.
+      if (room.state === 'active') await this.bounceRemovedSender(roomId, room, packet, item);
       await packet.consumeInbox([item.msg_id]);
       return;
     }
@@ -195,6 +198,36 @@ export class IntakePump {
     await packet.consumeInbox([item.msg_id]);
   }
 
+  /**
+   * One content-free self-assertion per removed seat (spec §5.2, OC-8), so a
+   * healthy ex-client stops sending. The durable bounced_at mark precedes the
+   * best-effort send: at-most-once, and a hostile peer gets nothing further.
+   */
+  private async bounceRemovedSender(
+    roomId: string,
+    room: Room,
+    packet: RoomPacket,
+    item: InboxItem,
+  ): Promise<void> {
+    const removed = room.seats.find(
+      (candidate) => candidate.identity === item.sender_id && candidate.state === 'removed',
+    );
+    if (!removed || removed.bounced_at !== undefined) return;
+    if (room.seats.some(
+      (candidate) => candidate.identity === item.sender_id && candidate.state === 'active',
+    )) return;
+    const seats = room.seats.map((candidate) =>
+      candidate.participant_id === removed.participant_id
+        ? { ...candidate, bounced_at: this.now() }
+        : candidate);
+    await this.store.save(RoomSchema.parse({ ...room, seats }));
+    try {
+      const unsigned = { version: 1 as const, kind: 'room_not_member' as const, room_id: roomId };
+      const signature = await packet.sign(canonicalJson(unsigned));
+      await packet.send(item.sender_id, canonicalJson({ ...unsigned, signature }));
+    } catch { /* best effort — the channel is severed or severing */ }
+  }
+
   private async completeSnapshotIntents(roomId: string): Promise<void> {
     const records = await this.store.read(roomId);
     for (const message of records.filter(
@@ -224,6 +257,13 @@ export class IntakePump {
 
   private async relayPendingUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
     const records = await this.store.read(roomId);
+    const room = await this.store.load(roomId);
+    const activeCids = new Set(room.seats
+      .filter((seat) => seat.state === 'active')
+      .map((seat) => seat.identity));
+    const removedCids = new Set(room.seats
+      .filter((seat) => seat.state === 'removed')
+      .map((seat) => seat.identity));
     const messages = new Map(records
       .filter((record): record is MessageRecord => record.kind === 'message')
       .map((message) => [message.message_id, message]));
@@ -240,6 +280,22 @@ export class IntakePump {
       // with a network effect or a result that would claim a send was tried.
       if (!message) continue;
       if (!message.recipient_identities.includes(intent.recipient_identity)) continue;
+      if (!activeCids.has(intent.recipient_identity) && removedCids.has(intent.recipient_identity)) {
+        // The seat was removed after fan-out: terminal result, never a send (§5.3).
+        const skipped = await this.store.append(roomId, {
+          version: 1,
+          kind: 'relay_result',
+          room_id: roomId,
+          at: this.now(),
+          intent_record_id: intent.record_id,
+          message_id: intent.message_id,
+          recipient_identity: intent.recipient_identity,
+          status: 'skipped_removed',
+        });
+        if (skipped.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
+        completed.add(intent.record_id);
+        continue;
+      }
 
       const unsigned = {
         version: 1 as const,

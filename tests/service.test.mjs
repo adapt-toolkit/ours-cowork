@@ -578,10 +578,13 @@ test('admission uses only exact invite origins, never contact names or roles for
     'cid-alice': { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[2] },
   };
   const room = await f.service.reconcileRoom(ROOM_ID);
-  assert.deepEqual(room.seats, [{
+  assert.equal(room.seats.length, 1);
+  const { participant_id, ...seat } = room.seats[0];
+  assert.match(participant_id, /^[0-7][0-9a-hjkmnp-tv-z]{25}$/);
+  assert.deepEqual(seat, {
     identity: 'cid-alice', display_name: 'Alice', role: 'trusted-looking label',
-    invite_id: invite.invite_id, accepted_at: TIMES[2],
-  }]);
+    invite_id: invite.invite_id, accepted_at: TIMES[2], state: 'active',
+  });
   assert.deepEqual(room.invites[0].accepted_cids, ['cid-alice']);
   assert.equal(room.state, 'provisioning', 'two accepts are required');
 });

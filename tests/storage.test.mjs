@@ -13,11 +13,15 @@ const AT = '2026-08-02T10:11:12.345Z';
 
 function room(overrides = {}) {
   return {
-    version: 1,
+    version: 2,
     room_id: ROOM_ID,
     identity_name: `cowork-room-${ROOM_ID}`,
     identity_cid: 'cid-room',
-    mission: { goal: 'Ship it', briefing: 'Work together.' },
+    mission: { goal: 'Ship it', briefing: 'Work together.', briefing_version: 1 },
+    role_briefings: {},
+    anonymous: false,
+    quiet_membership: false,
+    membership_epoch: 0,
     state: 'provisioning',
     invites: [],
     seats: [],
@@ -625,4 +629,86 @@ test('delete resumes every expected partial stage and removes explicitly authori
     await assert.rejects(store.delete(ROOM_ID), /unexpected residue/i);
     assert.equal(fs.existsSync(unknown), true);
   });
+});
+
+// ---- Rooms evolution Phase A (spec §7) — lazy v1 → v2 migration ----
+
+function roomV1(overrides = {}) {
+  return {
+    version: 1,
+    room_id: ROOM_ID,
+    identity_name: `cowork-room-${ROOM_ID}`,
+    identity_cid: 'cid-room',
+    mission: { goal: 'Ship it', briefing: 'Work together.' },
+    state: 'provisioning',
+    invites: [],
+    seats: [],
+    created_at: AT,
+    ...overrides,
+  };
+}
+
+test('load migrates a v1 room.json to v2 with a one-time .v1.bak beside it', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore();
+  t.after(cleanup);
+
+  const v1 = roomV1({
+    state: 'active',
+    activated_at: AT,
+    invites: [{
+      invite_id: 'invite-1', mode: 'public', role: 'reviewer', min_accepts: 1,
+      accepted_cids: ['cid-alice'], state: 'live', created_at: AT,
+    }],
+    seats: [{
+      identity: 'cid-alice', display_name: 'Alice', role: 'reviewer',
+      invite_id: 'invite-1', accepted_at: AT,
+    }],
+  });
+  const roomDir = join(stateDir, 'rooms', ROOM_ID);
+  fs.mkdirSync(roomDir, { recursive: true, mode: 0o700 });
+  const originalBytes = `${JSON.stringify(v1)}\n`;
+  writeFileSync(join(roomDir, 'room.json'), originalBytes, { mode: 0o600 });
+  writeFileSync(join(roomDir, 'archive.jsonl'), '', { mode: 0o600 });
+
+  const migrated = await store.load(ROOM_ID);
+  assert.equal(migrated.version, 2);
+  assert.equal(migrated.anonymous, false);
+  assert.equal(migrated.quiet_membership, false);
+  assert.equal(migrated.membership_epoch, 0);
+  assert.deepEqual(migrated.role_briefings, {});
+  assert.equal(migrated.mission.briefing_version, 1);
+  assert.equal(migrated.seats[0].state, 'active');
+  assert.match(migrated.seats[0].participant_id, /^[0-7][0-9a-hjkmnp-tv-z]{25}$/);
+  assert.equal(migrated.seats[0].alias, undefined);
+
+  // one-time backup keeps the exact pre-migration bytes
+  const backupPath = join(roomDir, 'room.json.v1.bak');
+  assert.equal(readFileSync(backupPath, 'utf8'), originalBytes);
+  assert.equal(mode(backupPath), 0o600);
+
+  // the durable metadata is now v2 and stable across loads
+  const persisted = JSON.parse(readFileSync(join(roomDir, 'room.json'), 'utf8'));
+  assert.equal(persisted.version, 2);
+  const again = await store.load(ROOM_ID);
+  assert.deepEqual(again, migrated);
+  assert.equal(readFileSync(backupPath, 'utf8'), originalBytes);
+});
+
+test('migration does not clobber an existing .v1.bak and v2 rooms load untouched', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore();
+  t.after(cleanup);
+
+  const roomDir = join(stateDir, 'rooms', ROOM_ID);
+  fs.mkdirSync(roomDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(roomDir, 'room.json'), `${JSON.stringify(roomV1())}\n`, { mode: 0o600 });
+  writeFileSync(join(roomDir, 'archive.jsonl'), '', { mode: 0o600 });
+  writeFileSync(join(roomDir, 'room.json.v1.bak'), 'pre-existing backup\n', { mode: 0o600 });
+
+  const migrated = await store.load(ROOM_ID);
+  assert.equal(migrated.version, 2);
+  assert.equal(readFileSync(join(roomDir, 'room.json.v1.bak'), 'utf8'), 'pre-existing backup\n');
+
+  const before = readFileSync(join(roomDir, 'room.json'), 'utf8');
+  await store.load(ROOM_ID);
+  assert.equal(readFileSync(join(roomDir, 'room.json'), 'utf8'), before);
 });

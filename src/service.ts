@@ -1,9 +1,8 @@
-import { randomBytes } from 'node:crypto';
-
 import { z } from 'zod';
 
 import {
   CreateRoomInputSchema,
+  DEFAULT_ROLE,
   InviteModeSchema,
   LowerCrockfordUlidSchema,
   PostMessageInputSchema,
@@ -19,13 +18,13 @@ import {
 import type { RoomPacket } from './packets.ts';
 import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
 import { IntakePump } from './intake.ts';
+import { generateUlid } from './ulid.ts';
 
-const CROCKFORD = '0123456789abcdefghjkmnpqrstvwxyz';
 const ROOM_ROLE = 'room';
 
 const CreateInviteInputSchema = z.object({
   mode: InviteModeSchema,
-  role: RoleSchema,
+  role: RoleSchema.optional(),
   min_accepts: z.number().int().positive().safe(),
 }).strict().superRefine((input, context) => {
   if (input.mode === 'one_time' && input.min_accepts !== 1) {
@@ -117,14 +116,18 @@ export class RoomService {
     const identityName = `cowork-room-${roomId}`;
     return this.lock(roomId, async () => {
       const provisional = RoomSchema.parse({
-        version: 1,
+        version: 2,
         room_id: roomId,
         identity_name: identityName,
         // PacketRegistry needs the durable room directory to exist first. A
         // valid, explicitly provisional value lets startup resume this exact
         // two-resource boundary without claiming a packet CID yet.
         identity_cid: '',
-        mission: { goal: settings.goal, briefing: settings.briefing },
+        mission: { goal: settings.goal, briefing: settings.briefing, briefing_version: 1 },
+        role_briefings: {},
+        anonymous: settings.anonymous ?? false,
+        quiet_membership: settings.quiet_membership ?? false,
+        membership_epoch: 0,
         state: 'provisioning',
         status: 'packet_pending',
         invites: [],
@@ -221,15 +224,22 @@ export class RoomService {
     return this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'update');
+      const briefingChanged = settings.briefing !== undefined && settings.briefing !== room.mission.briefing;
       const mission = {
         goal: settings.goal ?? room.mission.goal,
         briefing: settings.briefing ?? room.mission.briefing,
+        briefing_version: briefingChanged ? room.mission.briefing_version + 1 : room.mission.briefing_version,
       };
-      return this.store.save(RoomSchema.parse({
+      const next = await this.store.save(RoomSchema.parse({
         ...room,
         mission,
+        ...(settings.quiet_membership === undefined ? {} : { quiet_membership: settings.quiet_membership }),
         ...(settings.status === undefined ? {} : { status: settings.status }),
       }));
+      if (briefingChanged && next.state === 'active') {
+        await this.redeliverCommonBriefing(next);
+      }
+      return next;
     });
   }
 
@@ -244,7 +254,7 @@ export class RoomService {
       const invite = RoomInviteSchema.parse({
         invite_id: minted.invite_id,
         mode: request.mode,
-        role: request.role,
+        role: request.role ?? DEFAULT_ROLE,
         min_accepts: request.min_accepts,
         accepted_cids: [],
         state: 'live',
@@ -555,7 +565,7 @@ export class RoomService {
         },
         category: 'chat',
         text: request.text,
-        recipient_identities: uniqueIdentities(room.seats.map((seat) => seat.identity)),
+        recipient_identities: uniqueIdentities(activeSeats(room).map((seat) => seat.identity)),
       });
       if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong room message kind');
       for (const recipientIdentity of appended.recipient_identities) {
@@ -592,12 +602,25 @@ export class RoomService {
       if (!invite
         || invite.state === 'receipt_pending'
         || (invite.recovery_of !== undefined && invite.recovery_confirmed !== true)) continue;
+      const seated = [...room.seats, ...newSeats];
+      const predecessor = invite.replaces_seat === undefined
+        ? undefined
+        : seated.find((seat) => seat.participant_id === invite.replaces_seat && seat.state === 'removed');
+      if (invite.replaces_seat !== undefined && !predecessor) continue;
       newSeats.push({
         identity: cid,
         display_name: displayName,
         role: invite.role,
         invite_id: invite.invite_id,
         accepted_at: origin.at,
+        participant_id: LowerCrockfordUlidSchema.parse(generateUlid()),
+        state: 'active',
+        ...(predecessor === undefined ? {} : { replaces_seat: predecessor.participant_id }),
+        // OC-6 (owner override): a replacement into a role inherits the
+        // predecessor's alias — the alias binds to the seat/role lineage.
+        ...(room.anonymous
+          ? { alias: predecessor?.alias ?? mintAlias(seated, invite.role) }
+          : {}),
       });
       existingCids.add(cid);
     }
@@ -631,15 +654,20 @@ export class RoomService {
       return { ...invite, accepted_cids, state };
     });
 
-    let next: Room = RoomSchema.parse({ ...room, seats, invites });
+    let next: Room = RoomSchema.parse({
+      ...room,
+      seats,
+      invites,
+      membership_epoch: room.membership_epoch + newSeats.length,
+    });
     const requirementsMet = invites
       .filter((invite) => invite.state !== 'revoked')
       .every((invite) => invite.accepted_cids.length >= invite.min_accepts);
     if (next.state === 'provisioning' && seats.length > 0 && requirementsMet) {
-      const activationAt = await this.ensureActivationBriefing(next, seats);
+      const activationAt = await this.ensureActivationBriefing(next, activeSeats(next));
       next = RoomSchema.parse({ ...next, state: 'active', activated_at: activationAt });
-    } else if (next.state === 'active') {
-      for (const seat of newSeats) await this.ensureLateBriefing(next, seat);
+    } else if (next.state === 'active' && newSeats.length > 0) {
+      await this.ensureActivationBriefing(next, newSeats);
     }
     return this.store.save(next);
   }
@@ -767,71 +795,116 @@ export class RoomService {
     return { version: 1, room_id: roomId, deleted: true, scope: 'this_host' };
   }
 
+  /**
+   * Deliver the common briefing followed by the seat's role briefing (spec
+   * §3.3): exactly once per (seat, briefing kind, version) via the message +
+   * relay-intent ledger. Returns the timestamp of the common briefing message
+   * that admitted the earliest of the given recipients (activation time).
+   */
   private async ensureActivationBriefing(room: Room, recipients: Seat[]): Promise<string> {
+    const at = await this.ensureBriefingKind(room, recipients, {
+      category: 'briefing',
+      text: room.mission.briefing,
+      briefing_version: room.mission.briefing_version,
+    });
+    await this.ensureRoleBriefings(room, recipients);
+    return at;
+  }
+
+  private async ensureRoleBriefings(room: Room, recipients: Seat[]): Promise<void> {
+    for (const seat of recipients) {
+      const briefing = room.role_briefings[seat.role];
+      if (!briefing) continue;
+      await this.ensureBriefingKind(room, [seat], {
+        category: 'role_briefing',
+        briefing_role: seat.role,
+        text: briefing.text,
+        briefing_version: briefing.version,
+      });
+    }
+  }
+
+  /** Re-deliver the (just bumped) common briefing to every active seat. */
+  private async redeliverCommonBriefing(room: Room): Promise<void> {
+    await this.ensureBriefingKind(room, activeSeats(room), {
+      category: 'briefing',
+      text: room.mission.briefing,
+      briefing_version: room.mission.briefing_version,
+    });
+  }
+
+  private async ensureBriefingKind(
+    room: Room,
+    recipients: Seat[],
+    briefing: {
+      category: 'briefing' | 'role_briefing';
+      briefing_role?: string;
+      text: string;
+      briefing_version: number;
+    },
+  ): Promise<string> {
     const records = await this.store.read(room.room_id);
-    let message: MessageRecord | undefined = records.find(
-      (record): record is MessageRecord => record.kind === 'message' && record.category === 'briefing',
-    );
-    if (!message) message = await this.appendBriefing(room, recipients);
-    const intents = new Set(records
-      .filter((record) => record.kind === 'relay_intent' && record.message_id === message!.message_id)
-      .map((record) => record.kind === 'relay_intent' ? record.recipient_identity : ''));
-    for (const recipientIdentity of message.recipient_identities) {
-      if (!intents.has(recipientIdentity)) {
+    // A pre-evolution briefing record carries no version stamp; it delivered
+    // what is now version 1, so migration alone never re-sends anything.
+    const matching = records.filter((record): record is MessageRecord =>
+      record.kind === 'message'
+      && record.category === briefing.category
+      && record.briefing_role === briefing.briefing_role
+      && (record.briefing_version ?? 1) === briefing.briefing_version);
+    const intentsByMessage = new Map<string, Set<string>>();
+    for (const record of records) {
+      if (record.kind !== 'relay_intent') continue;
+      const intents = intentsByMessage.get(record.message_id) ?? new Set<string>();
+      intents.add(record.recipient_identity);
+      intentsByMessage.set(record.message_id, intents);
+    }
+    const covered = new Set<string>();
+    for (const message of matching) {
+      const intents = intentsByMessage.get(message.message_id) ?? new Set<string>();
+      for (const recipientIdentity of message.recipient_identities) {
+        covered.add(recipientIdentity);
+        if (!intents.has(recipientIdentity)) {
+          await this.store.append(room.room_id, {
+            version: 1,
+            kind: 'relay_intent',
+            room_id: room.room_id,
+            at: this.now(),
+            message_id: message.message_id,
+            recipient_identity: recipientIdentity,
+          });
+        }
+      }
+    }
+    const missing = recipients.filter((seat) => !covered.has(seat.identity));
+    let appendedAt: string | undefined;
+    if (missing.length > 0) {
+      const appended = await this.store.append(room.room_id, {
+        version: 1,
+        kind: 'message',
+        room_id: room.room_id,
+        at: this.now(),
+        message_id: LowerCrockfordUlidSchema.parse(this.nextMessageId()),
+        author: { identity: room.identity_cid, display_name: room.identity_name, role: ROOM_ROLE },
+        category: briefing.category,
+        ...(briefing.briefing_role === undefined ? {} : { briefing_role: briefing.briefing_role }),
+        briefing_version: briefing.briefing_version,
+        text: briefing.text,
+        recipient_identities: uniqueIdentities(missing.map((seat) => seat.identity)),
+      });
+      if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong briefing record kind');
+      appendedAt = appended.at;
+      for (const recipientIdentity of appended.recipient_identities) {
         await this.store.append(room.room_id, {
           version: 1,
           kind: 'relay_intent',
           room_id: room.room_id,
           at: this.now(),
-          message_id: message.message_id,
+          message_id: appended.message_id,
           recipient_identity: recipientIdentity,
         });
       }
     }
-    const originalAudience = new Set(message.recipient_identities);
-    for (const recipient of recipients) {
-      if (!originalAudience.has(recipient.identity)) await this.ensureLateBriefing(room, recipient);
-    }
-    return message.at;
-  }
-
-  private async ensureLateBriefing(room: Room, seat: Seat): Promise<void> {
-    const records = await this.store.read(room.room_id);
-    let message: MessageRecord | undefined = [...records].reverse().find(
-      (record): record is MessageRecord => record.kind === 'message'
-        && record.category === 'briefing'
-        && record.recipient_identities.includes(seat.identity),
-    );
-    if (!message) message = await this.appendBriefing(room, [seat]);
-    const alreadyBriefed = records.some((record) =>
-      record.kind === 'relay_intent'
-      && record.message_id === message!.message_id
-      && record.recipient_identity === seat.identity);
-    if (alreadyBriefed) return;
-    await this.store.append(room.room_id, {
-      version: 1,
-      kind: 'relay_intent',
-      room_id: room.room_id,
-      at: this.now(),
-      message_id: message.message_id,
-      recipient_identity: seat.identity,
-    });
-  }
-
-  private async appendBriefing(room: Room, recipients: Seat[]): Promise<MessageRecord> {
-    const record = await this.store.append(room.room_id, {
-      version: 1,
-      kind: 'message',
-      room_id: room.room_id,
-      at: this.now(),
-      message_id: LowerCrockfordUlidSchema.parse(this.nextMessageId()),
-      author: { identity: room.identity_cid, display_name: room.identity_name, role: ROOM_ROLE },
-      category: 'briefing',
-      text: room.mission.briefing,
-      recipient_identities: uniqueIdentities(recipients.map((seat) => seat.identity)),
-    });
-    if (record.kind !== 'message') throw new RoomServiceError('storage returned the wrong briefing record kind');
-    return record;
+    return matching[0]?.at ?? appendedAt ?? this.now();
   }
 
   private lock<T>(roomId: string, work: () => T | Promise<T>): Promise<T> {
@@ -862,26 +935,17 @@ export class RoomService {
   }
 }
 
-function generateUlid(): string {
-  let time = Date.now();
-  const output = new Array<string>(26);
-  for (let index = 9; index >= 0; index -= 1) {
-    output[index] = CROCKFORD[time % 32]!;
-    time = Math.floor(time / 32);
-  }
-  const entropy = randomBytes(10);
-  let bits = 0;
-  let value = 0;
-  let byteIndex = 0;
-  for (let index = 10; index < 26; index += 1) {
-    while (bits < 5) {
-      value = (value << 8) | entropy[byteIndex++]!;
-      bits += 8;
-    }
-    bits -= 5;
-    output[index] = CROCKFORD[(value >>> bits) & 31]!;
-  }
-  return output.join('');
+function activeSeats(room: Room): Seat[] {
+  return room.seats.filter((seat) => seat.state === 'active');
+}
+
+/**
+ * Room-scoped pseudonym "<role> #<n>": n is the per-role admission ordinal
+ * counted over every seat ever admitted with the role (removed seats keep
+ * their ordinal; replacements inherit instead of minting).
+ */
+function mintAlias(seated: Seat[], role: string): string {
+  return `${role} #${seated.filter((seat) => seat.role === role).length + 1}`;
 }
 
 function uniqueIdentities(identities: string[]): string[] {

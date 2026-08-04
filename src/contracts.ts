@@ -45,7 +45,11 @@ export const MissionTextSchema = utf8Bounded('mission text', MAX_TEXT_BYTES);
 export const MessageTextSchema = utf8Bounded('message text', MAX_TEXT_BYTES);
 
 export const RoomStateSchema = z.enum(['provisioning', 'active', 'closing', 'closed']);
+export const SeatStateSchema = z.enum(['active', 'removed']);
 export const InviteModeSchema = z.enum(['one_time', 'public']);
+
+/** Built-in role assigned when an invite omits one (owner amendment to spec OC table). */
+export const DEFAULT_ROLE = 'Participant';
 export const InviteStateSchema = z.enum([
   'live',
   'consumed',
@@ -55,13 +59,55 @@ export const InviteStateSchema = z.enum([
 ]);
 export const RelayStatusSchema = z.enum(['queued', 'send_failed']);
 
-export const SeatSchema = z.object({
+const SeatV1Schema = z.object({
   identity: NonEmptyStringSchema,
   display_name: NonEmptyStringSchema,
   role: RoleSchema,
   invite_id: NonEmptyStringSchema,
   accepted_at: Rfc3339Schema,
 }).strict();
+
+export const SeatSchema = z.object({
+  identity: NonEmptyStringSchema,
+  display_name: NonEmptyStringSchema,
+  role: RoleSchema,
+  invite_id: NonEmptyStringSchema,
+  accepted_at: Rfc3339Schema,
+  participant_id: LowerCrockfordUlidSchema,
+  state: SeatStateSchema,
+  alias: NonEmptyStringSchema.optional(),
+  removed_at: Rfc3339Schema.optional(),
+  removed_epoch: z.number().int().nonnegative().safe().optional(),
+  replaces_seat: LowerCrockfordUlidSchema.optional(),
+  bounced_at: Rfc3339Schema.optional(),
+}).strict().superRefine((seat, context) => {
+  if (seat.state === 'removed') {
+    if (seat.removed_at === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['removed_at'],
+        message: 'removed seats require removed_at',
+      });
+    }
+    if (seat.removed_epoch === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['removed_epoch'],
+        message: 'removed seats require removed_epoch',
+      });
+    }
+  } else {
+    for (const field of ['removed_at', 'removed_epoch', 'bounced_at'] as const) {
+      if (seat[field] !== undefined) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [field],
+          message: `${field} is reserved for removed seats`,
+        });
+      }
+    }
+  }
+});
 
 export const RoomInviteSchema = z.object({
   invite_id: NonEmptyStringSchema,
@@ -73,6 +119,7 @@ export const RoomInviteSchema = z.object({
   recovery_of: NonEmptyStringSchema.optional(),
   recovery_confirmed: z.boolean().optional(),
   created_at: Rfc3339Schema,
+  replaces_seat: LowerCrockfordUlidSchema.optional(),
 }).strict().superRefine((invite, context) => {
   if (invite.mode === 'one_time' && invite.min_accepts !== 1) {
     context.addIssue({
@@ -127,25 +174,36 @@ export const RoomInviteSchema = z.object({
   }
 });
 
-export const MissionSchema = z.object({
+const MissionV1Schema = z.object({
   goal: MissionTextSchema,
   briefing: MissionTextSchema,
 }).strict();
 
-export const RoomSchema = z.object({
-  version: z.literal(1),
-  room_id: LowerCrockfordUlidSchema,
-  identity_name: NonEmptyStringSchema,
-  identity_cid: z.string(),
-  mission: MissionSchema,
-  state: RoomStateSchema,
-  status: NonEmptyStringSchema.optional(),
-  invites: z.array(RoomInviteSchema),
-  seats: z.array(SeatSchema),
-  created_at: Rfc3339Schema,
-  activated_at: Rfc3339Schema.optional(),
-  closed_at: Rfc3339Schema.optional(),
-}).strict().superRefine((room, context) => {
+export const MissionSchema = z.object({
+  goal: MissionTextSchema,
+  briefing: MissionTextSchema,
+  briefing_version: PositiveSafeIntegerSchema,
+}).strict();
+
+export const RoleBriefingSchema = z.object({
+  text: MissionTextSchema,
+  version: PositiveSafeIntegerSchema,
+  updated_at: Rfc3339Schema,
+}).strict();
+
+interface RoomLineageView {
+  room_id: string;
+  identity_name: string;
+  identity_cid: string;
+  state: z.infer<typeof RoomStateSchema>;
+  status?: string;
+  invites: z.infer<typeof RoomInviteSchema>[];
+  seats: unknown[];
+  activated_at?: string;
+  closed_at?: string;
+}
+
+function refineRoomLineage(room: RoomLineageView, context: z.RefinementCtx): void {
   const pendingIdentityName = `cowork-room-${room.room_id}`;
   const exactPacketPending = room.state === 'provisioning'
     && room.status === 'packet_pending'
@@ -209,19 +267,155 @@ export const RoomSchema = z.object({
       }
     }
   }
+}
+
+const RoomCommonShape = {
+  room_id: LowerCrockfordUlidSchema,
+  identity_name: NonEmptyStringSchema,
+  identity_cid: z.string(),
+  state: RoomStateSchema,
+  status: NonEmptyStringSchema.optional(),
+  invites: z.array(RoomInviteSchema),
+  created_at: Rfc3339Schema,
+  activated_at: Rfc3339Schema.optional(),
+  closed_at: Rfc3339Schema.optional(),
+} as const;
+
+/** The pre-evolution on-disk shape, accepted only by the explicit migration path. */
+export const RoomV1Schema = z.object({
+  ...RoomCommonShape,
+  version: z.literal(1),
+  mission: MissionV1Schema,
+  seats: z.array(SeatV1Schema),
+}).strict().superRefine(refineRoomLineage);
+
+export const RoomSchema = z.object({
+  ...RoomCommonShape,
+  version: z.literal(2),
+  mission: MissionSchema,
+  role_briefings: z.record(RoleSchema, RoleBriefingSchema),
+  anonymous: z.boolean(),
+  quiet_membership: z.boolean(),
+  membership_epoch: z.number().int().nonnegative().safe(),
+  seats: z.array(SeatSchema),
+}).strict().superRefine((room, context) => {
+  refineRoomLineage(room, context);
+  const byParticipant = new Map<string, z.infer<typeof SeatSchema>>();
+  const activeAliases = new Set<string>();
+  for (const [index, seat] of room.seats.entries()) {
+    if (byParticipant.has(seat.participant_id)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['seats', index, 'participant_id'],
+        message: 'participant_id must be unique within the room',
+      });
+    }
+    byParticipant.set(seat.participant_id, seat);
+    if (room.anonymous && seat.alias === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['seats', index, 'alias'],
+        message: 'anonymous rooms require an alias on every seat',
+      });
+    }
+    if (!room.anonymous && seat.alias !== undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['seats', index, 'alias'],
+        message: 'aliases are reserved for anonymous rooms',
+      });
+    }
+    if (seat.state === 'active' && seat.alias !== undefined) {
+      if (activeAliases.has(seat.alias)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['seats', index, 'alias'],
+          message: 'active seats must hold distinct aliases',
+        });
+      }
+      activeAliases.add(seat.alias);
+    }
+    if (seat.removed_epoch !== undefined && seat.removed_epoch > room.membership_epoch) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['seats', index, 'removed_epoch'],
+        message: 'removed_epoch cannot exceed the room membership_epoch',
+      });
+    }
+  }
+  for (const [index, seat] of room.seats.entries()) {
+    if (seat.replaces_seat === undefined) continue;
+    const predecessor = byParticipant.get(seat.replaces_seat);
+    if (!predecessor || predecessor === seat || predecessor.state !== 'removed') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['seats', index, 'replaces_seat'],
+        message: 'replaces_seat must reference a removed seat in this room',
+      });
+      continue;
+    }
+    if (predecessor.role !== seat.role) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['seats', index, 'role'],
+        message: 'a replacement seat must inherit the predecessor role',
+      });
+    }
+    if (room.anonymous && seat.alias !== predecessor.alias) {
+      // Owner choice OC-6: the alias binds to the seat/role lineage.
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['seats', index, 'alias'],
+        message: 'an anonymous replacement seat must inherit the predecessor alias',
+      });
+    }
+  }
 });
+
+/** Additive v1 → v2 mapping (spec §7). Existing rooms keep their exact behavior. */
+export function migrateRoomV1(
+  room: z.infer<typeof RoomV1Schema>,
+  mintParticipantId: () => string,
+): z.infer<typeof RoomSchema> {
+  return RoomSchema.parse({
+    ...room,
+    version: 2,
+    mission: { ...room.mission, briefing_version: 1 },
+    role_briefings: {},
+    anonymous: false,
+    quiet_membership: false,
+    membership_epoch: 0,
+    seats: room.seats.map((seat) => ({
+      ...seat,
+      participant_id: LowerCrockfordUlidSchema.parse(mintParticipantId()),
+      state: 'active',
+    })),
+  });
+}
 
 /** Caller-controlled room creation fields. Identity and authorship are host-owned. */
 export const CreateRoomInputSchema = z.object({
   goal: MissionTextSchema,
   briefing: MissionTextSchema,
+  anonymous: z.boolean().optional(),
+  quiet_membership: z.boolean().optional(),
 }).strict();
 
 export const UpdateRoomInputSchema = z.object({
   goal: MissionTextSchema.optional(),
   briefing: MissionTextSchema.optional(),
   status: NonEmptyStringSchema.optional(),
+  quiet_membership: z.boolean().optional(),
 }).strict().refine((input) => Object.keys(input).length > 0, 'at least one setting is required');
+
+export const RoleBriefingSetInputSchema = z.object({
+  role: RoleSchema,
+  text: MissionTextSchema,
+}).strict();
+
+export const RoleBriefingDeleteInputSchema = z.object({
+  role: RoleSchema,
+}).strict();
 
 /** Caller-controlled operator message fields. The service assigns room authorship. */
 export const PostMessageInputSchema = z.object({
@@ -248,11 +442,21 @@ const AppendCommonShape = {
   at: Rfc3339Schema,
 } as const;
 
+export const MembershipNoticeSchema = z.object({
+  action: z.enum(['remove']),
+  alias: NonEmptyStringSchema.optional(),
+  role: RoleSchema.optional(),
+  epoch: z.number().int().nonnegative().safe(),
+}).strict();
+
 const MessageShape = {
   kind: z.literal('message'),
   message_id: LowerCrockfordUlidSchema,
   author: AuthorSnapshotSchema,
-  category: z.enum(['briefing', 'chat']),
+  category: z.enum(['briefing', 'role_briefing', 'chat', 'membership']),
+  briefing_role: RoleSchema.optional(),
+  briefing_version: PositiveSafeIntegerSchema.optional(),
+  membership: MembershipNoticeSchema.optional(),
   text: MessageTextSchema,
   recipient_identities: z.array(NonEmptyStringSchema).superRefine((identities, context) => {
     const seen = new Set<string>();
@@ -286,6 +490,27 @@ const RelayResultShape = {
   wire_id: NonEmptyStringSchema.optional(),
 } as const;
 
+const MembershipIntentShape = {
+  kind: z.literal('membership_intent'),
+  action: z.enum(['remove']),
+  participant_id: LowerCrockfordUlidSchema,
+  recipient_identity: NonEmptyStringSchema,
+  role: RoleSchema,
+  alias: NonEmptyStringSchema.optional(),
+  epoch: PositiveSafeIntegerSchema,
+  notify: z.boolean(),
+} as const;
+
+const MembershipResultShape = {
+  kind: z.literal('membership_result'),
+  intent_record_id: NonEmptyStringSchema,
+  participant_id: LowerCrockfordUlidSchema,
+  status: RelayStatusSchema,
+  notified: z.boolean(),
+  key_material_retained: z.literal(true),
+  uncertain_after_restart: z.literal(true).optional(),
+} as const;
+
 const CloseNoticeIntentShape = {
   kind: z.literal('close_notice_intent'),
   recipient_identity: NonEmptyStringSchema,
@@ -304,6 +529,8 @@ const CloseNoticeResultShape = {
 export const MessageRecordSchema = z.object({ ...RecordCommonShape, ...MessageShape }).strict();
 export const RelayIntentRecordSchema = z.object({ ...RecordCommonShape, ...RelayIntentShape }).strict();
 export const RelayResultRecordSchema = z.object({ ...RecordCommonShape, ...RelayResultShape }).strict();
+export const MembershipIntentRecordSchema = z.object({ ...RecordCommonShape, ...MembershipIntentShape }).strict();
+export const MembershipResultRecordSchema = z.object({ ...RecordCommonShape, ...MembershipResultShape }).strict();
 export const CloseNoticeIntentRecordSchema = z.object({ ...RecordCommonShape, ...CloseNoticeIntentShape }).strict();
 export const CloseNoticeResultRecordSchema = z.object({ ...RecordCommonShape, ...CloseNoticeResultShape }).strict();
 
@@ -311,9 +538,56 @@ const RawCommunicationRecordSchema = z.discriminatedUnion('kind', [
   MessageRecordSchema,
   RelayIntentRecordSchema,
   RelayResultRecordSchema,
+  MembershipIntentRecordSchema,
+  MembershipResultRecordSchema,
   CloseNoticeIntentRecordSchema,
   CloseNoticeResultRecordSchema,
 ]);
+
+interface MessageCategoryView {
+  category: 'briefing' | 'role_briefing' | 'chat' | 'membership';
+  briefing_role?: string;
+  briefing_version?: number;
+  membership?: z.infer<typeof MembershipNoticeSchema>;
+}
+
+function refineMessageCategory(message: MessageCategoryView, context: z.RefinementCtx): void {
+  const requires = (field: 'briefing_role' | 'briefing_version' | 'membership', present: boolean): void => {
+    if (present && message[field] === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [field],
+        message: `${message.category} messages require ${field}`,
+      });
+    }
+    if (!present && message[field] !== undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [field],
+        message: `${field} is forbidden on ${message.category} messages`,
+      });
+    }
+  };
+  requires('briefing_role', message.category === 'role_briefing');
+  requires('membership', message.category === 'membership');
+  if (message.category === 'role_briefing' && message.briefing_version === undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['briefing_version'],
+      message: 'role_briefing messages require briefing_version',
+    });
+  }
+  // Common briefings may carry briefing_version (absent on pre-evolution records).
+  if (message.category === 'chat' || message.category === 'membership') {
+    if (message.briefing_version !== undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['briefing_version'],
+        message: `briefing_version is forbidden on ${message.category} messages`,
+      });
+    }
+  }
+}
 
 export const CommunicationRecordSchema = RawCommunicationRecordSchema.superRefine((record, context) => {
   if (record.record_id !== `${record.room_id}:${record.seq}`) {
@@ -323,22 +597,31 @@ export const CommunicationRecordSchema = RawCommunicationRecordSchema.superRefin
       message: 'record_id must equal room_id + ":" + seq',
     });
   }
+  if (record.kind === 'message') refineMessageCategory(record, context);
 });
 
 export const AppendRecordSchema = z.discriminatedUnion('kind', [
   z.object({ ...AppendCommonShape, ...MessageShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayIntentShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayResultShape }).strict(),
+  z.object({ ...AppendCommonShape, ...MembershipIntentShape }).strict(),
+  z.object({ ...AppendCommonShape, ...MembershipResultShape }).strict(),
   z.object({ ...AppendCommonShape, ...CloseNoticeIntentShape }).strict(),
   z.object({ ...AppendCommonShape, ...CloseNoticeResultShape }).strict(),
-]);
+]).superRefine((record, context) => {
+  if (record.kind === 'message') refineMessageCategory(record, context);
+});
 
 export type RoomState = z.infer<typeof RoomStateSchema>;
+export type SeatState = z.infer<typeof SeatStateSchema>;
 export type InviteMode = z.infer<typeof InviteModeSchema>;
 export type RelayStatus = z.infer<typeof RelayStatusSchema>;
 export type Seat = z.infer<typeof SeatSchema>;
 export type RoomInvite = z.infer<typeof RoomInviteSchema>;
 export type Room = z.infer<typeof RoomSchema>;
+export type RoomV1 = z.infer<typeof RoomV1Schema>;
+export type RoleBriefing = z.infer<typeof RoleBriefingSchema>;
+export type MembershipNotice = z.infer<typeof MembershipNoticeSchema>;
 export type AuthorSnapshot = z.infer<typeof AuthorSnapshotSchema>;
 export type CommunicationRecord = z.infer<typeof CommunicationRecordSchema>;
 export type AppendRecord = z.infer<typeof AppendRecordSchema>;

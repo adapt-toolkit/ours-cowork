@@ -1,5 +1,3 @@
-import { randomBytes } from 'node:crypto';
-
 import { z } from 'zod';
 
 import {
@@ -9,8 +7,7 @@ import {
 } from './contracts.ts';
 import type { InboxItem, RoomPacket } from './packets.ts';
 import type { CoworkStore, RoomMutex } from './storage.ts';
-
-const CROCKFORD = '0123456789abcdefghjkmnpqrstvwxyz';
+import { generateUlid } from './ulid.ts';
 
 type IntakeStore = Pick<CoworkStore, 'mutex' | 'load' | 'append' | 'read'>;
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
@@ -145,7 +142,9 @@ export class IntakePump {
 
   private async processInboxItem(roomId: string, packet: RoomPacket, item: InboxItem): Promise<void> {
     const room = await this.store.load(roomId);
-    const seat = room.seats.find((candidate) => candidate.identity === item.sender_id);
+    const seat = room.seats.find(
+      (candidate) => candidate.identity === item.sender_id && candidate.state === 'active',
+    );
     if (room.state !== 'active' || !seat) {
       // Inbox entries are ordinary packet state, not an authorization source.
       // Refused entries are deliberately drained without creating an archive
@@ -158,6 +157,7 @@ export class IntakePump {
     let message = this.findSourceMessage(before, item);
     if (!message) {
       const recipientIdentities = unique(room.seats
+        .filter((recipient) => recipient.state === 'active')
         .map((recipient) => recipient.identity)
         .filter((identity) => identity !== seat.identity));
       const appended = await this.store.append(roomId, {
@@ -238,12 +238,15 @@ export class IntakePump {
 
       const unsigned = {
         version: 1 as const,
-        kind: message.category === 'briefing' ? 'room_briefing' as const : 'room_msg' as const,
+        kind: wireKind(message.category),
         room_id: roomId,
         message_id: message.message_id,
         author: message.author,
         text: message.text,
         at: message.at,
+        ...(message.briefing_role === undefined ? {} : { briefing_role: message.briefing_role }),
+        ...(message.briefing_version === undefined ? {} : { briefing_version: message.briefing_version }),
+        ...(message.membership === undefined ? {} : { membership: message.membership }),
       };
       const signature = await packet.sign(canonicalJson(unsigned));
       const body = canonicalJson({ ...unsigned, signature });
@@ -313,24 +316,14 @@ function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
 
-function generateUlid(): string {
-  let time = Date.now();
-  const output = new Array<string>(26);
-  for (let index = 9; index >= 0; index -= 1) {
-    output[index] = CROCKFORD[time % 32]!;
-    time = Math.floor(time / 32);
+function wireKind(
+  category: 'briefing' | 'role_briefing' | 'chat' | 'membership',
+): 'room_briefing' | 'room_role_briefing' | 'room_msg' | 'room_membership' {
+  switch (category) {
+    case 'briefing': return 'room_briefing';
+    case 'role_briefing': return 'room_role_briefing';
+    case 'membership': return 'room_membership';
+    default: return 'room_msg';
   }
-  const entropy = randomBytes(10);
-  let bits = 0;
-  let value = 0;
-  let byteIndex = 0;
-  for (let index = 10; index < 26; index += 1) {
-    while (bits < 5) {
-      value = (value << 8) | entropy[byteIndex++]!;
-      bits += 8;
-    }
-    bits -= 5;
-    output[index] = CROCKFORD[(value >>> bits) & 31]!;
-  }
-  return output.join('');
 }
+

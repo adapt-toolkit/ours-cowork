@@ -12,6 +12,8 @@ import {
   RoleSchema,
   RoomInviteSchema,
   RoomSchema,
+  RoomV1Schema,
+  migrateRoomV1,
 } from '../src/contracts.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
@@ -19,6 +21,25 @@ const MESSAGE_ID = '01jz6y7n8p9q0r1s2t3v4w5x6z';
 const AT = '2026-08-02T10:11:12.345Z';
 
 function room(overrides = {}) {
+  return {
+    version: 2,
+    room_id: ROOM_ID,
+    identity_name: `cowork-room-${ROOM_ID}`,
+    identity_cid: 'cid-room',
+    mission: { goal: 'Ship it', briefing: 'Work together.', briefing_version: 1 },
+    role_briefings: {},
+    anonymous: false,
+    quiet_membership: false,
+    membership_epoch: 0,
+    state: 'provisioning',
+    invites: [],
+    seats: [],
+    created_at: AT,
+    ...overrides,
+  };
+}
+
+function roomAsV1(overrides = {}) {
   return {
     version: 1,
     room_id: ROOM_ID,
@@ -79,8 +100,8 @@ test('text bounds count exact UTF-8 bytes, not JavaScript code units', () => {
   assert.throws(() => MessageTextSchema.parse(''));
   assert.throws(() => MessageTextSchema.parse(`${'🤖'.repeat(65_536)}a`));
 
-  assert.equal(RoomSchema.parse(room({ mission: { goal: '🤖'.repeat(65_536), briefing: 'x' } })).version, 1);
-  assert.throws(() => RoomSchema.parse(room({ mission: { goal: 'x', briefing: `${'x'.repeat(262_144)}x` } })));
+  assert.equal(RoomSchema.parse(room({ mission: { goal: '🤖'.repeat(65_536), briefing: 'x', briefing_version: 1 } })).version, 2);
+  assert.throws(() => RoomSchema.parse(room({ mission: { goal: 'x', briefing: `${'x'.repeat(262_144)}x`, briefing_version: 1 } })));
 });
 
 test('room and invite schemas are strict, versioned, and enforce invite thresholds', () => {
@@ -89,7 +110,7 @@ test('room and invite schemas are strict, versioned, and enforce invite threshol
     assert.equal(RoomSchema.parse(room({ state })).state, state);
   }
   for (const invalid of [
-    room({ version: 2 }),
+    room({ version: 1 }),
     room({ state: 'paused' }),
     { ...room(), extra: true },
   ]) assert.throws(() => RoomSchema.parse(invalid));
@@ -226,4 +247,228 @@ test('communication records form a strict discriminated version-1 union', () => 
 
   const { seq: _seq, record_id: _recordId, ...appendMessage } = message;
   assert.equal(AppendRecordSchema.parse(appendMessage).kind, 'message');
+});
+
+// ---- Rooms evolution Phase A (spec §3.1, §4.1, §5.1, §7) — contracts v2 ----
+
+const PID_1 = '01jz6y7n8p9q0r1s2t3v4w5x70';
+const PID_2 = '01jz6y7n8p9q0r1s2t3v4w5x71';
+const PID_3 = '01jz6y7n8p9q0r1s2t3v4w5x72';
+
+function seatV2(overrides = {}) {
+  return {
+    identity: 'cid-alice',
+    display_name: 'Alice',
+    role: 'reviewer',
+    invite_id: 'invite-1',
+    accepted_at: AT,
+    participant_id: PID_1,
+    state: 'active',
+    ...overrides,
+  };
+}
+
+function roomV2(overrides = {}) {
+  return {
+    version: 2,
+    room_id: ROOM_ID,
+    identity_name: `cowork-room-${ROOM_ID}`,
+    identity_cid: 'cid-room',
+    mission: { goal: 'Ship it', briefing: 'Work together.', briefing_version: 1 },
+    role_briefings: {},
+    anonymous: false,
+    quiet_membership: false,
+    membership_epoch: 0,
+    state: 'provisioning',
+    invites: [],
+    seats: [],
+    created_at: AT,
+    ...overrides,
+  };
+}
+
+test('room schema v2 round-trips briefing versions, anonymity, and membership fields', () => {
+  const value = roomV2({
+    anonymous: true,
+    quiet_membership: true,
+    membership_epoch: 2,
+    role_briefings: {
+      reviewer: { text: 'Review the diffs.', version: 3, updated_at: AT },
+      Participant: { text: 'Welcome.', version: 1, updated_at: AT },
+    },
+    seats: [
+      seatV2({ alias: 'reviewer #1' }),
+      seatV2({
+        identity: 'cid-bob', display_name: 'Bob', participant_id: PID_2,
+        alias: 'reviewer #2', state: 'removed', removed_at: AT, removed_epoch: 1,
+      }),
+      seatV2({
+        identity: 'cid-carol', display_name: 'Carol', participant_id: PID_3,
+        alias: 'reviewer #2', replaces_seat: PID_2,
+      }),
+    ],
+  });
+  assert.deepEqual(RoomSchema.parse(value), value);
+  assert.equal(RoomSchema.parse(roomV2()).membership_epoch, 0);
+});
+
+test('room schema v2 rejects v1 payloads and invalid membership/anonymity combos', () => {
+  // version literal is 2; v1 rooms only enter through explicit migration
+  assert.throws(() => RoomSchema.parse(roomAsV1()));
+  assert.throws(() => RoomSchema.parse(roomV2({ version: 1 })));
+  // core v2 top-level fields are required
+  for (const missing of ['anonymous', 'quiet_membership', 'membership_epoch', 'role_briefings']) {
+    const { [missing]: _dropped, ...rest } = roomV2();
+    assert.throws(() => RoomSchema.parse(rest), missing);
+  }
+  const { briefing_version: _bv, ...missionV1 } = roomV2().mission;
+  assert.throws(() => RoomSchema.parse(roomV2({ mission: missionV1 })));
+  // alias required iff anonymous
+  assert.throws(() => RoomSchema.parse(roomV2({ anonymous: true, seats: [seatV2()] })));
+  assert.throws(() => RoomSchema.parse(roomV2({ seats: [seatV2({ alias: 'reviewer #1' })] })));
+  // removed seats need removal metadata; active seats must not carry it
+  assert.throws(() => RoomSchema.parse(roomV2({ membership_epoch: 1, seats: [seatV2({ state: 'removed' })] })));
+  assert.throws(() => RoomSchema.parse(roomV2({ membership_epoch: 1, seats: [seatV2({ state: 'removed', removed_at: AT })] })));
+  assert.throws(() => RoomSchema.parse(roomV2({ seats: [seatV2({ removed_at: AT })] })));
+  assert.throws(() => RoomSchema.parse(roomV2({ seats: [seatV2({ removed_epoch: 0 })] })));
+  // removal epochs stay within the room's membership epoch
+  assert.throws(() => RoomSchema.parse(roomV2({
+    membership_epoch: 1,
+    seats: [seatV2({ state: 'removed', removed_at: AT, removed_epoch: 2 })],
+  })));
+  // participant ids are unique; active aliases are unique
+  assert.throws(() => RoomSchema.parse(roomV2({
+    seats: [seatV2(), seatV2({ identity: 'cid-bob', display_name: 'Bob' })],
+  })));
+  assert.throws(() => RoomSchema.parse(roomV2({
+    anonymous: true,
+    seats: [
+      seatV2({ alias: 'reviewer #1' }),
+      seatV2({ identity: 'cid-bob', display_name: 'Bob', participant_id: PID_2, alias: 'reviewer #1' }),
+    ],
+  })));
+  // replacement lineage: predecessor must exist, be removed, and share the role
+  assert.throws(() => RoomSchema.parse(roomV2({ seats: [seatV2({ replaces_seat: PID_2 })] })));
+  assert.throws(() => RoomSchema.parse(roomV2({
+    membership_epoch: 1,
+    seats: [
+      seatV2({ state: 'removed', removed_at: AT, removed_epoch: 1 }),
+      seatV2({ identity: 'cid-bob', display_name: 'Bob', participant_id: PID_2, role: 'writer', replaces_seat: PID_1 }),
+    ],
+  })));
+  // OC-6 (owner override): anonymous replacement inherits the predecessor alias
+  assert.throws(() => RoomSchema.parse(roomV2({
+    anonymous: true,
+    membership_epoch: 2,
+    seats: [
+      seatV2({ alias: 'reviewer #1', state: 'removed', removed_at: AT, removed_epoch: 1 }),
+      seatV2({ identity: 'cid-bob', display_name: 'Bob', participant_id: PID_2, alias: 'reviewer #2', replaces_seat: PID_1 }),
+    ],
+  })));
+  // role briefing keys obey role bounds
+  assert.throws(() => RoomSchema.parse(roomV2({
+    role_briefings: { ['x'.repeat(257)]: { text: 't', version: 1, updated_at: AT } },
+  })));
+});
+
+test('room invites may stamp a replacement seat lineage', () => {
+  const invite = {
+    invite_id: 'invite-1', mode: 'one_time', role: 'reviewer', min_accepts: 1,
+    accepted_cids: [], state: 'live', created_at: AT, replaces_seat: PID_1,
+  };
+  assert.equal(RoomInviteSchema.parse(invite).replaces_seat, PID_1);
+  assert.throws(() => RoomInviteSchema.parse({ ...invite, replaces_seat: '' }));
+});
+
+test('create input accepts per-room anonymity and quiet membership configuration', () => {
+  assert.deepEqual(
+    CreateRoomInputSchema.parse({ goal: 'g', briefing: 'b' }),
+    { goal: 'g', briefing: 'b' },
+  );
+  const value = CreateRoomInputSchema.parse({ goal: 'g', briefing: 'b', anonymous: true, quiet_membership: true });
+  assert.equal(value.anonymous, true);
+  assert.equal(value.quiet_membership, true);
+  assert.throws(() => CreateRoomInputSchema.parse({ goal: 'g', briefing: 'b', anonymous: 'yes' }));
+});
+
+test('migrateRoomV1 maps v1 rooms onto additive v2 defaults', () => {
+  const seated = roomAsV1({
+    state: 'active',
+    activated_at: AT,
+    invites: [{
+      invite_id: 'invite-1', mode: 'public', role: 'reviewer', min_accepts: 1,
+      accepted_cids: ['cid-alice'], state: 'live', created_at: AT,
+    }],
+    seats: [{
+      identity: 'cid-alice', display_name: 'Alice', role: 'reviewer',
+      invite_id: 'invite-1', accepted_at: AT,
+    }],
+  });
+  const ulids = [PID_1, PID_2];
+  const migrated = migrateRoomV1(RoomV1Schema.parse(seated), () => ulids.shift());
+  assert.equal(migrated.version, 2);
+  assert.equal(migrated.anonymous, false);
+  assert.equal(migrated.quiet_membership, false);
+  assert.equal(migrated.membership_epoch, 0);
+  assert.deepEqual(migrated.role_briefings, {});
+  assert.equal(migrated.mission.briefing_version, 1);
+  assert.equal(migrated.mission.goal, 'Ship it');
+  assert.equal(migrated.seats[0].participant_id, PID_1);
+  assert.equal(migrated.seats[0].state, 'active');
+  assert.equal(migrated.seats[0].alias, undefined);
+  assert.deepEqual(RoomSchema.parse(migrated), migrated);
+});
+
+test('message records gain role_briefing and membership categories with pinned payloads', () => {
+  const common = {
+    version: 1, room_id: ROOM_ID, seq: 1, record_id: `${ROOM_ID}:1`, at: AT,
+    kind: 'message', message_id: MESSAGE_ID,
+    author: { identity: 'cid-room', display_name: 'room-name', role: 'room' },
+    recipient_identities: ['cid-alice'],
+  };
+  // pre-evolution records parse unchanged
+  assert.equal(CommunicationRecordSchema.parse({ ...common, category: 'briefing', text: 'b' }).category, 'briefing');
+  assert.equal(CommunicationRecordSchema.parse({ ...common, category: 'chat', text: 'c' }).category, 'chat');
+  // versioned common briefing
+  const versionedBriefing = { ...common, category: 'briefing', text: 'b', briefing_version: 2 };
+  assert.equal(CommunicationRecordSchema.parse(versionedBriefing).briefing_version, 2);
+  // per-role briefing requires role + version
+  const roleBriefing = { ...common, category: 'role_briefing', text: 'r', briefing_role: 'reviewer', briefing_version: 3 };
+  assert.deepEqual(CommunicationRecordSchema.parse(roleBriefing), roleBriefing);
+  assert.throws(() => CommunicationRecordSchema.parse({ ...common, category: 'role_briefing', text: 'r' }));
+  assert.throws(() => CommunicationRecordSchema.parse({ ...common, category: 'role_briefing', text: 'r', briefing_role: 'reviewer' }));
+  // membership notices carry action/alias/epoch, never identities
+  const membership = {
+    ...common, category: 'membership', text: 'reviewer #2 left the room',
+    membership: { action: 'remove', alias: 'reviewer #2', role: 'reviewer', epoch: 3 },
+  };
+  assert.deepEqual(CommunicationRecordSchema.parse(membership), membership);
+  assert.throws(() => CommunicationRecordSchema.parse({ ...common, category: 'membership', text: 'x' }));
+  // chat records must not carry briefing or membership payloads
+  assert.throws(() => CommunicationRecordSchema.parse({ ...common, category: 'chat', text: 'c', briefing_version: 1 }));
+  assert.throws(() => CommunicationRecordSchema.parse({ ...common, category: 'chat', text: 'c', briefing_role: 'reviewer' }));
+  assert.throws(() => CommunicationRecordSchema.parse({
+    ...common, category: 'chat', text: 'c',
+    membership: { action: 'remove', alias: 'a', role: 'r', epoch: 1 },
+  }));
+});
+
+test('membership intent and result records ride the archive pump contracts', () => {
+  const intent = {
+    version: 1, room_id: ROOM_ID, seq: 5, record_id: `${ROOM_ID}:5`, at: AT,
+    kind: 'membership_intent', action: 'remove', participant_id: PID_1,
+    recipient_identity: 'cid-alice', role: 'reviewer', epoch: 1, notify: true,
+    alias: 'reviewer #1',
+  };
+  assert.deepEqual(CommunicationRecordSchema.parse(intent).participant_id, PID_1);
+  const result = {
+    version: 1, room_id: ROOM_ID, seq: 6, record_id: `${ROOM_ID}:6`, at: AT,
+    kind: 'membership_result', intent_record_id: `${ROOM_ID}:5`, participant_id: PID_1,
+    status: 'queued', notified: true, key_material_retained: true,
+  };
+  assert.deepEqual(CommunicationRecordSchema.parse(result).status, 'queued');
+  assert.throws(() => CommunicationRecordSchema.parse({ ...result, key_material_retained: false }));
+  assert.throws(() => CommunicationRecordSchema.parse({ ...intent, action: 'promote' }));
+  const { seq: _s, record_id: _r, ...appendIntent } = intent;
+  assert.equal(AppendRecordSchema.parse(appendIntent).kind, 'membership_intent');
 });

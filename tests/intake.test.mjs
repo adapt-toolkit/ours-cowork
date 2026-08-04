@@ -116,17 +116,21 @@ class Registry {
 
 function room(overrides = {}) {
   return {
-    version: 1,
+    version: 2,
     room_id: ROOM_ID,
     identity_name: `cowork-room-${ROOM_ID}`,
     identity_cid: 'cid-room',
-    mission: { goal: 'Ship', briefing: 'Read the mission.' },
+    mission: { goal: 'Ship', briefing: 'Read the mission.', briefing_version: 1 },
+    role_briefings: {},
+    anonymous: false,
+    quiet_membership: false,
+    membership_epoch: 3,
     state: 'active',
     invites: [],
     seats: [
-      { identity: 'cid-alice', display_name: 'Alice', role: 'builder', invite_id: 'invite-a', accepted_at: AT },
-      { identity: 'cid-bob', display_name: 'Bob', role: 'reviewer', invite_id: 'invite-b', accepted_at: AT },
-      { identity: 'cid-cara', display_name: 'Cara', role: 'observer', invite_id: 'invite-c', accepted_at: AT },
+      { identity: 'cid-alice', display_name: 'Alice', role: 'builder', invite_id: 'invite-a', accepted_at: AT, participant_id: '01jz6y7n8p9q0r1s2t3v4w5xa1', state: 'active' },
+      { identity: 'cid-bob', display_name: 'Bob', role: 'reviewer', invite_id: 'invite-b', accepted_at: AT, participant_id: '01jz6y7n8p9q0r1s2t3v4w5xa2', state: 'active' },
+      { identity: 'cid-cara', display_name: 'Cara', role: 'observer', invite_id: 'invite-c', accepted_at: AT, participant_id: '01jz6y7n8p9q0r1s2t3v4w5xa3', state: 'active' },
     ],
     created_at: AT,
     activated_at: AT,

@@ -8,10 +8,13 @@ import {
   CommunicationRecordSchema,
   LowerCrockfordUlidSchema,
   RoomSchema,
+  RoomV1Schema,
+  migrateRoomV1,
   type AppendRecord,
   type CommunicationRecord,
   type Room,
 } from './contracts.ts';
+import { generateUlid } from './ulid.ts';
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -304,10 +307,16 @@ export class CoworkStore {
           `room "${validRoomId}" has archive residue without deletion metadata`,
         );
       }
-      const expected = new Set(['archive.jsonl', 'room.json']);
+      const expected = new Set(['archive.jsonl', 'room.json', 'room.json.v1.bak']);
       const unexpected = this.fs.readdirSync(roomDir).filter((name) => !expected.has(name));
       if (unexpected.length > 0) {
         throw new CoworkStorageError(`room "${validRoomId}" contains live or unexpected residue: ${unexpected.join(', ')}`);
+      }
+      const backupPath = `${metadataPath}.v1.bak`;
+      if (this.lstatIfPresent(backupPath)) {
+        this.assertRegularFile(backupPath, 'room metadata v1 backup');
+        this.fs.unlinkSync(backupPath);
+        this.fsyncDirectory(roomDir);
       }
       if (archivePresent) {
         this.assertRegularFile(archivePath, 'room archive');
@@ -365,9 +374,52 @@ export class CoworkStore {
     } catch (error) {
       throw this.wrap(`malformed metadata for room "${roomId}"`, error);
     }
-    const room = RoomSchema.parse(decoded);
+    const room = this.isVersion1(decoded)
+      ? this.migrateUnlocked(roomId, decoded, bytes)
+      : RoomSchema.parse(decoded);
     if (room.room_id !== roomId) throw new CoworkStorageError(`metadata room_id does not match room "${roomId}"`);
     return room;
+  }
+
+  private isVersion1(decoded: unknown): boolean {
+    return typeof decoded === 'object' && decoded !== null
+      && (decoded as { version?: unknown }).version === 1;
+  }
+
+  /**
+   * Lazy additive v1 → v2 migration (spec §7): preserve the exact pre-migration
+   * bytes once as room.json.v1.bak, then atomically persist the v2 metadata.
+   * The backup write is durable before the metadata rename, so a crash between
+   * the two re-runs migration against unchanged v1 bytes.
+   */
+  private migrateUnlocked(roomId: string, decoded: unknown, originalBytes: Buffer): Room {
+    const v1 = RoomV1Schema.parse(decoded);
+    if (v1.room_id !== roomId) throw new CoworkStorageError(`metadata room_id does not match room "${roomId}"`);
+    const migrated = migrateRoomV1(v1, generateUlid);
+    const backupPath = `${this.metadataPath(roomId)}.v1.bak`;
+    if (!this.lstatIfPresent(backupPath)) {
+      let fd: number | undefined;
+      try {
+        fd = this.fs.openSync(
+          backupPath,
+          nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL | nodeFs.constants.O_WRONLY | NO_FOLLOW,
+          FILE_MODE,
+        );
+        this.validateOpenPath(fd, backupPath, 'room metadata v1 backup', 'file', true);
+        this.fs.fchmodSync(fd, FILE_MODE);
+        this.writeAll(fd, originalBytes);
+        this.fs.fsyncSync(fd);
+      } catch (error) {
+        throw this.wrap(`failed to back up room "${roomId}" v1 metadata`, error);
+      } finally {
+        if (fd !== undefined) {
+          try { this.fs.closeSync(fd); } catch { /* the preceding result is authoritative */ }
+        }
+      }
+      this.fsyncDirectory(dirname(backupPath));
+    }
+    this.atomicMetadataWrite(this.metadataPath(roomId), migrated);
+    return migrated;
   }
 
   private scanArchive(roomId: string): ScanResult {

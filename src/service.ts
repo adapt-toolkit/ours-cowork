@@ -6,6 +6,8 @@ import {
   InviteModeSchema,
   LowerCrockfordUlidSchema,
   PostMessageInputSchema,
+  RoleBriefingDeleteInputSchema,
+  RoleBriefingSetInputSchema,
   RoleSchema,
   RoomInviteSchema,
   RoomSchema,
@@ -221,7 +223,7 @@ export class RoomService {
   async updateRoom(roomId: string, input: unknown): Promise<Room> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const settings = UpdateRoomInputSchema.parse(input);
-    return this.lock(id, async () => {
+    const { room: updated, redelivered } = await this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'update');
       const briefingChanged = settings.briefing !== undefined && settings.briefing !== room.mission.briefing;
@@ -238,8 +240,58 @@ export class RoomService {
       }));
       if (briefingChanged && next.state === 'active') {
         await this.redeliverCommonBriefing(next);
+        return { room: next, redelivered: true };
       }
-      return next;
+      return { room: next, redelivered: false };
+    });
+    if (redelivered) await this.intake.resumePending(id);
+    return updated;
+  }
+
+  /** Author or edit one role's briefing; an edit bumps its version and re-delivers to seats of that role only (spec §3.3). */
+  async setRoleBriefing(roomId: string, input: unknown): Promise<Room> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = RoleBriefingSetInputSchema.parse(input);
+    const { room: updated, redelivered } = await this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'set a role briefing for');
+      const existing = room.role_briefings[request.role];
+      if (existing && existing.text === request.text) return { room, redelivered: false };
+      const briefing = {
+        text: request.text,
+        version: existing === undefined ? 1 : existing.version + 1,
+        updated_at: this.now(),
+      };
+      const next = await this.store.save(RoomSchema.parse({
+        ...room,
+        role_briefings: { ...room.role_briefings, [request.role]: briefing },
+      }));
+      if (next.state !== 'active') return { room: next, redelivered: false };
+      const holders = activeSeats(next).filter((seat) => seat.role === request.role);
+      if (holders.length === 0) return { room: next, redelivered: false };
+      await this.ensureBriefingKind(next, holders, {
+        category: 'role_briefing',
+        briefing_role: request.role,
+        text: briefing.text,
+        briefing_version: briefing.version,
+      });
+      return { room: next, redelivered: true };
+    });
+    if (redelivered) await this.intake.resumePending(id);
+    return updated;
+  }
+
+  async deleteRoleBriefing(roomId: string, input: unknown): Promise<Room> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = RoleBriefingDeleteInputSchema.parse(input);
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'delete a role briefing for');
+      if (room.role_briefings[request.role] === undefined) {
+        throw new RoomServiceError(`no role briefing exists for "${request.role}" in room "${id}"`);
+      }
+      const { [request.role]: _removed, ...rest } = room.role_briefings;
+      return this.store.save(RoomSchema.parse({ ...room, role_briefings: rest }));
     });
   }
 

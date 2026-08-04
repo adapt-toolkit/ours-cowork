@@ -261,6 +261,17 @@ test('room commands send exactly one JSONL request over management.sock', async 
     { args: ['room', 'delete', 'room1', '--yes'], method: 'room.delete', params: { room_id: 'room1', confirm: true } },
     { args: ['room', 'recover', 'room1'], method: 'room.recover', params: { room_id: 'room1' } },
     { args: ['room', 'recover', 'room1', '--confirm', 'old1', 'new1'], method: 'room.recover.confirm', params: { room_id: 'room1', recovery_of: 'old1', invite_id: 'new1' } },
+    // Rooms evolution Phase A5 verbs
+    { args: ['room', 'create', '--goal', 'Ship', '--briefing', 'B', '--anonymous', '--quiet-membership'], method: 'room.create', params: { goal: 'Ship', briefing: 'B', anonymous: true, quiet_membership: true } },
+    { args: ['room', 'settings', 'room1', '--quiet-membership', 'false'], method: 'room.settings', params: { room_id: 'room1', quiet_membership: false } },
+    { args: ['room', 'invite', 'room1'], method: 'room.invite', params: { room_id: 'room1', mode: 'one_time', min_accepts: 1 } },
+    { args: ['room', 'role-briefing', 'room1', '--role', 'reviewer', '--text', 'Review the diffs'], method: 'room.briefing.role.set', params: { room_id: 'room1', role: 'reviewer', text: 'Review the diffs' } },
+    { args: ['room', 'role-briefing', 'room1', '--role', 'reviewer', '--delete'], method: 'room.briefing.role.delete', params: { room_id: 'room1', role: 'reviewer' } },
+    { args: ['room', 'remove', 'room1', 'cid-participant'], method: 'room.participant.remove', params: { room_id: 'room1', participant: 'cid-participant' } },
+    { args: ['room', 'remove', 'room1', 'cid-participant', '--silent'], method: 'room.participant.remove', params: { room_id: 'room1', participant: 'cid-participant', notify: false } },
+    { args: ['room', 'replace', 'room1', 'cid-participant'], method: 'room.participant.replace', params: { room_id: 'room1', participant: 'cid-participant' } },
+    { args: ['room', 'replace', 'room1', 'cid-participant', '--mode', 'public', '--min-accepts', '2'], method: 'room.participant.replace', params: { room_id: 'room1', participant: 'cid-participant', mode: 'public', min_accepts: 2 } },
+    { args: ['room', 'history', 'room1', '--view', 'participant'], method: 'room.history', params: { room_id: 'room1', view: 'participant' } },
   ];
   for (const expected of cases) {
     await withRpc({ result: { ok: true } }, async (rpc) => {

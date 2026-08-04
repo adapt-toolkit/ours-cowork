@@ -99,10 +99,14 @@ export class RpcDispatcher {
 export interface RoomServiceApi {
   createRoom(input: unknown): Promise<unknown>;
   updateRoom(roomId: string, input: unknown): Promise<unknown>;
+  setRoleBriefing(roomId: string, input: unknown): Promise<unknown>;
+  deleteRoleBriefing(roomId: string, input: unknown): Promise<unknown>;
   createInvite(roomId: string, input: unknown): Promise<unknown>;
   revokeInvite(roomId: string, inviteId: string): Promise<unknown>;
   recoverInvites(roomId: string): Promise<unknown>;
   confirmRecoveredInvite(roomId: string, recoveryOf: string, inviteId: string): Promise<unknown>;
+  removeParticipant(roomId: string, input: unknown): Promise<unknown>;
+  replaceParticipant(roomId: string, input: unknown): Promise<unknown>;
   listRooms(): Promise<unknown>;
   showRoom(roomId: string): Promise<unknown>;
   participants(roomId: string): Promise<unknown>;
@@ -118,7 +122,26 @@ const RecoverConfirmParams = z.object({
   room_id: z.string(), recovery_of: z.string(), invite_id: z.string(),
 }).strict();
 const HistoryParams = z.object({
-  room_id: z.string(), after: z.number().optional(), limit: z.number().optional(),
+  room_id: z.string(),
+  after: z.number().optional(),
+  limit: z.number().optional(),
+  view: z.enum(['operator', 'participant']).optional(),
+}).strict();
+const RoleBriefingSetParams = z.object({
+  room_id: z.string(), role: z.string(), text: z.string(),
+}).strict();
+const RoleBriefingDeleteParams = z.object({
+  room_id: z.string(), role: z.string(),
+}).strict();
+const ParticipantRemoveParams = z.object({
+  room_id: z.string(), participant: z.string(), notify: z.boolean().optional(),
+}).strict();
+const ParticipantReplaceParams = z.object({
+  room_id: z.string(),
+  participant: z.string(),
+  notify: z.boolean().optional(),
+  mode: z.enum(['one_time', 'public']).optional(),
+  min_accepts: z.number().optional(),
 }).strict();
 
 export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRouteTable {
@@ -126,15 +149,35 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
     'room.create': { auth: true, run: (params) => service.createRoom(params) },
     'room.settings': { auth: true, run: (params) => {
       const { room_id, ...input } = z.object({
-        room_id: z.string(), goal: z.unknown().optional(), briefing: z.unknown().optional(), status: z.unknown().optional(),
+        room_id: z.string(),
+        goal: z.unknown().optional(),
+        briefing: z.unknown().optional(),
+        status: z.unknown().optional(),
+        quiet_membership: z.unknown().optional(),
       }).strict().parse(params);
       return service.updateRoom(room_id, input);
     } },
+    'room.briefing.role.set': { auth: true, run: (params) => {
+      const { room_id, ...input } = RoleBriefingSetParams.parse(params);
+      return service.setRoleBriefing(room_id, input);
+    } },
+    'room.briefing.role.delete': { auth: true, run: (params) => {
+      const { room_id, ...input } = RoleBriefingDeleteParams.parse(params);
+      return service.deleteRoleBriefing(room_id, input);
+    } },
     'room.invite': { auth: true, run: (params) => {
       const { room_id, ...input } = z.object({
-        room_id: z.string(), mode: z.unknown(), role: z.unknown(), min_accepts: z.unknown(),
+        room_id: z.string(), mode: z.unknown(), role: z.unknown().optional(), min_accepts: z.unknown(),
       }).strict().parse(params);
       return service.createInvite(room_id, input);
+    } },
+    'room.participant.remove': { auth: true, run: (params) => {
+      const { room_id, ...input } = ParticipantRemoveParams.parse(params);
+      return service.removeParticipant(room_id, input);
+    } },
+    'room.participant.replace': { auth: true, run: (params) => {
+      const { room_id, ...input } = ParticipantReplaceParams.parse(params);
+      return service.replaceParticipant(room_id, input);
     } },
     'room.revoke': { auth: true, run: (params) => {
       const value = InviteRevokeParams.parse(params);

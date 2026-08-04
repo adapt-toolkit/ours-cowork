@@ -79,6 +79,8 @@ const NATIVE_MUTATION_METHODS = new Set([
   'room.close',
   'room.recover',
   'room.recover.confirm',
+  'room.participant.remove',
+  'room.participant.replace',
 ]);
 
 export function rpcTimeoutForMethod(method: string): number {
@@ -116,14 +118,17 @@ Usage:
   ours-cowork [--json] docs [topic]
 
 Room commands:
-  create --goal <text> --briefing <text>
-  settings <room-id> [--goal <text>] [--briefing <text>] [--status <text>]
-  invite <room-id> --role <label> [--mode one_time|public] [--min-accepts <n>]
+  create --goal <text> --briefing <text> [--anonymous] [--quiet-membership]
+  settings <room-id> [--goal <text>] [--briefing <text>] [--status <text>] [--quiet-membership true|false]
+  role-briefing <room-id> --role <label> (--text <text> | --delete)
+  invite <room-id> [--role <label>] [--mode one_time|public] [--min-accepts <n>]
   revoke <room-id> <invite-id>
+  remove <room-id> <participant> [--silent]
+  replace <room-id> <participant> [--mode one_time|public] [--min-accepts <n>] [--silent]
   list
   show <room-id>
   participants <room-id>
-  history <room-id> [--after <seq>] [--limit <n>]
+  history <room-id> [--after <seq>] [--limit <n>] [--view operator|participant]
   message <room-id> --text <text>
   close <room-id>
   delete <room-id> --yes
@@ -218,22 +223,43 @@ function roomRequest(command: string | undefined, args: string[]): { method: str
   if (!command) usageError('room requires a command');
   switch (command) {
     case 'create': {
-      const parsed = parseOptions(args, ['--goal', '--briefing']);
+      const parsed = parseOptions(args, ['--goal', '--briefing'], ['--anonymous', '--quiet-membership']);
       exactPositionals(parsed, 0, 'room create');
       return { method: 'room.create', params: {
         goal: requiredFlag(parsed, '--goal', 'room create'),
         briefing: requiredFlag(parsed, '--briefing', 'room create'),
+        ...(parsed.booleans.has('--anonymous') ? { anonymous: true } : {}),
+        ...(parsed.booleans.has('--quiet-membership') ? { quiet_membership: true } : {}),
       } };
     }
     case 'settings': {
-      const parsed = parseOptions(args, ['--goal', '--briefing', '--status']);
+      const parsed = parseOptions(args, ['--goal', '--briefing', '--status', '--quiet-membership']);
       const [roomId] = exactPositionals(parsed, 1, 'room settings');
       const params: Record<string, unknown> = { room_id: roomId };
       for (const [flag, key] of [['--goal', 'goal'], ['--briefing', 'briefing'], ['--status', 'status']] as const) {
         if (parsed.values[flag] !== undefined) params[key] = parsed.values[flag];
       }
+      const quiet = parsed.values['--quiet-membership'];
+      if (quiet !== undefined) {
+        if (quiet !== 'true' && quiet !== 'false') usageError('--quiet-membership must be true or false');
+        params.quiet_membership = quiet === 'true';
+      }
       if (Object.keys(params).length === 1) usageError('room settings requires at least one setting option');
       return { method: 'room.settings', params };
+    }
+    case 'role-briefing': {
+      const parsed = parseOptions(args, ['--role', '--text'], ['--delete']);
+      const [roomId] = exactPositionals(parsed, 1, 'room role-briefing');
+      const role = requiredFlag(parsed, '--role', 'room role-briefing');
+      if (parsed.booleans.has('--delete')) {
+        if (parsed.values['--text'] !== undefined) usageError('room role-briefing takes either --text or --delete');
+        return { method: 'room.briefing.role.delete', params: { room_id: roomId, role } };
+      }
+      return { method: 'room.briefing.role.set', params: {
+        room_id: roomId,
+        role,
+        text: requiredFlag(parsed, '--text', 'room role-briefing'),
+      } };
     }
     case 'invite': {
       const parsed = parseOptions(args, ['--mode', '--role', '--min-accepts']);
@@ -247,8 +273,33 @@ function roomRequest(command: string | undefined, args: string[]): { method: str
       return { method: 'room.invite', params: {
         room_id: roomId,
         mode,
-        role: requiredFlag(parsed, '--role', 'room invite'),
+        // Omitted role = the built-in "Participant" role (daemon-side default).
+        ...(parsed.values['--role'] === undefined ? {} : { role: parsed.values['--role'] }),
         min_accepts: minimum,
+      } };
+    }
+    case 'remove': {
+      const parsed = parseOptions(args, [], ['--silent']);
+      const [roomId, participant] = exactPositionals(parsed, 2, 'room remove');
+      return { method: 'room.participant.remove', params: {
+        room_id: roomId,
+        participant,
+        ...(parsed.booleans.has('--silent') ? { notify: false } : {}),
+      } };
+    }
+    case 'replace': {
+      const parsed = parseOptions(args, ['--mode', '--min-accepts'], ['--silent']);
+      const [roomId, participant] = exactPositionals(parsed, 2, 'room replace');
+      const mode = parsed.values['--mode'];
+      if (mode !== undefined && mode !== 'one_time' && mode !== 'public') usageError('--mode must be one_time or public');
+      return { method: 'room.participant.replace', params: {
+        room_id: roomId,
+        participant,
+        ...(mode === undefined ? {} : { mode }),
+        ...(parsed.values['--min-accepts'] === undefined
+          ? {}
+          : { min_accepts: parseInteger(parsed.values['--min-accepts'], '--min-accepts', 1) }),
+        ...(parsed.booleans.has('--silent') ? { notify: false } : {}),
       } };
     }
     case 'revoke': {
@@ -267,11 +318,16 @@ function roomRequest(command: string | undefined, args: string[]): { method: str
       return { method: `room.${command}`, params: { room_id: roomId } };
     }
     case 'history': {
-      const parsed = parseOptions(args, ['--after', '--limit']);
+      const parsed = parseOptions(args, ['--after', '--limit', '--view']);
       const [roomId] = exactPositionals(parsed, 1, 'room history');
       const params: Record<string, unknown> = { room_id: roomId };
       if (parsed.values['--after'] !== undefined) params.after = parseInteger(parsed.values['--after'], '--after', 0);
       if (parsed.values['--limit'] !== undefined) params.limit = parseInteger(parsed.values['--limit'], '--limit', 1);
+      const view = parsed.values['--view'];
+      if (view !== undefined) {
+        if (view !== 'operator' && view !== 'participant') usageError('--view must be operator or participant');
+        params.view = view;
+      }
       return { method: 'room.history', params };
     }
     case 'message': {

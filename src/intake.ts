@@ -171,6 +171,11 @@ export class IntakePump {
           display_name: seat.display_name,
           role: seat.role,
         },
+        // In an anonymous room the archive keeps both identities (INV-R4);
+        // the relay pump substitutes the alias into every outbound body.
+        ...(room.anonymous && seat.alias !== undefined
+          ? { author_alias: { participant_id: seat.participant_id, alias: seat.alias } }
+          : {}),
         category: 'chat',
         text: item.text,
         recipient_identities: recipientIdentities,
@@ -241,7 +246,12 @@ export class IntakePump {
         kind: wireKind(message.category),
         room_id: roomId,
         message_id: message.message_id,
-        author: message.author,
+        // INV-R3: an anonymous author leaves the archive only in alias form.
+        author: message.author_alias === undefined ? message.author : {
+          identity: message.author_alias.participant_id,
+          display_name: message.author_alias.alias,
+          role: message.author.role,
+        },
         text: message.text,
         at: message.at,
         ...(message.briefing_role === undefined ? {} : { briefing_role: message.briefing_role }),

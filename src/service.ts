@@ -41,7 +41,30 @@ const CreateInviteInputSchema = z.object({
 const HistoryOptionsSchema = z.object({
   after: z.number().int().nonnegative().safe().optional(),
   limit: z.number().int().positive().safe().optional(),
+  view: z.enum(['operator', 'participant']).optional(),
 }).strict();
+
+/**
+ * The participant-facing history projection (§4.4 item 7): message records
+ * only, authors redacted to alias form in anonymous rooms, and no routing
+ * identities, so no other participant's cid or contact name ever leaves the
+ * operator boundary through this view.
+ */
+export interface ParticipantHistoryRecord {
+  version: 1;
+  room_id: string;
+  seq: number;
+  record_id: string;
+  at: string;
+  kind: 'message';
+  message_id: string;
+  author: { identity: string; display_name: string; role: string };
+  category: 'briefing' | 'role_briefing' | 'chat' | 'membership';
+  briefing_role?: string;
+  briefing_version?: number;
+  membership?: unknown;
+  text: string;
+}
 
 const DeleteRoomInputSchema = z.object({
   confirm: z.literal(true),
@@ -534,10 +557,33 @@ export class RoomService {
     return (await this.showRoom(roomId)).seats;
   }
 
-  async history(roomId: string, options: unknown = {}): Promise<CommunicationRecord[]> {
+  async history(
+    roomId: string,
+    options: unknown = {},
+  ): Promise<CommunicationRecord[] | ParticipantHistoryRecord[]> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
-    const page = HistoryOptionsSchema.parse(options) as ArchiveReadOptions;
-    return this.store.read(id, page);
+    const { view, ...page } = HistoryOptionsSchema.parse(options);
+    const records = await this.store.read(id, page as ArchiveReadOptions);
+    if (view !== 'participant') return records;
+    return records
+      .filter((record): record is MessageRecord => record.kind === 'message')
+      .map((record): ParticipantHistoryRecord => {
+        const {
+          author_alias,
+          recipient_identities: _recipients,
+          source_msg_id: _sourceMsg,
+          source_wire_id: _sourceWire,
+          ...rest
+        } = record;
+        return {
+          ...rest,
+          author: author_alias === undefined ? record.author : {
+            identity: author_alias.participant_id,
+            display_name: author_alias.alias,
+            role: record.author.role,
+          },
+        };
+      });
   }
 
   /**

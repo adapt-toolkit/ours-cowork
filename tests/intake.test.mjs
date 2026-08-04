@@ -583,3 +583,126 @@ test('notify chains a dirty replacement after a failed worker and still reports 
   await replacement.catch(() => {});
   assert.equal(calls, 2, 'dirty shutdown work must be handed to a replacement worker');
 });
+
+// ---- Rooms evolution Phase A3 (spec §4.2, §4.4, §8.3) — anonymity ----
+
+function anonymousRoom(overrides = {}) {
+  const base = room();
+  return {
+    ...base,
+    anonymous: true,
+    seats: [
+      { ...base.seats[0], alias: 'builder #1' },
+      { ...base.seats[1], alias: 'reviewer #1' },
+      { ...base.seats[2], alias: 'observer #1' },
+    ],
+    ...overrides,
+  };
+}
+
+test('anonymous rooms relay alias authors with zero real identity bytes in signed bodies (release-blocking pin)', async () => {
+  const f = fixture({ room: anonymousRoom() });
+  f.packet.inbox.push(incoming());
+
+  const consoleLines = [];
+  const original = { log: console.log, error: console.error, warn: console.warn, info: console.info };
+  for (const level of Object.keys(original)) {
+    console[level] = (...parts) => { consoleLines.push(parts.map(String).join(' ')); };
+  }
+  try {
+    await f.pump.pump(ROOM_ID);
+  } finally {
+    for (const level of Object.keys(original)) console[level] = original[level];
+  }
+
+  const records = await f.store.read(ROOM_ID);
+  const [message] = byKind(records, 'message');
+  // the archive keeps BOTH the real seat identity and the alias (INV-R4)
+  assert.deepEqual(message.author, { identity: 'cid-alice', display_name: 'Alice', role: 'builder' });
+  assert.deepEqual(message.author_alias, {
+    participant_id: '01jz6y7n8p9q0r1s2t3v4w5xa1',
+    alias: 'builder #1',
+  });
+
+  // the relayed signed body carries only the room-scoped pseudonym
+  assert.equal(f.packet.sendCalls.length, 2);
+  for (const call of [...f.packet.sendCalls.map((send) => send.body), ...f.packet.signCalls]) {
+    const bytes = Buffer.from(call, 'utf8');
+    assert.equal(bytes.includes('cid-alice'), false, 'no author cid bytes in a relayed body');
+    assert.equal(bytes.includes('Alice'), false, 'no author display-name bytes in a relayed body');
+    assert.equal(bytes.includes('cid-bob'), false, 'no recipient cid bytes in a relayed body');
+    assert.equal(bytes.includes('Untrusted current name'), false, 'no sender-claimed name bytes');
+  }
+  const body = JSON.parse(f.packet.sendCalls[0].body);
+  assert.deepEqual(body.author, {
+    identity: '01jz6y7n8p9q0r1s2t3v4w5xa1',
+    display_name: 'builder #1',
+    role: 'builder',
+  });
+
+  // default-level logs never pair an alias with a cid (§4.4 item 6)
+  for (const line of consoleLines) {
+    assert.equal(line.includes('cid-alice') && line.includes('builder #1'), false, line);
+  }
+});
+
+test('non-anonymous rooms keep the real author snapshot on the wire (regression)', async () => {
+  const f = fixture();
+  f.packet.inbox.push(incoming());
+  await f.pump.pump(ROOM_ID);
+  const body = JSON.parse(f.packet.sendCalls[0].body);
+  assert.deepEqual(body.author, { identity: 'cid-alice', display_name: 'Alice', role: 'builder' });
+  const records = await f.store.read(ROOM_ID);
+  assert.equal(byKind(records, 'message')[0].author_alias, undefined);
+});
+
+test('room-voice messages in anonymous rooms carry the room author and no seat identity bytes', async () => {
+  const f = fixture({ room: anonymousRoom() });
+  await f.service.postMessage(ROOM_ID, { text: 'Operator update.' });
+  assert.equal(f.packet.sendCalls.length, 3);
+  for (const call of f.packet.sendCalls) {
+    const body = JSON.parse(call.body);
+    assert.deepEqual(body.author, { identity: 'cid-room', display_name: `cowork-room-${ROOM_ID}`, role: 'room' });
+    for (const leak of ['cid-alice', 'cid-bob', 'cid-cara', 'Alice', 'Bob', 'Cara']) {
+      assert.equal(Buffer.from(call.body, 'utf8').includes(leak), false, `${leak} leaked into a room-voice body`);
+    }
+  }
+});
+
+test('history views: participant redacts to alias form and drops identities; operator keeps both', async () => {
+  const f = fixture({ room: anonymousRoom() });
+  f.packet.inbox.push(incoming());
+  await f.pump.pump(ROOM_ID);
+
+  const operatorView = await f.service.history(ROOM_ID, {});
+  assert.equal(operatorView.some((record) => record.kind === 'relay_intent'), true);
+  const operatorMessage = operatorView.find((record) => record.kind === 'message');
+  assert.equal(operatorMessage.author.identity, 'cid-alice');
+  assert.equal(operatorMessage.author_alias.alias, 'builder #1');
+
+  const participantView = await f.service.history(ROOM_ID, { view: 'participant' });
+  assert.equal(participantView.length, 1);
+  const [redacted] = participantView;
+  assert.equal(redacted.kind, 'message');
+  assert.deepEqual(redacted.author, {
+    identity: '01jz6y7n8p9q0r1s2t3v4w5xa1',
+    display_name: 'builder #1',
+    role: 'builder',
+  });
+  assert.equal('author_alias' in redacted, false);
+  assert.equal('recipient_identities' in redacted, false);
+  assert.equal('source_msg_id' in redacted, false);
+  assert.equal('source_wire_id' in redacted, false);
+  const rendered = Buffer.from(JSON.stringify(participantView), 'utf8');
+  for (const leak of ['cid-alice', 'cid-bob', 'cid-cara', 'Alice', 'Untrusted current name']) {
+    assert.equal(rendered.includes(leak), false, `${leak} leaked into the participant history view`);
+  }
+
+  // non-anonymous participant view keeps real authors but still drops routing identities
+  const plain = fixture();
+  plain.packet.inbox.push(incoming());
+  await plain.pump.pump(ROOM_ID);
+  const plainView = await plain.service.history(ROOM_ID, { view: 'participant' });
+  assert.equal(plainView[0].author.identity, 'cid-alice');
+  assert.equal('recipient_identities' in plainView[0], false);
+});

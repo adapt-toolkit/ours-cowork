@@ -449,10 +449,20 @@ export const MembershipNoticeSchema = z.object({
   epoch: z.number().int().nonnegative().safe(),
 }).strict();
 
+/**
+ * Archived alongside the real author snapshot in anonymous rooms (INV-R4):
+ * the operator keeps both, the relay uses only this room-scoped pseudonym.
+ */
+export const AuthorAliasSchema = z.object({
+  participant_id: LowerCrockfordUlidSchema,
+  alias: NonEmptyStringSchema,
+}).strict();
+
 const MessageShape = {
   kind: z.literal('message'),
   message_id: LowerCrockfordUlidSchema,
   author: AuthorSnapshotSchema,
+  author_alias: AuthorAliasSchema.optional(),
   category: z.enum(['briefing', 'role_briefing', 'chat', 'membership']),
   briefing_role: RoleSchema.optional(),
   briefing_version: PositiveSafeIntegerSchema.optional(),

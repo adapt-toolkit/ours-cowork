@@ -40,6 +40,39 @@ export function canonicalJson(value: unknown): string {
   return encoded;
 }
 
+/**
+ * THE ONLY PLACE A SIGNED BODY CROSSES THE WIRE.
+ *
+ * Every outbound envelope is signed here, canonicalised here, and sent here.
+ * That is not tidiness — it is what makes the anonymity pins mean something.
+ *
+ * The byte-level privacy pins (§8.3) assert that no real cid, contact display
+ * name or sender-claimed name appears in any relayed body of an anonymous room.
+ * They read the bodies produced by the send sites that existed when they were
+ * written. There were two. NOTHING ASSERTED THAT THERE WERE ONLY TWO, so the
+ * moment someone added a third — a file relay, a receipt, a control notice —
+ * the pins would go on passing while covering strictly less of the code. A
+ * gate that silently stops covering new code is worse than no gate, because
+ * its green is read as though it still means what it did.
+ *
+ * So: one funnel, and `tests/intake.test.mjs` enumerates the `packet.send`
+ * call sites in `src/` and fails if there is more than this one. Adding an
+ * outbound path now forces you through the funnel the pins already read.
+ *
+ * It deliberately does NOT interpret the outcome or touch the ledger — callers
+ * differ on that (the bounce is best-effort, the relay journals a result), and
+ * folding either in here would make the funnel a policy decision instead of a
+ * choke point.
+ */
+export async function sendSignedBody(
+  packet: Pick<RoomPacket, 'sign' | 'send'>,
+  recipientIdentity: string,
+  unsigned: Record<string, unknown>,
+): Promise<Awaited<ReturnType<RoomPacket['send']>>> {
+  const signature = await packet.sign(canonicalJson(unsigned));
+  return packet.send(recipientIdentity, canonicalJson({ ...unsigned, signature }));
+}
+
 /** Archive, consume, and relay participant messages for hosted room packets. */
 export class IntakePump {
   private readonly store: IntakeStore;
@@ -223,8 +256,7 @@ export class IntakePump {
     await this.store.save(RoomSchema.parse({ ...room, seats }));
     try {
       const unsigned = { version: 1 as const, kind: 'room_not_member' as const, room_id: roomId };
-      const signature = await packet.sign(canonicalJson(unsigned));
-      await packet.send(item.sender_id, canonicalJson({ ...unsigned, signature }));
+      await sendSignedBody(packet, item.sender_id, unsigned);
     } catch { /* best effort — the channel is severed or severing */ }
   }
 
@@ -314,12 +346,10 @@ export class IntakePump {
         ...(message.briefing_version === undefined ? {} : { briefing_version: message.briefing_version }),
         ...(message.membership === undefined ? {} : { membership: message.membership }),
       };
-      const signature = await packet.sign(canonicalJson(unsigned));
-      const body = canonicalJson({ ...unsigned, signature });
       // RoomPacket.send returns only an observed queued/refused outcome. A
       // thrown call remains result-less because its acceptance is unknown and
       // will deliberately be retried on restart with the stable message ID.
-      const outcome = await packet.send(intent.recipient_identity, body);
+      const outcome = await sendSignedBody(packet, intent.recipient_identity, unsigned);
       const appended = await this.store.append(roomId, {
         version: 1,
         kind: 'relay_result',

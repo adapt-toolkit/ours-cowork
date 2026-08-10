@@ -785,3 +785,94 @@ test('relay intents addressed to a removed seat resolve as skipped_removed and a
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 2);
   assert.deepEqual(f.packet.sendCalls.map((call) => call.recipient), ['cid-bob']);
 });
+
+// ---- The outbound funnel (§8.3 pin coverage) --------------------------------
+
+test('there is exactly ONE packet.send call site in src/, and it is the signing funnel', async () => {
+  // WHAT THIS GUARDS, and why a count is the right shape for it.
+  //
+  // The byte-level privacy pins assert that no real cid, contact display name or
+  // sender-claimed name reaches a relayed body in an anonymous room. They read
+  // the bodies produced by the send sites that existed when they were written.
+  // There were two — the relay and the removed-member bounce — and both were
+  // pinned. NOTHING ASSERTED THAT THERE WERE ONLY TWO.
+  //
+  // So a third outbound path — a file relay, a receipt, a control notice — could
+  // be added and the pins would go on passing while covering strictly less of
+  // the code than the day they were written. Their green would be read as though
+  // it still meant what it did. That is worse than having no pin, because nobody
+  // re-reads a green.
+  //
+  // Counting the sites is the only assertion that fails when the code GROWS.
+  // Every other test here asserts about behaviour that exists; this one asserts
+  // about behaviour that does not exist yet.
+  //
+  // If you are here because you added an outbound path: route it through
+  // `sendSignedBody` rather than raising the number. That is the whole point —
+  // the funnel is what the pins already read, so going through it means your new
+  // path is covered on the day you write it.
+  const { readdirSync, readFileSync } = await import('node:fs');
+  const { dirname, join, resolve } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+
+  const SRC = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'src');
+  const files = [];
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) walk(path);
+      else if (entry.name.endsWith('.ts')) files.push(path);
+    }
+  };
+  walk(SRC);
+
+  // The scan must have something to read. A walk that finds nothing passes every
+  // assertion below it, and is one renamed directory away.
+  assert.ok(files.length >= 8, `expected at least 8 files under src/, found ${files.length}`);
+
+  const sites = [];
+  for (const file of files) {
+    // Comments are stripped because this repo documents the rule in prose that
+    // necessarily contains the very expression being counted — including the
+    // docstring on the funnel itself. A scanner that cannot tell code from the
+    // comment explaining the code forces people to stop writing the comment.
+    // Block comments are replaced by the SAME NUMBER OF NEWLINES rather than
+    // deleted, so reported line numbers still point at the real file. A guard
+    // that names the wrong line costs more time than it saves — the first
+    // version of this test reported intake.ts:46 for a call on line 73.
+    const code = readFileSync(file, 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, (block) => '\n'.repeat((block.match(/\n/g) ?? []).length))
+      .replace(/^[ \t]*\/\/.*$/gm, '');
+    code.split('\n').forEach((line, index) => {
+      // `packet.send(` and `this.packet(...).send(` — the room-packet wire call.
+      // `this.send(` / `this.child.send(` in src/daemon.ts are node IPC to the
+      // supervised child process, not the ours wire, and are deliberately out of
+      // scope: they carry no signed body and no participant identity.
+      if (/\bpacket\.send\s*\(/.test(line)) sites.push(`${file.slice(SRC.length + 1)}:${index + 1}`);
+    });
+  }
+
+  assert.deepEqual(
+    sites,
+    ['intake.ts:73'],
+    'every signed body must leave through sendSignedBody.\n'
+    + `  found: ${JSON.stringify(sites)}\n`
+    + '  If you added an outbound path, route it through sendSignedBody instead of\n'
+    + '  adding a site here — that is what puts it inside the anonymity pins.',
+  );
+
+  // And the one site must actually BE the funnel, not merely the first match:
+  // a rename that moved the call out of sendSignedBody while keeping the count
+  // at one would satisfy the assertion above and defeat its purpose.
+  const intake = readFileSync(join(SRC, 'intake.ts'), 'utf8');
+  const funnel = intake.slice(intake.indexOf('export async function sendSignedBody'));
+  const funnelBody = funnel.slice(0, funnel.indexOf('\n}\n') + 3);
+  assert.ok(
+    /\bpacket\.send\s*\(/.test(funnelBody),
+    'the single packet.send call site must live inside sendSignedBody',
+  );
+  assert.ok(
+    /packet\.sign\s*\(/.test(funnelBody),
+    'and sendSignedBody must be what signs it — an unsigned funnel is not the contract',
+  );
+});

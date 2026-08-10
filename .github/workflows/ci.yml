@@ -1,12 +1,27 @@
 name: CI
 
+# Gates -> Conventional-Commits version bump -> npm publish.
+#
+# Required repository secrets:
+#   - NPM_TOKEN: npm automation token with publish rights to @ours.network.
+#   - VERSION_BUMP_APP_ID / VERSION_BUMP_APP_PRIVATE_KEY: GitHub App credentials
+#     used to push the release commit through branch protection.
+
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       COWORK_CHROME_PATH: /usr/bin/google-chrome
     steps:
@@ -28,3 +43,77 @@ jobs:
       - run: npm run test:web
       - run: npm run test:browser
       - run: for i in 1 2 3; do node --test tests/e2e.test.mjs || exit 1; done
+
+  version-bump:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    name: Version bump
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      bumped: ${{ steps.bump.outputs.bumped }}
+      new-sha: ${{ steps.bump.outputs.new-sha }}
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.VERSION_BUMP_APP_ID }}
+          private-key: ${{ secrets.VERSION_BUMP_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Run version bump
+        id: bump
+        run: bash .github/workflows/scripts/bump-version.sh
+
+  npm-publish:
+    needs: [test, version-bump]
+    if: needs.version-bump.outputs.bumped == 'true'
+    runs-on: ubuntu-latest
+    name: Publish to npm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version-bump.outputs.new-sha }}
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: scripts/compile-mufl.sh
+      - run: npm run build
+      - name: Verify npm artifact
+        run: |
+          test "$(node -p "require('./package.json').version")" = "${{ needs.version-bump.outputs.version }}"
+          npm pack --dry-run --json > /tmp/ours-cowork-pack.json
+          node - <<'NODE'
+          const pack = require('/tmp/ours-cowork-pack.json')[0];
+          const files = new Set(pack.files.map((entry) => entry.path));
+          for (const path of [
+            'dist/cli.js', 'dist/daemon.js', 'dist/web/index.html',
+            'LICENSE', 'README.md',
+          ]) {
+            if (!files.has(path)) throw new Error(`@ours.network/cowork package is missing ${path}`);
+          }
+          if (![...files].some((path) => path.startsWith('dist/mufl_code/') && path.endsWith('.muflo'))) {
+            throw new Error('@ours.network/cowork package is missing its compiled MUFL packet');
+          }
+          NODE
+      - name: Publish @ours.network/cowork
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Summary
+        run: echo "Published @ours.network/cowork@${{ needs.version-bump.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"

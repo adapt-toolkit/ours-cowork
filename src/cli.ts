@@ -556,13 +556,11 @@ function httpGetReady(url: string, timeoutMs: number): Promise<boolean> {
       if (deadline) clearTimeout(deadline);
       deadline = undefined;
       request.removeListener('response', onResponse);
-      request.removeListener('error', onRequestError);
       request.removeListener('timeout', onRequestTimeout);
       request.removeListener('close', onRequestClose);
       request.setTimeout(0);
       if (response) {
         response.removeListener('end', onResponseEnd);
-        response.removeListener('error', onResponseError);
         response.removeListener('aborted', onResponseAborted);
         response.removeListener('close', onResponseClose);
         if (!response.destroyed) response.destroy();
@@ -581,14 +579,17 @@ function httpGetReady(url: string, timeoutMs: number): Promise<boolean> {
       if (settled) { incoming.destroy(); return; }
       response = incoming;
       incoming.once('end', onResponseEnd);
-      incoming.once('error', onResponseError);
+      incoming.on('error', onResponseError);
       incoming.once('aborted', onResponseAborted);
       incoming.once('close', onResponseClose);
       incoming.resume();
     };
     const request = http.get(url);
     request.once('response', onResponse);
-    request.once('error', onRequestError);
+    // Destroying an incomplete exchange can emit ECONNRESET after settle()
+    // chooses the readiness result. Keep this terminal handler attached so a
+    // late socket error cannot escape as an uncaught exception.
+    request.on('error', onRequestError);
     request.once('timeout', onRequestTimeout);
     request.once('close', onRequestClose);
     request.setTimeout(timeoutMs);

@@ -182,7 +182,7 @@ test('web disabled, readiness timeout, and JSON mode preserve exact side-effect 
   assert.equal(opened, 0);
 });
 
-test('web readiness enforces an absolute deadline after headers, incomplete close, and response trickle', { timeout: 5_000 }, async () => {
+test('web readiness enforces an absolute deadline after headers, incomplete close, and response trickle', { timeout: 10_000 }, async () => {
   for (const behavior of ['incomplete-close', 'trickle']) {
     const server = createHttpServer((_request, response) => {
       if (behavior === 'incomplete-close') {
@@ -203,14 +203,16 @@ test('web readiness enforces an absolute deadline after headers, incomplete clos
     });
     const address = server.address();
     assert(address && typeof address !== 'string');
-    const started = Date.now();
     try {
-      const outcome = await Promise.race([
-        waitForHttpReadiness(`http://127.0.0.1:${address.port}/`, 120),
-        new Promise((resolveHung) => setTimeout(() => resolveHung('hung'), 600)),
-      ]);
-      assert.equal(outcome, false, `${behavior} readiness did not settle false`);
-      assert(Date.now() - started < 500, `${behavior} exceeded its absolute readiness deadline`);
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        const started = Date.now();
+        const outcome = await Promise.race([
+          waitForHttpReadiness(`http://127.0.0.1:${address.port}/`, 120),
+          new Promise((resolveHung) => setTimeout(() => resolveHung('hung'), 600)),
+        ]);
+        assert.equal(outcome, false, `${behavior} readiness attempt ${attempt} did not settle false`);
+        assert(Date.now() - started < 500, `${behavior} attempt ${attempt} exceeded its absolute readiness deadline`);
+      }
     } finally {
       server.closeAllConnections();
       await new Promise((resolveClose) => server.close(resolveClose));

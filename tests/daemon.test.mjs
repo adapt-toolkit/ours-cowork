@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
-import { acquireDaemonLock, CoworkDaemon } from '../src/daemon-runtime.ts';
+import { acquireDaemonLock, CoworkDaemon, isIntakeNotification } from '../src/daemon-runtime.ts';
 import { DAEMON_SHUTDOWN_TIMEOUT_MS, DaemonSupervisor } from '../src/daemon.ts';
 import {
   ensureRuntimeState,
@@ -17,6 +17,13 @@ import {
 
 const DAEMON_EXECUTABLE = fileURLToPath(new URL('../dist/daemon.js', import.meta.url));
 const DAEMON_EXECUTABLE_URL = new URL('../dist/daemon.js', import.meta.url).href;
+
+test('room intake wakes for messages, files, and contact admission only', () => {
+  assert.equal(isIntakeNotification('message_received'), true);
+  assert.equal(isIntakeNotification('file_received'), true);
+  assert.equal(isIntakeNotification('contact_accepted'), true);
+  assert.equal(isIntakeNotification('notification_registered'), false);
+});
 
 async function waitForChildExitOrKill(child, timeoutMs) {
   const exited = child.exitCode !== null || child.signalCode !== null

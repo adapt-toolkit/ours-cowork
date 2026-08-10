@@ -1207,7 +1207,7 @@ export class RoomService {
       && (record.briefing_version ?? 1) === briefing.briefing_version);
     const intentsByMessage = new Map<string, Set<string>>();
     for (const record of records) {
-      if (record.kind !== 'relay_intent') continue;
+      if (record.kind !== 'relay_intent' || record.message_id === undefined) continue;
       const intents = intentsByMessage.get(record.message_id) ?? new Set<string>();
       intents.add(record.recipient_identity);
       intentsByMessage.set(record.message_id, intents);

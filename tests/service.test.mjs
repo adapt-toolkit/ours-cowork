@@ -111,6 +111,9 @@ class FakePacket {
   listContacts() { return structuredClone(this.contacts); }
   listContactOrigins() { return structuredClone(this.origins); }
   peekInbox() { return []; }
+  peekFileInbox() { return []; }
+  consumeFileInbox() { return Promise.resolve({ consumed: [], deferred: [] }); }
+  sendFile() { throw new Error('not used'); }
   async consumeInbox() { return { consumed: [], deferred: [] }; }
   async send() { return { status: 'queued', wire_id: 'wire' }; }
   async removeContact() { return { status: 'queued', notified: true, key_material_retained: true }; }

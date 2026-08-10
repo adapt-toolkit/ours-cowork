@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 
 import {
   AppendRecordSchema,
   CommunicationRecordSchema,
   CreateRoomInputSchema,
+  FileMimeSchema,
+  FileNameSchema,
   LowerCrockfordUlidSchema,
   MessageTextSchema,
+  MAX_FILE_BYTES,
   PostMessageInputSchema,
   Rfc3339Schema,
   RoleSchema,
@@ -102,6 +106,17 @@ test('text bounds count exact UTF-8 bytes, not JavaScript code units', () => {
 
   assert.equal(RoomSchema.parse(room({ mission: { goal: '🤖'.repeat(65_536), briefing: 'x', briefing_version: 1 } })).version, 2);
   assert.throws(() => RoomSchema.parse(room({ mission: { goal: 'x', briefing: `${'x'.repeat(262_144)}x`, briefing_version: 1 } })));
+});
+
+test('file policy is opaque binary with path-free names, bounded MIME metadata, and a 2 MiB ceiling', () => {
+  assert.equal(MAX_FILE_BYTES, 2_097_152);
+  assert.equal(FileNameSchema.parse('evidence.tar.gz'), 'evidence.tar.gz');
+  for (const invalid of ['', '.', '..', '../secret', 'a/b', 'a\\b', 'x'.repeat(256)]) {
+    assert.throws(() => FileNameSchema.parse(invalid), invalid);
+  }
+  assert.equal(FileMimeSchema.parse(''), '');
+  assert.equal(FileMimeSchema.parse('application/x-custom; profile=test'), 'application/x-custom; profile=test');
+  assert.throws(() => FileMimeSchema.parse('x'.repeat(256)));
 });
 
 test('room and invite schemas are strict, versioned, and enforce invite thresholds', () => {
@@ -247,6 +262,41 @@ test('communication records form a strict discriminated version-1 union', () => 
 
   const { seq: _seq, record_id: _recordId, ...appendMessage } = message;
   assert.equal(AppendRecordSchema.parse(appendMessage).kind, 'message');
+});
+
+test('file archive records bind canonical bytes, size, digest, and one relay subject', () => {
+  const bytes = Buffer.from([0, 1, 2, 255]);
+  const file = {
+    version: 1,
+    kind: 'file',
+    room_id: ROOM_ID,
+    seq: 1,
+    record_id: `${ROOM_ID}:1`,
+    at: AT,
+    file_id: MESSAGE_ID,
+    author: { identity: 'cid-alice', display_name: 'Alice', role: 'researcher' },
+    filename: 'evidence.bin',
+    mime: 'application/octet-stream',
+    size: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    data_base64: bytes.toString('base64'),
+    recipient_identities: ['cid-bob'],
+    source_file_id: 7,
+    source_wire_id: 'wire-file-7',
+  };
+  assert.equal(CommunicationRecordSchema.parse(file).kind, 'file');
+  assert.throws(() => CommunicationRecordSchema.parse({ ...file, size: bytes.length + 1 }), /size/i);
+  assert.throws(() => CommunicationRecordSchema.parse({ ...file, sha256: '0'.repeat(64) }), /sha256/i);
+  assert.throws(() => CommunicationRecordSchema.parse({ ...file, data_base64: `${file.data_base64}=` }), /base64/i);
+
+  const intent = {
+    version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: 2,
+    record_id: `${ROOM_ID}:2`, at: AT, file_id: MESSAGE_ID, recipient_identity: 'cid-bob',
+  };
+  assert.equal(CommunicationRecordSchema.parse(intent).file_id, MESSAGE_ID);
+  assert.throws(() => CommunicationRecordSchema.parse({ ...intent, message_id: MESSAGE_ID }), /exactly one/i);
+  const { file_id: _fileId, ...missing } = intent;
+  assert.throws(() => CommunicationRecordSchema.parse(missing), /exactly one/i);
 });
 
 // ---- Rooms evolution Phase A (spec §3.1, §4.1, §5.1, §7) — contracts v2 ----

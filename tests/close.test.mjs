@@ -111,6 +111,9 @@ class FakePacket {
   listInvites() { return []; }
   listContactOrigins() { return {}; }
   peekInbox() { return []; }
+  peekFileInbox() { return []; }
+  consumeFileInbox() { return Promise.resolve({ consumed: [], deferred: [] }); }
+  sendFile() { throw new Error('not used'); }
   consumeInbox() { throw new Error('not used'); }
   send() { throw new Error('not used'); }
   sign() { throw new Error('not used'); }

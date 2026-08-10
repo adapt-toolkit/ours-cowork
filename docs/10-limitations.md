@@ -1,6 +1,8 @@
 # Limitations
 
-- The retained archive is plaintext on this host. Filesystem ownership and `0700`/`0600` modes limit local access, but the archive is not encrypted at rest by ours-cowork.
+- The retained archive is plaintext on this host, including exact participant file bytes encoded as base64. Filesystem ownership and `0700`/`0600` modes limit local access, but the archive is not encrypted at rest by ours-cowork.
+- Files are opaque bytes. Cowork records MIME as untrusted metadata and does not inspect content, scan for malware, execute it, or infer safety from the filename or MIME value. Recipients must apply their own content policy.
+- Files are limited to 2 MiB (2,097,152 bytes). Larger files are rejected loudly because the pinned core cannot provide the same retained, unacknowledged delivery and archive-redrive guarantee for them. There is no chunking or local path staging in this release.
 - Invite secrets exist only for the process lifetime that minted them and in the receipt returned to the operator. Durable room metadata stores descriptors, not invite blobs. A prior one-time or public secret is not reconstructable; a durable invite marked as needing replacement requires explicit recovery to mint a new secret.
 - Relay recovery is at-least-once. A crash after transport acceptance but before the durable result can retry a send, so participants may observe duplicates. The system does not provide exactly once relay semantics.
 - The host records transport acceptance and failures; it does not observe delivery, reading, or remote processing. A successful operator command must not be interpreted as participant receipt.

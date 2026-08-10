@@ -6,6 +6,7 @@ import {
   isRoomDto,
   isRoomListDto,
   type CommunicationRecordDto,
+  type FileRecordDto,
   type MessageRecordDto,
   type RoomDto,
   type RoomInviteDto,
@@ -54,6 +55,28 @@ function event(seq: number): CommunicationRecordDto {
   };
 }
 
+function file(seq: number, overrides: Partial<FileRecordDto> = {}): FileRecordDto {
+  return {
+    version: 1,
+    room_id: ROOM_ID,
+    seq,
+    record_id: `${ROOM_ID}:${seq}`,
+    at: AT,
+    kind: 'file',
+    file_id: MESSAGE_ID,
+    author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' },
+    filename: 'evidence.bin',
+    mime: 'application/octet-stream',
+    size: 4,
+    sha256: '0'.repeat(64),
+    data_base64: 'AAEC/w==',
+    recipient_identities: ['cid-bob'],
+    source_file_id: 7,
+    source_wire_id: 'wire-file-7',
+    ...overrides,
+  };
+}
+
 function invite(overrides: Partial<RoomInviteDto> = {}): RoomInviteDto {
   return {
     invite_id: 'invite-1',
@@ -96,7 +119,7 @@ describe('room DTO guards', () => {
     expect(isRoomListDto([validRoom])).toBe(true);
     expect(isParticipantListDto(validRoom.seats)).toBe(true);
     expect(isParticipantListDto([validRoom.seats[0]!, { ...validRoom.seats[0]!, display_name: 'Duplicate' }])).toBe(false);
-    expect(isHistoryDto([message(1), event(2)])).toBe(true);
+    expect(isHistoryDto([message(1), event(2), file(3)])).toBe(true);
     expect(isRoomDto({ ...validRoom, mission: { goal: 42, briefing: 'no' } })).toBe(false);
     expect(isHistoryDto([{ ...message(1), seq: '1' }])).toBe(false);
   });
@@ -122,6 +145,28 @@ describe('room DTO guards', () => {
       kind: 'close_notice_result', intent_record_id: 'intent-2', recipient_identity: 'cid-a',
       status: 'queued', notified: false, key_material_retained: true, uncertain_after_restart: true,
     }])).toBe(true);
+
+    const validFile = file(3, {
+      author_alias: { participant_id: '01jz6y7n8p9q0r1s2t3v4w5x72', alias: 'builder #1' },
+    });
+    expect(isHistoryDto([
+      validFile,
+      { ...event(4), message_id: undefined, file_id: MESSAGE_ID },
+      {
+        version: 1, room_id: ROOM_ID, seq: 5, record_id: `${ROOM_ID}:5`, at: AT,
+        kind: 'relay_result', intent_record_id: `${ROOM_ID}:4`, file_id: MESSAGE_ID,
+        recipient_identity: 'cid-bob', status: 'skipped_removed', metadata_wire_id: 'wire-meta',
+      },
+    ])).toBe(true);
+    for (const invalid of [
+      { ...validFile, filename: '../secret' },
+      { ...validFile, size: 3 },
+      { ...validFile, data_base64: 'AAEC/w=' },
+      { ...validFile, sha256: 'A'.repeat(64) },
+      { ...validFile, author_alias: { participant_id: 'not-a-participant', alias: 'builder #1' } },
+      { ...event(4), file_id: MESSAGE_ID },
+      { ...event(4), message_id: undefined },
+    ]) expect(isHistoryDto([invalid])).toBe(false);
   });
 
   it('rejects adversarial room descriptors that violate native shape and durable invariants', () => {
@@ -208,10 +253,10 @@ describe('history model', () => {
   });
 
   it('keeps operational records out of chat and in the events projection', () => {
-    const records = [event(2), message(1), event(3)];
+    const records = [event(2), message(1), file(3), event(4)];
 
     expect(projectChat(records).map((row) => row.seq)).toEqual([1]);
-    expect(projectEvents(records).map((row) => row.seq)).toEqual([2, 3]);
+    expect(projectEvents(records).map((row) => row.seq)).toEqual([2, 3, 4]);
   });
 
   it('mounts the newest 500 rows and expands earlier rows in 500-row increments', () => {

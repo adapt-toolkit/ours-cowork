@@ -71,6 +71,11 @@ export interface AuthorDto {
   role: string;
 }
 
+export interface AuthorAliasDto {
+  participant_id: string;
+  alias: string;
+}
+
 interface RecordCommonDto {
   version: 1;
   room_id: string;
@@ -92,17 +97,35 @@ export interface MessageRecordDto extends RecordCommonDto {
 
 export interface RelayIntentRecordDto extends RecordCommonDto {
   kind: 'relay_intent';
-  message_id: string;
+  message_id?: string;
+  file_id?: string;
   recipient_identity: string;
 }
 
 export interface RelayResultRecordDto extends RecordCommonDto {
   kind: 'relay_result';
   intent_record_id: string;
-  message_id: string;
+  message_id?: string;
+  file_id?: string;
   recipient_identity: string;
   status: RelayStatus;
   wire_id?: string;
+  metadata_wire_id?: string;
+}
+
+export interface FileRecordDto extends RecordCommonDto {
+  kind: 'file';
+  file_id: string;
+  author: AuthorDto;
+  author_alias?: AuthorAliasDto;
+  filename: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  data_base64: string;
+  recipient_identities: string[];
+  source_file_id: number;
+  source_wire_id?: string;
 }
 
 export interface CloseNoticeIntentRecordDto extends RecordCommonDto {
@@ -121,6 +144,7 @@ export interface CloseNoticeResultRecordDto extends RecordCommonDto {
 }
 
 export type OperationalRecordDto =
+  | FileRecordDto
   | RelayIntentRecordDto
   | RelayResultRecordDto
   | CloseNoticeIntentRecordDto
@@ -131,9 +155,12 @@ export type CommunicationRecordDto = MessageRecordDto | OperationalRecordDto;
 const ROOM_STATES = new Set<unknown>(['provisioning', 'active', 'closing', 'closed']);
 const INVITE_MODES = new Set<unknown>(['one_time', 'public']);
 const INVITE_STATES = new Set<unknown>(['live', 'consumed', 'revoked', 'replacement_required', 'receipt_pending']);
-const RELAY_STATUSES = new Set<unknown>(['queued', 'send_failed']);
+const RELAY_STATUSES = new Set<unknown>(['queued', 'send_failed', 'skipped_removed']);
 const LOWER_CROCKFORD_ULID = /^[0-7][0-9a-hjkmnp-tv-z]{25}$/;
 const MAX_TEXT_BYTES = 262_144;
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_FILE_NAME_BYTES = 255;
+const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;
 const RECORD_COMMON_KEYS = ['version', 'room_id', 'seq', 'record_id', 'at', 'kind'] as const;
 const ROOM_KEYS = ['version', 'room_id', 'identity_name', 'identity_cid', 'mission', 'state', 'invites', 'seats', 'created_at'] as const;
@@ -306,16 +333,34 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
         && (value.source_msg_id === undefined || isNonNegativeSafeInteger(value.source_msg_id))
         && optionalString(value.source_wire_id);
     case 'relay_intent':
-      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'message_id', 'recipient_identity'])
-        && isLowerCrockfordUlid(value.message_id)
+      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'recipient_identity'], ['message_id', 'file_id'])
+        && hasExactlyOneRelaySubject(value)
         && isString(value.recipient_identity);
     case 'relay_result':
-      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'intent_record_id', 'message_id', 'recipient_identity', 'status'], ['wire_id'])
+      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'intent_record_id', 'recipient_identity', 'status'], ['message_id', 'file_id', 'wire_id', 'metadata_wire_id'])
         && isString(value.intent_record_id)
-        && isLowerCrockfordUlid(value.message_id)
+        && hasExactlyOneRelaySubject(value)
         && isString(value.recipient_identity)
         && RELAY_STATUSES.has(value.status)
-        && optionalString(value.wire_id);
+        && optionalString(value.wire_id)
+        && optionalString(value.metadata_wire_id);
+    case 'file': {
+      const decodedSize = canonicalBase64DecodedSize(value.data_base64);
+      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'file_id', 'author', 'filename', 'mime', 'size', 'sha256', 'data_base64', 'recipient_identities', 'source_file_id'], ['author_alias', 'source_wire_id'])
+        && isLowerCrockfordUlid(value.file_id)
+        && isAuthor(value.author)
+        && (value.author_alias === undefined || isAuthorAlias(value.author_alias))
+        && isFileName(value.filename)
+        && isUtf8Within(value.mime, MAX_MIME_BYTES)
+        && isNonNegativeSafeInteger(value.size)
+        && value.size <= MAX_FILE_BYTES
+        && typeof value.sha256 === 'string'
+        && /^[0-9a-f]{64}$/.test(value.sha256)
+        && decodedSize === value.size
+        && isUniqueStringArray(value.recipient_identities)
+        && isNonNegativeSafeInteger(value.source_file_id)
+        && optionalString(value.source_wire_id);
+    }
     case 'close_notice_intent':
       return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'recipient_identity'])
         && isString(value.recipient_identity);
@@ -392,6 +437,38 @@ function isAuthor(value: unknown): value is AuthorDto {
     && isString(value.identity)
     && isString(value.display_name)
     && isUtf8Bounded(value.role, MAX_ROLE_BYTES);
+}
+
+function isAuthorAlias(value: unknown): value is AuthorAliasDto {
+  return isRecord(value)
+    && hasExactKeys(value, ['participant_id', 'alias'])
+    && isLowerCrockfordUlid(value.participant_id)
+    && isString(value.alias);
+}
+
+function hasExactlyOneRelaySubject(value: Record<string, unknown>): boolean {
+  const message = value.message_id === undefined ? false : isLowerCrockfordUlid(value.message_id);
+  const file = value.file_id === undefined ? false : isLowerCrockfordUlid(value.file_id);
+  return message !== file;
+}
+
+function isFileName(value: unknown): value is string {
+  return isUtf8Bounded(value, MAX_FILE_NAME_BYTES)
+    && value !== '.'
+    && value !== '..'
+    && !/[\x00/\\]/.test(value);
+}
+
+function isUtf8Within(value: unknown, maximumBytes: number): value is string {
+  return typeof value === 'string' && new TextEncoder().encode(value).byteLength <= maximumBytes;
+}
+
+function canonicalBase64DecodedSize(value: unknown): number | undefined {
+  if (typeof value !== 'string'
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return undefined;
+  if (value.length === 0) return 0;
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0;
+  return (value.length / 4) * 3 - padding;
 }
 
 function hasRecordCommon(value: unknown): value is Record<string, unknown> & RecordCommonDto {

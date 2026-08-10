@@ -69,16 +69,23 @@ class FakePacket {
   name = `cowork-room-${ROOM_ID}`;
   cid = 'cid-room';
   inbox = [];
+  fileInbox = [];
   sendCalls = [];
+  sendFileCalls = [];
   signCalls = [];
   consumeCalls = [];
+  consumeFileCalls = [];
   nextSend = { status: 'queued', wire_id: 'wire-out' };
   beforeConsume;
   afterConsume;
   beforeSign;
   beforeSend;
+  beforeConsumeFile;
+  afterConsumeFile;
+  beforeSendFile;
 
   peekInbox() { return structuredClone(this.inbox); }
+  peekFileInbox() { return structuredClone(this.fileInbox); }
 
   async consumeInbox(expectedIds) {
     if (this.beforeConsume) await this.beforeConsume(expectedIds);
@@ -93,6 +100,17 @@ class FakePacket {
     return { consumed, deferred };
   }
 
+  async consumeFileInbox(expectedIds) {
+    if (this.beforeConsumeFile) await this.beforeConsumeFile(expectedIds);
+    this.consumeFileCalls.push([...expectedIds]);
+    const expected = new Set(expectedIds);
+    const consumed = this.fileInbox.filter((item) => expected.has(item.file_id)).map((item) => item.file_id);
+    const deferred = this.fileInbox.filter((item) => !expected.has(item.file_id)).map((item) => item.file_id);
+    this.fileInbox = this.fileInbox.filter((item) => !expected.has(item.file_id));
+    if (this.afterConsumeFile) await this.afterConsumeFile({ consumed, deferred });
+    return { consumed, deferred };
+  }
+
   async sign(body) {
     this.signCalls.push(body);
     if (this.beforeSign) await this.beforeSign(body);
@@ -103,6 +121,12 @@ class FakePacket {
     this.sendCalls.push({ recipient, body });
     if (this.beforeSend) await this.beforeSend(recipient, body);
     return structuredClone(this.nextSend);
+  }
+
+  async sendFile(recipient, filename, mime, data) {
+    this.sendFileCalls.push({ recipient, filename, mime, data: Buffer.from(data) });
+    if (this.beforeSendFile) await this.beforeSendFile(recipient, filename, mime, data);
+    return { status: 'queued', wire_id: 'wire-file-out' };
   }
 
   mintInvite() { throw new Error('not used'); }
@@ -155,6 +179,20 @@ function incoming(overrides = {}) {
   };
 }
 
+function incomingFile(overrides = {}) {
+  return {
+    file_id: 9,
+    sender_id: 'cid-alice',
+    sender_name: 'Untrusted current name',
+    filename: 'evidence.bin',
+    mime: 'application/octet-stream',
+    data: Buffer.from([0, 1, 2, 255]),
+    date: '2026-08-02T10:12:30.000Z',
+    wire_id: 'wire-file-in-9',
+    ...overrides,
+  };
+}
+
 function fixture(options = {}) {
   const store = new MemoryStore();
   const packet = new FakePacket();
@@ -175,6 +213,143 @@ function fixture(options = {}) {
 }
 
 function byKind(records, kind) { return records.filter((record) => record.kind === kind); }
+
+// ---- Durable file broadcast -------------------------------------------------
+
+test('participant files archive bytes before consume and relay metadata + core bytes to every other seat', async () => {
+  const f = fixture();
+  f.packet.fileInbox.push(incomingFile());
+
+  await f.pump.pump(ROOM_ID);
+
+  const records = await f.store.read(ROOM_ID);
+  const [file] = byKind(records, 'file');
+  assert.equal(file.filename, 'evidence.bin');
+  assert.equal(file.mime, 'application/octet-stream');
+  assert.equal(file.size, 4);
+  assert.equal(file.data_base64, Buffer.from([0, 1, 2, 255]).toString('base64'));
+  assert.deepEqual(file.author, { identity: 'cid-alice', display_name: 'Alice', role: 'builder' });
+  assert.deepEqual(file.recipient_identities, ['cid-bob', 'cid-cara']);
+  assert.deepEqual(f.packet.consumeFileCalls, [[9]]);
+  assert.deepEqual(f.packet.sendFileCalls.map((call) => call.recipient), ['cid-bob', 'cid-cara']);
+  assert(f.packet.sendFileCalls.every((call) => call.data.equals(Buffer.from([0, 1, 2, 255]))));
+  assert.deepEqual(byKind(records, 'relay_intent').map((intent) => intent.file_id), [file.file_id, file.file_id]);
+  assert.deepEqual(byKind(records, 'relay_result').map((result) => ({
+    file_id: result.file_id,
+    status: result.status,
+    wire_id: result.wire_id,
+    metadata_wire_id: result.metadata_wire_id,
+  })), [
+    { file_id: file.file_id, status: 'queued', wire_id: 'wire-file-out', metadata_wire_id: 'wire-out' },
+    { file_id: file.file_id, status: 'queued', wire_id: 'wire-file-out', metadata_wire_id: 'wire-out' },
+  ]);
+  const metadata = JSON.parse(f.packet.sendCalls[0].body);
+  assert.equal(metadata.kind, 'room_file');
+  assert.equal(metadata.file_id, file.file_id);
+  assert.equal(metadata.sha256, file.sha256);
+  assert.equal('data_base64' in metadata, false, 'file bytes must use the core binary path, not text JSON');
+});
+
+test('file crash redrive keeps archive/intents stable and retries only a result-less recipient', async () => {
+  const f = fixture();
+  f.store.rooms.set(ROOM_ID, room({ seats: room().seats.slice(0, 2) }));
+  f.packet.fileInbox.push(incomingFile());
+  let crashBeforeConsume = true;
+  f.packet.beforeConsumeFile = () => {
+    if (crashBeforeConsume) {
+      crashBeforeConsume = false;
+      throw new Error('crash after durable file intents');
+    }
+  };
+  await assert.rejects(f.pump.pump(ROOM_ID), /durable file intents/);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'file').length, 1);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_intent').length, 1);
+  assert.equal(f.packet.sendFileCalls.length, 0, 'consume precedes every file send');
+
+  f.packet.beforeConsumeFile = undefined;
+  let crashBeforeResult = true;
+  f.store.beforeAppend = (draft) => {
+    if (crashBeforeResult && draft.kind === 'relay_result') {
+      crashBeforeResult = false;
+      throw new Error('crash before file result fsync');
+    }
+  };
+  await assert.rejects(f.pump.pump(ROOM_ID), /file result fsync/);
+  assert.equal(f.packet.sendFileCalls.length, 1);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 0);
+
+  f.store.beforeAppend = undefined;
+  await f.pump.resumePending(ROOM_ID);
+  assert.equal(f.packet.sendFileCalls.length, 2);
+  assert(f.packet.sendFileCalls[0].data.equals(f.packet.sendFileCalls[1].data));
+  assert.equal(f.packet.sendCalls[0].body, f.packet.sendCalls[1].body, 'metadata retry keeps the stable file_id');
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 1);
+  await f.pump.resumePending(ROOM_ID);
+  assert.equal(f.packet.sendFileCalls.length, 2, 'terminal file result suppresses later redrive');
+});
+
+test('a file intent frozen before seat removal resolves skipped_removed without sending bytes or metadata', async () => {
+  const f = fixture();
+  f.packet.fileInbox.push(incomingFile());
+  let crash = true;
+  f.packet.beforeConsumeFile = () => {
+    if (crash) {
+      crash = false;
+      throw new Error('freeze file fanout before removal');
+    }
+  };
+  await assert.rejects(f.pump.pump(ROOM_ID), /freeze file fanout/);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_intent').length, 2);
+
+  const changed = await f.store.load(ROOM_ID);
+  changed.membership_epoch += 1;
+  changed.seats = changed.seats.map((seat) => seat.identity === 'cid-bob'
+    ? { ...seat, state: 'removed', removed_at: AT, removed_epoch: changed.membership_epoch }
+    : seat);
+  await f.store.save(changed);
+  f.packet.beforeConsumeFile = undefined;
+
+  await f.pump.pump(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls.map((call) => call.recipient), ['cid-cara']);
+  assert.deepEqual(f.packet.sendFileCalls.map((call) => call.recipient), ['cid-cara']);
+  const results = byKind(await f.store.read(ROOM_ID), 'relay_result');
+  assert.deepEqual(
+    results.map((result) => [result.recipient_identity, result.status]).sort(),
+    [['cid-bob', 'skipped_removed'], ['cid-cara', 'queued']],
+  );
+  await f.pump.resumePending(ROOM_ID);
+  assert.equal(f.packet.sendFileCalls.length, 1, 'terminal skip and queue results suppress every later retry');
+});
+
+test('oversized files fail loudly without archive, consume, or relay effects', async () => {
+  const f = fixture();
+  f.packet.fileInbox.push(incomingFile({ data: Buffer.alloc(2 * 1024 * 1024 + 1) }));
+  await assert.rejects(f.pump.pump(ROOM_ID), /at most 2097152 bytes \(2 MiB\)/);
+  assert.deepEqual(await f.store.read(ROOM_ID), []);
+  assert.equal(f.packet.fileInbox.length, 1);
+  assert.equal(f.packet.consumeFileCalls.length, 0);
+  assert.equal(f.packet.sendFileCalls.length, 0);
+});
+
+test('anonymous file metadata uses only the alias author and never leaks real seat or claimed names', async () => {
+  const f = fixture({ room: anonymousRoom() });
+  f.packet.fileInbox.push(incomingFile());
+  await f.pump.pump(ROOM_ID);
+  const [file] = byKind(await f.store.read(ROOM_ID), 'file');
+  assert.equal(file.author.identity, 'cid-alice');
+  assert.equal(file.author_alias.alias, 'builder #1');
+  for (const call of [...f.packet.sendCalls.map((send) => send.body), ...f.packet.signCalls]) {
+    const bytes = Buffer.from(call, 'utf8');
+    for (const leak of ['cid-alice', 'Alice', 'cid-bob', 'cid-cara', 'Untrusted current name']) {
+      assert.equal(bytes.includes(leak), false, `${leak} leaked into signed file metadata`);
+    }
+  }
+  assert.deepEqual(JSON.parse(f.packet.sendCalls[0].body).author, {
+    identity: '01jz6y7n8p9q0r1s2t3v4w5xa1',
+    display_name: 'builder #1',
+    role: 'builder',
+  });
+});
 
 test('canonical JSON recursively sorts keys and participant fan-out excludes its durable seat author', async () => {
   assert.equal(
@@ -852,14 +1027,15 @@ test('there is exactly ONE packet.send call site in src/, and it is the signing 
     });
   }
 
-  assert.deepEqual(
-    sites,
-    ['intake.ts:73'],
+  assert.equal(
+    sites.length,
+    1,
     'every signed body must leave through sendSignedBody.\n'
     + `  found: ${JSON.stringify(sites)}\n`
     + '  If you added an outbound path, route it through sendSignedBody instead of\n'
     + '  adding a site here — that is what puts it inside the anonymity pins.',
   );
+  assert.match(sites[0], /^intake\.ts:\d+$/, `the one packet.send site moved outside intake.ts: ${sites[0]}`);
 
   // And the one site must actually BE the funnel, not merely the first match:
   // a rename that moved the call out of sendSignedBody while keeping the count

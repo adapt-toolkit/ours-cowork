@@ -68,6 +68,24 @@ function renderMessages(value) {
   return messages;
 }
 
+function renderFiles(value) {
+  const files = [];
+  for (let index = 0; ; index += 1) {
+    const file = value.Reduce(index);
+    if (file.IsNil()) break;
+    files.push({
+      file_id: Number(file.Reduce('file_id').Visualize()),
+      sender_id: file.Reduce('sender_id').Visualize(),
+      sender_name: file.Reduce('sender_name').Visualize(),
+      filename: file.Reduce('filename').Visualize(),
+      mime: file.Reduce('mime').Visualize(),
+      data: Buffer.from(file.Reduce('data').GetBinary()),
+      status: file.Reduce('status').Visualize(),
+    });
+  }
+  return files;
+}
+
 function roomEnvelopes(peer) {
   return peer.inbox().flatMap((message) => {
     try { return [{ ...JSON.parse(message.text), sender_id: message.sender_id }]; }
@@ -174,6 +192,7 @@ if (process.argv.includes('--e2e-driver')) {
         }, unit.bytes);
       });
       peer.inbox = () => renderMessages(readonly(peer, '::actor::list_incoming_messages'));
+      peer.fileInbox = () => renderFiles(readonly(peer, '::actor::list_incoming_files'));
       peer.contacts = () => readonly(peer, '::a2a_messaging::list_contacts').Visualize();
       packets.push(peer);
       await mutate(peer, '::a2a_messaging::set_my_name', { name });
@@ -188,6 +207,19 @@ if (process.argv.includes('--e2e-driver')) {
 
     async function send(peer, roomCid, text) {
       await mutate(peer, '::a2a_messaging::send_message', { contact: roomCid, text });
+    }
+
+    async function sendFile(peer, roomCid, filename, mime, data) {
+      await mutate(peer, '::a2a_messaging::send_file', {
+        contact: roomCid,
+        filename,
+        mime,
+        data: peer.pw.packet.NewBinaryFromBuffer(Buffer.from(data)),
+      });
+    }
+
+    async function getFiles(peer) {
+      return renderFiles((await mutate(peer, '::actor::get_files', {})).Reduce('files'));
     }
 
     t.after(async () => {
@@ -373,6 +405,39 @@ if (process.argv.includes('--e2e-driver')) {
         && message.author.identity === alice.cid && message.author.role === 'lead'), 'participant relay with exact attribution');
       assert.equal(roomEnvelopes(alice).some((message) => message.text === 'participant relay from Alice'), false);
       stage('participant-relayed');
+
+      const aliceBytes = Buffer.from([0, 1, 2, 255, 0, 7]);
+      await sendFile(alice, roomCid, 'alice-evidence.bin', 'application/octet-stream', aliceBytes);
+      await waitFor(
+        () => bob.fileInbox().some((file) => file.filename === 'alice-evidence.bin'),
+        'Alice file relayed through room to Bob inbox',
+      );
+      let received = await getFiles(bob);
+      assert.equal(received.length, 1);
+      assert.equal(received[0].sender_id, roomCid);
+      assert.equal(received[0].mime, 'application/octet-stream');
+      assert.deepEqual(received[0].data, aliceBytes);
+      assert.equal(received[0].status, 'processed');
+      await waitFor(() => roomEnvelopes(bob).some((message) => message.kind === 'room_file'
+        && message.filename === 'alice-evidence.bin'
+        && message.author.identity === alice.cid), 'Alice signed file metadata at Bob');
+
+      const bobBytes = Buffer.from('Bob evidence with NUL\0and UTF-8 ✓');
+      await sendFile(bob, roomCid, 'bob-evidence.txt', 'text/plain; charset=utf-8', bobBytes);
+      await waitFor(
+        () => alice.fileInbox().some((file) => file.filename === 'bob-evidence.txt'),
+        'Bob file relayed through room to Alice inbox',
+      );
+      received = await getFiles(alice);
+      assert.equal(received.length, 1);
+      assert.equal(received[0].sender_id, roomCid);
+      assert.equal(received[0].mime, 'text/plain; charset=utf-8');
+      assert.deepEqual(received[0].data, bobBytes);
+      assert.equal(received[0].status, 'processed');
+      await waitFor(() => roomEnvelopes(alice).some((message) => message.kind === 'room_file'
+        && message.filename === 'bob-evidence.txt'
+        && message.author.identity === bob.cid), 'Bob signed file metadata at Alice');
+      stage('files-relayed-both-directions');
 
       const operatorRecord = await runCli(['room', 'message', roomId, '--text', 'operator voice']);
       assert.equal(operatorRecord.author.identity, roomCid);

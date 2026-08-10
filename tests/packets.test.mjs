@@ -183,6 +183,37 @@ test('hosted sends propagate every rejected mutation and map only explicit refus
   assert.deepEqual(await hosted.send('cid-peer', 'body'), { status: 'send_failed' });
 });
 
+test('hosted file sends pass opaque bytes to core and reject oversized input before mutation', async () => {
+  const calls = [];
+  const nil = { IsNil: () => true, Visualize: () => '' };
+  const native = {
+    name: 'fake-room', cid: 'cid-fake', pw: {},
+    newBinary: (bytes) => ({ opaqueBytes: Buffer.from(bytes) }),
+    mutatingTx: async (name, target) => {
+      calls.push({ name, target });
+      return { Reduce: () => nil };
+    },
+  };
+  const hosted = new HostedRoomPacket(native, () => {}, () => {});
+  assert.deepEqual(
+    await hosted.sendFile('cid-peer', 'payload.bin', 'application/octet-stream', Buffer.from([0, 255, 7])),
+    { status: 'queued', wire_id: undefined },
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, '::a2a_messaging::send_file');
+  assert.equal(calls[0].target.contact, 'cid-peer');
+  assert.equal(calls[0].target.filename, 'payload.bin');
+  assert.equal(calls[0].target.mime, 'application/octet-stream');
+  assert.deepEqual(calls[0].target.data.opaqueBytes, Buffer.from([0, 255, 7]));
+  assert.equal('path' in calls[0].target, false);
+
+  await assert.rejects(
+    hosted.sendFile('cid-peer', 'too-large.bin', '', Buffer.alloc((2 * 1024 * 1024) + 1)),
+    /at most 2097152 bytes/,
+  );
+  assert.equal(calls.length, 1, 'oversized data never reaches the native mutation');
+});
+
 test('hosted inbox consume uses one atomic expected-ID mutation', async () => {
   const calls = [];
   const list = (numbers) => ({
@@ -417,42 +448,42 @@ async function runPacketDriver() {
       'attacker acceptance by gamma room',
     );
     progress('attacker-connected');
-
-    await assert.rejects(
-      gamma.packet.mutatingTx(
-        '::a2a_messaging::send_file',
-        {
-          contact: attacker.cid,
-          filename: 'blocked.txt',
-          mime: 'text/plain',
-          data: gamma.packet.newBinary(Buffer.from('blocked')),
-        },
-        undefined,
-        250,
-      ),
-      /timed out waiting for transaction result/,
-    );
     const gammaCid = gamma.cid;
-    await waitFor(() => registry.get('gamma') === undefined, 'timed-out gamma eviction');
-    assert.equal(host.packetCount, 4, 'unknown local outcome must remove the stale native packet');
-    gamma = await registry.restore('gamma', gammaCid);
+
+    // Historical coverage deliberately forced both file directions to fail.
+    // The room actor now accepts opaque bytes and the hosted API never stages a
+    // filesystem path, so a successful send must keep the packet registered.
+    assert.equal(
+      (await gamma.sendFile(attacker.cid, 'outbound.bin', 'application/octet-stream', Buffer.from([0, 255, 1]))).status,
+      'queued',
+    );
     assert.equal(registry.get('gamma'), gamma);
     assert.equal(host.packetCount, 5);
-    progress('timeout-restored');
+    progress('outbound-file');
     await attacker.mutatingTx('::a2a_messaging::send_file', {
       contact: gamma.cid,
-      filename: 'inbound-blocked.txt',
+      filename: 'inbound.bin',
       mime: 'text/plain',
-      data: attacker.newBinary(Buffer.from('inbound blocked')),
+      data: attacker.newBinary(Buffer.from([9, 0, 8])),
+    });
+    await waitFor(
+      () => gamma.peekFileInbox().some((file) => file.filename === 'inbound.bin'),
+      'inbound room file',
+    );
+    const inboundFile = gamma.peekFileInbox().find((file) => file.filename === 'inbound.bin');
+    assert.deepEqual(inboundFile.data, Buffer.from([9, 0, 8]));
+    assert.deepEqual(await gamma.consumeFileInbox([inboundFile.file_id]), {
+      consumed: [inboundFile.file_id],
+      deferred: [],
     });
     await attacker.mutatingTx('::actor::call_external_sign', {
       target: gamma.cid,
       canonical_json: '{"version":1}',
     });
     await sleep(300);
-    assert.equal(registry.get('gamma'), gamma, 'refused inbound transactions keep the registry entry');
-    assert.equal(host.packetCount, 5, 'refused inbound transactions keep the native room packet');
-    progress('refusals-contained');
+    assert.equal(registry.get('gamma'), gamma, 'guarded inbound transactions keep the registry entry');
+    assert.equal(host.packetCount, 5, 'guarded inbound transactions keep the native room packet');
+    progress('files-and-origin-guard');
 
     const alphaInvite = await alpha.mintInvite('public');
     await withScopeAsync(async (lifetime) => {

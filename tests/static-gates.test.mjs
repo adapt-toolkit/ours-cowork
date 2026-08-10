@@ -243,6 +243,9 @@ test('built distribution remains standalone and contains one compiled packet', (
   assert.deepEqual(builtWebFiles.flatMap((path) =>
     webReleaseViolations(normalized(path), readFileSync(path, 'utf8'))), []);
   assert.deepEqual(WEB_RELEASE_ARTIFACTS.filter((path) => !builtWebFiles.map(normalized).includes(path)), []);
+  assert.match(readFileSync(join(ROOT, 'dist', 'cli.js'), 'utf8'), /room_name/);
+  assert.match(readFileSync(join(ROOT, 'dist', 'cli.js'), 'utf8'), /--name/);
+  assert.match(readFileSync(join(ROOT, 'dist', 'web', 'assets', 'app.js'), 'utf8'), /room_name/);
   const packets = filesBelow(join(ROOT, 'dist', 'mufl_code'), new Set(['.muflo']));
   assert.equal(packets.length, 1);
 });

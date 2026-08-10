@@ -41,6 +41,7 @@ function makeRoom() {
   return {
     version: 1,
     room_id: ROOM_ID,
+    room_name: 'Browser room',
     identity_name: 'Browser Room',
     identity_cid: 'browser-room-cid',
     mission: { goal: 'Browser release proof', briefing: 'Exercise the shipped console.' },
@@ -153,12 +154,13 @@ test('shipped web console creates, selects, invites, and sends through the real 
   });
   await page.goto(`http://127.0.0.1:${transport.restAddress.port}/`);
   await page.getByRole('button', { name: 'Create room' }).click();
+  await page.getByLabel('Name').fill('Browser room');
   await page.getByLabel('Goal').fill('Browser release proof');
   await page.getByLabel('Briefing').fill('Exercise the shipped console.');
   await page.getByRole('button', { name: 'Create mission room', exact: true }).click();
 
   await assertProjection(page, async () => {
-    await page.getByRole('heading', { name: 'Browser release proof' }).waitFor();
+    await page.getByRole('heading', { name: 'Browser room' }).waitFor();
     await page.waitForURL(new RegExp(`#\\/rooms\\/${ROOM_ID}$`));
     await page.getByRole('tabpanel', { name: 'Invites' }).waitFor();
   }, runtimeErrors);
@@ -186,7 +188,7 @@ test('shipped web console creates, selects, invites, and sends through the real 
   assert.equal(service.calls.filter(([method]) => method === 'room.message').length, 1);
   assert.deepEqual(service.calls.find(([method]) => method === 'room.create'), [
     'room.create',
-    { goal: 'Browser release proof', briefing: 'Exercise the shipped console.' },
+    { name: 'Browser room', goal: 'Browser release proof', briefing: 'Exercise the shipped console.' },
   ]);
   assert.deepEqual(service.calls.find(([method]) => method === 'room.invite'), [
     'room.invite',

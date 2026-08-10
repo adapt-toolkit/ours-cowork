@@ -15,8 +15,11 @@ import {
   Rfc3339Schema,
   RoleSchema,
   RoomInviteSchema,
+  RoomNameSchema,
   RoomSchema,
   RoomV1Schema,
+  UpdateRoomInputSchema,
+  defaultRoomName,
   migrateRoomV1,
 } from '../src/contracts.ts';
 
@@ -28,6 +31,7 @@ function room(overrides = {}) {
   return {
     version: 2,
     room_id: ROOM_ID,
+    room_name: 'Release room',
     identity_name: `cowork-room-${ROOM_ID}`,
     identity_cid: 'cid-room',
     mission: { goal: 'Ship it', briefing: 'Work together.', briefing_version: 1 },
@@ -106,6 +110,33 @@ test('text bounds count exact UTF-8 bytes, not JavaScript code units', () => {
 
   assert.equal(RoomSchema.parse(room({ mission: { goal: '🤖'.repeat(65_536), briefing: 'x', briefing_version: 1 } })).version, 2);
   assert.throws(() => RoomSchema.parse(room({ mission: { goal: 'x', briefing: `${'x'.repeat(262_144)}x`, briefing_version: 1 } })));
+});
+
+test('room names trim, NFC-normalize, count Unicode code points, and reject control/format characters', () => {
+  assert.equal(RoomNameSchema.parse('  Cafe\u0301  '), 'Café');
+  assert.equal(RoomNameSchema.parse('🤖'.repeat(64)), '🤖'.repeat(64));
+  for (const invalid of [
+    '',
+    '   ',
+    'a'.repeat(65),
+    'line\nbreak',
+    '\ntrimmed-looking',
+    'zero\u200bwidth',
+    '\ufeffleading-format',
+    'direction\u202ereversed',
+  ]) assert.throws(() => RoomNameSchema.parse(invalid), JSON.stringify(invalid));
+
+  assert.deepEqual(CreateRoomInputSchema.parse({ name: '  Cafe\u0301  ', goal: 'Goal', briefing: 'Brief' }), {
+    name: 'Café', goal: 'Goal', briefing: 'Brief',
+  });
+  assert.deepEqual(UpdateRoomInputSchema.parse({ name: '  Renamed  ' }), { name: 'Renamed' });
+});
+
+test('otherwise unnamed current rooms receive the deterministic display fallback', () => {
+  const unnamed = room();
+  delete unnamed.room_name;
+  assert.equal(RoomSchema.parse(unnamed).room_name, defaultRoomName(ROOM_ID));
+  assert.equal(defaultRoomName(ROOM_ID), 'Room 01jz6y7n');
 });
 
 test('file policy is opaque binary with path-free names, bounded MIME metadata, and a 2 MiB ceiling', () => {
@@ -322,6 +353,7 @@ function roomV2(overrides = {}) {
   return {
     version: 2,
     room_id: ROOM_ID,
+    room_name: 'Release room',
     identity_name: `cowork-room-${ROOM_ID}`,
     identity_cid: 'cid-room',
     mission: { goal: 'Ship it', briefing: 'Work together.', briefing_version: 1 },

@@ -14,6 +14,7 @@ function createdRoom(): RoomDto {
   return {
     version: 1,
     room_id: ROOM_ID,
+    room_name: 'Launch room',
     identity_name: `cowork-room-${ROOM_ID}`,
     identity_cid: 'cid-new-room',
     mission: { goal: 'Release coordination', briefing: 'Keep deploy owners aligned' },
@@ -42,6 +43,11 @@ describe('create and settings dialogs', () => {
     render(<CoworkApp rpc={{ call } as RpcClient} />);
 
     await user.click(await screen.findByRole('button', { name: 'Create room' }));
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'a'.repeat(65) } });
+    expect(screen.getByText('Name must be at most 64 characters.')).toBeVisible();
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'hidden\u200bname' } });
+    expect(screen.getByText('Name cannot contain control or format characters.')).toBeVisible();
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: '  Cafe\u0301 launch  ' } });
     fireEvent.change(screen.getByLabelText('Goal'), { target: { value: '🤖'.repeat(65_537) } });
     fireEvent.change(screen.getByLabelText('Briefing'), { target: { value: 'Briefing' } });
     expect(screen.getByText('Goal must be at most 262144 UTF-8 bytes.')).toBeVisible();
@@ -55,13 +61,13 @@ describe('create and settings dialogs', () => {
     await user.click(submit);
 
     expect(call).toHaveBeenCalledWith('room.create', {
-      goal: 'Release coordination', briefing: 'Keep deploy owners aligned',
+      name: 'Café launch', goal: 'Release coordination', briefing: 'Keep deploy owners aligned',
     });
     expect(call.mock.calls.filter(([method]) => method === 'room.create')).toHaveLength(1);
     expect(screen.getByRole('button', { name: 'Creating room…' })).toBeDisabled();
 
     await user.tab();
-    expect(screen.getByLabelText('Goal')).toHaveFocus();
+    expect(screen.getByLabelText('Name')).toHaveFocus();
     invoker.focus();
     fireEvent.keyDown(document, { key: 'Tab', shiftKey: true });
     expect(screen.getByLabelText('Briefing')).toHaveFocus();
@@ -87,6 +93,7 @@ describe('create and settings dialogs', () => {
     render(<CoworkApp rpc={{ call } as RpcClient} />);
 
     await user.click(await screen.findByRole('button', { name: 'Create room' }));
+    await user.type(screen.getByLabelText('Name'), 'Launch room');
     await user.type(screen.getByLabelText('Goal'), 'Release coordination');
     await user.type(screen.getByLabelText('Briefing'), 'Keep deploy owners aligned');
     await user.click(screen.getByRole('button', { name: 'Create mission room' }));
@@ -114,6 +121,7 @@ describe('create and settings dialogs', () => {
     const user = userEvent.setup();
     render(<CoworkApp rpc={{ call } as RpcClient} />);
     await user.click(await screen.findByRole('button', { name: 'Create room' }));
+    await user.type(screen.getByLabelText('Name'), 'Retained room');
     await user.type(screen.getByLabelText('Goal'), 'Retained create goal');
     await user.type(screen.getByLabelText('Briefing'), 'Retained create briefing');
 
@@ -151,6 +159,7 @@ describe('create and settings dialogs', () => {
       expect(container.querySelector('.room-rail')).not.toHaveAttribute('hidden');
 
       await user.click(create);
+      await user.type(screen.getByLabelText('Name'), 'Launch room');
       await user.type(screen.getByLabelText('Goal'), 'Release coordination');
       await user.type(screen.getByLabelText('Briefing'), 'Keep deploy owners aligned');
       await user.click(screen.getByRole('button', { name: 'Create mission room' }));
@@ -183,6 +192,26 @@ describe('create and settings dialogs', () => {
     await user.click(screen.getByRole('button', { name: 'Save settings' }));
 
     expect(call).toHaveBeenCalledWith('room.settings', { room_id: ROOM_ID, status: 'ready' });
+  });
+
+  it('normalizes a changed friendly name through settings', async () => {
+    const target = createdRoom();
+    const call = vi.fn(async (method: string) => {
+      if (method === 'room.list') return [target];
+      if (method === 'room.show') return target;
+      if (method === 'room.settings') return { ...target, room_name: 'Café planning' };
+      throw new Error(`unexpected ${method}`);
+    });
+    const user = userEvent.setup();
+    location.hash = `#/rooms/${ROOM_ID}`;
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Room settings' }));
+    await user.clear(screen.getByLabelText('Name'));
+    await user.type(screen.getByLabelText('Name'), '  Cafe\u0301 planning  ');
+    await user.click(screen.getByRole('button', { name: 'Save settings' }));
+
+    expect(call).toHaveBeenCalledWith('room.settings', { room_id: ROOM_ID, name: 'Café planning' });
   });
 
   it('preserves persisted whitespace and submits only the exact changed setting', async () => {
@@ -231,7 +260,7 @@ describe('create and settings dialogs', () => {
 
     target = { ...target, mission: { ...target.mission, goal: 'Server-refreshed goal' } };
     fireEvent(document, new Event('visibilitychange'));
-    await screen.findByRole('heading', { name: 'Server-refreshed goal' });
+    await screen.findByText('Server-refreshed goal', { selector: '.mission-strip p' });
     await user.click(settings);
     expect(screen.getByLabelText('Goal')).toHaveValue('Server-refreshed goal');
     expect(within(screen.getByRole('dialog', { name: 'Room settings' })).getByRole('button', { name: 'Save settings' })).toBeDisabled();

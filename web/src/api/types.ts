@@ -1,3 +1,5 @@
+import { isNormalizedRoomName } from '../roomName';
+
 export type RoomState = 'provisioning' | 'active' | 'closing' | 'closed';
 export type InviteMode = 'one_time' | 'public';
 export type InviteState = 'live' | 'consumed' | 'revoked' | 'replacement_required' | 'receipt_pending';
@@ -46,6 +48,7 @@ export interface RoleBriefingDto {
 export interface RoomDto {
   version: 1 | 2;
   room_id: string;
+  room_name: string;
   identity_name: string;
   identity_cid: string;
   mission: MissionDto;
@@ -183,7 +186,7 @@ const MAX_FILE_NAME_BYTES = 255;
 const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;
 const RECORD_COMMON_KEYS = ['version', 'room_id', 'seq', 'record_id', 'at', 'kind'] as const;
-const ROOM_V1_KEYS = ['version', 'room_id', 'identity_name', 'identity_cid', 'mission', 'state', 'invites', 'seats', 'created_at'] as const;
+const ROOM_V1_KEYS = ['version', 'room_id', 'room_name', 'identity_name', 'identity_cid', 'mission', 'state', 'invites', 'seats', 'created_at'] as const;
 const ROOM_V2_KEYS = [...ROOM_V1_KEYS, 'role_briefings', 'anonymous', 'quiet_membership', 'membership_epoch'] as const;
 
 export function isRoomDto(value: unknown): value is RoomDto {
@@ -191,6 +194,7 @@ export function isRoomDto(value: unknown): value is RoomDto {
   const v2 = value.version === 2;
   if (!hasExactKeys(value, v2 ? ROOM_V2_KEYS : ROOM_V1_KEYS, ['status', 'activated_at', 'closed_at'])
     || !isLowerCrockfordUlid(value.room_id)
+    || !isNormalizedRoomName(value.room_name)
     || !isString(value.identity_name)
     || typeof value.identity_cid !== 'string'
     || !isMission(value.mission, v2)

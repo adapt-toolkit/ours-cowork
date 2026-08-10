@@ -15,6 +15,7 @@ function room(overrides = {}) {
   return {
     version: 2,
     room_id: ROOM_ID,
+    room_name: 'Release room',
     identity_name: `cowork-room-${ROOM_ID}`,
     identity_cid: 'cid-room',
     mission: { goal: 'Ship it', briefing: 'Work together.', briefing_version: 1 },
@@ -672,6 +673,7 @@ test('load migrates a v1 room.json to v2 with a one-time .v1.bak beside it', asy
 
   const migrated = await store.load(ROOM_ID);
   assert.equal(migrated.version, 2);
+  assert.equal(migrated.room_name, 'Room 01jz6y7n');
   assert.equal(migrated.anonymous, false);
   assert.equal(migrated.quiet_membership, false);
   assert.equal(migrated.membership_epoch, 0);
@@ -692,6 +694,43 @@ test('load migrates a v1 room.json to v2 with a one-time .v1.bak beside it', asy
   const again = await store.load(ROOM_ID);
   assert.deepEqual(again, migrated);
   assert.equal(readFileSync(backupPath, 'utf8'), originalBytes);
+});
+
+test('load atomically persists the deterministic name for legacy unnamed v2 metadata', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore();
+  t.after(cleanup);
+
+  const legacy = room();
+  delete legacy.room_name;
+  const roomDir = join(stateDir, 'rooms', ROOM_ID);
+  fs.mkdirSync(roomDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(roomDir, 'room.json'), `${JSON.stringify(legacy)}\n`, { mode: 0o600 });
+  writeFileSync(join(roomDir, 'archive.jsonl'), '', { mode: 0o600 });
+
+  const migrated = await store.load(ROOM_ID);
+  assert.equal(migrated.version, 2);
+  assert.equal(migrated.room_name, 'Room 01jz6y7n');
+  assert.equal(migrated.room_id, ROOM_ID);
+  assert.equal(migrated.identity_name, legacy.identity_name);
+  const persisted = JSON.parse(readFileSync(join(roomDir, 'room.json'), 'utf8'));
+  assert.equal(persisted.room_name, 'Room 01jz6y7n');
+  assert.equal(fs.existsSync(join(roomDir, 'room.json.v1.bak')), false);
+  assert.deepEqual(await store.load(ROOM_ID), migrated);
+});
+
+test('load canonicalizes and persists non-NFC v2 room names at the storage boundary', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore();
+  t.after(cleanup);
+
+  const legacy = room({ room_name: '  Cafe\u0301 launch  ' });
+  const roomDir = join(stateDir, 'rooms', ROOM_ID);
+  fs.mkdirSync(roomDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(roomDir, 'room.json'), `${JSON.stringify(legacy)}\n`, { mode: 0o600 });
+  writeFileSync(join(roomDir, 'archive.jsonl'), '', { mode: 0o600 });
+
+  assert.equal((await store.load(ROOM_ID)).room_name, 'Café launch');
+  const persisted = JSON.parse(readFileSync(join(roomDir, 'room.json'), 'utf8'));
+  assert.equal(persisted.room_name, 'Café launch');
 });
 
 test('migration does not clobber an INTACT existing .v1.bak and v2 rooms load untouched', async (t) => {

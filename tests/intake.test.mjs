@@ -147,6 +147,7 @@ function room(overrides = {}) {
   return {
     version: 2,
     room_id: ROOM_ID,
+    room_name: 'Release room',
     identity_name: `cowork-room-${ROOM_ID}`,
     identity_cid: 'cid-room',
     mission: { goal: 'Ship', briefing: 'Read the mission.', briefing_version: 1 },

@@ -19,10 +19,8 @@ const STATE_LABELS: Record<RoomState, string> = {
   closed: 'Closed',
 };
 
-export function roomTitle(room: Pick<RoomDto, 'room_id' | 'mission'>): string {
-  const goal = room.mission.goal.trim();
-  if (goal) return goal;
-  return room.room_id.length > 18 ? `${room.room_id.slice(0, 15)}…` : room.room_id;
+export function roomTitle(room: Pick<RoomDto, 'room_name'>): string {
+  return room.room_name;
 }
 
 export function RoomRail({

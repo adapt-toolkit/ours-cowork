@@ -177,6 +177,10 @@ test('create validates caller input first and provisions exactly one named room 
     f.service.createRoom({ goal: 'Ship', briefing: 'Brief', identity_cid: 'forged' }),
     /unrecognized|invalid/i,
   );
+  await assert.rejects(
+    f.service.createRoom({ name: 'hidden\u200bname', goal: 'Ship', briefing: 'Brief' }),
+    /control|format/i,
+  );
   assert.equal(f.registry.createCalls.length, 0);
 
   const room = await create(f);
@@ -186,8 +190,30 @@ test('create validates caller input first and provisions exactly one named room 
     bio: `ours-cowork mission room ${ROOM_ID}`,
   }]);
   assert.equal(room.identity_name, `cowork-room-${ROOM_ID}`);
+  assert.equal(room.room_name, 'Room 01jz6y7n');
   assert.equal(room.identity_cid, `cid-room-${ROOM_ID}`);
   assert.equal(room.state, 'provisioning');
+});
+
+test('create normalizes friendly names, allows duplicates, and leaves technical identities keyed by room_id', async () => {
+  const store = new MemoryStore();
+  const registry = new FakeRegistry();
+  const ids = [ROOM_ID, '01jz6y7n8p9q0r1s2t3v4w5x70'];
+  let timeIndex = 0;
+  const service = new RoomService(store, registry, {
+    roomId: () => ids.shift(),
+    messageId: () => MESSAGE_IDS[0],
+    now: () => TIMES[timeIndex++],
+  });
+
+  const first = await service.createRoom({ name: '  Cafe\u0301 launch  ', goal: 'One', briefing: 'Brief' });
+  const second = await service.createRoom({ name: 'Café launch', goal: 'Two', briefing: 'Brief' });
+  assert.equal(first.room_name, 'Café launch');
+  assert.equal(second.room_name, 'Café launch');
+  assert.notEqual(first.room_id, second.room_id);
+  assert.equal(first.identity_name, `cowork-room-${first.room_id}`);
+  assert.equal(second.identity_name, `cowork-room-${second.room_id}`);
+  assert.deepEqual((await service.listRooms()).map((room) => room.room_name), ['Café launch', 'Café launch']);
 });
 
 test('recoverRoom resumes the durable provisioning boundary with exactly one live packet', async () => {
@@ -760,7 +786,8 @@ test('projections update settings and page numeric history without exposing invi
   const f = fixture();
   await create(f);
   await f.service.createInvite(ROOM_ID, { mode: 'one_time', role: 'builder', min_accepts: 1 });
-  const updated = await f.service.updateRoom(ROOM_ID, { status: 'working', goal: 'New goal' });
+  const updated = await f.service.updateRoom(ROOM_ID, { name: '  Renamed room  ', status: 'working', goal: 'New goal' });
+  assert.equal(updated.room_name, 'Renamed room');
   assert.equal(updated.status, 'working');
   assert.equal(updated.mission.goal, 'New goal');
   assert.equal((await f.service.listRooms()).length, 1);

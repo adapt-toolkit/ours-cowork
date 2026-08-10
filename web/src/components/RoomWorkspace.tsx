@@ -46,7 +46,6 @@ export function RoomWorkspace({ room, records = [], historyReady = false, connec
         <div className="workspace-identity">
           <p className="eyebrow">Mission room</p>
           <h1>{roomTitle(room)}</h1>
-          <p className="mono identity-name">{room.identity_name}</p>
         </div>
         <span className={`lifecycle-badge lifecycle-badge--${room.state}`}>{lifecycleLabel(room.state)}</span>
         <button className="secondary-button context-toggle" type="button" onClick={onOpenContext} data-modal-fallback="true">Context</button>

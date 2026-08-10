@@ -16,7 +16,7 @@ const MESSAGE_ID = '01jz6y7n8p9q0r1s2t3v4w5x72';
 function room(roomId = ROOM_ONE): RoomDto {
   const label = roomId === ROOM_ONE ? 'room-1' : 'room-2';
   return {
-    version: 1, room_id: roomId, identity_name: `cowork-${label}`, identity_cid: `cid-${label}`,
+    version: 1, room_id: roomId, room_name: label, identity_name: `cowork-${label}`, identity_cid: `cid-${label}`,
     mission: { goal: `Goal ${label}`, briefing: `Briefing ${label}` }, state: 'active',
     invites: [], seats: [], created_at: AT,
   };
@@ -160,7 +160,7 @@ describe('selected-room paginated history', () => {
     });
     render(<CoworkApp rpc={{ call } as RpcClient} />);
 
-    await screen.findByRole('heading', { name: 'Goal room-1' });
+    await screen.findByRole('heading', { name: 'room-1' });
     await vi.waitFor(() => expect(call.mock.calls.some(([method]) => method === 'room.history')).toBe(true));
     await act(async () => Promise.resolve());
     expect(screen.queryByText('message 1')).not.toBeInTheDocument();
@@ -219,9 +219,9 @@ describe('selected-room paginated history', () => {
     render(<CoworkApp rpc={{ call } as RpcClient} />);
 
     expect(await screen.findByText('Retained first-room history')).toBeVisible();
-    await user.click(screen.getByText('Goal room-2'));
+    await user.click(screen.getByText('room-2'));
     expect(await screen.findByText('Second-room history')).toBeVisible();
-    await user.click(screen.getByText('Goal room-1'));
+    await user.click(screen.getByText('room-1'));
     expect(await screen.findByText('Retained first-room history')).toBeVisible();
     expect(call.mock.calls.filter(([method, params]) => method === 'room.history' && params.room_id === ROOM_ONE).at(-1)?.[1]).toEqual(
       { room_id: ROOM_ONE, after: 1, limit: 200 },
@@ -245,7 +245,7 @@ describe('selected-room paginated history', () => {
     render(<CoworkApp rpc={{ call } as RpcClient} />);
     await vi.waitFor(() => expect(call.mock.calls.some(([method, params]) => method === 'room.history' && params.room_id === ROOM_ONE)).toBe(true));
 
-    await user.click(await screen.findByText('Goal room-2'));
+    await user.click(await screen.findByText('room-2'));
     expect(await screen.findByText('Current room record')).toBeVisible();
     lateFirst.resolve([message(1, { text: 'Stale previous-room record' })]);
     await act(async () => lateFirst.promise);

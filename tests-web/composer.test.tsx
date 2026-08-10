@@ -74,7 +74,7 @@ describe('authoritative room composer', () => {
 
   it('posts once without an optimistic row, then refreshes history immediately after authoritative confirmation', async () => {
     const target: RoomDto = {
-      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-room-1', identity_cid: 'cid-room',
+      version: 1, room_id: ROOM_ID, room_name: 'Release coordination', identity_name: 'cowork-room-room-1', identity_cid: 'cid-room',
       mission: { goal: 'Release coordination', briefing: 'Coordinate carefully' }, state: 'active',
       invites: [], seats: [], created_at: AT,
     };
@@ -113,12 +113,12 @@ describe('authoritative room composer', () => {
   it('keeps a pending send with its source room and refreshes only that room after navigation', async () => {
     const secondRoomId = '01jz6y7n8p9q0r1s2t3v4w5x72';
     const first = {
-      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-one', identity_cid: 'cid-one',
+      version: 1, room_id: ROOM_ID, room_name: 'First mission', identity_name: 'cowork-room-one', identity_cid: 'cid-one',
       mission: { goal: 'First mission', briefing: 'First briefing' }, state: 'active' as const,
       invites: [], seats: [], created_at: AT,
     };
     const second = {
-      ...first, room_id: secondRoomId, identity_name: 'cowork-room-two', identity_cid: 'cid-two',
+      ...first, room_id: secondRoomId, room_name: 'Second mission', identity_name: 'cowork-room-two', identity_cid: 'cid-two',
       mission: { goal: 'Second mission', briefing: 'Second briefing' },
     };
     const text = 'Source-room authoritative update';
@@ -165,12 +165,12 @@ describe('authoritative room composer', () => {
   it('allows one concurrent pending send per room and isolates their completion state', async () => {
     const secondRoomId = '01jz6y7n8p9q0r1s2t3v4w5x72';
     const first: RoomDto = {
-      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-one', identity_cid: 'cid-one',
+      version: 1, room_id: ROOM_ID, room_name: 'First concurrent mission', identity_name: 'cowork-room-one', identity_cid: 'cid-one',
       mission: { goal: 'First concurrent mission', briefing: 'First concurrent briefing' }, state: 'active',
       invites: [], seats: [], created_at: AT,
     };
     const second: RoomDto = {
-      ...first, room_id: secondRoomId, identity_name: 'cowork-room-two', identity_cid: 'cid-two',
+      ...first, room_id: secondRoomId, room_name: 'Second concurrent mission', identity_name: 'cowork-room-two', identity_cid: 'cid-two',
       mission: { goal: 'Second concurrent mission', briefing: 'Second concurrent briefing' },
     };
     const firstText = 'First room pending text';
@@ -233,11 +233,11 @@ describe('authoritative room composer', () => {
   ])('isolates a deferred %s draft and error across room switches', async (_label, failure, expectedError) => {
     const secondRoomId = '01jz6y7n8p9q0r1s2t3v4w5x72';
     const first: RoomDto = {
-      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-one', identity_cid: 'cid-one',
+      version: 1, room_id: ROOM_ID, room_name: 'First mission', identity_name: 'cowork-room-one', identity_cid: 'cid-one',
       mission: { goal: 'First mission', briefing: 'First briefing' }, state: 'active', invites: [], seats: [], created_at: AT,
     };
     const second: RoomDto = {
-      ...first, room_id: secondRoomId, identity_name: 'cowork-room-two', identity_cid: 'cid-two',
+      ...first, room_id: secondRoomId, room_name: 'Second mission', identity_name: 'cowork-room-two', identity_cid: 'cid-two',
       mission: { goal: 'Second mission', briefing: 'Second briefing' },
     };
     const pending = deferred<MessageRecordDto>();
@@ -272,7 +272,7 @@ describe('authoritative room composer', () => {
 
   it('drops pending composer state safely when its room is deleted before the send resolves', async () => {
     let current: RoomDto | undefined = {
-      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-one', identity_cid: 'cid-one',
+      version: 1, room_id: ROOM_ID, room_name: 'Deletion race', identity_name: 'cowork-room-one', identity_cid: 'cid-one',
       mission: { goal: 'Deletion race', briefing: 'Deletion briefing' }, state: 'active', invites: [], seats: [], created_at: AT,
     };
     const requestedRoom = current;
@@ -318,7 +318,7 @@ describe('authoritative room composer', () => {
     ['foreign union field', (record: MessageRecordDto) => ({ ...record, notified: true })],
   ])('retains the draft when message confirmation has a %s', async (_label, corrupt) => {
     const target: RoomDto = {
-      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-room-1', identity_cid: 'cid-room',
+      version: 1, room_id: ROOM_ID, room_name: 'Release coordination', identity_name: 'cowork-room-room-1', identity_cid: 'cid-room',
       mission: { goal: 'Release coordination', briefing: 'Coordinate carefully' }, state: 'active',
       invites: [], seats: [], created_at: AT,
     };
@@ -348,7 +348,7 @@ describe('authoritative room composer', () => {
 
   it('does not submit a retained draft after the selected room disconnects', async () => {
     const target: RoomDto = {
-      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-room-1', identity_cid: 'cid-room',
+      version: 1, room_id: ROOM_ID, room_name: 'Release coordination', identity_name: 'cowork-room-room-1', identity_cid: 'cid-room',
       mission: { goal: 'Release coordination', briefing: 'Coordinate carefully' }, state: 'active',
       invites: [], seats: [], created_at: AT,
     };
@@ -378,7 +378,7 @@ describe('authoritative room composer', () => {
 
   it('does not submit a retained draft after the selected room leaves active state', async () => {
     let target: RoomDto = {
-      version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-room-1', identity_cid: 'cid-room',
+      version: 1, room_id: ROOM_ID, room_name: 'Release coordination', identity_name: 'cowork-room-room-1', identity_cid: 'cid-room',
       mission: { goal: 'Release coordination', briefing: 'Coordinate carefully' }, state: 'active',
       invites: [], seats: [], created_at: AT,
     };

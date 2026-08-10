@@ -9,7 +9,7 @@ import { validateConfirmedRecoveryInvite, validateCreatedInviteReceipt, validate
 
 const ROOM_ONE = '01jz6y7n8p9q0r1s2t3v4w5x70';
 const ROOM_TWO = '01jz6y7n8p9q0r1s2t3v4w5x71';
-const base: RoomDto = { version: 1, room_id: ROOM_ONE, identity_name: 'cowork-room', identity_cid: 'cid-room', mission: { goal: 'Ship', briefing: 'Brief' }, state: 'provisioning', invites: [], seats: [], created_at: '2026-08-03T00:00:00Z' };
+const base: RoomDto = { version: 1, room_id: ROOM_ONE, room_name: 'Ship room', identity_name: 'cowork-room', identity_cid: 'cid-room', mission: { goal: 'Ship', briefing: 'Brief' }, state: 'provisioning', invites: [], seats: [], created_at: '2026-08-03T00:00:00Z' };
 
 describe('invite management', () => {
   it('submits once and forgets a copied create secret on close', async () => {
@@ -59,7 +59,7 @@ describe('invite management', () => {
     const user = userEvent.setup();
     const stale = { invite_id: 'old-one', mode: 'one_time' as const, role: 'reviewer', min_accepts: 1, accepted_cids: [], state: 'replacement_required' as const, created_at: base.created_at };
     const first = { ...base, invites: [stale] };
-    const second = { ...base, room_id: ROOM_TWO, mission: { ...base.mission, goal: 'Other' } };
+    const second = { ...base, room_id: ROOM_TWO, room_name: 'Other room', mission: { ...base.mission, goal: 'Other' } };
     const pending = deferred<InviteReceiptDto[]>();
     const recovered: InviteReceiptDto = { room_id: first.room_id, invite: { ...stale, invite_id: 'new-one', state: 'receipt_pending', recovery_of: stale.invite_id, recovery_confirmed: false }, blob: 'RECOVERY-SECRET', reusable: false, recovery_of: stale.invite_id };
     const call = vi.fn((method: string, params: Record<string, unknown>) => {
@@ -73,7 +73,7 @@ describe('invite management', () => {
     render(<CoworkApp rpc={{ call } as RpcClient} />);
     await user.click(await screen.findByRole('tab', { name: 'Invite' }));
     await user.click(screen.getByRole('button', { name: 'Recover missing invites' }));
-    await user.click(screen.getByText('Other'));
+    await user.click(screen.getByText('Other room'));
     pending.resolve([recovered]);
     await act(async () => pending.promise);
     expect(await screen.findByText('RECOVERY-SECRET')).toBeVisible();

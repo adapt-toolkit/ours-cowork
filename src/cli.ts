@@ -118,8 +118,8 @@ Usage:
   ours-cowork [--json] docs [topic]
 
 Room commands:
-  create --goal <text> --briefing <text> [--anonymous] [--quiet-membership]
-  settings <room-id> [--goal <text>] [--briefing <text>] [--status <text>] [--quiet-membership true|false]
+  create [--name <display-name>] --goal <text> --briefing <text> [--anonymous] [--quiet-membership]
+  settings <room-id> [--name <display-name>] [--goal <text>] [--briefing <text>] [--status <text>] [--quiet-membership true|false]
   role-briefing <room-id> --role <label> (--text <text> | --delete)
   invite <room-id> [--role <label>] [--mode one_time|public] [--min-accepts <n>]
   revoke <room-id> <invite-id>
@@ -223,9 +223,10 @@ function roomRequest(command: string | undefined, args: string[]): { method: str
   if (!command) usageError('room requires a command');
   switch (command) {
     case 'create': {
-      const parsed = parseOptions(args, ['--goal', '--briefing'], ['--anonymous', '--quiet-membership']);
+      const parsed = parseOptions(args, ['--name', '--goal', '--briefing'], ['--anonymous', '--quiet-membership']);
       exactPositionals(parsed, 0, 'room create');
       return { method: 'room.create', params: {
+        ...(parsed.values['--name'] === undefined ? {} : { name: parsed.values['--name'] }),
         goal: requiredFlag(parsed, '--goal', 'room create'),
         briefing: requiredFlag(parsed, '--briefing', 'room create'),
         ...(parsed.booleans.has('--anonymous') ? { anonymous: true } : {}),
@@ -233,10 +234,10 @@ function roomRequest(command: string | undefined, args: string[]): { method: str
       } };
     }
     case 'settings': {
-      const parsed = parseOptions(args, ['--goal', '--briefing', '--status', '--quiet-membership']);
+      const parsed = parseOptions(args, ['--name', '--goal', '--briefing', '--status', '--quiet-membership']);
       const [roomId] = exactPositionals(parsed, 1, 'room settings');
       const params: Record<string, unknown> = { room_id: roomId };
-      for (const [flag, key] of [['--goal', 'goal'], ['--briefing', 'briefing'], ['--status', 'status']] as const) {
+      for (const [flag, key] of [['--name', 'name'], ['--goal', 'goal'], ['--briefing', 'briefing'], ['--status', 'status']] as const) {
         if (parsed.values[flag] !== undefined) params[key] = parsed.values[flag];
       }
       const quiet = parsed.values['--quiet-membership'];

@@ -377,6 +377,9 @@ export class CoworkStore {
     const room = this.isVersion1(decoded)
       ? this.migrateUnlocked(roomId, decoded, bytes)
       : RoomSchema.parse(decoded);
+    if (!this.isVersion1(decoded) && this.persistedRoomName(decoded) !== room.room_name) {
+      this.atomicMetadataWrite(this.metadataPath(roomId), room);
+    }
     if (room.room_id !== roomId) throw new CoworkStorageError(`metadata room_id does not match room "${roomId}"`);
     return room;
   }
@@ -384,6 +387,12 @@ export class CoworkStore {
   private isVersion1(decoded: unknown): boolean {
     return typeof decoded === 'object' && decoded !== null
       && (decoded as { version?: unknown }).version === 1;
+  }
+
+  private persistedRoomName(decoded: unknown): unknown {
+    return typeof decoded === 'object' && decoded !== null
+      ? (decoded as { room_name?: unknown }).room_name
+      : undefined;
   }
 
   /**

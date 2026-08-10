@@ -150,6 +150,7 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
     'room.settings': { auth: true, run: (params) => {
       const { room_id, ...input } = z.object({
         room_id: z.string(),
+        name: z.unknown().optional(),
         goal: z.unknown().optional(),
         briefing: z.unknown().optional(),
         status: z.unknown().optional(),

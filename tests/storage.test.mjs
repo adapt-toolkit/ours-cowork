@@ -694,7 +694,7 @@ test('load migrates a v1 room.json to v2 with a one-time .v1.bak beside it', asy
   assert.equal(readFileSync(backupPath, 'utf8'), originalBytes);
 });
 
-test('migration does not clobber an existing .v1.bak and v2 rooms load untouched', async (t) => {
+test('migration does not clobber an INTACT existing .v1.bak and v2 rooms load untouched', async (t) => {
   const { stateDir, store, cleanup } = temporaryStore();
   t.after(cleanup);
 
@@ -702,13 +702,91 @@ test('migration does not clobber an existing .v1.bak and v2 rooms load untouched
   fs.mkdirSync(roomDir, { recursive: true, mode: 0o700 });
   writeFileSync(join(roomDir, 'room.json'), `${JSON.stringify(roomV1())}\n`, { mode: 0o600 });
   writeFileSync(join(roomDir, 'archive.jsonl'), '', { mode: 0o600 });
-  writeFileSync(join(roomDir, 'room.json.v1.bak'), 'pre-existing backup\n', { mode: 0o600 });
+  // NOTE: this fixture used to be the string 'pre-existing backup\n'. It is now a
+  // real v1 document, because the once-only rule was narrowed on purpose: a
+  // backup is protected when it is INTACT, not merely when it exists. The
+  // corrupt case is the test below, and it is why the rule was narrowed.
+  const priorBackup = `${JSON.stringify(roomV1({ mission: { goal: 'Older goal', briefing: 'Older briefing.' } }))}\n`;
+  writeFileSync(join(roomDir, 'room.json.v1.bak'), priorBackup, { mode: 0o600 });
 
   const migrated = await store.load(ROOM_ID);
   assert.equal(migrated.version, 2);
-  assert.equal(readFileSync(join(roomDir, 'room.json.v1.bak'), 'utf8'), 'pre-existing backup\n');
+  assert.equal(readFileSync(join(roomDir, 'room.json.v1.bak'), 'utf8'), priorBackup);
 
   const before = readFileSync(join(roomDir, 'room.json'), 'utf8');
   await store.load(ROOM_ID);
   assert.equal(readFileSync(join(roomDir, 'room.json'), 'utf8'), before);
+});
+
+test('a partial .v1.bak from a crashed backup write is REPLACED, not trusted', async (t) => {
+  // THE CRASH THIS GUARDS. The backup used to be written in place under
+  // O_CREAT|O_EXCL and the once-only rule was an EXISTENCE check. A crash inside
+  // that write leaves a partial file that exists, so the next load skipped the
+  // backup, wrote v2, and the pre-migration bytes were gone with no error and no
+  // warning — the one artefact that exists to undo a bad migration reduced to a
+  // fragment. Measured before the fix: 40 bytes of 604, JSON.parse false,
+  // room.json already v2.
+  //
+  // COUNTERFACTUAL RUN: reverting migrateUnlocked to the existence check makes
+  // this test fail on the final assertion with the 40-byte prefix still on disk.
+  const { stateDir, store, cleanup } = temporaryStore();
+  t.after(cleanup);
+
+  const roomDir = join(stateDir, 'rooms', ROOM_ID);
+  fs.mkdirSync(roomDir, { recursive: true, mode: 0o700 });
+  const originalBytes = `${JSON.stringify(roomV1())}\n`;
+  writeFileSync(join(roomDir, 'room.json'), originalBytes, { mode: 0o600 });
+  writeFileSync(join(roomDir, 'archive.jsonl'), '', { mode: 0o600 });
+  // exactly what a crash mid-write leaves: present, truncated, never fsynced
+  const backupPath = join(roomDir, 'room.json.v1.bak');
+  writeFileSync(backupPath, originalBytes.slice(0, 40), { mode: 0o600 });
+
+  const migrated = await store.load(ROOM_ID);
+  assert.equal(migrated.version, 2);
+
+  const repaired = readFileSync(backupPath, 'utf8');
+  assert.equal(repaired, originalBytes, 'the fragment was replaced with the real pre-migration bytes');
+  assert.equal(mode(backupPath), 0o600);
+  // and what it holds is genuinely a loadable v1 document, not just longer bytes
+  assert.equal(JSON.parse(repaired).version, 1);
+});
+
+test('the .v1.bak is re-loadable: restoring it migrates again, with FRESH participant ids', async (t) => {
+  // Reading this test is the fastest way to learn the property that matters for
+  // recovery: restoring the backup is NOT a rollback. It produces a DIFFERENT v2.
+  const { stateDir, store, cleanup } = temporaryStore();
+  t.after(cleanup);
+
+  const roomDir = join(stateDir, 'rooms', ROOM_ID);
+  fs.mkdirSync(roomDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(roomDir, 'room.json'), `${JSON.stringify(roomV1({
+    state: 'active',
+    activated_at: AT,
+    invites: [{
+      invite_id: 'invite-1', mode: 'public', role: 'reviewer', min_accepts: 1,
+      accepted_cids: ['cid-alice'], state: 'live', created_at: AT,
+    }],
+    seats: [{
+      identity: 'cid-alice', display_name: 'Alice', role: 'reviewer',
+      invite_id: 'invite-1', accepted_at: AT,
+    }],
+  }))}\n`, { mode: 0o600 });
+  writeFileSync(join(roomDir, 'archive.jsonl'), '', { mode: 0o600 });
+
+  const first = await store.load(ROOM_ID);
+  const backupPath = join(roomDir, 'room.json.v1.bak');
+
+  // the operator's actual recovery: put the backup back and load
+  fs.copyFileSync(backupPath, join(roomDir, 'room.json'));
+  fs.rmSync(backupPath);
+  const second = await store.load(ROOM_ID);
+
+  assert.equal(second.version, 2, 'the restored backup migrates cleanly');
+  assert.equal(second.seats[0].identity, 'cid-alice', 'the real seat identity survives');
+  assert.notEqual(
+    second.seats[0].participant_id,
+    first.seats[0].participant_id,
+    'participant ids are RE-MINTED — restoring is not a rollback; in an anonymous room every '
+    + 'participant gets a new on-wire pseudonymous identity',
+  );
 });

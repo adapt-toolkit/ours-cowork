@@ -77,6 +77,25 @@ function renderMessages(value) {
   return messages;
 }
 
+function renderFiles(value) {
+  const files = [];
+  for (let index = 0; ; index += 1) {
+    const file = value.Reduce(index);
+    if (file.IsNil()) break;
+    files.push({
+      file_id: Number(file.Reduce('file_id').Visualize()),
+      sender_id: file.Reduce('sender_id').Visualize(),
+      sender_name: file.Reduce('sender_name').Visualize(),
+      filename: file.Reduce('filename').Visualize(),
+      mime: file.Reduce('mime').Visualize(),
+      data: Buffer.from(file.Reduce('data').GetBinary()),
+      status: file.Reduce('status').Visualize(),
+      wire_id: file.Reduce('wire_id').Visualize(),
+    });
+  }
+  return files;
+}
+
 function renderIntArray(value) {
   const output = [];
   for (let index = 0; ; index += 1) {
@@ -250,6 +269,10 @@ test('minimal cowork actor speaks the real ours packet protocol', async (t) => {
     return renderMessages(readonly(packet, '::actor::list_incoming_messages'));
   }
 
+  function fileInbox(packet) {
+    return renderFiles(readonly(packet, '::actor::list_incoming_files'));
+  }
+
   async function namePacket(packet, name) {
     await mutate(packet, '::a2a_messaging::set_my_name', { name });
   }
@@ -368,6 +391,24 @@ test('minimal cowork actor speaks the real ours packet protocol', async (t) => {
     'permissive fixture contact acceptance',
   );
 
+  for (const [filename, mime] of [
+    ['../poison.bin', 'application/octet-stream'],
+    ['.', 'application/octet-stream'],
+    ['back\\slash.bin', 'application/octet-stream'],
+    ['€'.repeat(86), 'application/octet-stream'],
+    ['valid-name.bin', '€'.repeat(86)],
+  ]) {
+    const rejectsBefore = room.rejects.length;
+    await mutate(permissive, '::a2a_messaging::send_file', {
+      contact: room.cid,
+      filename,
+      mime,
+      data: binary(permissive, Buffer.from('poison')),
+    });
+    await waitFor(() => room.rejects.length > rejectsBefore, `invalid file metadata rejection: ${JSON.stringify(filename)}`);
+  }
+  assert.deepEqual(fileInbox(room), [], 'invalid metadata must abort before the room actor persists an unread file');
+
   // The fixture is an actual notification service. Registering exercises the
   // cowork actor's client-confirm hook and leaves core-owned client state that
   // must survive the room export/import below.
@@ -380,30 +421,52 @@ test('minimal cowork actor speaks the real ours packet protocol', async (t) => {
   );
   progress('notifications');
 
-  // Outgoing and incoming file rejection are distinct paths. The permissive
-  // fixture accepts files, so the first assertion can only come from cowork's
-  // sender hook. The reverse send succeeds locally and then reaches cowork's
-  // receiver hook, whose exact abort is observed as an inbound packet failure.
-  const outgoingFileBytes = binary(room, Buffer.from('outgoing blocked'));
-  await assert.rejects(
-    mutate(room, '::a2a_messaging::send_file', {
-      contact: permissive.cid,
-      filename: 'outgoing-blocked.txt',
-      mime: 'text/plain',
-      data: outgoingFileBytes,
-    }),
-    /Room packets do not accept files/,
-  );
-  const inboundRejectCount = room.rejects.length;
-  await mutate(permissive, '::a2a_messaging::send_file', {
-    contact: room.cid,
-    filename: 'inbound-blocked.txt',
-    mime: 'text/plain',
-    data: binary(permissive, Buffer.from('inbound blocked')),
+  // Historical note: this block used to prove that both outgoing and incoming
+  // files were deliberately refused. The durable archive/intent ledger now
+  // makes those paths positive while retaining an explicit 2 MiB policy.
+  const roomToBob = Buffer.from([0, 1, 2, 255, 42]);
+  await mutate(room, '::a2a_messaging::send_file', {
+    contact: bob.cid,
+    filename: 'room-to-bob.bin',
+    mime: 'application/octet-stream',
+    data: binary(room, roomToBob),
   });
   await waitFor(
-    () => room.rejects.slice(inboundRejectCount).some((message) => message.includes('Room packets do not accept files')),
-    'cowork inbound file hook rejection',
+    () => fileInbox(bob).some((file) => file.filename === 'room-to-bob.bin'),
+    'room-to-peer file',
+  );
+  let receivedFiles = renderFiles((await mutate(bob, '::actor::get_files', {})).Reduce('files'));
+  assert.equal(receivedFiles.length, 1);
+  assert.equal(receivedFiles[0].sender_id, room.cid);
+  assert.equal(receivedFiles[0].mime, 'application/octet-stream');
+  assert.deepEqual(receivedFiles[0].data, roomToBob);
+  assert.equal(receivedFiles[0].status, 'processed');
+
+  const bobToRoom = Buffer.from('bob to room\0bytes');
+  await mutate(bob, '::a2a_messaging::send_file', {
+    contact: room.cid,
+    filename: 'bob-to-room.txt',
+    mime: 'text/plain',
+    data: binary(bob, bobToRoom),
+  });
+  await waitFor(
+    () => fileInbox(room).some((file) => file.filename === 'bob-to-room.txt'),
+    'peer-to-room file',
+  );
+  receivedFiles = renderFiles((await mutate(room, '::actor::get_files', {})).Reduce('files'));
+  assert.equal(receivedFiles.length, 1);
+  assert.equal(receivedFiles[0].sender_id, bob.cid);
+  assert.deepEqual(receivedFiles[0].data, bobToRoom);
+  assert.equal(receivedFiles[0].status, 'processed');
+
+  await assert.rejects(
+    mutate(room, '::a2a_messaging::send_file', {
+      contact: bob.cid,
+      filename: 'too-large.bin',
+      mime: 'application/octet-stream',
+      data: binary(room, Buffer.alloc((2 * 1024 * 1024) + 1)),
+    }),
+    /at most 2097152 bytes/,
   );
 
   // A real encrypted peer call arrives with external origin and must not reach
@@ -416,7 +479,7 @@ test('minimal cowork actor speaks the real ours packet protocol', async (t) => {
     'external-origin sign_app_envelope rejection',
   );
   assert.match(room.rejects.at(-1), /origin/i);
-  progress('refusals');
+  progress('files-and-origin-guard');
 
   const removal = await mutate(room, '::a2a_messaging::remove_contact', { contact: bob.cid });
   assert.equal(bool(removal.Reduce('notified')), true);
@@ -476,6 +539,15 @@ test('minimal cowork actor speaks the real ours packet protocol', async (t) => {
   await waitFor(() => inbox(restored).some((message) => message.text === 'after-import-sequence'), 'post-import message sequence');
   const afterImport = inbox(restored).find((message) => message.text === 'after-import-sequence');
   assert.equal(afterImport.msg_id, maxExportedMessageId + 1);
+  await mutate(charlie, '::a2a_messaging::send_file', {
+    contact: restored.cid,
+    filename: 'after-import.bin',
+    mime: 'application/octet-stream',
+    data: binary(charlie, Buffer.from('restart remains usable')),
+  });
+  await waitFor(() => fileInbox(restored).some((file) => file.filename === 'after-import.bin'), 'valid file after import');
+  const afterImportFiles = renderFiles((await mutate(restored, '::actor::get_files', {})).Reduce('files'));
+  assert.deepEqual(afterImportFiles.map((file) => file.filename), ['after-import.bin']);
   progress('restored');
   driverCompleted = true;
   } catch (error) {

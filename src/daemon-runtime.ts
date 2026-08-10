@@ -76,6 +76,11 @@ export type DaemonStage = 'post-lock' | 'during-host-init' | 'post-host' | 'pre-
 
 export interface DaemonShutdownResult { requiresProcessExit: boolean }
 
+/** Packet notifications which may add durable room work. */
+export function isIntakeNotification(event: string): boolean {
+  return event === 'message_received' || event === 'file_received' || event === 'contact_accepted';
+}
+
 export class DaemonShutdownError extends AggregateError {
   readonly requiresProcessExit: boolean;
 
@@ -192,7 +197,7 @@ export class CoworkDaemon {
         {
           log: this.options.log,
           onNotify: (roomId, event) => {
-            if (event === 'message_received' || event === 'contact_accepted') {
+            if (isIntakeNotification(event)) {
               this.handleNotification(roomId, event, serviceRef);
             }
           },

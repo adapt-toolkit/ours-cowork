@@ -9,6 +9,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { ensureRuntimeState, loadConfig, type CoworkConfig } from './config.ts';
+import { MAX_MANAGEMENT_RESPONSE_BYTES } from './contracts.ts';
 
 const EXIT = {
   success: 0,
@@ -25,7 +26,6 @@ export const NATIVE_RPC_TIMEOUT_MS = 120_000;
 const START_TIMEOUT_MS = 30_000;
 const WEB_READY_TIMEOUT_MS = 30_000;
 const STOP_TIMEOUT_MS = 12_000;
-const MAX_RESPONSE_BYTES = 1024 * 1024;
 const SELF = fileURLToPath(import.meta.url);
 const SYSTEMD_UNIT = 'ours-cowork.service';
 const LAUNCHD_LABEL = 'network.ours.cowork';
@@ -395,8 +395,8 @@ export function rpcCall(
     socket.on('data', (chunk: string) => {
       if (settled) return;
       size += Buffer.byteLength(chunk, 'utf8');
-      if (size > MAX_RESPONSE_BYTES) {
-        finishError(new CliError(EXIT.internal, 'internal', 'daemon response exceeded 1 MiB'));
+      if (size > MAX_MANAGEMENT_RESPONSE_BYTES) {
+        finishError(new CliError(EXIT.internal, 'internal', 'daemon response exceeded 4 MiB'));
         return;
       }
       bytes += chunk;
@@ -556,13 +556,11 @@ function httpGetReady(url: string, timeoutMs: number): Promise<boolean> {
       if (deadline) clearTimeout(deadline);
       deadline = undefined;
       request.removeListener('response', onResponse);
-      request.removeListener('error', onRequestError);
       request.removeListener('timeout', onRequestTimeout);
       request.removeListener('close', onRequestClose);
       request.setTimeout(0);
       if (response) {
         response.removeListener('end', onResponseEnd);
-        response.removeListener('error', onResponseError);
         response.removeListener('aborted', onResponseAborted);
         response.removeListener('close', onResponseClose);
         if (!response.destroyed) response.destroy();
@@ -581,14 +579,17 @@ function httpGetReady(url: string, timeoutMs: number): Promise<boolean> {
       if (settled) { incoming.destroy(); return; }
       response = incoming;
       incoming.once('end', onResponseEnd);
-      incoming.once('error', onResponseError);
+      incoming.on('error', onResponseError);
       incoming.once('aborted', onResponseAborted);
       incoming.once('close', onResponseClose);
       incoming.resume();
     };
     const request = http.get(url);
     request.once('response', onResponse);
-    request.once('error', onRequestError);
+    // Destroying an incomplete exchange can emit ECONNRESET after settle()
+    // chooses the readiness result. Keep this terminal handler attached so a
+    // late socket error cannot escape as an uncaught exception.
+    request.on('error', onRequestError);
     request.once('timeout', onRequestTimeout);
     request.once('close', onRequestClose);
     request.setTimeout(timeoutMs);
@@ -844,6 +845,41 @@ function readDocs(topic: string | undefined): { topic: string; text: string } {
   catch (error) { throw new CliError(EXIT.internal, 'internal', `offline documentation is missing: ${file}`, { cause: error }); }
 }
 
+async function readHistoryPages(
+  socketPath: string,
+  params: Record<string, unknown>,
+): Promise<unknown[]> {
+  const requested = typeof params.limit === 'number' ? params.limit : Number.MAX_SAFE_INTEGER;
+  let after = typeof params.after === 'number' ? params.after : 0;
+  const records: unknown[] = [];
+  while (records.length < requested) {
+    const remaining = requested - records.length;
+    const pageParams = { ...params, after, ...(remaining < Number.MAX_SAFE_INTEGER ? { limit: remaining } : {}) };
+    const page = await rpcCall(
+      socketPath,
+      'room.history',
+      pageParams,
+      rpcTimeoutForMethod('room.history'),
+    );
+    if (!Array.isArray(page)) {
+      throw new CliError(EXIT.internal, 'internal', 'daemon returned an invalid history page');
+    }
+    if (page.length === 0) break;
+    for (const record of page) {
+      const seq = record !== null && typeof record === 'object'
+        ? (record as { seq?: unknown }).seq
+        : undefined;
+      if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq <= after) {
+        throw new CliError(EXIT.internal, 'internal', 'daemon returned a non-progressing history page');
+      }
+      after = seq;
+      records.push(record);
+      if (records.length === requested) break;
+    }
+  }
+  return records;
+}
+
 async function execute(args: string[], output: Output): Promise<void> {
   const command = args[0] ?? 'help';
   if (command === 'help' || command === '--help' || command === '-h') {
@@ -860,12 +896,15 @@ async function execute(args: string[], output: Output): Promise<void> {
   if (command === 'room') {
     const request = roomRequest(args[1], args.slice(2));
     const config = loadCliConfig();
-    const result = await rpcCall(
-      join(config.stateDir, 'management.sock'),
-      request.method,
-      request.params,
-      rpcTimeoutForMethod(request.method),
-    );
+    const socketPath = join(config.stateDir, 'management.sock');
+    const result = request.method === 'room.history'
+      ? await readHistoryPages(socketPath, request.params)
+      : await rpcCall(
+        socketPath,
+        request.method,
+        request.params,
+        rpcTimeoutForMethod(request.method),
+      );
     output.success(result);
     return;
   }

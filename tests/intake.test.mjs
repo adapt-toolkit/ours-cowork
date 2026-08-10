@@ -69,16 +69,23 @@ class FakePacket {
   name = `cowork-room-${ROOM_ID}`;
   cid = 'cid-room';
   inbox = [];
+  fileInbox = [];
   sendCalls = [];
+  sendFileCalls = [];
   signCalls = [];
   consumeCalls = [];
+  consumeFileCalls = [];
   nextSend = { status: 'queued', wire_id: 'wire-out' };
   beforeConsume;
   afterConsume;
   beforeSign;
   beforeSend;
+  beforeConsumeFile;
+  afterConsumeFile;
+  beforeSendFile;
 
   peekInbox() { return structuredClone(this.inbox); }
+  peekFileInbox() { return structuredClone(this.fileInbox); }
 
   async consumeInbox(expectedIds) {
     if (this.beforeConsume) await this.beforeConsume(expectedIds);
@@ -93,6 +100,17 @@ class FakePacket {
     return { consumed, deferred };
   }
 
+  async consumeFileInbox(expectedIds) {
+    if (this.beforeConsumeFile) await this.beforeConsumeFile(expectedIds);
+    this.consumeFileCalls.push([...expectedIds]);
+    const expected = new Set(expectedIds);
+    const consumed = this.fileInbox.filter((item) => expected.has(item.file_id)).map((item) => item.file_id);
+    const deferred = this.fileInbox.filter((item) => !expected.has(item.file_id)).map((item) => item.file_id);
+    this.fileInbox = this.fileInbox.filter((item) => !expected.has(item.file_id));
+    if (this.afterConsumeFile) await this.afterConsumeFile({ consumed, deferred });
+    return { consumed, deferred };
+  }
+
   async sign(body) {
     this.signCalls.push(body);
     if (this.beforeSign) await this.beforeSign(body);
@@ -103,6 +121,12 @@ class FakePacket {
     this.sendCalls.push({ recipient, body });
     if (this.beforeSend) await this.beforeSend(recipient, body);
     return structuredClone(this.nextSend);
+  }
+
+  async sendFile(recipient, filename, mime, data) {
+    this.sendFileCalls.push({ recipient, filename, mime, data: Buffer.from(data) });
+    if (this.beforeSendFile) await this.beforeSendFile(recipient, filename, mime, data);
+    return { status: 'queued', wire_id: 'wire-file-out' };
   }
 
   mintInvite() { throw new Error('not used'); }
@@ -155,6 +179,20 @@ function incoming(overrides = {}) {
   };
 }
 
+function incomingFile(overrides = {}) {
+  return {
+    file_id: 9,
+    sender_id: 'cid-alice',
+    sender_name: 'Untrusted current name',
+    filename: 'evidence.bin',
+    mime: 'application/octet-stream',
+    data: Buffer.from([0, 1, 2, 255]),
+    date: '2026-08-02T10:12:30.000Z',
+    wire_id: 'wire-file-in-9',
+    ...overrides,
+  };
+}
+
 function fixture(options = {}) {
   const store = new MemoryStore();
   const packet = new FakePacket();
@@ -175,6 +213,161 @@ function fixture(options = {}) {
 }
 
 function byKind(records, kind) { return records.filter((record) => record.kind === kind); }
+
+// ---- Durable file broadcast -------------------------------------------------
+
+test('restart intake drains legacy invalid file metadata without archiving it or blocking later files', async () => {
+  const f = fixture();
+  f.packet.fileInbox.push(
+    incomingFile({ file_id: 8, filename: '../poison.bin' }),
+    incomingFile({ file_id: 9, mime: 'x'.repeat(256) }),
+    incomingFile({ file_id: 10, filename: 'after-restart.bin', data: Buffer.from('usable') }),
+  );
+
+  await f.pump.resumePending(ROOM_ID);
+
+  assert.deepEqual(f.packet.consumeFileCalls, [[8], [9], [10]]);
+  assert.deepEqual(f.packet.fileInbox, []);
+  const files = byKind(await f.store.read(ROOM_ID), 'file');
+  assert.equal(files.length, 1);
+  assert.equal(files[0].filename, 'after-restart.bin');
+  assert.equal(JSON.stringify(await f.store.read(ROOM_ID)).includes('poison.bin'), false);
+});
+
+test('participant files archive bytes before consume and relay metadata + core bytes to every other seat', async () => {
+  const f = fixture();
+  f.packet.fileInbox.push(incomingFile());
+
+  await f.pump.pump(ROOM_ID);
+
+  const records = await f.store.read(ROOM_ID);
+  const [file] = byKind(records, 'file');
+  assert.equal(file.filename, 'evidence.bin');
+  assert.equal(file.mime, 'application/octet-stream');
+  assert.equal(file.size, 4);
+  assert.equal(file.data_base64, Buffer.from([0, 1, 2, 255]).toString('base64'));
+  assert.deepEqual(file.author, { identity: 'cid-alice', display_name: 'Alice', role: 'builder' });
+  assert.deepEqual(file.recipient_identities, ['cid-bob', 'cid-cara']);
+  assert.deepEqual(f.packet.consumeFileCalls, [[9]]);
+  assert.deepEqual(f.packet.sendFileCalls.map((call) => call.recipient), ['cid-bob', 'cid-cara']);
+  assert(f.packet.sendFileCalls.every((call) => call.data.equals(Buffer.from([0, 1, 2, 255]))));
+  assert.deepEqual(byKind(records, 'relay_intent').map((intent) => intent.file_id), [file.file_id, file.file_id]);
+  assert.deepEqual(byKind(records, 'relay_result').map((result) => ({
+    file_id: result.file_id,
+    status: result.status,
+    wire_id: result.wire_id,
+    metadata_wire_id: result.metadata_wire_id,
+  })), [
+    { file_id: file.file_id, status: 'queued', wire_id: 'wire-file-out', metadata_wire_id: 'wire-out' },
+    { file_id: file.file_id, status: 'queued', wire_id: 'wire-file-out', metadata_wire_id: 'wire-out' },
+  ]);
+  const metadata = JSON.parse(f.packet.sendCalls[0].body);
+  assert.equal(metadata.kind, 'room_file');
+  assert.equal(metadata.file_id, file.file_id);
+  assert.equal(metadata.sha256, file.sha256);
+  assert.equal('data_base64' in metadata, false, 'file bytes must use the core binary path, not text JSON');
+});
+
+test('file crash redrive keeps archive/intents stable and retries only a result-less recipient', async () => {
+  const f = fixture();
+  f.store.rooms.set(ROOM_ID, room({ seats: room().seats.slice(0, 2) }));
+  f.packet.fileInbox.push(incomingFile());
+  let crashBeforeConsume = true;
+  f.packet.beforeConsumeFile = () => {
+    if (crashBeforeConsume) {
+      crashBeforeConsume = false;
+      throw new Error('crash after durable file intents');
+    }
+  };
+  await assert.rejects(f.pump.pump(ROOM_ID), /durable file intents/);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'file').length, 1);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_intent').length, 1);
+  assert.equal(f.packet.sendFileCalls.length, 0, 'consume precedes every file send');
+
+  f.packet.beforeConsumeFile = undefined;
+  let crashBeforeResult = true;
+  f.store.beforeAppend = (draft) => {
+    if (crashBeforeResult && draft.kind === 'relay_result') {
+      crashBeforeResult = false;
+      throw new Error('crash before file result fsync');
+    }
+  };
+  await assert.rejects(f.pump.pump(ROOM_ID), /file result fsync/);
+  assert.equal(f.packet.sendFileCalls.length, 1);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 0);
+
+  f.store.beforeAppend = undefined;
+  await f.pump.resumePending(ROOM_ID);
+  assert.equal(f.packet.sendFileCalls.length, 2);
+  assert(f.packet.sendFileCalls[0].data.equals(f.packet.sendFileCalls[1].data));
+  assert.equal(f.packet.sendCalls[0].body, f.packet.sendCalls[1].body, 'metadata retry keeps the stable file_id');
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 1);
+  await f.pump.resumePending(ROOM_ID);
+  assert.equal(f.packet.sendFileCalls.length, 2, 'terminal file result suppresses later redrive');
+});
+
+test('a file intent frozen before seat removal resolves skipped_removed without sending bytes or metadata', async () => {
+  const f = fixture();
+  f.packet.fileInbox.push(incomingFile());
+  let crash = true;
+  f.packet.beforeConsumeFile = () => {
+    if (crash) {
+      crash = false;
+      throw new Error('freeze file fanout before removal');
+    }
+  };
+  await assert.rejects(f.pump.pump(ROOM_ID), /freeze file fanout/);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_intent').length, 2);
+
+  const changed = await f.store.load(ROOM_ID);
+  changed.membership_epoch += 1;
+  changed.seats = changed.seats.map((seat) => seat.identity === 'cid-bob'
+    ? { ...seat, state: 'removed', removed_at: AT, removed_epoch: changed.membership_epoch }
+    : seat);
+  await f.store.save(changed);
+  f.packet.beforeConsumeFile = undefined;
+
+  await f.pump.pump(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls.map((call) => call.recipient), ['cid-cara']);
+  assert.deepEqual(f.packet.sendFileCalls.map((call) => call.recipient), ['cid-cara']);
+  const results = byKind(await f.store.read(ROOM_ID), 'relay_result');
+  assert.deepEqual(
+    results.map((result) => [result.recipient_identity, result.status]).sort(),
+    [['cid-bob', 'skipped_removed'], ['cid-cara', 'queued']],
+  );
+  await f.pump.resumePending(ROOM_ID);
+  assert.equal(f.packet.sendFileCalls.length, 1, 'terminal skip and queue results suppress every later retry');
+});
+
+test('oversized files fail loudly without archive, consume, or relay effects', async () => {
+  const f = fixture();
+  f.packet.fileInbox.push(incomingFile({ data: Buffer.alloc(2 * 1024 * 1024 + 1) }));
+  await assert.rejects(f.pump.pump(ROOM_ID), /at most 2097152 bytes \(2 MiB\)/);
+  assert.deepEqual(await f.store.read(ROOM_ID), []);
+  assert.equal(f.packet.fileInbox.length, 1);
+  assert.equal(f.packet.consumeFileCalls.length, 0);
+  assert.equal(f.packet.sendFileCalls.length, 0);
+});
+
+test('anonymous file metadata uses only the alias author and never leaks real seat or claimed names', async () => {
+  const f = fixture({ room: anonymousRoom() });
+  f.packet.fileInbox.push(incomingFile());
+  await f.pump.pump(ROOM_ID);
+  const [file] = byKind(await f.store.read(ROOM_ID), 'file');
+  assert.equal(file.author.identity, 'cid-alice');
+  assert.equal(file.author_alias.alias, 'builder #1');
+  for (const call of [...f.packet.sendCalls.map((send) => send.body), ...f.packet.signCalls]) {
+    const bytes = Buffer.from(call, 'utf8');
+    for (const leak of ['cid-alice', 'Alice', 'cid-bob', 'cid-cara', 'Untrusted current name']) {
+      assert.equal(bytes.includes(leak), false, `${leak} leaked into signed file metadata`);
+    }
+  }
+  assert.deepEqual(JSON.parse(f.packet.sendCalls[0].body).author, {
+    identity: '01jz6y7n8p9q0r1s2t3v4w5xa1',
+    display_name: 'builder #1',
+    role: 'builder',
+  });
+});
 
 test('canonical JSON recursively sorts keys and participant fan-out excludes its durable seat author', async () => {
   assert.equal(
@@ -784,4 +977,96 @@ test('relay intents addressed to a removed seat resolve as skipped_removed and a
   await f.pump.pump(ROOM_ID);
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 2);
   assert.deepEqual(f.packet.sendCalls.map((call) => call.recipient), ['cid-bob']);
+});
+
+// ---- The outbound funnel (§8.3 pin coverage) --------------------------------
+
+test('there is exactly ONE packet.send call site in src/, and it is the signing funnel', async () => {
+  // WHAT THIS GUARDS, and why a count is the right shape for it.
+  //
+  // The byte-level privacy pins assert that no real cid, contact display name or
+  // sender-claimed name reaches a relayed body in an anonymous room. They read
+  // the bodies produced by the send sites that existed when they were written.
+  // There were two — the relay and the removed-member bounce — and both were
+  // pinned. NOTHING ASSERTED THAT THERE WERE ONLY TWO.
+  //
+  // So a third outbound path — a file relay, a receipt, a control notice — could
+  // be added and the pins would go on passing while covering strictly less of
+  // the code than the day they were written. Their green would be read as though
+  // it still meant what it did. That is worse than having no pin, because nobody
+  // re-reads a green.
+  //
+  // Counting the sites is the only assertion that fails when the code GROWS.
+  // Every other test here asserts about behaviour that exists; this one asserts
+  // about behaviour that does not exist yet.
+  //
+  // If you are here because you added an outbound path: route it through
+  // `sendSignedBody` rather than raising the number. That is the whole point —
+  // the funnel is what the pins already read, so going through it means your new
+  // path is covered on the day you write it.
+  const { readdirSync, readFileSync } = await import('node:fs');
+  const { dirname, join, resolve } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+
+  const SRC = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'src');
+  const files = [];
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) walk(path);
+      else if (entry.name.endsWith('.ts')) files.push(path);
+    }
+  };
+  walk(SRC);
+
+  // The scan must have something to read. A walk that finds nothing passes every
+  // assertion below it, and is one renamed directory away.
+  assert.ok(files.length >= 8, `expected at least 8 files under src/, found ${files.length}`);
+
+  const sites = [];
+  for (const file of files) {
+    // Comments are stripped because this repo documents the rule in prose that
+    // necessarily contains the very expression being counted — including the
+    // docstring on the funnel itself. A scanner that cannot tell code from the
+    // comment explaining the code forces people to stop writing the comment.
+    // Block comments are replaced by the SAME NUMBER OF NEWLINES rather than
+    // deleted, so reported line numbers still point at the real file. A guard
+    // that names the wrong line costs more time than it saves — the first
+    // version of this test reported intake.ts:46 for a call on line 73.
+    const code = readFileSync(file, 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, (block) => '\n'.repeat((block.match(/\n/g) ?? []).length))
+      .replace(/^[ \t]*\/\/.*$/gm, '');
+    code.split('\n').forEach((line, index) => {
+      // `packet.send(` and `this.packet(...).send(` — the room-packet wire call.
+      // `this.send(` / `this.child.send(` in src/daemon.ts are node IPC to the
+      // supervised child process, not the ours wire, and are deliberately out of
+      // scope: they carry no signed body and no participant identity.
+      if (/\bpacket\.send\s*\(/.test(line)) sites.push(`${file.slice(SRC.length + 1)}:${index + 1}`);
+    });
+  }
+
+  assert.equal(
+    sites.length,
+    1,
+    'every signed body must leave through sendSignedBody.\n'
+    + `  found: ${JSON.stringify(sites)}\n`
+    + '  If you added an outbound path, route it through sendSignedBody instead of\n'
+    + '  adding a site here — that is what puts it inside the anonymity pins.',
+  );
+  assert.match(sites[0], /^intake\.ts:\d+$/, `the one packet.send site moved outside intake.ts: ${sites[0]}`);
+
+  // And the one site must actually BE the funnel, not merely the first match:
+  // a rename that moved the call out of sendSignedBody while keeping the count
+  // at one would satisfy the assertion above and defeat its purpose.
+  const intake = readFileSync(join(SRC, 'intake.ts'), 'utf8');
+  const funnel = intake.slice(intake.indexOf('export async function sendSignedBody'));
+  const funnelBody = funnel.slice(0, funnel.indexOf('\n}\n') + 3);
+  assert.ok(
+    /\bpacket\.send\s*\(/.test(funnelBody),
+    'the single packet.send call site must live inside sendSignedBody',
+  );
+  assert.ok(
+    /packet\.sign\s*\(/.test(funnelBody),
+    'and sendSignedBody must be what signs it — an unsigned funnel is not the contract',
+  );
 });

@@ -1,6 +1,18 @@
+import { createHash } from 'node:crypto';
+
 import { z } from 'zod';
 
 const MAX_TEXT_BYTES = 262_144;
+export const MAX_FILE_BYTES = 2 * 1024 * 1024;
+/**
+ * History remains an array-shaped public response, but each daemon page is
+ * byte-bounded.  Three MiB fits one maximum-size file record after base64
+ * expansion; the management envelope gets a separate one-MiB allowance.
+ */
+export const MAX_HISTORY_PAGE_BYTES = 3 * 1024 * 1024;
+export const MAX_MANAGEMENT_RESPONSE_BYTES = MAX_HISTORY_PAGE_BYTES + (1024 * 1024);
+const MAX_FILE_NAME_BYTES = 255;
+const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;
 
 function utf8Bounded(label: string, maximumBytes: number): z.ZodType<string> {
@@ -43,6 +55,14 @@ export const Rfc3339Schema = z.string().refine(isStrictRfc3339, 'must be a valid
 export const RoleSchema = utf8Bounded('role', MAX_ROLE_BYTES);
 export const MissionTextSchema = utf8Bounded('mission text', MAX_TEXT_BYTES);
 export const MessageTextSchema = utf8Bounded('message text', MAX_TEXT_BYTES);
+export const FileNameSchema = utf8Bounded('file name', MAX_FILE_NAME_BYTES)
+  .refine((value) => value !== '.' && value !== '..', 'file name must not be a relative path token')
+  .refine((value) => !/[\x00/\\]/.test(value), 'file name must be a single path-free name');
+/** MIME is opaque metadata, not an execution allowlist; empty means unspecified. */
+export const FileMimeSchema = z.string().refine(
+  (value) => Buffer.byteLength(value, 'utf8') <= MAX_MIME_BYTES,
+  `file MIME metadata must be at most ${MAX_MIME_BYTES} UTF-8 bytes`,
+);
 
 export const RoomStateSchema = z.enum(['provisioning', 'active', 'closing', 'closed']);
 export const SeatStateSchema = z.enum(['active', 'removed']);
@@ -487,7 +507,8 @@ const MessageShape = {
 
 const RelayIntentShape = {
   kind: z.literal('relay_intent'),
-  message_id: LowerCrockfordUlidSchema,
+  message_id: LowerCrockfordUlidSchema.optional(),
+  file_id: LowerCrockfordUlidSchema.optional(),
   recipient_identity: NonEmptyStringSchema,
 } as const;
 
@@ -497,10 +518,39 @@ export const RelayResultStatusSchema = z.enum(['queued', 'send_failed', 'skipped
 const RelayResultShape = {
   kind: z.literal('relay_result'),
   intent_record_id: NonEmptyStringSchema,
-  message_id: LowerCrockfordUlidSchema,
+  message_id: LowerCrockfordUlidSchema.optional(),
+  file_id: LowerCrockfordUlidSchema.optional(),
   recipient_identity: NonEmptyStringSchema,
   status: RelayResultStatusSchema,
   wire_id: NonEmptyStringSchema.optional(),
+  metadata_wire_id: NonEmptyStringSchema.optional(),
+} as const;
+
+const FileShape = {
+  kind: z.literal('file'),
+  file_id: LowerCrockfordUlidSchema,
+  author: AuthorSnapshotSchema,
+  author_alias: AuthorAliasSchema.optional(),
+  filename: FileNameSchema,
+  mime: FileMimeSchema,
+  size: z.number().int().nonnegative().max(MAX_FILE_BYTES),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  data_base64: z.string(),
+  recipient_identities: z.array(NonEmptyStringSchema).superRefine((identities, context) => {
+    const seen = new Set<string>();
+    for (const [index, identity] of identities.entries()) {
+      if (seen.has(identity)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index],
+          message: 'recipient identities must be unique',
+        });
+      }
+      seen.add(identity);
+    }
+  }),
+  source_file_id: z.number().int().nonnegative().safe(),
+  source_wire_id: NonEmptyStringSchema.optional(),
 } as const;
 
 const MembershipIntentShape = {
@@ -540,6 +590,7 @@ const CloseNoticeResultShape = {
 } as const;
 
 export const MessageRecordSchema = z.object({ ...RecordCommonShape, ...MessageShape }).strict();
+export const FileRecordSchema = z.object({ ...RecordCommonShape, ...FileShape }).strict();
 export const RelayIntentRecordSchema = z.object({ ...RecordCommonShape, ...RelayIntentShape }).strict();
 export const RelayResultRecordSchema = z.object({ ...RecordCommonShape, ...RelayResultShape }).strict();
 export const MembershipIntentRecordSchema = z.object({ ...RecordCommonShape, ...MembershipIntentShape }).strict();
@@ -549,6 +600,7 @@ export const CloseNoticeResultRecordSchema = z.object({ ...RecordCommonShape, ..
 
 const RawCommunicationRecordSchema = z.discriminatedUnion('kind', [
   MessageRecordSchema,
+  FileRecordSchema,
   RelayIntentRecordSchema,
   RelayResultRecordSchema,
   MembershipIntentRecordSchema,
@@ -562,6 +614,38 @@ interface MessageCategoryView {
   briefing_role?: string;
   briefing_version?: number;
   membership?: z.infer<typeof MembershipNoticeSchema>;
+}
+
+function refineRelaySubject(
+  record: { kind: string; message_id?: string; file_id?: string },
+  context: z.RefinementCtx,
+): void {
+  if (record.kind !== 'relay_intent' && record.kind !== 'relay_result') return;
+  if ((record.message_id === undefined) === (record.file_id === undefined)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['message_id'],
+      message: 'relay records require exactly one of message_id or file_id',
+    });
+  }
+}
+
+function refineFileRecord(
+  record: { kind: string; data_base64?: string; size?: number; sha256?: string },
+  context: z.RefinementCtx,
+): void {
+  if (record.kind !== 'file' || record.data_base64 === undefined) return;
+  const bytes = Buffer.from(record.data_base64, 'base64');
+  if (bytes.toString('base64') !== record.data_base64) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['data_base64'], message: 'file bytes must use canonical base64' });
+  }
+  if (bytes.length !== record.size) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['size'], message: 'file size must match decoded bytes' });
+  }
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  if (digest !== record.sha256) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['sha256'], message: 'file sha256 must match decoded bytes' });
+  }
 }
 
 function refineMessageCategory(message: MessageCategoryView, context: z.RefinementCtx): void {
@@ -611,10 +695,13 @@ export const CommunicationRecordSchema = RawCommunicationRecordSchema.superRefin
     });
   }
   if (record.kind === 'message') refineMessageCategory(record, context);
+  refineRelaySubject(record, context);
+  refineFileRecord(record, context);
 });
 
 export const AppendRecordSchema = z.discriminatedUnion('kind', [
   z.object({ ...AppendCommonShape, ...MessageShape }).strict(),
+  z.object({ ...AppendCommonShape, ...FileShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayIntentShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayResultShape }).strict(),
   z.object({ ...AppendCommonShape, ...MembershipIntentShape }).strict(),
@@ -623,6 +710,8 @@ export const AppendRecordSchema = z.discriminatedUnion('kind', [
   z.object({ ...AppendCommonShape, ...CloseNoticeResultShape }).strict(),
 ]).superRefine((record, context) => {
   if (record.kind === 'message') refineMessageCategory(record, context);
+  refineRelaySubject(record, context);
+  refineFileRecord(record, context);
 });
 
 export type RoomState = z.infer<typeof RoomStateSchema>;

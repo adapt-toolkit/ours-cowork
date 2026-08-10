@@ -115,7 +115,7 @@ describe('selected-room paginated history', () => {
   });
   afterEach(() => vi.useRealTimers());
 
-  it('loads 200-record pages through the first short page, then polls after the numeric high-water mark', async () => {
+  it('loads byte-short pages through an empty EOF page, then polls after the numeric high-water mark', async () => {
     const target = room();
     const history = Array.from({ length: 401 }, (_, index) => message(index + 1));
     const call = vi.fn(async (method: string, params: Record<string, unknown>) => {
@@ -135,6 +135,7 @@ describe('selected-room paginated history', () => {
       { room_id: ROOM_ONE, after: 0, limit: 200 },
       { room_id: ROOM_ONE, after: 200, limit: 200 },
       { room_id: ROOM_ONE, after: 400, limit: 200 },
+      { room_id: ROOM_ONE, after: 401, limit: 200 },
     ]);
 
     await act(() => vi.advanceTimersByTimeAsync(2_000));

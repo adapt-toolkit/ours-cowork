@@ -11,6 +11,7 @@ import {
   withScope,
   withScopeAsync,
 } from './adapt.ts';
+import { FileMimeSchema, FileNameSchema, MAX_FILE_BYTES } from './contracts.ts';
 
 export type InviteMode = 'one_time' | 'public';
 export type RelayStatus = 'queued' | 'send_failed';
@@ -20,6 +21,17 @@ export interface InboxItem {
   sender_id: string;
   sender_name: string;
   text: string;
+  date: string;
+  wire_id: string;
+}
+
+export interface FileInboxItem {
+  file_id: number;
+  sender_id: string;
+  sender_name: string;
+  filename: string;
+  mime: string;
+  data: Buffer;
   date: string;
   wire_id: string;
 }
@@ -34,7 +46,10 @@ export interface RoomPacket {
   listContactOrigins(): Record<string, { via: string; invite_id: string; at: string }>;
   peekInbox(): InboxItem[];
   consumeInbox(expectedIds: number[]): Promise<{ consumed: number[]; deferred: number[] }>;
+  peekFileInbox(): FileInboxItem[];
+  consumeFileInbox(expectedIds: number[]): Promise<{ consumed: number[]; deferred: number[] }>;
   send(contactCid: string, body: string): Promise<{ status: RelayStatus; wire_id?: string }>;
+  sendFile(contactCid: string, filename: string, mime: string, data: Buffer): Promise<{ status: RelayStatus; wire_id?: string }>;
   removeContact(contactCid: string): Promise<{
     status: RelayStatus;
     notified: boolean;
@@ -628,6 +643,26 @@ export class HostedRoomPacket implements RoomPacket {
     });
   }
 
+  peekFileInbox(): FileInboxItem[] {
+    return withScope((lifetime) => renderFileInbox(
+      this.packet.readonlyTx('::actor::list_incoming_files', lifetime),
+    ).filter((file) => file.status === 'unread').map(({ status: _status, ...file }) => file));
+  }
+
+  async consumeFileInbox(expectedIds: number[]): Promise<{ consumed: number[]; deferred: number[] }> {
+    return withScopeAsync(async (lifetime) => {
+      const result = await this.packet.mutatingTx(
+        '::actor::consume_files',
+        { expected_ids: expectedIds },
+        lifetime,
+      );
+      return {
+        consumed: renderIntegerArray(result.Reduce('consumed')),
+        deferred: renderIntegerArray(result.Reduce('deferred')),
+      };
+    });
+  }
+
   async send(contactCid: string, body: string): Promise<{ status: RelayStatus; wire_id?: string }> {
     return withScopeAsync(async (lifetime) => {
       const result = await this.packet.mutatingTx(
@@ -636,6 +671,38 @@ export class HostedRoomPacket implements RoomPacket {
         lifetime,
       );
       const refused = !result.Reduce('downgrade_refused').IsNil();
+      return refused
+        ? { status: 'send_failed' as const }
+        : { status: 'queued' as const, wire_id: nilString(result.Reduce('wire_id')) || undefined };
+    });
+  }
+
+  async sendFile(
+    contactCid: string,
+    filename: string,
+    mime: string,
+    data: Buffer,
+  ): Promise<{ status: RelayStatus; wire_id?: string }> {
+    const validName = FileNameSchema.parse(filename);
+    const validMime = FileMimeSchema.parse(mime);
+    if (data.length > MAX_FILE_BYTES) {
+      throw new RangeError(`room files must be at most ${MAX_FILE_BYTES} bytes (2 MiB)`);
+    }
+    return withScopeAsync(async (lifetime) => {
+      const result = await this.packet.mutatingTx(
+        '::a2a_messaging::send_file',
+        {
+          contact: contactCid,
+          filename: validName,
+          mime: validMime,
+          // The core contract takes bytes. A filesystem path here would make
+          // recovery depend on staging ownership and is deliberately forbidden.
+          data: this.packet.newBinary(data, lifetime),
+        },
+        lifetime,
+      );
+      const refused = !result.Reduce('downgrade_refused').IsNil()
+        || !result.Reduce('migrating').IsNil();
       return refused
         ? { status: 'send_failed' as const }
         : { status: 'queued' as const, wire_id: nilString(result.Reduce('wire_id')) || undefined };
@@ -682,6 +749,7 @@ export class HostedRoomPacket implements RoomPacket {
 }
 
 type RenderedInbox = InboxItem & { status: string };
+type RenderedFileInbox = FileInboxItem & { status: string };
 
 function renderInbox(value: AdaptValue): RenderedInbox[] {
   const output: RenderedInbox[] = [];
@@ -697,6 +765,27 @@ function renderInbox(value: AdaptValue): RenderedInbox[] {
       date: adaptTimeToRfc3339(message.Reduce('date').Visualize()),
       status: message.Reduce('status').Visualize(),
       wire_id: message.Reduce('wire_id').Visualize(),
+    });
+  }
+  return output;
+}
+
+function renderFileInbox(value: AdaptValue): RenderedFileInbox[] {
+  const output: RenderedFileInbox[] = [];
+  if (value.IsNil()) return output;
+  for (let index = 0; ; index += 1) {
+    const file = value.Reduce(index);
+    if (file.IsNil()) break;
+    output.push({
+      file_id: Number(file.Reduce('file_id').Visualize()),
+      sender_id: file.Reduce('sender_id').Visualize(),
+      sender_name: file.Reduce('sender_name').Visualize(),
+      filename: file.Reduce('filename').Visualize(),
+      mime: file.Reduce('mime').Visualize(),
+      data: Buffer.from(file.Reduce('data').GetBinary()),
+      date: adaptTimeToRfc3339(file.Reduce('date').Visualize()),
+      status: file.Reduce('status').Visualize(),
+      wire_id: file.Reduce('wire_id').Visualize(),
     });
   }
   return output;

@@ -112,7 +112,9 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
         historyByRoomRef.current = { ...historyByRoomRef.current, [roomId]: records };
         setHistoryByRoom(historyByRoomRef.current);
       }
-      if (result.length < 200) {
+      // Byte-bounded daemon pages can be shorter than the record limit even
+      // when more history exists. Only an empty page is the EOF marker.
+      if (result.length === 0) {
         if (!current()) return;
         setHistoryReadyByRoom((ready) => deletedRoomIdsRef.current.has(roomId) || ready[roomId]
           ? ready

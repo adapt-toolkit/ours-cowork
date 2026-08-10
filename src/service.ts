@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
   CreateRoomInputSchema,
   DEFAULT_ROLE,
+  defaultRoomName,
   InviteModeSchema,
   LowerCrockfordUlidSchema,
   MAX_HISTORY_PAGE_BYTES,
@@ -191,6 +192,7 @@ export class RoomService {
       const provisional = RoomSchema.parse({
         version: 2,
         room_id: roomId,
+        room_name: settings.name ?? defaultRoomName(roomId),
         identity_name: identityName,
         // PacketRegistry needs the durable room directory to exist first. A
         // valid, explicitly provisional value lets startup resume this exact
@@ -305,6 +307,7 @@ export class RoomService {
       };
       const next = await this.store.save(RoomSchema.parse({
         ...room,
+        room_name: settings.name ?? room.room_name,
         mission,
         ...(settings.quiet_membership === undefined ? {} : { quiet_membership: settings.quiet_membership }),
         ...(settings.status === undefined ? {} : { status: settings.status }),

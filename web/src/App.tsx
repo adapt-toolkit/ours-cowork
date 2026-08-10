@@ -270,10 +270,10 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
     void selectedPoller.current?.refresh();
   }, []);
 
-  const createRoom = useCallback(async (goal: string, briefing: string) => {
+  const createRoom = useCallback(async (name: string, goal: string, briefing: string) => {
     if (connectedRef.current !== true) throw new Error('The daemon is disconnected. Your fields are retained.');
     try {
-      const result = await rpc.call('room.create', { goal: goal.trim(), briefing: briefing.trim() });
+      const result = await rpc.call('room.create', { name, goal: goal.trim(), briefing: briefing.trim() });
       if (!isRoomDto(result)) throw new Error('daemon returned invalid created room details');
       setCreateOpen(false);
       setContextTab('invite');
@@ -286,7 +286,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
     }
   }, [refreshAfterMutation, reportFailure, rpc, selectRoom]);
 
-  const saveSettings = useCallback(async (roomId: string, changes: { goal?: string; briefing?: string; status?: string }) => {
+  const saveSettings = useCallback(async (roomId: string, changes: { name?: string; goal?: string; briefing?: string; status?: string }) => {
     if (Object.keys(changes).length === 0) return;
     const requestedRoom = roomsRef.current.find((room) => room.room_id === roomId);
     if (connectedRef.current !== true) throw new Error('The daemon is disconnected. Your fields are retained.');

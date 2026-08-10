@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 
 import { RpcError } from '../api/rpc';
 import type { RoomDto } from '../api/types';
+import { normalizeRoomName, roomNameError } from '../roomName';
 import { roomTitle } from './RoomRail';
 
 const MAX_MISSION_BYTES = 262_144;
@@ -13,8 +14,9 @@ export function CreateRoomDialog({ open, connected, restoreFocus, fallbackFocus,
   restoreFocus?: HTMLElement;
   fallbackFocus?(): HTMLElement | undefined;
   onClose(): void;
-  onCreate(goal: string, briefing: string): Promise<void>;
+  onCreate(name: string, goal: string, briefing: string): Promise<void>;
 }) {
+  const [name, setName] = useState('');
   const [goal, setGoal] = useState('');
   const [briefing, setBriefing] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -22,17 +24,19 @@ export function CreateRoomDialog({ open, connected, restoreFocus, fallbackFocus,
   const submittingRef = useRef(false);
 
   if (!open) return null;
+  const nameError = roomNameError(name);
   const goalError = missionError('Goal', goal);
   const briefingError = missionError('Briefing', briefing);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (!connected || goalError || briefingError || submittingRef.current) return;
+    if (!connected || nameError || goalError || briefingError || submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
     setError(undefined);
     try {
-      await onCreate(goal.trim(), briefing.trim());
+      await onCreate(normalizeRoomName(name), goal.trim(), briefing.trim());
+      setName('');
       setGoal('');
       setBriefing('');
     } catch (failure) {
@@ -49,13 +53,14 @@ export function CreateRoomDialog({ open, connected, restoreFocus, fallbackFocus,
     <Modal title="Create mission room" open={open} restoreFocus={restoreFocus} fallbackFocus={fallbackFocus} onClose={onClose} locked={submitting}>
       <form className="dialog-form" onSubmit={submit}>
         <p className="dialog-intro">Define the shared objective. Invitation requirements are added after the room is created.</p>
-        <MissionField label="Goal" value={goal} onChange={setGoal} error={goalError} rows={3} autoFocus trimForBytes />
+        <TextField label="Name" value={name} onChange={setName} error={nameError} autoFocus />
+        <MissionField label="Goal" value={goal} onChange={setGoal} error={goalError} rows={3} trimForBytes />
         <MissionField label="Briefing" value={briefing} onChange={setBriefing} error={briefingError} rows={6} trimForBytes />
         {!connected && <p className="form-error" role="status">Create is unavailable because the daemon disconnected. Your fields are retained and no request was sent.</p>}
         {error && <p className="form-error" role="alert">{error}</p>}
         <div className="dialog-actions">
           <button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>Cancel</button>
-          <button className="primary-button" type="submit" disabled={!connected || submitting || Boolean(goalError || briefingError)}>{submitting ? 'Creating room…' : 'Create mission room'}</button>
+          <button className="primary-button" type="submit" disabled={!connected || submitting || Boolean(nameError || goalError || briefingError)}>{submitting ? 'Creating room…' : 'Create mission room'}</button>
         </div>
       </form>
     </Modal>
@@ -69,8 +74,9 @@ export function SettingsDialog({ room, open, connected, capable, restoreFocus, o
   capable: boolean;
   restoreFocus?: HTMLElement;
   onClose(): void;
-  onSave(changes: { goal?: string; briefing?: string; status?: string }): Promise<void>;
+  onSave(changes: { name?: string; goal?: string; briefing?: string; status?: string }): Promise<void>;
 }) {
+  const [name, setName] = useState(room.room_name);
   const [goal, setGoal] = useState(room.mission.goal);
   const [briefing, setBriefing] = useState(room.mission.briefing);
   const [status, setStatus] = useState(room.status ?? '');
@@ -79,17 +85,21 @@ export function SettingsDialog({ room, open, connected, capable, restoreFocus, o
   const submittingRef = useRef(false);
   useEffect(() => {
     if (!open) return;
+    setName(room.room_name);
     setGoal(room.mission.goal);
     setBriefing(room.mission.briefing);
     setStatus(room.status ?? '');
     setError(undefined);
-  }, [open, room.mission.briefing, room.mission.goal, room.room_id, room.status]);
+  }, [open, room.mission.briefing, room.mission.goal, room.room_id, room.room_name, room.status]);
   if (!open) return null;
 
+  const nameError = roomNameError(name);
   const goalError = exactMissionError('Goal', goal);
   const briefingError = exactMissionError('Briefing', briefing);
   const statusError = room.status && !status ? 'An existing status cannot be cleared.' : undefined;
-  const changes: { goal?: string; briefing?: string; status?: string } = {};
+  const changes: { name?: string; goal?: string; briefing?: string; status?: string } = {};
+  const normalizedName = normalizeRoomName(name);
+  if (normalizedName !== room.room_name) changes.name = normalizedName;
   if (goal !== room.mission.goal) changes.goal = goal;
   if (briefing !== room.mission.briefing) changes.briefing = briefing;
   if (status !== (room.status ?? '')) changes.status = status;
@@ -97,7 +107,7 @@ export function SettingsDialog({ room, open, connected, capable, restoreFocus, o
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (!connected || !capable || !dirty || goalError || briefingError || statusError || submittingRef.current) return;
+    if (!connected || !capable || !dirty || nameError || goalError || briefingError || statusError || submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
     setError(undefined);
@@ -113,14 +123,15 @@ export function SettingsDialog({ room, open, connected, capable, restoreFocus, o
   return (
     <Modal title="Room settings" open={open} restoreFocus={restoreFocus} onClose={onClose} locked={submitting}>
       <form className="dialog-form" onSubmit={submit}>
-        <MissionField label="Goal" value={goal} onChange={setGoal} error={goalError} rows={3} autoFocus />
+        <TextField label="Name" value={name} onChange={setName} error={nameError} autoFocus />
+        <MissionField label="Goal" value={goal} onChange={setGoal} error={goalError} rows={3} />
         <MissionField label="Briefing" value={briefing} onChange={setBriefing} error={briefingError} rows={5} />
         <TextField label="Status (optional)" value={status} onChange={setStatus} error={statusError} />
         {(!connected || !capable) && <p className="form-error" role="status">Settings are unavailable because the connection or room lifecycle changed. Your fields are retained and no request was sent.</p>}
         {error && <p className="form-error" role="alert">{error}</p>}
         <div className="dialog-actions">
           <button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>Cancel</button>
-          <button className="primary-button" type="submit" disabled={!connected || !capable || submitting || !dirty || Boolean(goalError || briefingError || statusError)}>{submitting ? 'Saving…' : 'Save settings'}</button>
+          <button className="primary-button" type="submit" disabled={!connected || !capable || submitting || !dirty || Boolean(nameError || goalError || briefingError || statusError)}>{submitting ? 'Saving…' : 'Save settings'}</button>
         </div>
       </form>
     </Modal>
@@ -220,10 +231,10 @@ function MissionField({ label, value, onChange, error, rows, autoFocus = false, 
   return <div className="field"><label htmlFor={id}>{label}</label><textarea id={id} value={value} rows={rows} onChange={(event) => onChange(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? errorId : undefined} autoFocus={autoFocus} data-autofocus={autoFocus ? 'true' : undefined} />{error ? <small id={errorId} className="field-error">{error}</small> : <small>{byteLength(trimForBytes ? value.trim() : value)} / {MAX_MISSION_BYTES} bytes</small>}</div>;
 }
 
-function TextField({ label, value, onChange, error }: { label: string; value: string; onChange(value: string): void; error?: string }) {
+function TextField({ label, value, onChange, error, autoFocus = false }: { label: string; value: string; onChange(value: string): void; error?: string; autoFocus?: boolean }) {
   const id = useId();
   const errorId = `${id}-error`;
-  return <div className="field"><label htmlFor={id}>{label}</label><input id={id} value={value} onChange={(event) => onChange(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? errorId : undefined} />{error && <small id={errorId} className="field-error">{error}</small>}</div>;
+  return <div className="field"><label htmlFor={id}>{label}</label><input id={id} value={value} onChange={(event) => onChange(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? errorId : undefined} autoFocus={autoFocus} data-autofocus={autoFocus ? 'true' : undefined} />{error && <small id={errorId} className="field-error">{error}</small>}</div>;
 }
 
 export function Modal({ title, open, restoreFocus, fallbackFocus, onClose, locked, children }: { title: string; open: boolean; restoreFocus?: HTMLElement; fallbackFocus?(): HTMLElement | undefined; onClose(): void; locked: boolean; children: ReactNode }) {

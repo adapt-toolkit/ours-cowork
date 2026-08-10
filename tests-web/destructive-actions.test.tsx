@@ -19,7 +19,7 @@ function deferred<T>() {
 
 function room(state: RoomDto['state']): RoomDto {
   return {
-    version: 1, room_id: ROOM_ID, identity_name: 'cowork-room-operations', identity_cid: 'cid-room',
+    version: 1, room_id: ROOM_ID, room_name: 'Operations', identity_name: 'cowork-room-operations', identity_cid: 'cid-room',
     mission: { goal: 'Release coordination', briefing: 'Coordinate the release' }, state,
     invites: [], seats: [], created_at: AT,
     ...(state === 'closed' ? { closed_at: AT } : {}),
@@ -51,7 +51,7 @@ describe('close and delete actions', () => {
     await user.type(confirm, 'wrong');
     expect(screen.getByRole('button', { name: 'Close room permanently' })).toBeDisabled();
     await user.clear(confirm);
-    await user.type(confirm, 'Release coordination');
+    await user.type(confirm, 'Operations');
     await user.click(screen.getByRole('button', { name: 'Close room permanently' }));
     await user.click(screen.getByRole('button', { name: 'Closing room…' }));
     expect(call.mock.calls.filter(([method]) => method === 'room.close')).toHaveLength(1);
@@ -80,7 +80,7 @@ describe('close and delete actions', () => {
     await user.click(screen.getByRole('button', { name: 'Close room permanently' }));
     expect(await screen.findByText(/outcome is unknown/i)).toBeVisible();
     expect(screen.getByLabelText('Type room title or ID to close')).toHaveValue(ROOM_ID);
-    expect(screen.getByRole('heading', { name: 'Release coordination' })).toBeVisible();
+    expect(screen.getByRole('heading', { name: 'Operations' })).toBeVisible();
     expect(call.mock.calls.filter(([method]) => method === 'room.close')).toHaveLength(1);
   });
 
@@ -157,7 +157,7 @@ describe('close and delete actions', () => {
     expect(dialog).toHaveTextContent(/deletes the plaintext local archive and room metadata from this host/i);
     expect(dialog).toHaveTextContent(/does not purge remote copies/i);
     expect(dialog).toHaveTextContent(/does not securely erase/i);
-    await user.type(screen.getByLabelText('Type exact room ID to delete'), 'Release coordination');
+    await user.type(screen.getByLabelText('Type exact room ID to delete'), 'Operations');
     expect(screen.getByRole('button', { name: 'Delete local archive' })).toBeDisabled();
     await user.clear(screen.getByLabelText('Type exact room ID to delete'));
     await user.type(screen.getByLabelText('Type exact room ID to delete'), ROOM_ID);
@@ -215,14 +215,14 @@ describe('close and delete actions', () => {
 
     expect(screen.getByRole('heading', { name: 'Select a room' })).toBeVisible();
     expect(location.hash).toBe('#/');
-    expect(screen.queryByText('Release coordination')).not.toBeInTheDocument();
+    expect(screen.queryByText('Operations')).not.toBeInTheDocument();
     expect(screen.queryByText('Late Participant')).not.toBeInTheDocument();
     expect(screen.queryByText('Late deleted archive record')).not.toBeInTheDocument();
 
     const listCallsBeforeFuturePoll = call.mock.calls.filter(([method]) => method === 'room.list').length;
     fireEvent(document, new Event('visibilitychange'));
     await vi.waitFor(() => expect(call.mock.calls.filter(([method]) => method === 'room.list').length).toBeGreaterThan(listCallsBeforeFuturePoll));
-    expect(screen.queryByText('Release coordination')).not.toBeInTheDocument();
+    expect(screen.queryByText('Operations')).not.toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Select a room' })).toBeVisible();
     expect(location.hash).toBe('#/');
   });
@@ -245,7 +245,7 @@ describe('close and delete actions', () => {
 
     expect(await screen.findByText(/delete request did not receive a confirmation/i)).toBeVisible();
     expect(screen.getByLabelText('Type exact room ID to delete')).toHaveValue(ROOM_ID);
-    expect(screen.getByRole('heading', { name: 'Release coordination' })).toBeVisible();
+    expect(screen.getByRole('heading', { name: 'Operations' })).toBeVisible();
     expect(location.hash).toBe(`#/rooms/${ROOM_ID}`);
     expect(call.mock.calls.filter(([method]) => method === 'room.delete')).toHaveLength(1);
   });

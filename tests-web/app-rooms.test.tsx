@@ -14,6 +14,7 @@ function room(roomId: string, goal: string, state: RoomDto['state']): RoomDto {
   return {
     version: 1,
     room_id: roomId,
+    room_name: goal,
     identity_name: `cowork-room-${roomId}`,
     identity_cid: `cid-${roomId}`,
     mission: { goal, briefing: `${goal} briefing` },
@@ -92,8 +93,8 @@ describe('CoworkApp room orchestration', () => {
   afterEach(() => vi.useRealTimers());
 
   it('groups rooms, hash-routes selection, and refreshes the list every five seconds', async () => {
-    const release = room(ROOM_ONE, 'Release coordination', 'active');
-    const archive = room(ROOM_TWO, 'Finished migration', 'closed');
+    const release = { ...room(ROOM_ONE, 'Release coordination', 'active'), room_name: 'Launch bridge' };
+    const archive = { ...room(ROOM_TWO, 'Finished migration', 'closed'), room_name: 'Migration archive' };
     const call = vi.fn(async (method: string, params: Record<string, unknown>) => {
       if (method === 'room.list') return [release, archive];
       if (method === 'room.show' && params.room_id === ROOM_ONE) return release;
@@ -103,14 +104,18 @@ describe('CoworkApp room orchestration', () => {
 
     render(<CoworkApp rpc={{ call } as RpcClient} />);
 
-    expect(await screen.findByText('Release coordination')).toBeVisible();
+    expect(await screen.findByText('Launch bridge')).toBeVisible();
+    expect(screen.getByText('Migration archive')).toBeVisible();
     expect(within(screen.getByRole('region', { name: 'Open rooms' })).getByText('Active')).toBeVisible();
     expect(within(screen.getByRole('region', { name: 'Closed rooms' })).getByText('Closed')).toBeVisible();
     expect(screen.getByText('1 accepted · 1 needed')).toBeVisible();
 
-    await user.click(screen.getByText('Release coordination'));
+    await user.click(screen.getByText('Launch bridge'));
     expect(location.hash).toBe(`#/rooms/${ROOM_ONE}`);
-    expect(await screen.findByRole('heading', { name: 'Release coordination' })).toBeVisible();
+    expect(await screen.findByRole('heading', { name: 'Launch bridge' })).toBeVisible();
+    expect(screen.getByText('Release coordination', { selector: '.mission-strip p' })).toBeVisible();
+    expect(screen.queryByText(release.identity_name)).not.toBeInTheDocument();
+    expect(screen.getByText('Room name').nextElementSibling).toHaveTextContent('Launch bridge');
 
     const before = call.mock.calls.filter(([method]) => method === 'room.list').length;
     await act(() => vi.advanceTimersByTimeAsync(5_000));

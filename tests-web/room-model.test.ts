@@ -95,6 +95,7 @@ function room(overrides: Partial<RoomDto> = {}): RoomDto {
   return {
     version: 1,
     room_id: ROOM_ID,
+    room_name: 'Operations',
     identity_name: 'cowork-room-operations',
     identity_cid: 'cid-room',
     mission: { goal: 'Ship it', briefing: 'Build carefully' },
@@ -214,9 +215,15 @@ describe('room DTO guards', () => {
       seats: [{ identity: 'cid-alice', display_name: 'Alice', role: 'builder', invite_id: source.invite_id, accepted_at: AT }],
     });
     expect(isRoomDto(valid)).toBe(true);
+    expect(isRoomDto(room({ room_name: 'Café launch 🤖' }))).toBe(true);
 
     const invalid = [
       { ...valid, extra: true },
+      { ...valid, room_name: undefined },
+      { ...valid, room_name: '  Operations  ' },
+      { ...valid, room_name: 'Cafe\u0301' },
+      { ...valid, room_name: 'hidden\u200bname' },
+      { ...valid, room_name: 'a'.repeat(65) },
       { ...valid, room_id: 'room-1' },
       { ...valid, created_at: '2026-02-29T00:00:00Z' },
       { ...valid, activated_at: 'not-a-time' },

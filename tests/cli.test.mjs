@@ -251,7 +251,9 @@ test('web CLI exits 1 with the exact disabled message', async () => {
 test('room commands send exactly one JSONL request over management.sock', async () => {
   const cases = [
     { args: ['room', 'create', '--goal', 'Ship', '--briefing', 'Stay focused'], method: 'room.create', params: { goal: 'Ship', briefing: 'Stay focused' } },
+    { args: ['room', 'create', '--name', 'Launch room', '--goal', 'Ship', '--briefing', 'Stay focused'], method: 'room.create', params: { name: 'Launch room', goal: 'Ship', briefing: 'Stay focused' } },
     { args: ['room', 'settings', 'room1', '--goal', 'G', '--status', 'ready'], method: 'room.settings', params: { room_id: 'room1', goal: 'G', status: 'ready' } },
+    { args: ['room', 'settings', 'room1', '--name', 'Renamed room'], method: 'room.settings', params: { room_id: 'room1', name: 'Renamed room' } },
     { args: ['room', 'invite', 'room1', '--mode', 'public', '--role', 'reviewer', '--min-accepts', '2'], method: 'room.invite', params: { room_id: 'room1', mode: 'public', role: 'reviewer', min_accepts: 2 } },
     { args: ['room', 'revoke', 'room1', 'invite1'], method: 'room.revoke', params: { room_id: 'room1', invite_id: 'invite1' } },
     { args: ['room', 'list'], method: 'room.list', params: {} },

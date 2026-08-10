@@ -14,6 +14,7 @@ export const MAX_MANAGEMENT_RESPONSE_BYTES = MAX_HISTORY_PAGE_BYTES + (1024 * 10
 const MAX_FILE_NAME_BYTES = 255;
 const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;
+export const MAX_ROOM_NAME_CHARACTERS = 64;
 
 function utf8Bounded(label: string, maximumBytes: number): z.ZodType<string> {
   return z.string()
@@ -52,6 +53,25 @@ function isStrictRfc3339(value: string): boolean {
 }
 
 export const Rfc3339Schema = z.string().refine(isStrictRfc3339, 'must be a valid RFC3339 timestamp');
+export function normalizeRoomName(value: string): string {
+  return value.trim().normalize('NFC');
+}
+
+export const RoomNameSchema = z.string()
+  .refine(
+    (value) => !/[\p{Cc}\p{Cf}]/u.test(value),
+    'room name must not contain Unicode control or format characters',
+  )
+  .transform(normalizeRoomName)
+  .superRefine((value, context) => {
+    const length = Array.from(value).length;
+    if (length < 1 || length > MAX_ROOM_NAME_CHARACTERS) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `room name must contain 1-${MAX_ROOM_NAME_CHARACTERS} Unicode characters after normalization`,
+      });
+    }
+  });
 export const RoleSchema = utf8Bounded('role', MAX_ROLE_BYTES);
 export const MissionTextSchema = utf8Bounded('mission text', MAX_TEXT_BYTES);
 export const MessageTextSchema = utf8Bounded('message text', MAX_TEXT_BYTES);
@@ -309,8 +329,9 @@ export const RoomV1Schema = z.object({
   seats: z.array(SeatV1Schema),
 }).strict().superRefine(refineRoomLineage);
 
-export const RoomSchema = z.object({
+const CurrentRoomSchema = z.object({
   ...RoomCommonShape,
+  room_name: RoomNameSchema,
   version: z.literal(2),
   mission: MissionSchema,
   role_briefings: z.record(RoleSchema, RoleBriefingSchema),
@@ -392,6 +413,22 @@ export const RoomSchema = z.object({
   }
 });
 
+/** Deterministic display name for metadata created before room_name existed. */
+export function defaultRoomName(roomId: string): string {
+  return `Room ${LowerCrockfordUlidSchema.parse(roomId).slice(0, 8)}`;
+}
+
+/**
+ * room_name was added additively to metadata v2. Accept an otherwise-valid
+ * unnamed room long enough for storage to persist the deterministic fallback.
+ */
+export const RoomSchema = z.preprocess((value) => {
+  if (typeof value !== 'object' || value === null || Object.hasOwn(value, 'room_name')) return value;
+  const roomId = (value as { room_id?: unknown }).room_id;
+  if (typeof roomId !== 'string' || !LowerCrockfordUlidSchema.safeParse(roomId).success) return value;
+  return { ...value, room_name: defaultRoomName(roomId) };
+}, CurrentRoomSchema);
+
 /** Additive v1 → v2 mapping (spec §7). Existing rooms keep their exact behavior. */
 export function migrateRoomV1(
   room: z.infer<typeof RoomV1Schema>,
@@ -415,6 +452,7 @@ export function migrateRoomV1(
 
 /** Caller-controlled room creation fields. Identity and authorship are host-owned. */
 export const CreateRoomInputSchema = z.object({
+  name: RoomNameSchema.optional(),
   goal: MissionTextSchema,
   briefing: MissionTextSchema,
   anonymous: z.boolean().optional(),
@@ -422,6 +460,7 @@ export const CreateRoomInputSchema = z.object({
 }).strict();
 
 export const UpdateRoomInputSchema = z.object({
+  name: RoomNameSchema.optional(),
   goal: MissionTextSchema.optional(),
   briefing: MissionTextSchema.optional(),
   status: NonEmptyStringSchema.optional(),

@@ -7,7 +7,9 @@ ours-cowork web
 ours-cowork docs
 ```
 
-`ours-cowork web` starts the daemon if it is absent, waits for the console, and opens `http://127.0.0.1:3052/`. Create a room first, then add each invitation requirement from its Invite panel. The Communication view contains the human-readable room chat; operational records remain in Events and the complete ordered stream remains in Archive.
+`ours-cowork web` starts the daemon if it is absent, waits for the console, and opens `http://127.0.0.1:3052/`. Create a room with a friendly display name first, then add each invitation requirement from its Invite panel. Names are trimmed, normalized to Unicode NFC, and may contain 1–64 Unicode characters excluding control and format characters. Duplicate names are allowed. The Communication view contains the human-readable room chat; operational records remain in Events and the complete ordered stream remains in Archive.
+
+The friendly `room_name` is presentation metadata. The opaque `room_id` remains the stable key for routing, URLs, storage, and identity correlation, and the underlying technical room identity is never renamed. Rooms created before friendly names existed migrate deterministically to `Room <first 8 room_id characters>`.
 
 The localhost HTTP console has no authentication. Keep it bound to `127.0.0.1`; do not proxy, forward, or expose the port to other hosts. Room state is refreshed by periodic polling, not pushed to the browser.
 

@@ -122,11 +122,11 @@ test('phase-A verbs are reachable over authenticated RPC with strict params (spe
   assert.deepEqual(calls.at(-1), ['replaceParticipant', 'r1', { participant: 'cid-a', mode: 'public', min_accepts: 2 }]);
 
   // configurability rides existing verbs: create flags, settings toggle, history view
-  await send('room.create', { goal: 'g', briefing: 'b', anonymous: true, quiet_membership: true });
-  assert.deepEqual(calls.at(-1), ['createRoom', { goal: 'g', briefing: 'b', anonymous: true, quiet_membership: true }]);
+  await send('room.create', { name: 'Launch room', goal: 'g', briefing: 'b', anonymous: true, quiet_membership: true });
+  assert.deepEqual(calls.at(-1), ['createRoom', { name: 'Launch room', goal: 'g', briefing: 'b', anonymous: true, quiet_membership: true }]);
 
-  await send('room.settings', { room_id: 'r1', quiet_membership: true });
-  assert.deepEqual(calls.at(-1), ['updateRoom', 'r1', { quiet_membership: true }]);
+  await send('room.settings', { room_id: 'r1', name: 'Renamed room', quiet_membership: true });
+  assert.deepEqual(calls.at(-1), ['updateRoom', 'r1', { name: 'Renamed room', quiet_membership: true }]);
 
   await send('room.history', { room_id: 'r1', view: 'participant' });
   assert.deepEqual(calls.at(-1), ['history', 'r1', { view: 'participant' }]);

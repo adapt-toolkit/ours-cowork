@@ -357,11 +357,18 @@ if (process.argv.includes('--e2e-driver')) {
       await runCli(['room', 'delete', publicProof.room_id, '--yes']);
       stage('invite-redemption-semantics');
 
-      const created = await runCli(['room', 'create', '--goal', 'Ship the release', '--briefing', 'Keep evidence and blockers explicit']);
+      const created = await runCli(['room', 'create', '--name', '  Cafe\u0301 launch 🤖  ', '--goal', 'Ship the release', '--briefing', 'Keep evidence and blockers explicit']);
       const roomId = created.room_id;
       const roomCid = created.identity_cid;
       stage('room-created');
       assert.match(roomId, /^[0-7][0-9a-hjkmnp-tv-z]{25}$/);
+      assert.equal(created.room_name, 'Café launch 🤖');
+      assert.equal((await runCli(['room', 'list'])).find((candidate) => candidate.room_id === roomId).room_name, 'Café launch 🤖');
+      const renamed = await runCli(['room', 'settings', roomId, '--name', 'Delivery bridge']);
+      assert.equal(renamed.room_name, 'Delivery bridge');
+      assert.equal(renamed.room_id, roomId);
+      assert.equal(renamed.identity_name, created.identity_name);
+      assert.equal(renamed.identity_cid, roomCid);
 
       const oneTime = await runCli(['room', 'invite', roomId, '--mode', 'one_time', '--role', 'lead', '--min-accepts', '1']);
       const publicInvite = await runCli(['room', 'invite', roomId, '--mode', 'public', '--role', 'reviewer', '--min-accepts', '1']);

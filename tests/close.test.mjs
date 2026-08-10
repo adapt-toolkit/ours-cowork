@@ -145,18 +145,22 @@ class FakeRegistry {
 
 function room(overrides = {}) {
   return {
-    version: 1,
+    version: 2,
     room_id: ROOM_ID,
     identity_name: `cowork-room-${ROOM_ID}`,
     identity_cid: 'cid-room',
-    mission: { goal: 'Ship', briefing: 'Read the mission.' },
+    mission: { goal: 'Ship', briefing: 'Read the mission.', briefing_version: 1 },
+    role_briefings: {},
+    anonymous: false,
+    quiet_membership: false,
+    membership_epoch: 2,
     state: 'active',
     invites: [],
     seats: [
-      { identity: 'cid-alice', display_name: 'Alice', role: 'builder', invite_id: 'invite-a', accepted_at: AT },
+      { identity: 'cid-alice', display_name: 'Alice', role: 'builder', invite_id: 'invite-a', accepted_at: AT, participant_id: '01jz6y7n8p9q0r1s2t3v4w5xb1', state: 'active' },
       // A historical seat which is no longer a current core contact must not
       // cause a fabricated remove call or close-notice outcome.
-      { identity: 'cid-former', display_name: 'Former', role: 'reviewer', invite_id: 'invite-b', accepted_at: AT },
+      { identity: 'cid-former', display_name: 'Former', role: 'reviewer', invite_id: 'invite-b', accepted_at: AT, participant_id: '01jz6y7n8p9q0r1s2t3v4w5xb2', state: 'active' },
     ],
     created_at: AT,
     activated_at: AT,

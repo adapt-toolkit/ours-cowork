@@ -89,11 +89,63 @@ test('the exhaustive service route table marks every route auth:true', () => {
   const service = new Proxy({}, { get: () => async () => null });
   const routes = createServiceRoutes(service);
   assert.deepEqual(Object.keys(routes).sort(), [
+    'room.briefing.role.delete', 'room.briefing.role.set',
     'room.close', 'room.create', 'room.delete', 'room.history', 'room.invite', 'room.list',
-    'room.message', 'room.participants', 'room.recover', 'room.recover.confirm', 'room.revoke',
+    'room.message', 'room.participant.remove', 'room.participant.replace', 'room.participants',
+    'room.recover', 'room.recover.confirm', 'room.revoke',
     'room.settings', 'room.show',
   ]);
   assert(Object.values(routes).every((route) => route.auth === true));
+});
+
+test('phase-A verbs are reachable over authenticated RPC with strict params (spec §8.5)', async () => {
+  const calls = [];
+  const service = new Proxy({}, {
+    get: (_target, method) => async (...args) => { calls.push([method, ...args]); return { ok: true }; },
+  });
+  const dispatcher = new RpcDispatcher(createServiceRoutes(service));
+  const send = (method, params) => dispatcher.dispatch({ version: 1, id: 'x', method, params });
+
+  assert.deepEqual(
+    await send('room.briefing.role.set', { room_id: 'r1', role: 'reviewer', text: 'Review.' }),
+    { version: 1, id: 'x', result: { ok: true } },
+  );
+  assert.deepEqual(calls.at(-1), ['setRoleBriefing', 'r1', { role: 'reviewer', text: 'Review.' }]);
+
+  await send('room.briefing.role.delete', { room_id: 'r1', role: 'reviewer' });
+  assert.deepEqual(calls.at(-1), ['deleteRoleBriefing', 'r1', { role: 'reviewer' }]);
+
+  await send('room.participant.remove', { room_id: 'r1', participant: 'cid-a', notify: false });
+  assert.deepEqual(calls.at(-1), ['removeParticipant', 'r1', { participant: 'cid-a', notify: false }]);
+
+  await send('room.participant.replace', { room_id: 'r1', participant: 'cid-a', mode: 'public', min_accepts: 2 });
+  assert.deepEqual(calls.at(-1), ['replaceParticipant', 'r1', { participant: 'cid-a', mode: 'public', min_accepts: 2 }]);
+
+  // configurability rides existing verbs: create flags, settings toggle, history view
+  await send('room.create', { goal: 'g', briefing: 'b', anonymous: true, quiet_membership: true });
+  assert.deepEqual(calls.at(-1), ['createRoom', { goal: 'g', briefing: 'b', anonymous: true, quiet_membership: true }]);
+
+  await send('room.settings', { room_id: 'r1', quiet_membership: true });
+  assert.deepEqual(calls.at(-1), ['updateRoom', 'r1', { quiet_membership: true }]);
+
+  await send('room.history', { room_id: 'r1', view: 'participant' });
+  assert.deepEqual(calls.at(-1), ['history', 'r1', { view: 'participant' }]);
+
+  // an invite without a role reaches the service role-less (default Participant)
+  await send('room.invite', { room_id: 'r1', mode: 'one_time', min_accepts: 1 });
+  assert.deepEqual(calls.at(-1), ['createInvite', 'r1', { mode: 'one_time', min_accepts: 1 }]);
+
+  // strictness: unknown keys never reach the service
+  for (const [method, params] of [
+    ['room.briefing.role.set', { room_id: 'r1', role: 'x', text: 't', extra: true }],
+    ['room.participant.remove', { room_id: 'r1', participant: 'cid-a', alias: 'spoof' }],
+    ['room.participant.replace', { room_id: 'r1', participant: 'cid-a', replaces_seat: 'spoof' }],
+  ]) {
+    const before = calls.length;
+    const response = await send(method, params);
+    assert.equal(response.error.code, 'invalid_params', method);
+    assert.equal(calls.length, before);
+  }
 });
 
 test('REST is unauthenticated, loopback-only, emits no CORS, and excludes daemon control routes', async (t) => {

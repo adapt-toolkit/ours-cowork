@@ -8,10 +8,13 @@ import {
   CommunicationRecordSchema,
   LowerCrockfordUlidSchema,
   RoomSchema,
+  RoomV1Schema,
+  migrateRoomV1,
   type AppendRecord,
   type CommunicationRecord,
   type Room,
 } from './contracts.ts';
+import { generateUlid } from './ulid.ts';
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -304,10 +307,16 @@ export class CoworkStore {
           `room "${validRoomId}" has archive residue without deletion metadata`,
         );
       }
-      const expected = new Set(['archive.jsonl', 'room.json']);
+      const expected = new Set(['archive.jsonl', 'room.json', 'room.json.v1.bak']);
       const unexpected = this.fs.readdirSync(roomDir).filter((name) => !expected.has(name));
       if (unexpected.length > 0) {
         throw new CoworkStorageError(`room "${validRoomId}" contains live or unexpected residue: ${unexpected.join(', ')}`);
+      }
+      const backupPath = `${metadataPath}.v1.bak`;
+      if (this.lstatIfPresent(backupPath)) {
+        this.assertRegularFile(backupPath, 'room metadata v1 backup');
+        this.fs.unlinkSync(backupPath);
+        this.fsyncDirectory(roomDir);
       }
       if (archivePresent) {
         this.assertRegularFile(archivePath, 'room archive');
@@ -365,9 +374,106 @@ export class CoworkStore {
     } catch (error) {
       throw this.wrap(`malformed metadata for room "${roomId}"`, error);
     }
-    const room = RoomSchema.parse(decoded);
+    const room = this.isVersion1(decoded)
+      ? this.migrateUnlocked(roomId, decoded, bytes)
+      : RoomSchema.parse(decoded);
     if (room.room_id !== roomId) throw new CoworkStorageError(`metadata room_id does not match room "${roomId}"`);
     return room;
+  }
+
+  private isVersion1(decoded: unknown): boolean {
+    return typeof decoded === 'object' && decoded !== null
+      && (decoded as { version?: unknown }).version === 1;
+  }
+
+  /**
+   * Lazy additive v1 → v2 migration (spec §7): preserve the exact pre-migration
+   * bytes once as room.json.v1.bak, then atomically persist the v2 metadata.
+   *
+   * THE BACKUP IS WRITTEN TEMP → FSYNC → RENAME, not opened in place, and the
+   * reason is a crash window that an existence check cannot see. The earlier
+   * version guarded with `if (!lstatIfPresent(backupPath))` and wrote straight
+   * into the final path under O_CREAT|O_EXCL. A crash inside that write leaves a
+   * PARTIAL file that nonetheless EXISTS, so the next load's existence check
+   * skips the backup, writes v2, and the pre-migration bytes are gone — no
+   * error, no warning, and the one artefact that exists to undo a bad migration
+   * is a truncated fragment. Measured before the fix: a 40-byte prefix of a
+   * 604-byte room, JSON.parse false, room.json already v2.
+   *
+   * A rename is atomic, so the final path now only ever appears complete. The
+   * temp file is created with O_EXCL under a pid+random name and removed on
+   * failure, so a crashed attempt leaves at most an orphan temp, never a
+   * plausible-looking backup.
+   *
+   * AND AN EXISTING BACKUP IS PARSED BEFORE IT IS TRUSTED, which repairs the
+   * case where a partial file is ALREADY on disk from a build without this fix —
+   * exactly the state a host that ran the previous code could be in right now.
+   * A backup that does not parse as v1 is replaced by the bytes we hold, because
+   * those are the real pre-migration bytes and the fragment is worthless.
+   *
+   * WHAT THE BACKUP IS NOT: restoring it is NOT a rollback. See the note on
+   * `restoreV1Backup` — re-migrating mints fresh participant ids.
+   */
+  private migrateUnlocked(roomId: string, decoded: unknown, originalBytes: Buffer): Room {
+    const v1 = RoomV1Schema.parse(decoded);
+    if (v1.room_id !== roomId) throw new CoworkStorageError(`metadata room_id does not match room "${roomId}"`);
+    const migrated = migrateRoomV1(v1, generateUlid);
+    const backupPath = `${this.metadataPath(roomId)}.v1.bak`;
+    if (!this.hasIntactV1Backup(backupPath)) {
+      this.atomicBytesWrite(backupPath, originalBytes, 'room metadata v1 backup');
+    }
+    this.atomicMetadataWrite(this.metadataPath(roomId), migrated);
+    return migrated;
+  }
+
+  /**
+   * Is there already a backup we would be willing to hand back to an operator?
+   *
+   * Existence is not the question — a partial file exists. It must parse and
+   * still claim to be the v1 metadata for this room; anything else is a fragment
+   * and is better overwritten with the bytes we are holding right now.
+   */
+  private hasIntactV1Backup(backupPath: string): boolean {
+    if (!this.lstatIfPresent(backupPath)) return false;
+    try {
+      const decoded = JSON.parse(utf8Decoder.decode(this.readFileNoFollow(backupPath, 'room metadata v1 backup')));
+      return this.isVersion1(decoded);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Durably place exact bytes at `path`: temp under O_EXCL, fsync, rename, fsync
+   * the directory. The same dance as atomicMetadataWrite, which serialises a Room
+   * rather than taking bytes verbatim — and taking them verbatim is the whole
+   * point for a backup, whose value is being byte-identical to what was there.
+   */
+  private atomicBytesWrite(path: string, bytes: Buffer, label: string): void {
+    if (this.lstatIfPresent(path)) this.assertRegularFile(path, label);
+    const temp = `${path}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`;
+    let fd: number | undefined;
+    try {
+      fd = this.fs.openSync(
+        temp,
+        nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL | nodeFs.constants.O_WRONLY | NO_FOLLOW,
+        FILE_MODE,
+      );
+      this.validateOpenPath(fd, temp, `temporary ${label}`, 'file', true);
+      this.fs.fchmodSync(fd, FILE_MODE);
+      this.writeAll(fd, bytes);
+      this.fs.fsyncSync(fd);
+      this.fs.closeSync(fd);
+      fd = undefined;
+      this.fs.renameSync(temp, path);
+      this.fsyncDirectory(dirname(path));
+    } catch (error) {
+      if (fd !== undefined) {
+        try { this.fs.closeSync(fd); } catch { /* original failure wins */ }
+      }
+      try { this.fs.rmSync(temp, { force: true }); } catch { /* best effort */ }
+      throw this.wrap(`failed to write ${label} at ${path}`, error);
+    }
   }
 
   private scanArchive(roomId: string): ScanResult {

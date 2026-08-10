@@ -578,10 +578,13 @@ test('admission uses only exact invite origins, never contact names or roles for
     'cid-alice': { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[2] },
   };
   const room = await f.service.reconcileRoom(ROOM_ID);
-  assert.deepEqual(room.seats, [{
+  assert.equal(room.seats.length, 1);
+  const { participant_id, ...seat } = room.seats[0];
+  assert.match(participant_id, /^[0-7][0-9a-hjkmnp-tv-z]{25}$/);
+  assert.deepEqual(seat, {
     identity: 'cid-alice', display_name: 'Alice', role: 'trusted-looking label',
-    invite_id: invite.invite_id, accepted_at: TIMES[2],
-  }]);
+    invite_id: invite.invite_id, accepted_at: TIMES[2], state: 'active',
+  });
   assert.deepEqual(room.invites[0].accepted_cids, ['cid-alice']);
   assert.equal(room.state, 'provisioning', 'two accepts are required');
 });
@@ -761,4 +764,381 @@ test('projections update settings and page numeric history without exposing invi
   assert.deepEqual(await f.service.participants(ROOM_ID), []);
   assert.deepEqual(await f.service.history(ROOM_ID, { after: 0, limit: 10 }), []);
   assert.equal(JSON.stringify(await f.service.showRoom(ROOM_ID)).includes('SECRET-BLOB'), false);
+});
+
+// ---- Rooms evolution Phase A2 (spec §3.3, §8.2) — dual briefings ----
+
+function evolutionFixture() {
+  const store = new MemoryStore();
+  const registry = new FakeRegistry();
+  let messageIndex = 0;
+  let tick = 0;
+  const service = new RoomService(store, registry, {
+    roomId: () => ROOM_ID,
+    messageId: () => `01jz6y7n8p9q0r1s2t3v4w6${String(messageIndex++).padStart(3, '0')}`.slice(0, 26),
+    now: () => new Date(Date.UTC(2026, 7, 2, 10, 11, 12, tick++)).toISOString(),
+  });
+  return { store, registry, service };
+}
+
+async function admit(f, invite, cid, name, at = '2026-08-02T10:20:00.000Z') {
+  const packet = f.registry.get(ROOM_ID);
+  packet.contacts.push({ name, container_id: cid });
+  packet.origins[cid] = { via: 'invite_public', invite_id: invite.invite_id, at };
+  return f.service.reconcileRoom(ROOM_ID);
+}
+
+function briefingsOf(records, category) {
+  return records.filter((record) => record.kind === 'message' && record.category === category);
+}
+
+function intentsFor(records, messageId) {
+  return records.filter((record) => record.kind === 'relay_intent' && record.message_id === messageId)
+    .map((record) => record.recipient_identity);
+}
+
+test('activation delivers the common briefing and the seat role briefing exactly once', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common mission.' });
+  await f.service.setRoleBriefing(ROOM_ID, { role: 'reviewer', text: 'Review the diffs.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'reviewer', min_accepts: 1 });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  await f.service.reconcileRoom(ROOM_ID);
+
+  const records = await f.store.read(ROOM_ID);
+  const common = briefingsOf(records, 'briefing');
+  const roled = briefingsOf(records, 'role_briefing');
+  assert.equal(common.length, 1);
+  assert.equal(common[0].briefing_version, 1);
+  assert.equal(common[0].text, 'Common mission.');
+  assert.deepEqual(common[0].recipient_identities, ['cid-alice']);
+  assert.equal(roled.length, 1);
+  assert.equal(roled[0].briefing_role, 'reviewer');
+  assert.equal(roled[0].briefing_version, 1);
+  assert.equal(roled[0].text, 'Review the diffs.');
+  assert.deepEqual(roled[0].recipient_identities, ['cid-alice']);
+  assert.deepEqual(intentsFor(records, common[0].message_id), ['cid-alice']);
+  assert.deepEqual(intentsFor(records, roled[0].message_id), ['cid-alice']);
+  // the room voice authors both
+  assert.equal(common[0].author.role, 'room');
+  assert.equal(roled[0].author.role, 'room');
+});
+
+test('a role without a briefing gets only the common briefing and no failure', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common mission.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'writer', min_accepts: 1 });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  const records = await f.store.read(ROOM_ID);
+  assert.equal(briefingsOf(records, 'briefing').length, 1);
+  assert.equal(briefingsOf(records, 'role_briefing').length, 0);
+});
+
+test('late and replacement seats receive both briefings at their current versions once', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common v1.' });
+  await f.service.setRoleBriefing(ROOM_ID, { role: 'reviewer', text: 'Role v1.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'reviewer', min_accepts: 1 });
+  await admit(f, invite, 'cid-alice', 'Alice');
+
+  // bump both briefings after activation
+  await f.service.updateRoom(ROOM_ID, { briefing: 'Common v2.' });
+  await f.service.setRoleBriefing(ROOM_ID, { role: 'reviewer', text: 'Role v2.' });
+
+  await admit(f, invite, 'cid-bob', 'Bob', '2026-08-02T10:30:00.000Z');
+  await f.service.reconcileRoom(ROOM_ID);
+
+  const records = await f.store.read(ROOM_ID);
+  const common = briefingsOf(records, 'briefing');
+  const roled = briefingsOf(records, 'role_briefing');
+  // v1 to alice, v2 re-delivery to alice, v2 to late bob
+  assert.deepEqual(
+    common.map((message) => [message.briefing_version, message.recipient_identities]),
+    [[1, ['cid-alice']], [2, ['cid-alice']], [2, ['cid-bob']]],
+  );
+  assert.deepEqual(
+    roled.map((message) => [message.briefing_version, message.recipient_identities]),
+    [[1, ['cid-alice']], [2, ['cid-alice']], [2, ['cid-bob']]],
+  );
+  assert.equal(common.at(-1).text, 'Common v2.');
+  assert.equal(roled.at(-1).text, 'Role v2.');
+});
+
+test('briefing version bumps re-deliver exactly to the affected seats', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common v1.' });
+  await f.service.setRoleBriefing(ROOM_ID, { role: 'reviewer', text: 'Reviewer v1.' });
+  await f.service.setRoleBriefing(ROOM_ID, { role: 'writer', text: 'Writer v1.' });
+  const { invite: reviewerInvite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'reviewer', min_accepts: 1 });
+  const { invite: writerInvite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'writer', min_accepts: 1 });
+  await admit(f, reviewerInvite, 'cid-alice', 'Alice');
+  await admit(f, writerInvite, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
+
+  // reviewer-only bump touches only alice
+  await f.service.setRoleBriefing(ROOM_ID, { role: 'reviewer', text: 'Reviewer v2.' });
+  let records = await f.store.read(ROOM_ID);
+  const reviewerV2 = briefingsOf(records, 'role_briefing')
+    .filter((message) => message.briefing_role === 'reviewer' && message.briefing_version === 2);
+  assert.deepEqual(reviewerV2.map((message) => message.recipient_identities), [['cid-alice']]);
+  assert.equal(briefingsOf(records, 'role_briefing')
+    .filter((message) => message.briefing_role === 'writer').length, 1);
+
+  // common bump touches everyone
+  await f.service.updateRoom(ROOM_ID, { briefing: 'Common v2.' });
+  records = await f.store.read(ROOM_ID);
+  const commonV2 = briefingsOf(records, 'briefing').filter((message) => message.briefing_version === 2);
+  assert.equal(commonV2.length, 1);
+  assert.deepEqual([...commonV2[0].recipient_identities].sort(), ['cid-alice', 'cid-bob']);
+
+  // setting identical text is a no-op, not a version bump
+  const before = (await f.store.read(ROOM_ID)).length;
+  await f.service.setRoleBriefing(ROOM_ID, { role: 'reviewer', text: 'Reviewer v2.' });
+  await f.service.updateRoom(ROOM_ID, { briefing: 'Common v2.' });
+  assert.equal((await f.store.read(ROOM_ID)).length, before);
+  const room = await f.service.showRoom(ROOM_ID);
+  assert.equal(room.mission.briefing_version, 2);
+  assert.equal(room.role_briefings.reviewer.version, 2);
+});
+
+test('role briefing authoring is operator-gated state with delete support', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const set = await f.service.setRoleBriefing(ROOM_ID, { role: 'reviewer', text: 'Role v1.' });
+  assert.equal(set.role_briefings.reviewer.version, 1);
+  assert.equal(set.role_briefings.reviewer.text, 'Role v1.');
+  const removed = await f.service.deleteRoleBriefing(ROOM_ID, { role: 'reviewer' });
+  assert.equal(removed.role_briefings.reviewer, undefined);
+  // deleting an absent role briefing is an explicit error
+  await assert.rejects(f.service.deleteRoleBriefing(ROOM_ID, { role: 'reviewer' }), /no role briefing/i);
+  // closed rooms refuse briefing authoring
+  f.store.rooms.get(ROOM_ID).state = 'closed';
+  f.store.rooms.get(ROOM_ID).closed_at = '2026-08-02T11:00:00.000Z';
+  await assert.rejects(f.service.setRoleBriefing(ROOM_ID, { role: 'reviewer', text: 'x' }), /closing|closed/i);
+});
+
+test('a crash between role-briefing append and its intent re-drives without duplication', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common mission.' });
+  await f.service.setRoleBriefing(ROOM_ID, { role: 'reviewer', text: 'Role v1.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'reviewer', min_accepts: 1 });
+
+  let armed = true;
+  f.store.beforeAppend = (draft) => {
+    if (armed && draft.kind === 'relay_intent') {
+      const messages = f.store.records.get(ROOM_ID).filter((record) =>
+        record.kind === 'message' && record.category === 'role_briefing');
+      if (messages.some((message) => message.message_id === draft.message_id)) {
+        armed = false;
+        throw new Error('crash after role briefing append');
+      }
+    }
+  };
+  const packet = f.registry.get(ROOM_ID);
+  packet.contacts.push({ name: 'Alice', container_id: 'cid-alice' });
+  packet.origins['cid-alice'] = { via: 'invite_public', invite_id: invite.invite_id, at: '2026-08-02T10:20:00.000Z' };
+  await assert.rejects(f.service.reconcileRoom(ROOM_ID), /crash after role briefing/);
+
+  f.store.beforeAppend = undefined;
+  await f.service.reconcileRoom(ROOM_ID);
+  await f.service.reconcileRoom(ROOM_ID);
+  const records = await f.store.read(ROOM_ID);
+  const roled = briefingsOf(records, 'role_briefing');
+  assert.equal(roled.length, 1);
+  assert.deepEqual(intentsFor(records, roled[0].message_id), ['cid-alice']);
+  const common = briefingsOf(records, 'briefing');
+  assert.equal(common.length, 1);
+  assert.deepEqual(intentsFor(records, common[0].message_id), ['cid-alice']);
+});
+
+// ---- Rooms evolution Phase A4 (spec §5.2–§5.3, §8.4) — removal & replacement ----
+
+function membershipRecords(records) {
+  return {
+    intents: records.filter((record) => record.kind === 'membership_intent'),
+    results: records.filter((record) => record.kind === 'membership_result'),
+    notices: records.filter((record) => record.kind === 'message' && record.category === 'membership'),
+  };
+}
+
+test('removeParticipant journals intent/result, severs the channel, bumps the epoch once, and announces', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  await admit(f, invite, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
+  const packet = f.registry.get(ROOM_ID);
+  packet.removeContactCalls = packet.removeContactCalls ?? [];
+  const epochBefore = (await f.service.showRoom(ROOM_ID)).membership_epoch;
+
+  const receipt = await f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' });
+  assert.equal(receipt.status, 'queued');
+  assert.equal(receipt.notified, true);
+  assert.equal(receipt.key_material_retained, true);
+
+  const room = await f.service.showRoom(ROOM_ID);
+  const seat = room.seats.find((candidate) => candidate.identity === 'cid-alice');
+  assert.equal(seat.state, 'removed');
+  assert.equal(typeof seat.removed_at, 'string');
+  assert.equal(seat.removed_epoch, epochBefore + 1);
+  assert.equal(room.membership_epoch, epochBefore + 1);
+
+  const records = await f.store.read(ROOM_ID);
+  const { intents, results, notices } = membershipRecords(records);
+  assert.equal(intents.length, 1);
+  assert.equal(intents[0].action, 'remove');
+  assert.equal(intents[0].participant_id, seat.participant_id);
+  assert.equal(intents[0].recipient_identity, 'cid-alice');
+  assert.equal(intents[0].epoch, epochBefore + 1);
+  assert.equal(results.length, 1);
+  assert.equal(results[0].intent_record_id, intents[0].record_id);
+  assert.deepEqual(
+    { status: results[0].status, notified: results[0].notified, key_material_retained: results[0].key_material_retained },
+    { status: 'queued', notified: true, key_material_retained: true },
+  );
+
+  // announcement goes to the remaining active seats only, epoch stamped
+  assert.equal(notices.length, 1);
+  assert.deepEqual(notices[0].recipient_identities, ['cid-bob']);
+  assert.deepEqual(notices[0].membership, { action: 'remove', alias: 'Alice', role: 'builder', epoch: epochBefore + 1 });
+  assert.equal(notices[0].author.role, 'room');
+
+  // fan-out after removal excludes the removed seat
+  await f.service.postMessage(ROOM_ID, { text: 'After removal.' });
+  const chat = (await f.store.read(ROOM_ID)).filter((record) =>
+    record.kind === 'message' && record.category === 'chat').at(-1);
+  assert.deepEqual(chat.recipient_identities, ['cid-bob']);
+
+  // a second removal of the same participant is an explicit error
+  await assert.rejects(f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' }), /active/i);
+});
+
+test('quiet_membership and notify:false suppress the announcement but never the journal', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.', quiet_membership: true });
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  await admit(f, invite, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
+  await f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' });
+  let { intents, results, notices } = membershipRecords(await f.store.read(ROOM_ID));
+  assert.equal(intents.length, 1);
+  assert.equal(intents[0].notify, false);
+  assert.equal(results.length, 1);
+  assert.equal(notices.length, 0);
+
+  const g = evolutionFixture();
+  await g.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite: inviteG } = await g.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  await admit(g, inviteG, 'cid-alice', 'Alice');
+  await admit(g, inviteG, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
+  await g.service.removeParticipant(ROOM_ID, { participant: 'cid-alice', notify: false });
+  ({ intents, results, notices } = membershipRecords(await g.store.read(ROOM_ID)));
+  assert.equal(intents[0].notify, false);
+  assert.equal(notices.length, 0);
+});
+
+test('anonymous replacement is unconditionally silent and the successor inherits the alias (OC-6/OC-2 override)', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.', anonymous: true });
+  await f.service.setRoleBriefing(ROOM_ID, { role: 'Developer', text: 'Build.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'Developer', min_accepts: 1 });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  await admit(f, invite, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
+  const before = await f.service.showRoom(ROOM_ID);
+  const aliceSeat = before.seats.find((seat) => seat.identity === 'cid-alice');
+  assert.equal(aliceSeat.alias, 'Developer #1');
+  const recordCountForBobBefore = (await f.store.read(ROOM_ID)).filter((record) =>
+    record.kind === 'message' && record.recipient_identities.includes('cid-bob')).length;
+
+  const replacement = await f.service.replaceParticipant(ROOM_ID, { participant: 'cid-alice', mode: 'one_time' });
+  assert.equal(replacement.invite.role, 'Developer');
+  assert.equal(replacement.invite.replaces_seat, aliceSeat.participant_id);
+  assert.equal(typeof replacement.blob, 'string');
+
+  // the removal half was silent: no membership notice despite quiet_membership=false
+  assert.equal(membershipRecords(await f.store.read(ROOM_ID)).notices.length, 0);
+
+  await admit(f, replacement.invite, 'cid-carol', 'Carol', '2026-08-02T10:40:00.000Z');
+  const after = await f.service.showRoom(ROOM_ID);
+  const carolSeat = after.seats.find((seat) => seat.identity === 'cid-carol');
+  assert.equal(carolSeat.alias, 'Developer #1', 'successor inherits the predecessor alias');
+  assert.equal(carolSeat.replaces_seat, aliceSeat.participant_id);
+  assert.notEqual(carolSeat.participant_id, aliceSeat.participant_id, 'internal identity still tracks the change');
+  assert.equal(after.membership_epoch > before.membership_epoch, true);
+
+  // the successor got the current common + role briefings, addressed only to it
+  const records = await f.store.read(ROOM_ID);
+  const carolBriefings = records.filter((record) => record.kind === 'message'
+    && record.recipient_identities.includes('cid-carol'));
+  assert.deepEqual(carolBriefings.map((message) => message.category).sort(), ['briefing', 'role_briefing']);
+  for (const briefing of carolBriefings) {
+    assert.deepEqual(briefing.recipient_identities, ['cid-carol']);
+  }
+
+  // the switch is unnoticeable to bob: not one new message addressed to it
+  const recordCountForBobAfter = records.filter((record) =>
+    record.kind === 'message' && record.recipient_identities.includes('cid-bob')).length;
+  assert.equal(recordCountForBobAfter, recordCountForBobBefore);
+});
+
+test('removal crash points re-drive from the intent ledger without duplicate epochs or results', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  await admit(f, invite, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
+  const packet = f.registry.get(ROOM_ID);
+
+  // crash after the intent append, before the seat-state save
+  let armed = true;
+  f.store.beforeSave = (room) => {
+    if (armed && room.seats.some((seat) => seat.state === 'removed')) {
+      armed = false;
+      throw new Error('crash after membership intent');
+    }
+  };
+  await assert.rejects(f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' }), /crash after membership intent/);
+  f.store.beforeSave = undefined;
+  assert.equal((await f.service.showRoom(ROOM_ID)).seats.find((seat) => seat.identity === 'cid-alice').state, 'active');
+
+  // recovery re-drives the pending intent to completion
+  await f.service.reconcileRoom(ROOM_ID);
+  const room = await f.service.showRoom(ROOM_ID);
+  assert.equal(room.seats.find((seat) => seat.identity === 'cid-alice').state, 'removed');
+  const { intents, results } = membershipRecords(await f.store.read(ROOM_ID));
+  assert.equal(intents.length, 1);
+  assert.equal(results.length, 1);
+  assert.equal(room.membership_epoch, intents[0].epoch);
+
+  // a second reconcile is a no-op
+  await f.service.reconcileRoom(ROOM_ID);
+  const settled = membershipRecords(await f.store.read(ROOM_ID));
+  assert.equal(settled.intents.length, 1);
+  assert.equal(settled.results.length, 1);
+});
+
+test('a removed cid re-admits only through an invite minted after its removal', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite: original } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  await admit(f, original, 'cid-alice', 'Alice');
+  await admit(f, original, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
+  await f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' });
+
+  // the pre-removal public invite cannot silently re-admit the removed cid
+  const packet = f.registry.get(ROOM_ID);
+  packet.contacts.push({ name: 'Alice returns', container_id: 'cid-alice' });
+  packet.origins['cid-alice'] = { via: 'invite_public', invite_id: original.invite_id, at: '2026-08-02T10:50:00.000Z' };
+  await f.service.reconcileRoom(ROOM_ID);
+  let seats = (await f.service.showRoom(ROOM_ID)).seats.filter((seat) => seat.identity === 'cid-alice');
+  assert.equal(seats.length, 1);
+  assert.equal(seats[0].state, 'removed');
+
+  // a deliberate fresh invite admits it with a fresh seat
+  const { invite: fresh } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  packet.origins['cid-alice'] = { via: 'invite_public', invite_id: fresh.invite_id, at: '2026-08-02T10:55:00.000Z' };
+  await f.service.reconcileRoom(ROOM_ID);
+  seats = (await f.service.showRoom(ROOM_ID)).seats.filter((seat) => seat.identity === 'cid-alice');
+  assert.equal(seats.length, 2);
+  assert.deepEqual(seats.map((seat) => seat.state).sort(), ['active', 'removed']);
+  assert.notEqual(seats[0].participant_id, seats[1].participant_id);
 });

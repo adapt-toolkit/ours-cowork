@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import test from 'node:test';
 
 import { RoomService } from '../src/service.ts';
+import { MAX_HISTORY_PAGE_BYTES } from '../src/contracts.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const MESSAGE_IDS = [
@@ -767,6 +768,31 @@ test('projections update settings and page numeric history without exposing invi
   assert.deepEqual(await f.service.participants(ROOM_ID), []);
   assert.deepEqual(await f.service.history(ROOM_ID, { after: 0, limit: 10 }), []);
   assert.equal(JSON.stringify(await f.service.showRoom(ROOM_ID)).includes('SECRET-BLOB'), false);
+});
+
+test('history returns byte-bounded short pages whose last sequence is a usable continuation cursor', async () => {
+  const f = fixture();
+  await create(f);
+  const bytes = Buffer.alloc(2 * 1024 * 1024, 0xa5);
+  const base64 = bytes.toString('base64');
+  const records = f.store.records.get(ROOM_ID);
+  for (let index = 1; index <= 2; index += 1) {
+    records.push({
+      version: 1, room_id: ROOM_ID, seq: index, record_id: `${ROOM_ID}:${index}`, at: TIMES[0],
+      kind: 'file', file_id: MESSAGE_IDS[index - 1],
+      author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' },
+      filename: `maximum-${index}.bin`, mime: 'application/octet-stream', size: bytes.length,
+      sha256: 'a'.repeat(64), data_base64: base64, recipient_identities: [], source_file_id: index,
+    });
+  }
+
+  const first = await f.service.history(ROOM_ID, { after: 0, limit: 2 });
+  assert.equal(first.length, 1, 'two maximum files must not share one transport page');
+  assert(Buffer.byteLength(JSON.stringify(first), 'utf8') <= MAX_HISTORY_PAGE_BYTES);
+  const second = await f.service.history(ROOM_ID, { after: first.at(-1).seq, limit: 1 });
+  assert.equal(second.length, 1);
+  assert.equal(second[0].seq, 2);
+  assert.deepEqual(await f.service.history(ROOM_ID, { after: second[0].seq, limit: 1 }), []);
 });
 
 // ---- Rooms evolution Phase A2 (spec §3.3, §8.2) — dual briefings ----

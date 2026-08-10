@@ -1,11 +1,12 @@
 export type RoomState = 'provisioning' | 'active' | 'closing' | 'closed';
 export type InviteMode = 'one_time' | 'public';
 export type InviteState = 'live' | 'consumed' | 'revoked' | 'replacement_required' | 'receipt_pending';
-export type RelayStatus = 'queued' | 'send_failed';
+export type RelayStatus = 'queued' | 'send_failed' | 'skipped_removed';
 
 export interface MissionDto {
   goal: string;
   briefing: string;
+  briefing_version?: number;
 }
 
 export interface ParticipantDto {
@@ -14,6 +15,13 @@ export interface ParticipantDto {
   role: string;
   invite_id: string;
   accepted_at: string;
+  participant_id?: string;
+  state?: 'active' | 'removed';
+  alias?: string;
+  removed_at?: string;
+  removed_epoch?: number;
+  replaces_seat?: string;
+  bounced_at?: string;
 }
 
 export interface RoomInviteDto {
@@ -25,15 +33,26 @@ export interface RoomInviteDto {
   state: InviteState;
   recovery_of?: string;
   recovery_confirmed?: boolean;
+  replaces_seat?: string;
   created_at: string;
 }
 
+export interface RoleBriefingDto {
+  text: string;
+  version: number;
+  updated_at: string;
+}
+
 export interface RoomDto {
-  version: 1;
+  version: 1 | 2;
   room_id: string;
   identity_name: string;
   identity_cid: string;
   mission: MissionDto;
+  role_briefings?: Record<string, RoleBriefingDto>;
+  anonymous?: boolean;
+  quiet_membership?: boolean;
+  membership_epoch?: number;
   state: RoomState;
   status?: string;
   invites: RoomInviteDto[];
@@ -137,7 +156,7 @@ export interface CloseNoticeResultRecordDto extends RecordCommonDto {
   kind: 'close_notice_result';
   intent_record_id: string;
   recipient_identity: string;
-  status: RelayStatus;
+  status: Exclude<RelayStatus, 'skipped_removed'>;
   notified: boolean;
   key_material_retained: true;
   uncertain_after_restart?: true;
@@ -156,6 +175,7 @@ const ROOM_STATES = new Set<unknown>(['provisioning', 'active', 'closing', 'clos
 const INVITE_MODES = new Set<unknown>(['one_time', 'public']);
 const INVITE_STATES = new Set<unknown>(['live', 'consumed', 'revoked', 'replacement_required', 'receipt_pending']);
 const RELAY_STATUSES = new Set<unknown>(['queued', 'send_failed', 'skipped_removed']);
+const DELIVERY_STATUSES = new Set<unknown>(['queued', 'send_failed']);
 const LOWER_CROCKFORD_ULID = /^[0-7][0-9a-hjkmnp-tv-z]{25}$/;
 const MAX_TEXT_BYTES = 262_144;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
@@ -163,29 +183,62 @@ const MAX_FILE_NAME_BYTES = 255;
 const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;
 const RECORD_COMMON_KEYS = ['version', 'room_id', 'seq', 'record_id', 'at', 'kind'] as const;
-const ROOM_KEYS = ['version', 'room_id', 'identity_name', 'identity_cid', 'mission', 'state', 'invites', 'seats', 'created_at'] as const;
+const ROOM_V1_KEYS = ['version', 'room_id', 'identity_name', 'identity_cid', 'mission', 'state', 'invites', 'seats', 'created_at'] as const;
+const ROOM_V2_KEYS = [...ROOM_V1_KEYS, 'role_briefings', 'anonymous', 'quiet_membership', 'membership_epoch'] as const;
 
 export function isRoomDto(value: unknown): value is RoomDto {
-  if (!isRecord(value)
-    || !hasExactKeys(value, ROOM_KEYS, ['status', 'activated_at', 'closed_at'])
-    || value.version !== 1
+  if (!isRecord(value) || (value.version !== 1 && value.version !== 2)) return false;
+  const v2 = value.version === 2;
+  if (!hasExactKeys(value, v2 ? ROOM_V2_KEYS : ROOM_V1_KEYS, ['status', 'activated_at', 'closed_at'])
     || !isLowerCrockfordUlid(value.room_id)
     || !isString(value.identity_name)
     || typeof value.identity_cid !== 'string'
-    || !isMission(value.mission)
+    || !isMission(value.mission, v2)
     || !ROOM_STATES.has(value.state)
     || !optionalString(value.status)
     || !Array.isArray(value.invites)
     || !value.invites.every(isRoomInvite)
     || !Array.isArray(value.seats)
-    || !value.seats.every(isParticipant)
+    || !value.seats.every((seat) => isParticipant(seat, v2))
     || !isStrictRfc3339(value.created_at)
     || !optionalStrictRfc3339(value.activated_at)
     || !optionalStrictRfc3339(value.closed_at)) return false;
 
+  if (v2 && (!isRoleBriefingMap(value.role_briefings)
+    || typeof value.anonymous !== 'boolean'
+    || typeof value.quiet_membership !== 'boolean'
+    || !isNonNegativeSafeInteger(value.membership_epoch))) return false;
+
   const inviteIds = new Set(value.invites.map((invite) => invite.invite_id));
   if (inviteIds.size !== value.invites.length
     || new Set(value.seats.map((seat) => seat.identity)).size !== value.seats.length) return false;
+
+  if (v2) {
+    const seats = value.seats as ParticipantDto[];
+    if (new Set(seats.map((seat) => seat.participant_id)).size !== seats.length) return false;
+    const activeAliases = new Set<string>();
+    for (const seat of seats) {
+      if (value.anonymous ? seat.alias === undefined : seat.alias !== undefined) return false;
+      if (seat.state === 'removed') {
+        if (seat.removed_at === undefined || seat.removed_epoch === undefined
+          || seat.removed_epoch > Number(value.membership_epoch)) return false;
+      } else if (seat.removed_at !== undefined || seat.removed_epoch !== undefined || seat.bounced_at !== undefined) {
+        return false;
+      }
+      if (seat.state === 'active' && seat.alias !== undefined) {
+        if (activeAliases.has(seat.alias)) return false;
+        activeAliases.add(seat.alias);
+      }
+    }
+    const byParticipant = new Map(seats.map((seat) => [seat.participant_id, seat]));
+    for (const seat of seats) {
+      if (seat.replaces_seat === undefined) continue;
+      const predecessor = byParticipant.get(seat.replaces_seat);
+      if (!predecessor || predecessor === seat || predecessor.state !== 'removed'
+        || predecessor.role !== seat.role
+        || (value.anonymous && predecessor.alias !== seat.alias)) return false;
+    }
+  }
 
   const exactPacketPending = value.state === 'provisioning'
     && value.status === 'packet_pending'
@@ -241,7 +294,7 @@ export function isRoomListDto(value: unknown): value is RoomDto[] {
 
 export function isParticipantListDto(value: unknown): value is ParticipantDto[] {
   return Array.isArray(value)
-    && value.every(isParticipant)
+    && value.every((participant) => isParticipant(participant))
     && new Set(value.map((participant) => participant.identity)).size === value.length;
 }
 
@@ -368,7 +421,7 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
       return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'intent_record_id', 'recipient_identity', 'status', 'notified', 'key_material_retained'], ['uncertain_after_restart'])
         && isString(value.intent_record_id)
         && isString(value.recipient_identity)
-        && RELAY_STATUSES.has(value.status)
+        && DELIVERY_STATUSES.has(value.status)
         && typeof value.notified === 'boolean'
         && value.key_material_retained === true
         && (value.uncertain_after_restart === undefined || value.uncertain_after_restart === true);
@@ -390,26 +443,51 @@ export function isDeleteRoomReceiptDto(value: unknown): value is DeleteRoomRecei
     && value.scope === 'this_host';
 }
 
-function isMission(value: unknown): value is MissionDto {
+function isMission(value: unknown, v2 = false): value is MissionDto {
   return isRecord(value)
-    && hasExactKeys(value, ['goal', 'briefing'])
+    && hasExactKeys(value, v2 ? ['goal', 'briefing', 'briefing_version'] : ['goal', 'briefing'])
     && isUtf8Bounded(value.goal, MAX_TEXT_BYTES)
-    && isUtf8Bounded(value.briefing, MAX_TEXT_BYTES);
+    && isUtf8Bounded(value.briefing, MAX_TEXT_BYTES)
+    && (!v2 || isPositiveSafeInteger(value.briefing_version));
 }
 
-function isParticipant(value: unknown): value is ParticipantDto {
-  return isRecord(value)
-    && hasExactKeys(value, ['identity', 'display_name', 'role', 'invite_id', 'accepted_at'])
-    && isString(value.identity)
+function isParticipant(value: unknown, requireV2?: boolean): value is ParticipantDto {
+  if (!isRecord(value)) return false;
+  const v2 = requireV2 ?? Object.hasOwn(value, 'participant_id');
+  if (!hasExactKeys(
+    value,
+    v2
+      ? ['identity', 'display_name', 'role', 'invite_id', 'accepted_at', 'participant_id', 'state']
+      : ['identity', 'display_name', 'role', 'invite_id', 'accepted_at'],
+    v2 ? ['alias', 'removed_at', 'removed_epoch', 'replaces_seat', 'bounced_at'] : [],
+  )) return false;
+  return isString(value.identity)
     && isString(value.display_name)
     && isUtf8Bounded(value.role, MAX_ROLE_BYTES)
     && isString(value.invite_id)
-    && isStrictRfc3339(value.accepted_at);
+    && isStrictRfc3339(value.accepted_at)
+    && (!v2 || (isLowerCrockfordUlid(value.participant_id)
+      && (value.state === 'active' || value.state === 'removed')
+      && optionalString(value.alias)
+      && optionalStrictRfc3339(value.removed_at)
+      && (value.removed_epoch === undefined || isNonNegativeSafeInteger(value.removed_epoch))
+      && (value.replaces_seat === undefined || isLowerCrockfordUlid(value.replaces_seat))
+      && optionalStrictRfc3339(value.bounced_at)));
+}
+
+function isRoleBriefingMap(value: unknown): value is Record<string, RoleBriefingDto> {
+  return isRecord(value) && Object.entries(value).every(([role, briefing]) =>
+    isUtf8Bounded(role, MAX_ROLE_BYTES)
+    && isRecord(briefing)
+    && hasExactKeys(briefing, ['text', 'version', 'updated_at'])
+    && isUtf8Bounded(briefing.text, MAX_TEXT_BYTES)
+    && isPositiveSafeInteger(briefing.version)
+    && isStrictRfc3339(briefing.updated_at));
 }
 
 function isRoomInvite(value: unknown): value is RoomInviteDto {
   if (!isRecord(value)
-    || !hasExactKeys(value, ['invite_id', 'mode', 'role', 'min_accepts', 'accepted_cids', 'state', 'created_at'], ['recovery_of', 'recovery_confirmed'])
+    || !hasExactKeys(value, ['invite_id', 'mode', 'role', 'min_accepts', 'accepted_cids', 'state', 'created_at'], ['recovery_of', 'recovery_confirmed', 'replaces_seat'])
     || !isString(value.invite_id)
     || !INVITE_MODES.has(value.mode)
     || !isUtf8Bounded(value.role, MAX_ROLE_BYTES)
@@ -418,6 +496,7 @@ function isRoomInvite(value: unknown): value is RoomInviteDto {
     || !INVITE_STATES.has(value.state)
     || !optionalString(value.recovery_of)
     || (value.recovery_confirmed !== undefined && typeof value.recovery_confirmed !== 'boolean')
+    || (value.replaces_seat !== undefined && !isLowerCrockfordUlid(value.replaces_seat))
     || !isStrictRfc3339(value.created_at)) return false;
   const invite = value as unknown as RoomInviteDto;
   if (invite.mode === 'one_time' && invite.min_accepts !== 1) return false;

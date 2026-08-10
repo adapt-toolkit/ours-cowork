@@ -4,6 +4,13 @@ import { z } from 'zod';
 
 const MAX_TEXT_BYTES = 262_144;
 export const MAX_FILE_BYTES = 2 * 1024 * 1024;
+/**
+ * History remains an array-shaped public response, but each daemon page is
+ * byte-bounded.  Three MiB fits one maximum-size file record after base64
+ * expansion; the management envelope gets a separate one-MiB allowance.
+ */
+export const MAX_HISTORY_PAGE_BYTES = 3 * 1024 * 1024;
+export const MAX_MANAGEMENT_RESPONSE_BYTES = MAX_HISTORY_PAGE_BYTES + (1024 * 1024);
 const MAX_FILE_NAME_BYTES = 255;
 const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;

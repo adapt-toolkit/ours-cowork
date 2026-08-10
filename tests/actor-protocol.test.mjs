@@ -391,6 +391,24 @@ test('minimal cowork actor speaks the real ours packet protocol', async (t) => {
     'permissive fixture contact acceptance',
   );
 
+  for (const [filename, mime] of [
+    ['../poison.bin', 'application/octet-stream'],
+    ['.', 'application/octet-stream'],
+    ['back\\slash.bin', 'application/octet-stream'],
+    ['€'.repeat(86), 'application/octet-stream'],
+    ['valid-name.bin', '€'.repeat(86)],
+  ]) {
+    const rejectsBefore = room.rejects.length;
+    await mutate(permissive, '::a2a_messaging::send_file', {
+      contact: room.cid,
+      filename,
+      mime,
+      data: binary(permissive, Buffer.from('poison')),
+    });
+    await waitFor(() => room.rejects.length > rejectsBefore, `invalid file metadata rejection: ${JSON.stringify(filename)}`);
+  }
+  assert.deepEqual(fileInbox(room), [], 'invalid metadata must abort before the room actor persists an unread file');
+
   // The fixture is an actual notification service. Registering exercises the
   // cowork actor's client-confirm hook and leaves core-owned client state that
   // must survive the room export/import below.
@@ -521,6 +539,15 @@ test('minimal cowork actor speaks the real ours packet protocol', async (t) => {
   await waitFor(() => inbox(restored).some((message) => message.text === 'after-import-sequence'), 'post-import message sequence');
   const afterImport = inbox(restored).find((message) => message.text === 'after-import-sequence');
   assert.equal(afterImport.msg_id, maxExportedMessageId + 1);
+  await mutate(charlie, '::a2a_messaging::send_file', {
+    contact: restored.cid,
+    filename: 'after-import.bin',
+    mime: 'application/octet-stream',
+    data: binary(charlie, Buffer.from('restart remains usable')),
+  });
+  await waitFor(() => fileInbox(restored).some((file) => file.filename === 'after-import.bin'), 'valid file after import');
+  const afterImportFiles = renderFiles((await mutate(restored, '::actor::get_files', {})).Reduce('files'));
+  assert.deepEqual(afterImportFiles.map((file) => file.filename), ['after-import.bin']);
   progress('restored');
   driverCompleted = true;
   } catch (error) {

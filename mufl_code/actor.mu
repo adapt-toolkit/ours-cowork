@@ -59,6 +59,8 @@ application actor loads libraries
             $reply_to    -> a2a_protocol::reply_ref_t+
         ).
         max_file_bytes is int = 2097152.
+        max_file_name_bytes is int = 255.
+        max_file_mime_bytes is int = 255.
 
         _read_or_abort = grab( _read_or_abort ).
         key_storage::init ($_read_or_abort -> _read_or_abort).
@@ -126,6 +128,25 @@ application actor loads libraries
             return fid.
         }
 
+        // Keep this boundary identical to FileNameSchema/FileMimeSchema in
+        // src/contracts.ts. Invalid metadata must abort before deposit_file can
+        // make an unread item durable, otherwise one poison item can block every
+        // startup resume pass.
+        fn validate_file_metadata (filename: str, mime: str) -> bool
+        {
+            abort "Room file name must be at least 1 UTF-8 byte." when (_strlen filename) < 1.
+            abort "Room file name must be at most 255 UTF-8 bytes." when (_strlen filename) > max_file_name_bytes.
+            abort "Room file name must not be a relative path token." when filename == "." || filename == "..".
+            path_character is bool = FALSE.
+            sc filename -- ( -> character)
+            {
+                if character == "/" || character == "\\" || character == "\0" { path_character -> TRUE. }
+            }
+            abort "Room file name must be a single path-free name." when path_character.
+            abort "Room file MIME metadata must be at most 255 UTF-8 bytes." when (_strlen mime) > max_file_mime_bytes.
+            return TRUE.
+        }
+
         a2a_messaging::init (
             $_read_or_abort -> _read_or_abort,
             $on_message_received -> fn (arg: any) -> transaction::action::type[]
@@ -157,6 +178,7 @@ application actor loads libraries
                 filename = (arg $filename) safe str.
                 mime is str = "".
                 if (arg $mime) != NIL { mime -> (arg $mime) safe str. }
+                validate_file_metadata filename mime.
                 data = (arg $data) safe bin.
                 file_date = (arg $date) safe time.
                 wire_id is str = "".

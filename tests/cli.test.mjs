@@ -271,10 +271,10 @@ test('room commands send exactly one JSONL request over management.sock', async 
     { args: ['room', 'remove', 'room1', 'cid-participant', '--silent'], method: 'room.participant.remove', params: { room_id: 'room1', participant: 'cid-participant', notify: false } },
     { args: ['room', 'replace', 'room1', 'cid-participant'], method: 'room.participant.replace', params: { room_id: 'room1', participant: 'cid-participant' } },
     { args: ['room', 'replace', 'room1', 'cid-participant', '--mode', 'public', '--min-accepts', '2'], method: 'room.participant.replace', params: { room_id: 'room1', participant: 'cid-participant', mode: 'public', min_accepts: 2 } },
-    { args: ['room', 'history', 'room1', '--view', 'participant'], method: 'room.history', params: { room_id: 'room1', view: 'participant' } },
+    { args: ['room', 'history', 'room1', '--view', 'participant'], method: 'room.history', params: { room_id: 'room1', view: 'participant', after: 0 } },
   ];
   for (const expected of cases) {
-    await withRpc({ result: { ok: true } }, async (rpc) => {
+    await withRpc((request) => ({ result: request.method === 'room.history' ? [] : { ok: true } }), async (rpc) => {
       const result = await runCli(expected.args, { env: rpc.env });
       assert.equal(result.code, 0, `${expected.args.join(' ')}: ${result.stderr}`);
       assert.equal(rpc.connections, 1);
@@ -285,6 +285,36 @@ test('room commands send exactly one JSONL request over management.sock', async 
       assert.deepEqual(rpc.requests[0].params, expected.params);
     });
   }
+});
+
+test('management RPC accepts one maximum file history page after base64 expansion', async () => {
+  const data_base64 = Buffer.alloc(2 * 1024 * 1024, 0xa5).toString('base64');
+  await withRawRpc((socket) => {
+    socket.once('data', (bytes) => {
+      const request = JSON.parse(bytes.toString('utf8'));
+      socket.end(`${JSON.stringify({ version: 1, id: request.id, result: [{ seq: 1, data_base64 }] })}\n`);
+    });
+  }, async (env) => {
+    const result = await rpcCall(join(env.OURS_COWORK_STATE_DIR, 'management.sock'), 'room.history', {});
+    assert.equal(result[0].data_base64.length, data_base64.length);
+  });
+});
+
+test('room history follows byte-short pages until the requested record limit', async () => {
+  const records = [{ seq: 1, value: 'first' }, { seq: 2, value: 'second' }];
+  await withRpc((request) => {
+    if (request.method !== 'room.history') return { result: {} };
+    const next = records.find((record) => record.seq > request.params.after);
+    return { result: next ? [next] : [] };
+  }, async (rpc) => {
+    const result = await runCli(['room', 'history', 'room1', '--limit', '2'], { env: rpc.env });
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), records);
+    assert.deepEqual(rpc.requests.map((request) => request.params), [
+      { room_id: 'room1', limit: 2, after: 0 },
+      { room_id: 'room1', limit: 1, after: 1 },
+    ]);
+  });
 });
 
 test('native mutations wait for one slow response while reads stay short and timeout is an honest unknown outcome', { timeout: 20_000 }, async () => {

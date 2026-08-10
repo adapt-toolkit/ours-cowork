@@ -17,6 +17,8 @@ ours-cowork room history <room-id>
 ours-cowork room history <room-id> --after 40 --limit 20
 ```
 
+Daemon history responses are capped at 3 MiB of JSON so one 2 MiB file record (about 2.8 MiB after base64 expansion) remains retrievable without allowing an unbounded management response. A page may therefore contain fewer records than `--limit` even when more records exist. Continue from the last returned `seq` with `--after`; only an empty page means end of history. The CLI follows these byte-short pages automatically and still prints up to the requested record limit.
+
 Participant messages and files are accepted only from durable seats in an active room. A file is opaque binary data: cowork neither interprets its MIME metadata nor executes its contents. Its filename must be a path-free name of at most 255 UTF-8 bytes (not `.`, `..`, or a name containing `/`, `\\`, or NUL); MIME metadata may be empty and is limited to 255 UTF-8 bytes. Zero-byte files are valid. The maximum file size is 2 MiB (2,097,152 bytes), and a larger file is rejected explicitly.
 
 Before consuming an incoming file from packet state, cowork durably archives its exact bytes as canonical base64 together with size and SHA-256, then durably creates every per-recipient relay intent. Each other active seat receives two core-protocol items: a signed `room_file` metadata envelope and a binary file containing the original bytes. Core receives bytes, never a local filesystem path, so there is no staging-file or path-permission dependency. A seat removed after fan-out is skipped terminally without receiving metadata or bytes. A crash can redrive an unfinished recipient from the archived bytes; an already terminal recipient is not retried.

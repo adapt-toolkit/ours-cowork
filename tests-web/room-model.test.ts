@@ -11,6 +11,7 @@ import {
   type RoomDto,
   type RoomInviteDto,
 } from '../web/src/api/types';
+import { RoomSchema } from '../src/contracts';
 import {
   mergeRecords,
   newestRows,
@@ -106,6 +107,34 @@ function room(overrides: Partial<RoomDto> = {}): RoomDto {
 }
 
 describe('room DTO guards', () => {
+  it('accepts the exact RoomSchema v2 shape returned by the shipped daemon', () => {
+    const daemonRoom = RoomSchema.parse({
+      version: 2,
+      room_id: ROOM_ID,
+      identity_name: `cowork-room-${ROOM_ID}`,
+      identity_cid: 'cid-room',
+      mission: { goal: 'Ship it', briefing: 'Build carefully', briefing_version: 1 },
+      role_briefings: { reviewer: { text: 'Review carefully', version: 2, updated_at: AT } },
+      anonymous: false,
+      quiet_membership: false,
+      membership_epoch: 0,
+      state: 'active',
+      invites: [],
+      seats: [{
+        identity: 'cid-alice', display_name: 'Alice', role: 'builder', invite_id: 'invite-1',
+        accepted_at: AT, participant_id: '01jz6y7n8p9q0r1s2t3v4w5x72', state: 'active',
+      }],
+      created_at: AT,
+      activated_at: AT,
+    });
+
+    expect(daemonRoom.version).toBe(2);
+    expect(isRoomDto(daemonRoom)).toBe(true);
+    expect(isRoomListDto([daemonRoom])).toBe(true);
+    expect(isParticipantListDto(daemonRoom.seats)).toBe(true);
+    expect(isRoomDto({ ...daemonRoom, role_briefings: undefined })).toBe(false);
+  });
+
   it('validates only browser-facing room, participant, and history shapes', () => {
     const validRoom = room({
       seats: [{
@@ -138,6 +167,11 @@ describe('room DTO guards', () => {
       { ...valid, source_msg_id: -1 },
       { ...valid, source_wire_id: '' },
       { ...event(2), notified: true },
+      {
+        version: 1, room_id: ROOM_ID, seq: 2, record_id: `${ROOM_ID}:2`, at: AT,
+        kind: 'close_notice_result', intent_record_id: 'intent-2', recipient_identity: 'cid-a',
+        status: 'skipped_removed', notified: false, key_material_retained: true,
+      },
     ]) expect(isHistoryDto([invalid])).toBe(false);
 
     expect(isHistoryDto([{

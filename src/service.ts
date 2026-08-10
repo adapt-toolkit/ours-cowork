@@ -5,6 +5,7 @@ import {
   DEFAULT_ROLE,
   InviteModeSchema,
   LowerCrockfordUlidSchema,
+  MAX_HISTORY_PAGE_BYTES,
   PostMessageInputSchema,
   RoleBriefingDeleteInputSchema,
   RoleBriefingSetInputSchema,
@@ -25,6 +26,24 @@ import { IntakePump } from './intake.ts';
 import { generateUlid } from './ulid.ts';
 
 const ROOM_ROLE = 'room';
+
+function byteBoundedHistoryPage<T>(records: T[]): T[] {
+  const page: T[] = [];
+  let bytes = 2; // JSON array brackets
+  for (const record of records) {
+    const encoded = JSON.stringify(record);
+    const nextBytes = Buffer.byteLength(encoded, 'utf8') + (page.length === 0 ? 0 : 1);
+    if (bytes + nextBytes > MAX_HISTORY_PAGE_BYTES) {
+      if (page.length === 0) {
+        throw new RangeError(`one history record exceeds the ${MAX_HISTORY_PAGE_BYTES}-byte page contract`);
+      }
+      break;
+    }
+    page.push(record);
+    bytes += nextBytes;
+  }
+  return page;
+}
 
 const CreateInviteInputSchema = z.object({
   mode: InviteModeSchema,
@@ -794,9 +813,11 @@ export class RoomService {
   ): Promise<CommunicationRecord[] | ParticipantHistoryRecord[]> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const { view, ...page } = HistoryOptionsSchema.parse(options);
-    const records = await this.store.read(id, page as ArchiveReadOptions);
-    if (view !== 'participant') return records;
-    return records
+    const records = await this.store.read(id, view === 'participant'
+      ? { after: page.after }
+      : page as ArchiveReadOptions);
+    if (view !== 'participant') return byteBoundedHistoryPage(records);
+    const projected = records
       .filter((record): record is MessageRecord => record.kind === 'message')
       .map((record): ParticipantHistoryRecord => {
         const {
@@ -815,6 +836,7 @@ export class RoomService {
           },
         };
       });
+    return byteBoundedHistoryPage(projected.slice(0, page.limit ?? Number.MAX_SAFE_INTEGER));
   }
 
   /**

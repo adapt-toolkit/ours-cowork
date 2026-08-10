@@ -216,6 +216,24 @@ function byKind(records, kind) { return records.filter((record) => record.kind =
 
 // ---- Durable file broadcast -------------------------------------------------
 
+test('restart intake drains legacy invalid file metadata without archiving it or blocking later files', async () => {
+  const f = fixture();
+  f.packet.fileInbox.push(
+    incomingFile({ file_id: 8, filename: '../poison.bin' }),
+    incomingFile({ file_id: 9, mime: 'x'.repeat(256) }),
+    incomingFile({ file_id: 10, filename: 'after-restart.bin', data: Buffer.from('usable') }),
+  );
+
+  await f.pump.resumePending(ROOM_ID);
+
+  assert.deepEqual(f.packet.consumeFileCalls, [[8], [9], [10]]);
+  assert.deepEqual(f.packet.fileInbox, []);
+  const files = byKind(await f.store.read(ROOM_ID), 'file');
+  assert.equal(files.length, 1);
+  assert.equal(files[0].filename, 'after-restart.bin');
+  assert.equal(JSON.stringify(await f.store.read(ROOM_ID)).includes('poison.bin'), false);
+});
+
 test('participant files archive bytes before consume and relay metadata + core bytes to every other seat', async () => {
   const f = fixture();
   f.packet.fileInbox.push(incomingFile());

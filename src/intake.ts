@@ -188,6 +188,18 @@ export class IntakePump {
     packet: RoomPacket,
     item: FileInboxItem,
   ): Promise<void> {
+    const parsedName = FileNameSchema.safeParse(item.filename);
+    const parsedMime = FileMimeSchema.safeParse(item.mime);
+    // New actors reject this metadata before persistence. This defensive drain
+    // handles state exported by an older actor so one poison unread item cannot
+    // make every daemon restart fail at resumePending.
+    if (!parsedName.success || !parsedMime.success) {
+      await packet.consumeFileInbox([item.file_id]);
+      return;
+    }
+    if (item.data.length > MAX_FILE_BYTES) {
+      throw new RangeError(`room files must be at most ${MAX_FILE_BYTES} bytes (2 MiB)`);
+    }
     const room = await this.store.load(roomId);
     const seat = room.seats.find(
       (candidate) => candidate.identity === item.sender_id && candidate.state === 'active',
@@ -197,10 +209,6 @@ export class IntakePump {
       await packet.consumeFileInbox([item.file_id]);
       return;
     }
-    if (item.data.length > MAX_FILE_BYTES) {
-      throw new RangeError(`room files must be at most ${MAX_FILE_BYTES} bytes (2 MiB)`);
-    }
-
     const records = await this.store.read(roomId);
     let file = this.findSourceFile(records, item);
     if (!file) {
@@ -219,8 +227,8 @@ export class IntakePump {
         ...(room.anonymous && seat.alias !== undefined
           ? { author_alias: { participant_id: seat.participant_id, alias: seat.alias } }
           : {}),
-        filename: FileNameSchema.parse(item.filename),
-        mime: FileMimeSchema.parse(item.mime),
+        filename: parsedName.data,
+        mime: parsedMime.data,
         size: bytes.length,
         sha256: createHash('sha256').update(bytes).digest('hex'),
         data_base64: bytes.toString('base64'),

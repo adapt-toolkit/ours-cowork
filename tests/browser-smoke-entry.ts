@@ -220,15 +220,18 @@ test('shipped web console creates, selects, invites, and sends through the real 
   await page.getByRole('tab', { name: 'Communication' }).focus();
   await page.keyboard.press('ArrowRight');
   assert.equal(await page.getByRole('tab', { name: 'Files' }).getAttribute('aria-selected'), 'true');
-  await page.getByRole('button', { name: 'Expand versions for evidence.html' }).click();
-  const versions = page.getByRole('list', { name: 'Versions of evidence.html' });
+  const evidenceVersionsToggle = page.getByRole('button', { name: 'Expand versions for evidence.html', exact: true });
+  assert.equal(await evidenceVersionsToggle.count(), 1);
+  assert.equal(await page.getByRole('button', { name: 'Expand versions for Evidence.html', exact: true }).count(), 1);
+  await evidenceVersionsToggle.click();
+  const versions = page.getByRole('list', { name: 'Versions of evidence.html', exact: true });
   assert.deepEqual(await versions.locator('.file-version__details strong').allTextContents(), ['Version 3', 'Version 2', 'Version 1']);
   await page.getByText('Evidence.html', { exact: true }).waitFor();
   assert.equal(await page.locator('section.workspace-content').textContent().then((text) => text.includes('QQ==') || text.includes('routing-')), false);
 
   const [download] = await Promise.all([
     page.waitForEvent('download'),
-    versions.getByRole('button', { name: 'Download evidence.html' }).first().click(),
+    versions.getByRole('button', { name: 'Download evidence.html', exact: true }).first().click(),
   ]);
   assert.equal(download.suggestedFilename(), 'evidence.html');
   const downloadedPath = await download.path();
@@ -278,8 +281,8 @@ test('shipped web console creates, selects, invites, and sends through the real 
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole('tab', { name: 'Files' }).click();
-  await page.getByRole('button', { name: 'Expand versions for evidence.html' }).click();
-  const mobileDownload = versions.getByRole('button', { name: 'Download evidence.html' }).first();
+  await evidenceVersionsToggle.click();
+  const mobileDownload = versions.getByRole('button', { name: 'Download evidence.html', exact: true }).first();
   assert((await mobileDownload.boundingBox()).height >= 44);
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
   await page.setViewportSize({ width: 320, height: 700 });

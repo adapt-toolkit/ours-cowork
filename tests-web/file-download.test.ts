@@ -29,6 +29,13 @@ describe('verified file download', () => {
     await expect(verifiedFileBytes({ dataBase64, size, sha256 })).rejects.toThrow(FILE_INTEGRITY_ERROR);
   });
 
+  it('blocks verified-looking bytes when WebCrypto cannot produce a digest', async () => {
+    vi.spyOn(globalThis.crypto.subtle, 'digest').mockRejectedValueOnce(new Error('digest unavailable'));
+
+    await expect(verifiedFileBytes({ dataBase64: 'QQ==', size: 1, sha256: SHA_A }))
+      .rejects.toThrow(FILE_INTEGRITY_ERROR);
+  });
+
   it('downloads only a verified octet-stream Blob with a safe derived name and prompt revocation', async () => {
     const anchor = document.createElement('a');
     const click = vi.spyOn(anchor, 'click').mockImplementation(() => undefined);

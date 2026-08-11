@@ -72,6 +72,18 @@ export const RoomNameSchema = z.string()
       });
     }
   });
+
+/** Authenticated announced-name contract for rooms created by current builds. */
+export const ROOM_IDENTITY_PREFIX = 'ours-cowork-room:';
+
+export function roomIdentityName(roomName: string): string {
+  return `${ROOM_IDENTITY_PREFIX}${RoomNameSchema.parse(roomName)}`;
+}
+
+/** Existing rooms retain this room-id-based identity name without migration. */
+export function legacyRoomIdentityName(roomId: string): string {
+  return `cowork-room-${LowerCrockfordUlidSchema.parse(roomId)}`;
+}
 export const RoleSchema = utf8Bounded('role', MAX_ROLE_BYTES);
 export const MissionTextSchema = utf8Bounded('mission text', MAX_TEXT_BYTES);
 export const MessageTextSchema = utf8Bounded('message text', MAX_TEXT_BYTES);
@@ -233,6 +245,7 @@ export const RoleBriefingSchema = z.object({
 
 interface RoomLineageView {
   room_id: string;
+  room_name?: string;
   identity_name: string;
   identity_cid: string;
   state: z.infer<typeof RoomStateSchema>;
@@ -244,10 +257,13 @@ interface RoomLineageView {
 }
 
 function refineRoomLineage(room: RoomLineageView, context: z.RefinementCtx): void {
-  const pendingIdentityName = `cowork-room-${room.room_id}`;
+  const pendingIdentityName = legacyRoomIdentityName(room.room_id);
+  const currentPendingIdentityName = room.room_name === undefined
+    ? undefined
+    : roomIdentityName(room.room_name);
   const exactPacketPending = room.state === 'provisioning'
     && room.status === 'packet_pending'
-    && room.identity_name === pendingIdentityName
+    && (room.identity_name === pendingIdentityName || room.identity_name === currentPendingIdentityName)
     && room.invites.length === 0
     && room.seats.length === 0
     && room.activated_at === undefined

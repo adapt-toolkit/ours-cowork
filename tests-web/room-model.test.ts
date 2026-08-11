@@ -263,6 +263,9 @@ describe('room DTO guards', () => {
     expect(isRoomDto(room({
       identity_cid: '', identity_name: `cowork-room-${ROOM_ID}`, status: 'packet_pending', state: 'provisioning',
     }))).toBe(true);
+    expect(isRoomDto(room({
+      identity_cid: '', identity_name: 'ours-cowork-room:Operations', status: 'packet_pending', state: 'provisioning',
+    }))).toBe(true);
   });
 });
 

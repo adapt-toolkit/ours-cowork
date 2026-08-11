@@ -364,6 +364,7 @@ if (process.argv.includes('--e2e-driver')) {
       stage('room-created');
       assert.match(roomId, /^[0-7][0-9a-hjkmnp-tv-z]{25}$/);
       assert.equal(created.room_name, 'Café launch 🤖');
+      assert.equal(created.identity_name, 'ours-cowork-room:Café launch 🤖');
       assert.equal((await runCli(['room', 'list'])).find((candidate) => candidate.room_id === roomId).room_name, 'Café launch 🤖');
       const renamed = await runCli(['room', 'settings', roomId, '--name', 'Delivery bridge']);
       assert.equal(renamed.room_name, 'Delivery bridge');
@@ -502,6 +503,7 @@ if (process.argv.includes('--e2e-driver')) {
       await runCli(['restart']);
       room = await runCli(['room', 'show', roomId]);
       assert.equal(room.identity_cid, roomCid, 'room CID is stable across daemon restart');
+      assert.equal(room.identity_name, created.identity_name, 'announced identity name is stable across daemon restart');
       assert.deepEqual(
         (await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']))
           .filter((record) => record.kind === 'file'),

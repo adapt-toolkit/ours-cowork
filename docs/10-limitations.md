@@ -13,3 +13,4 @@
 - The web console and HTTP room RPC have no authentication. They bind only to `127.0.0.1` and must not be forwarded, proxied, or exposed remotely.
 - Web updates use periodic polling rather than push. A view can lag daemon state until its next refresh; confirmed mutations trigger an immediate refresh.
 - Browser state is transient apart from the selected-room URL hash. Invite receipts disappear when closed and are not recoverable from browser storage.
+- Room names are not unique. New rooms announce `ours-cowork-room:<initial room_name>`, but that authenticated identity name is immutable while `room_name` remains editable. Interfaces must distinguish duplicate or renamed rooms by CID/room ID and may use local display aliases; an alias does not change authenticated provenance.

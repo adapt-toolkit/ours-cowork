@@ -14,6 +14,8 @@ import {
   RoomInviteSchema,
   RoomSchema,
   UpdateRoomInputSchema,
+  legacyRoomIdentityName,
+  roomIdentityName,
   type CommunicationRecord,
   type InviteMode,
   type RelayStatus,
@@ -187,12 +189,13 @@ export class RoomService {
     // host-owned identity, state, ID, or timestamp fields.
     const settings = CreateRoomInputSchema.parse(input);
     const roomId = LowerCrockfordUlidSchema.parse(this.nextRoomId());
-    const identityName = `cowork-room-${roomId}`;
+    const roomName = settings.name ?? defaultRoomName(roomId);
+    const identityName = roomIdentityName(roomName);
     return this.lock(roomId, async () => {
       const provisional = RoomSchema.parse({
         version: 2,
         room_id: roomId,
-        room_name: settings.name ?? defaultRoomName(roomId),
+        room_name: roomName,
         identity_name: identityName,
         // PacketRegistry needs the durable room directory to exist first. A
         // valid, explicitly provisional value lets startup resume this exact
@@ -1306,7 +1309,8 @@ export class RoomService {
     return room.identity_cid === ''
       && room.state === 'provisioning'
       && room.status === 'packet_pending'
-      && room.identity_name === `cowork-room-${room.room_id}`;
+      && (room.identity_name === legacyRoomIdentityName(room.room_id)
+        || room.identity_name === roomIdentityName(room.room_name));
   }
 
   private now(): string {

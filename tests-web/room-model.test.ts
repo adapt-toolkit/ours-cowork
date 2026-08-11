@@ -11,7 +11,7 @@ import {
   type RoomDto,
   type RoomInviteDto,
 } from '../web/src/api/types';
-import { RoomSchema } from '../src/contracts';
+import { CommunicationRecordSchema, RoomSchema } from '../src/contracts';
 import {
   groupFiles,
   mergeRecords,
@@ -154,6 +154,73 @@ describe('room DTO guards', () => {
     expect(isHistoryDto([message(1), event(2), file(3)])).toBe(true);
     expect(isRoomDto({ ...validRoom, mission: { goal: 42, briefing: 'no' } })).toBe(false);
     expect(isHistoryDto([{ ...message(1), seq: '1' }])).toBe(false);
+  });
+
+  it('faithfully accepts current daemon briefing and membership record contracts', () => {
+    const participantId = '01jz6y7n8p9q0r1s2t3v4w5x72';
+    const records = [
+      CommunicationRecordSchema.parse(message(1, {
+        category: 'briefing', briefing_version: 2, text: 'Current common briefing',
+      })),
+      CommunicationRecordSchema.parse(message(2, {
+        author_alias: { participant_id: participantId, alias: 'reviewer #1' },
+        category: 'role_briefing', briefing_role: 'reviewer', briefing_version: 3,
+        text: 'Current role briefing',
+      })),
+      CommunicationRecordSchema.parse(message(3, {
+        category: 'membership',
+        membership: { action: 'remove', alias: 'reviewer #1', role: 'reviewer', epoch: 4 },
+        text: 'Membership changed',
+      })),
+      CommunicationRecordSchema.parse({
+        version: 1, room_id: ROOM_ID, seq: 4, record_id: `${ROOM_ID}:4`, at: AT,
+        kind: 'membership_intent', action: 'remove', participant_id: participantId,
+        recipient_identity: 'cid-alice', role: 'reviewer', alias: 'reviewer #1', epoch: 4, notify: true,
+      }),
+      CommunicationRecordSchema.parse({
+        version: 1, room_id: ROOM_ID, seq: 5, record_id: `${ROOM_ID}:5`, at: AT,
+        kind: 'membership_result', intent_record_id: `${ROOM_ID}:4`, participant_id: participantId,
+        status: 'queued', notified: true, key_material_retained: true,
+      }),
+    ];
+
+    expect(isHistoryDto(records)).toBe(true);
+  });
+
+  it('preserves the daemon category-field and membership delivery invariants', () => {
+    const participantId = '01jz6y7n8p9q0r1s2t3v4w5x72';
+    const briefing = message(1, { category: 'briefing', briefing_version: 2 });
+    const roleBriefing = message(2, {
+      category: 'role_briefing', briefing_role: 'reviewer', briefing_version: 3,
+    });
+    const membership = message(3, {
+      category: 'membership', membership: { action: 'remove', epoch: 4 },
+    });
+    const membershipIntent = {
+      version: 1, room_id: ROOM_ID, seq: 4, record_id: `${ROOM_ID}:4`, at: AT,
+      kind: 'membership_intent', action: 'remove', participant_id: participantId,
+      recipient_identity: 'cid-alice', role: 'reviewer', epoch: 4, notify: true,
+    };
+    const membershipResult = {
+      version: 1, room_id: ROOM_ID, seq: 5, record_id: `${ROOM_ID}:5`, at: AT,
+      kind: 'membership_result', intent_record_id: `${ROOM_ID}:4`, participant_id: participantId,
+      status: 'queued', notified: true, key_material_retained: true,
+    };
+
+    for (const invalid of [
+      { ...briefing, briefing_role: 'reviewer' },
+      { ...briefing, briefing_version: 0 },
+      { ...roleBriefing, briefing_role: undefined },
+      { ...roleBriefing, briefing_version: undefined },
+      { ...message(6), briefing_version: 1 },
+      { ...membership, membership: undefined },
+      { ...membership, briefing_version: 1 },
+      { ...membership, membership: { action: 'remove', epoch: -1 } },
+      { ...membershipIntent, epoch: 0 },
+      { ...membershipIntent, alias: '' },
+      { ...membershipResult, status: 'skipped_removed' },
+      { ...membershipResult, uncertain_after_restart: false },
+    ]) expect(isHistoryDto([invalid])).toBe(false);
   });
 
   it('strictly mirrors archive record keys, identifiers, timestamps, record IDs, and union fields', () => {

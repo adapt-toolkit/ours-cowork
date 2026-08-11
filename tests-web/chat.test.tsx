@@ -165,6 +165,35 @@ describe('selected-room paginated history', () => {
     );
   });
 
+  it('accepts an evolved briefing record reached on a later history page', async () => {
+    const target = room();
+    const history = Array.from({ length: 610 }, (_, index) => message(index + 1));
+    history[609] = message(610, {
+      category: 'briefing', briefing_version: 2, text: 'Evolved paged briefing',
+    });
+    const call = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      if (method === 'room.list') return [target];
+      if (method === 'room.show') return target;
+      if (method === 'room.participants') return [];
+      if (method === 'room.history') {
+        const after = Number(params.after);
+        return history.filter((record) => record.seq > after).slice(0, Number(params.limit));
+      }
+      throw new Error(`unexpected ${method}`);
+    });
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+
+    expect(await screen.findByText('Evolved paged briefing')).toBeVisible();
+    expect(screen.queryByText(/History refresh failed/)).not.toBeInTheDocument();
+    expect(call.mock.calls.filter(([method]) => method === 'room.history').map(([, params]) => params)).toEqual([
+      { room_id: ROOM_ONE, after: 0, limit: 200 },
+      { room_id: ROOM_ONE, after: 200, limit: 200 },
+      { room_id: ROOM_ONE, after: 400, limit: 200 },
+      { room_id: ROOM_ONE, after: 600, limit: 200 },
+      { room_id: ROOM_ONE, after: 610, limit: 200 },
+    ]);
+  });
+
   it.each([
     ['gapped', [message(2)]],
     ['out-of-order', [message(2), message(1)]],

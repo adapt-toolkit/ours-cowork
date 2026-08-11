@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, connect } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -444,6 +445,43 @@ if (process.argv.includes('--e2e-driver')) {
       await waitFor(() => roomEnvelopes(alice).some((message) => message.kind === 'room_file'
         && message.filename === 'bob-evidence.txt'
         && message.author.identity === bob.cid), 'Bob signed file metadata at Alice');
+      const archivedFiles = await waitFor(async () => {
+        const history = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
+        const files = history.filter((record) => record.kind === 'file');
+        return files.length === 2 ? files : undefined;
+      }, 'canonical file rows archived by the real daemon');
+      assert.deepEqual(archivedFiles.map((record) => ({
+        author: record.author,
+        filename: record.filename,
+        mime: record.mime,
+        size: record.size,
+        sha256: record.sha256,
+        data_base64: record.data_base64,
+        recipient_identities: record.recipient_identities,
+      })), [
+        {
+          author: { identity: alice.cid, display_name: 'Alice', role: 'lead' },
+          filename: 'alice-evidence.bin',
+          mime: 'application/octet-stream',
+          size: aliceBytes.length,
+          sha256: createHash('sha256').update(aliceBytes).digest('hex'),
+          data_base64: aliceBytes.toString('base64'),
+          recipient_identities: [bob.cid],
+        },
+        {
+          author: { identity: bob.cid, display_name: 'Bob', role: 'reviewer' },
+          filename: 'bob-evidence.txt',
+          mime: 'text/plain; charset=utf-8',
+          size: bobBytes.length,
+          sha256: createHash('sha256').update(bobBytes).digest('hex'),
+          data_base64: bobBytes.toString('base64'),
+          recipient_identities: [alice.cid],
+        },
+      ]);
+      assert(archivedFiles.every((record) => Number.isSafeInteger(record.seq)
+        && record.record_id === `${roomId}:${record.seq}`
+        && Number.isSafeInteger(record.source_file_id)));
+      const archivedFileSnapshot = structuredClone(archivedFiles);
       stage('files-relayed-both-directions');
 
       const operatorRecord = await runCli(['room', 'message', roomId, '--text', 'operator voice']);
@@ -464,6 +502,12 @@ if (process.argv.includes('--e2e-driver')) {
       await runCli(['restart']);
       room = await runCli(['room', 'show', roomId]);
       assert.equal(room.identity_cid, roomCid, 'room CID is stable across daemon restart');
+      assert.deepEqual(
+        (await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']))
+          .filter((record) => record.kind === 'file'),
+        archivedFileSnapshot,
+        'authoritative file rows and bytes survive daemon restart unchanged',
+      );
       const oldPublic = room.invites.find((invite) => invite.invite_id === publicInvite.invite.invite_id);
       assert.equal(oldPublic.state, 'replacement_required');
       const replacements = await runCli(['room', 'recover', roomId]);
@@ -511,7 +555,13 @@ if (process.argv.includes('--e2e-driver')) {
       assert.equal(existsSync(join(roomDir, 'room.json')), true, 'closed metadata is retained');
       assert.equal(existsSync(join(roomDir, 'archive.jsonl')), true, 'closed archive is retained');
       assert(readFileSync(join(roomDir, 'archive.jsonl'), 'utf8').trim().length > 0);
-      assert((await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000'])).length > 0);
+      const closedHistory = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
+      assert(closedHistory.length > 0);
+      assert.deepEqual(
+        closedHistory.filter((record) => record.kind === 'file'),
+        archivedFileSnapshot,
+        'closed-room history retains the exact authoritative file rows',
+      );
       stage('closed-and-retained');
 
       const deleted = await runCli(['room', 'delete', roomId, '--yes']);

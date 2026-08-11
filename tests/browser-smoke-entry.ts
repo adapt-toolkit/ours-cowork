@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { accessSync, constants, mkdtempSync, rmSync } from 'node:fs';
+import { accessSync, constants, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
@@ -15,7 +15,10 @@ declare const __COWORK_BROWSER_TEST_ROOT__: string;
 const ROOT = __COWORK_BROWSER_TEST_ROOT__;
 const CREATED_AT = '2026-08-03T12:00:00.000Z';
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x70';
+const ROOM_TWO = '01jz6y7n8p9q0r1s2t3v4w5x79';
 const MESSAGE_ID = '01jz6y7n8p9q0r1s2t3v4w5x71';
+const SHA_A = '559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd';
+const SHA_B = 'df7e70e5021544f4834bbee64a9e3789febc4be81470df629cad6ddb03320a5c';
 
 function resolveChromeExecutable() {
   const configured = process.env.COWORK_CHROME_PATH;
@@ -37,13 +40,13 @@ function resolveChromeExecutable() {
   throw new Error('system Chrome is required for test:browser; set COWORK_CHROME_PATH or install google-chrome/chromium (no browser download is performed)');
 }
 
-function makeRoom() {
+function makeRoom(roomId = ROOM_ID, roomName = 'Browser room') {
   return {
     version: 1,
-    room_id: ROOM_ID,
-    room_name: 'Browser room',
-    identity_name: 'Browser Room',
-    identity_cid: 'browser-room-cid',
+    room_id: roomId,
+    room_name: roomName,
+    identity_name: `${roomName} identity`,
+    identity_cid: `browser-room-cid-${roomId.at(-1)}`,
     mission: { goal: 'Browser release proof', briefing: 'Exercise the shipped console.' },
     state: 'provisioning',
     invites: [],
@@ -54,17 +57,31 @@ function makeRoom() {
 
 function fakeService() {
   const calls = [];
-  const rooms = [];
-  const records = [];
+  const rooms = [{ ...makeRoom(ROOM_TWO, 'Second browser room'), state: 'active', activated_at: CREATED_AT }];
+  const records = [fileRecord(rooms[0], 1, 'second-room.bin', 'QQ==', SHA_A)];
   return {
     calls,
+    rooms,
+    records,
     async createRoom(input) {
       calls.push(['room.create', input]);
       const room = makeRoom();
       rooms.push(room);
+      records.push(
+        messageRecord(room, 1, 'Before attachment'),
+        fileRecord(room, 2, 'evidence.html', 'QQ==', SHA_A),
+        {
+          version: 1, room_id: room.room_id, seq: 3, record_id: `${room.room_id}:3`, at: CREATED_AT,
+          kind: 'relay_intent', file_id: '01jz6y7n8p9q0r1s2t3v4w5x72', recipient_identity: 'browser-participant-cid',
+        },
+        messageRecord(room, 4, 'After attachment'),
+        fileRecord(room, 5, 'evidence.html', 'QQ==', SHA_A),
+        fileRecord(room, 6, 'evidence.html', 'Qg==', SHA_B),
+        fileRecord(room, 7, 'Evidence.html', 'QQ==', SHA_A),
+      );
       return room;
     },
-    async updateRoom(roomId, input) { calls.push(['room.settings', { roomId, input }]); return rooms[0]; },
+    async updateRoom(roomId, input) { calls.push(['room.settings', { roomId, input }]); return rooms.find((room) => room.room_id === roomId); },
     async createInvite(roomId, input) {
       calls.push(['room.invite', { roomId, input }]);
       const invite = {
@@ -76,16 +93,18 @@ function fakeService() {
         state: 'live',
         created_at: CREATED_AT,
       };
-      rooms[0].invites = [{ ...invite, accepted_cids: ['browser-participant-cid'], state: 'consumed' }];
-      rooms[0].seats = [{
+      const room = rooms.find((candidate) => candidate.room_id === roomId);
+      assert(room);
+      room.invites = [{ ...invite, accepted_cids: ['browser-participant-cid'], state: 'consumed' }];
+      room.seats = [{
         identity: 'browser-participant-cid',
         display_name: 'Browser Participant',
         role: input.role,
         invite_id: invite.invite_id,
         accepted_at: CREATED_AT,
       }];
-      rooms[0].state = 'active';
-      rooms[0].activated_at = CREATED_AT;
+      room.state = 'active';
+      room.activated_at = CREATED_AT;
       return { room_id: roomId, invite, blob: 'one-time-browser-invite', reusable: false };
     },
     async revokeInvite() { throw new Error('unexpected revoke'); },
@@ -94,34 +113,47 @@ function fakeService() {
     async listRooms() { calls.push(['room.list']); return structuredClone(rooms); },
     async showRoom(roomId) {
       calls.push(['room.show', roomId]);
-      assert.equal(roomId, rooms[0]?.room_id);
-      return structuredClone(rooms[0]);
+      const room = rooms.find((candidate) => candidate.room_id === roomId);
+      assert(room);
+      return structuredClone(room);
     },
-    async participants(roomId) { calls.push(['room.participants', roomId]); return structuredClone(rooms[0]?.seats ?? []); },
+    async participants(roomId) { calls.push(['room.participants', roomId]); return structuredClone(rooms.find((room) => room.room_id === roomId)?.seats ?? []); },
     async history(roomId, options) {
       calls.push(['room.history', { roomId, options }]);
-      return records.filter((record) => record.seq > (options.after ?? 0)).slice(0, options.limit ?? 200);
+      return records.filter((record) => record.room_id === roomId && record.seq > (options.after ?? 0)).slice(0, options.limit ?? 200);
     },
     async postMessage(roomId, input) {
       calls.push(['room.message', { roomId, input }]);
-      const record = {
-        version: 1,
-        room_id: roomId,
-        seq: records.length + 1,
-        record_id: `${roomId}:${records.length + 1}`,
-        at: CREATED_AT,
-        kind: 'message',
-        message_id: MESSAGE_ID,
-        author: { identity: rooms[0].identity_cid, display_name: rooms[0].identity_name, role: 'room' },
-        category: 'chat',
-        text: input.text,
-        recipient_identities: [],
-      };
+      const room = rooms.find((candidate) => candidate.room_id === roomId);
+      assert(room);
+      const seq = Math.max(0, ...records.filter((candidate) => candidate.room_id === roomId).map((candidate) => candidate.seq)) + 1;
+      const record = messageRecord(room, seq, input.text, true);
       records.push(record);
       return record;
     },
     async closeRoom() { throw new Error('unexpected close'); },
     async deleteRoom() { throw new Error('unexpected delete'); },
+  };
+}
+
+function messageRecord(room, seq, text, roomVoice = false) {
+  return {
+    version: 1, room_id: room.room_id, seq, record_id: `${room.room_id}:${seq}`, at: CREATED_AT,
+    kind: 'message', message_id: MESSAGE_ID,
+    author: roomVoice
+      ? { identity: room.identity_cid, display_name: room.identity_name, role: 'room' }
+      : { identity: 'browser-participant-cid', display_name: 'Browser Participant', role: 'reviewer' },
+    category: 'chat', text, recipient_identities: [],
+  };
+}
+
+function fileRecord(room, seq, filename, dataBase64, sha256) {
+  return {
+    version: 1, room_id: room.room_id, seq, record_id: `${room.room_id}:${seq}`, at: CREATED_AT,
+    kind: 'file', file_id: `01jz6y7n8p9q0r1s2t3v4w5x7${seq}`,
+    author: { identity: 'browser-participant-cid', display_name: 'Browser Participant', role: 'reviewer' },
+    filename, mime: 'text/html', size: 1, sha256, data_base64: dataBase64,
+    recipient_identities: [], source_file_id: seq,
   };
 }
 
@@ -148,11 +180,14 @@ test('shipped web console creates, selects, invites, and sends through the real 
 
   const page = await browser.newPage();
   const runtimeErrors = [];
+  const requests = [];
   page.on('pageerror', (error) => runtimeErrors.push(`pageerror: ${error.message}`));
   page.on('console', (message) => {
     if (message.type() === 'error') runtimeErrors.push(`console.error: ${message.text()}`);
   });
-  await page.goto(`http://127.0.0.1:${transport.restAddress.port}/`);
+  page.on('request', (request) => requests.push(request.url()));
+  const origin = `http://127.0.0.1:${transport.restAddress.port}`;
+  await page.goto(`${origin}/`);
   await page.getByRole('button', { name: 'Create room' }).click();
   await page.getByLabel('Name').fill('Browser room');
   await page.getByLabel('Goal').fill('Browser release proof');
@@ -173,6 +208,41 @@ test('shipped web console creates, selects, invites, and sends through the real 
     await page.getByText('not stored by cowork', { exact: false }).waitFor();
   }, runtimeErrors);
   await page.getByRole('button', { name: 'Done' }).click();
+
+  await assertProjection(page, async () => {
+    const timelineRows = await page.getByRole('list', { name: 'Room communication' }).getByRole('listitem').allTextContents();
+    assert.match(timelineRows[0], /Before attachment/);
+    assert.match(timelineRows[1], /evidence\.html/);
+    assert.match(timelineRows[2], /After attachment/);
+    assert.equal(timelineRows.some((text) => text.includes('relay_intent')), false);
+  }, runtimeErrors);
+
+  await page.getByRole('tab', { name: 'Communication' }).focus();
+  await page.keyboard.press('ArrowRight');
+  assert.equal(await page.getByRole('tab', { name: 'Files' }).getAttribute('aria-selected'), 'true');
+  await page.getByRole('button', { name: 'Expand versions for evidence.html' }).click();
+  const versions = page.getByRole('list', { name: 'Versions of evidence.html' });
+  assert.deepEqual(await versions.locator('.file-version__details strong').allTextContents(), ['Version 3', 'Version 2', 'Version 1']);
+  await page.getByText('Evidence.html', { exact: true }).waitFor();
+  assert.equal(await page.locator('section.workspace-content').textContent().then((text) => text.includes('QQ==') || text.includes('routing-')), false);
+
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    versions.getByRole('button', { name: 'Download evidence.html' }).first().click(),
+  ]);
+  assert.equal(download.suggestedFilename(), 'evidence.html');
+  const downloadedPath = await download.path();
+  assert(downloadedPath);
+  assert.deepEqual(readFileSync(downloadedPath), Buffer.from('B'));
+
+  await page.getByText('Second browser room', { exact: true }).click();
+  await page.waitForURL(new RegExp(`#\/rooms\/${ROOM_TWO}$`));
+  await page.getByText('second-room.bin', { exact: true }).waitFor();
+  assert.equal(await page.getByText('evidence.html', { exact: true }).count(), 0);
+  await page.getByText('Browser room', { exact: true }).click();
+  await page.waitForURL(new RegExp(`#\/rooms\/${ROOM_ID}$`));
+  await page.getByText('evidence.html', { exact: true }).first().waitFor();
+  await page.getByRole('tab', { name: 'Communication' }).click();
 
   await page.getByLabel('Message the room').fill('Hello from the production bundle');
   await page.getByRole('button', { name: 'Send message' }).click();
@@ -198,6 +268,22 @@ test('shipped web console creates, selects, invites, and sends through the real 
     'room.message',
     { roomId: ROOM_ID, input: { text: 'Hello from the production bundle' } },
   ]);
+  assert.deepEqual(await page.evaluate(() => ({
+    local: localStorage.length,
+    session: sessionStorage.length,
+    cache: 'caches' in window ? 'unused' : 'unavailable',
+  })), { local: 0, session: 0, cache: 'unused' });
+  assert(requests.length > 0);
+  assert(requests.every((url) => url.startsWith(origin)), `unexpected remote request: ${requests.find((url) => !url.startsWith(origin))}`);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('tab', { name: 'Files' }).click();
+  await page.getByRole('button', { name: 'Expand versions for evidence.html' }).click();
+  const mobileDownload = versions.getByRole('button', { name: 'Download evidence.html' }).first();
+  assert((await mobileDownload.boundingBox()).height >= 44);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+  await page.setViewportSize({ width: 320, height: 700 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
   assert.deepEqual(runtimeErrors, []);
 });
 

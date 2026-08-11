@@ -4,7 +4,7 @@ import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { CoworkApp, type RpcClient } from '../web/src/App';
-import type { CommunicationRecordDto, MessageRecordDto, RoomDto } from '../web/src/api/types';
+import type { CommunicationRecordDto, FileRecordDto, MessageRecordDto, RoomDto } from '../web/src/api/types';
 import { ArchiveView } from '../web/src/components/ArchiveView';
 import { ChatTimeline } from '../web/src/components/ChatTimeline';
 
@@ -39,6 +39,17 @@ function relay(seq: number): CommunicationRecordDto {
   };
 }
 
+function file(seq: number): FileRecordDto {
+  return {
+    version: 1, room_id: ROOM_ONE, seq, record_id: `${ROOM_ONE}:${seq}`, at: AT,
+    kind: 'file', file_id: '01jz6y7n8p9q0r1s2t3v4w5x73',
+    author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' },
+    filename: 'proof.bin', mime: 'application/octet-stream', size: 1,
+    sha256: '559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd',
+    data_base64: 'QQ==', recipient_identities: ['cid-room-1'], source_file_id: seq,
+  };
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
@@ -46,10 +57,11 @@ function deferred<T>() {
 }
 
 describe('chat, events, and archive projections', () => {
-  it('keeps operational records out of chat, orders by numeric seq, and distinguishes briefing, participant, and room voice', () => {
+  it('interleaves inert file cards by numeric seq, excludes relay rows, and distinguishes message voices', () => {
     render(<ChatTimeline roomId={ROOM_ONE} records={[
       message(10, { author: { identity: 'cid-room-1', display_name: 'Operations room', role: 'room' }, text: 'Room decision' }),
-      relay(3),
+      relay(4),
+      file(3),
       message(2, { text: 'Participant update' }),
       message(1, { category: 'briefing', text: 'Mission briefing' }),
     ]} historyReady visible />);
@@ -59,10 +71,14 @@ describe('chat, events, and archive projections', () => {
     expect(within(timeline).getAllByRole('listitem').map((row) => row.textContent)).toEqual([
       expect.stringContaining('Mission briefing'),
       expect.stringContaining('Participant update'),
+      expect.stringContaining('proof.bin'),
       expect.stringContaining('Room decision'),
     ]);
     expect(screen.getAllByText('Mission briefing').at(-1)?.closest('li')).toHaveClass('chat-row--briefing');
     expect(screen.getByText('Participant update').closest('li')).toHaveClass('chat-row--participant');
+    expect(screen.getByText('proof.bin').closest('li')).toHaveClass('chat-row--file');
+    expect(screen.getByRole('button', { name: 'Download proof.bin' })).toBeVisible();
+    expect(timeline).not.toHaveTextContent('QQ==');
     expect(screen.getByText('Room decision').closest('li')).toHaveClass('chat-row--room');
   });
 
@@ -81,7 +97,7 @@ describe('chat, events, and archive projections', () => {
   it('announces only additions that arrive after initial history while the selected room is visible', () => {
     const initial = [message(1)];
     const { rerender } = render(<ChatTimeline roomId={ROOM_ONE} records={initial} historyReady visible />);
-    const live = screen.getByRole('status', { name: 'New room messages' });
+    const live = screen.getByRole('status', { name: 'New room items' });
     expect(live).toHaveTextContent('');
 
     rerender(<ChatTimeline roomId={ROOM_ONE} records={[...initial, message(2)]} historyReady visible={false} />);
@@ -89,7 +105,12 @@ describe('chat, events, and archive projections', () => {
     rerender(<ChatTimeline roomId={ROOM_ONE} records={[...initial, message(2), message(3)]} historyReady visible />);
     expect(live).toHaveTextContent('1 new message');
 
-    rerender(<ChatTimeline roomId={ROOM_TWO} records={[message(4, { room_id: ROOM_TWO, record_id: `${ROOM_TWO}:4` })]} historyReady visible />);
+    rerender(<ChatTimeline roomId={ROOM_ONE} records={[...initial, message(2), message(3), file(4)]} historyReady visible />);
+    expect(live).toHaveTextContent('1 new attachment');
+    rerender(<ChatTimeline roomId={ROOM_ONE} records={[...initial, message(2), message(3), file(4), message(5), file(6)]} historyReady visible />);
+    expect(live).toHaveTextContent('2 new room items');
+
+    rerender(<ChatTimeline roomId={ROOM_TWO} records={[message(7, { room_id: ROOM_TWO, record_id: `${ROOM_TWO}:7` })]} historyReady visible />);
     expect(live).toHaveTextContent('');
   });
 

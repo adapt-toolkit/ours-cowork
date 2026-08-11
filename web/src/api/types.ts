@@ -98,6 +98,13 @@ export interface AuthorAliasDto {
   alias: string;
 }
 
+export interface MembershipNoticeDto {
+  action: 'remove';
+  alias?: string;
+  role?: string;
+  epoch: number;
+}
+
 interface RecordCommonDto {
   version: 1;
   room_id: string;
@@ -110,7 +117,11 @@ export interface MessageRecordDto extends RecordCommonDto {
   kind: 'message';
   message_id: string;
   author: AuthorDto;
-  category: 'briefing' | 'chat';
+  author_alias?: AuthorAliasDto;
+  category: 'briefing' | 'role_briefing' | 'chat' | 'membership';
+  briefing_role?: string;
+  briefing_version?: number;
+  membership?: MembershipNoticeDto;
   text: string;
   recipient_identities: string[];
   source_msg_id?: number;
@@ -150,6 +161,27 @@ export interface FileRecordDto extends RecordCommonDto {
   source_wire_id?: string;
 }
 
+export interface MembershipIntentRecordDto extends RecordCommonDto {
+  kind: 'membership_intent';
+  action: 'remove';
+  participant_id: string;
+  recipient_identity: string;
+  role: string;
+  alias?: string;
+  epoch: number;
+  notify: boolean;
+}
+
+export interface MembershipResultRecordDto extends RecordCommonDto {
+  kind: 'membership_result';
+  intent_record_id: string;
+  participant_id: string;
+  status: Exclude<RelayStatus, 'skipped_removed'>;
+  notified: boolean;
+  key_material_retained: true;
+  uncertain_after_restart?: true;
+}
+
 export interface CloseNoticeIntentRecordDto extends RecordCommonDto {
   kind: 'close_notice_intent';
   recipient_identity: string;
@@ -169,6 +201,8 @@ export type OperationalRecordDto =
   | FileRecordDto
   | RelayIntentRecordDto
   | RelayResultRecordDto
+  | MembershipIntentRecordDto
+  | MembershipResultRecordDto
   | CloseNoticeIntentRecordDto
   | CloseNoticeResultRecordDto;
 
@@ -381,10 +415,15 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
   if (!hasRecordCommon(value)) return false;
   switch (value.kind) {
     case 'message':
-      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'message_id', 'author', 'category', 'text', 'recipient_identities'], ['source_msg_id', 'source_wire_id'])
+      return hasExactKeys(
+        value,
+        [...RECORD_COMMON_KEYS, 'message_id', 'author', 'category', 'text', 'recipient_identities'],
+        ['author_alias', 'briefing_role', 'briefing_version', 'membership', 'source_msg_id', 'source_wire_id'],
+      )
         && isLowerCrockfordUlid(value.message_id)
         && isAuthor(value.author)
-        && (value.category === 'briefing' || value.category === 'chat')
+        && (value.author_alias === undefined || isAuthorAlias(value.author_alias))
+        && isMessageCategory(value)
         && isUtf8Bounded(value.text, MAX_TEXT_BYTES)
         && isUniqueStringArray(value.recipient_identities)
         && (value.source_msg_id === undefined || isNonNegativeSafeInteger(value.source_msg_id))
@@ -418,6 +457,31 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
         && isNonNegativeSafeInteger(value.source_file_id)
         && optionalString(value.source_wire_id);
     }
+    case 'membership_intent':
+      return hasExactKeys(
+        value,
+        [...RECORD_COMMON_KEYS, 'action', 'participant_id', 'recipient_identity', 'role', 'epoch', 'notify'],
+        ['alias'],
+      )
+        && value.action === 'remove'
+        && isLowerCrockfordUlid(value.participant_id)
+        && isString(value.recipient_identity)
+        && isUtf8Bounded(value.role, MAX_ROLE_BYTES)
+        && optionalString(value.alias)
+        && isPositiveSafeInteger(value.epoch)
+        && typeof value.notify === 'boolean';
+    case 'membership_result':
+      return hasExactKeys(
+        value,
+        [...RECORD_COMMON_KEYS, 'intent_record_id', 'participant_id', 'status', 'notified', 'key_material_retained'],
+        ['uncertain_after_restart'],
+      )
+        && isString(value.intent_record_id)
+        && isLowerCrockfordUlid(value.participant_id)
+        && DELIVERY_STATUSES.has(value.status)
+        && typeof value.notified === 'boolean'
+        && value.key_material_retained === true
+        && (value.uncertain_after_restart === undefined || value.uncertain_after_restart === true);
     case 'close_notice_intent':
       return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'recipient_identity'])
         && isString(value.recipient_identity);
@@ -527,6 +591,38 @@ function isAuthorAlias(value: unknown): value is AuthorAliasDto {
     && hasExactKeys(value, ['participant_id', 'alias'])
     && isLowerCrockfordUlid(value.participant_id)
     && isString(value.alias);
+}
+
+function isMembershipNotice(value: unknown): value is MembershipNoticeDto {
+  return isRecord(value)
+    && hasExactKeys(value, ['action', 'epoch'], ['alias', 'role'])
+    && value.action === 'remove'
+    && optionalString(value.alias)
+    && (value.role === undefined || isUtf8Bounded(value.role, MAX_ROLE_BYTES))
+    && isNonNegativeSafeInteger(value.epoch);
+}
+
+function isMessageCategory(value: Record<string, unknown>): boolean {
+  switch (value.category) {
+    case 'briefing':
+      return value.briefing_role === undefined
+        && (value.briefing_version === undefined || isPositiveSafeInteger(value.briefing_version))
+        && value.membership === undefined;
+    case 'role_briefing':
+      return isUtf8Bounded(value.briefing_role, MAX_ROLE_BYTES)
+        && isPositiveSafeInteger(value.briefing_version)
+        && value.membership === undefined;
+    case 'chat':
+      return value.briefing_role === undefined
+        && value.briefing_version === undefined
+        && value.membership === undefined;
+    case 'membership':
+      return value.briefing_role === undefined
+        && value.briefing_version === undefined
+        && isMembershipNotice(value.membership);
+    default:
+      return false;
+  }
 }
 
 function hasExactlyOneRelaySubject(value: Record<string, unknown>): boolean {

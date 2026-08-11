@@ -23,7 +23,11 @@ Friendly names are trimmed and Unicode NFC-normalized, must contain 1–64 Unico
 
 ## Communication and records
 
-Communication is the human-readable chat: room and participant messages plus the mission briefing. Messages are not inserted optimistically; a sent message appears after the daemon's ordered history includes it. Events contains relay, recovery, close, and failure details. Archive contains the complete sequence-numbered stream and can show earlier loaded rows.
+Communication is the human-readable room stream: room and participant messages, the mission briefing, and inert file attachment cards at their exact archive sequence. Files are separate communication items and are not attached to nearby message text. The newest 500 communication items are mounted first; Show 500 earlier reveals more loaded history. Messages are not inserted optimistically; a sent message appears after the daemon's ordered history includes it. Events contains relay, recovery, close, and failure details. Archive contains the complete sequence-numbered stream and can show earlier loaded rows.
+
+Files lists every validated file already loaded from the selected room's paged history. It groups versions only when their raw filenames are exactly equal, including case, Unicode form, and whitespace; versions are numbered oldest-first from archive sequence and displayed newest-first. Group headers and expanded version lists mount 500 entries at a time, with controls to reveal every older entry. Repeated uploads remain distinct versions even when their bytes are identical.
+
+Files never preview or interpret content. Download decodes the archive's canonical base64, verifies the declared size and SHA-256 in the browser, and only then downloads a short-lived `application/octet-stream` Blob. An integrity mismatch is blocked. The reported MIME is shown as metadata only, and unsafe control/format characters or trailing spaces/dots are replaced in the derived download name without changing the displayed or grouped filename. Loaded files remain readable and downloadable when a room is closed or the daemon is disconnected; deleting the room removes its entire local archive and UI, with no per-file deletion.
 
 Room list and connection health poll every five seconds. The selected room, participants, and new history poll every two seconds. Polling pauses while the page is hidden, coalesces overlapping cycles, and refreshes after confirmed mutations. Version one does not use push updates.
 

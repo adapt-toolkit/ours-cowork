@@ -13,10 +13,12 @@ import {
 } from '../web/src/api/types';
 import { RoomSchema } from '../src/contracts';
 import {
+  groupFiles,
   mergeRecords,
   newestRows,
   projectChat,
   projectEvents,
+  projectFiles,
   roomCapabilities,
   showEarlierCount,
   unmetInviteCount,
@@ -275,7 +277,7 @@ describe('history model', () => {
     expect((merged[1] as MessageRecordDto).text).toBe('replacement');
   });
 
-  it('projects participant and room chat while rendering briefings separately', () => {
+  it('projects messages and files by numeric seq while rendering briefings separately', () => {
     const rows = projectChat([
       message(3, {
         author: { identity: 'cid-room', display_name: 'Room', role: 'room' },
@@ -283,21 +285,52 @@ describe('history model', () => {
       }),
       message(1, { category: 'briefing', text: 'Mission briefing' }),
       message(2, { text: 'Participant update' }),
-      event(4),
+      file(4, { filename: 'evidence.bin' }),
+      event(5),
     ]);
 
     expect(rows).toEqual([
       expect.objectContaining({ type: 'briefing', seq: 1, text: 'Mission briefing' }),
       expect.objectContaining({ type: 'message', seq: 2, speaker: 'participant', text: 'Participant update' }),
       expect.objectContaining({ type: 'message', seq: 3, speaker: 'room', text: 'Room update' }),
+      expect.objectContaining({ type: 'file', seq: 4, filename: 'evidence.bin' }),
     ]);
   });
 
-  it('keeps operational records out of chat and in the events projection', () => {
+  it('keeps relay records out of communication and file rows out of operational events', () => {
     const records = [event(2), message(1), file(3), event(4)];
 
-    expect(projectChat(records).map((row) => row.seq)).toEqual([1]);
-    expect(projectEvents(records).map((row) => row.seq)).toEqual([2, 3, 4]);
+    expect(projectChat(records).map((row) => row.seq)).toEqual([1, 3]);
+    expect(projectEvents(records).map((row) => row.seq)).toEqual([2, 4]);
+    expect(projectChat(records)[1]).toEqual({
+      type: 'file', seq: 3, recordId: `${ROOM_ID}:3`, fileId: MESSAGE_ID, at: AT,
+      author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' },
+      filename: 'evidence.bin', mime: 'application/octet-stream', size: 4,
+      sha256: '0'.repeat(64), dataBase64: 'AAEC/w==',
+    });
+  });
+
+  it('groups exact raw filenames, labels versions only by seq, retains duplicate bytes, and excludes other rooms', () => {
+    const otherRoom = '01jz6y7n8p9q0r1s2t3v4w5x79';
+    const records: CommunicationRecordDto[] = [
+      file(1, { filename: 'report', file_id: '01jz6y7n8p9q0r1s2t3v4w5x71' }),
+      file(2, { filename: 'Report', file_id: '01jz6y7n8p9q0r1s2t3v4w5x72' }),
+      file(3, { filename: 'é', file_id: '01jz6y7n8p9q0r1s2t3v4w5x73' }),
+      file(4, { filename: 'e\u0301', file_id: '01jz6y7n8p9q0r1s2t3v4w5x74' }),
+      file(5, { filename: 'report ', file_id: '01jz6y7n8p9q0r1s2t3v4w5x75' }),
+      file(6, { filename: 'report', file_id: '01jz6y7n8p9q0r1s2t3v4w5x76' }),
+      file(9, { filename: 'report', file_id: '01jz6y7n8p9q0r1s2t3v4w5x77' }),
+      file(10, { room_id: otherRoom, record_id: `${otherRoom}:10`, filename: 'foreign', file_id: '01jz6y7n8p9q0r1s2t3v4w5x78' }),
+    ];
+
+    expect(projectFiles(records, ROOM_ID).map((row) => row.seq)).toEqual([1, 2, 3, 4, 5, 6, 9]);
+    const groups = groupFiles(records, ROOM_ID);
+    expect(groups.map((group) => group.filename)).toEqual(['report', 'report ', 'e\u0301', 'é', 'Report']);
+    expect(groups[0]?.versions.map((version) => [version.seq, version.version, version.sha256])).toEqual([
+      [9, 3, '0'.repeat(64)],
+      [6, 2, '0'.repeat(64)],
+      [1, 1, '0'.repeat(64)],
+    ]);
   });
 
   it('mounts the newest 500 rows and expands earlier rows in 500-row increments', () => {

@@ -1,13 +1,15 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 
 import type { CommunicationRecordDto, RoomDto } from '../api/types';
 import { roomCapabilities } from '../state/roomModel';
 import { ArchiveView } from './ArchiveView';
 import { ChatTimeline } from './ChatTimeline';
+import { FilesView } from './FilesView';
 import { RoomComposer, type RoomComposerState } from './RoomComposer';
 import { roomTitle } from './RoomRail';
 
-type WorkspaceTab = 'communication' | 'events' | 'archive';
+const WORKSPACE_TABS = ['communication', 'files', 'events', 'archive'] as const;
+type WorkspaceTab = typeof WORKSPACE_TABS[number];
 
 export function RoomWorkspace({ room, records = [], historyReady = false, connected, visible = true, composerState, onComposerDraft, onOpenRooms, onOpenContext, onSettings, onSendMessage = unavailable }: {
   room?: RoomDto;
@@ -23,6 +25,7 @@ export function RoomWorkspace({ room, records = [], historyReady = false, connec
   onSendMessage?(text: string): Promise<void>;
 }) {
   const [tab, setTab] = useState<WorkspaceTab>('communication');
+  const tabRefs = useRef<Partial<Record<WorkspaceTab, HTMLButtonElement>>>({});
 
   if (!room) {
     return (
@@ -56,16 +59,40 @@ export function RoomWorkspace({ room, records = [], historyReady = false, connec
         <button className="quiet-button" type="button" onClick={(event) => onSettings(event.currentTarget)} disabled={!capabilities.canEditSettings}>Room settings</button>
       </div>
 
-      <nav className="workspace-tabs" aria-label="Room workspace">
-        {(['communication', 'events', 'archive'] as const).map((value) => (
-          <button key={value} type="button" role="tab" aria-selected={tab === value} onClick={() => setTab(value)}>
+      <nav className="workspace-tabs" aria-label="Room workspace" role="tablist">
+        {WORKSPACE_TABS.map((value) => (
+          <button
+            key={value}
+            ref={(node) => { tabRefs.current[value] = node ?? undefined; }}
+            id={`workspace-tab-${value}`}
+            type="button"
+            role="tab"
+            aria-controls={`workspace-panel-${value}`}
+            aria-selected={tab === value}
+            tabIndex={tab === value ? 0 : -1}
+            onClick={() => setTab(value)}
+            onKeyDown={(event) => {
+              const current = WORKSPACE_TABS.indexOf(value);
+              const next = event.key === 'ArrowRight' ? (current + 1) % WORKSPACE_TABS.length
+                : event.key === 'ArrowLeft' ? (current - 1 + WORKSPACE_TABS.length) % WORKSPACE_TABS.length
+                : event.key === 'Home' ? 0
+                : event.key === 'End' ? WORKSPACE_TABS.length - 1
+                : undefined;
+              if (next === undefined) return;
+              event.preventDefault();
+              const nextTab = WORKSPACE_TABS[next]!;
+              setTab(nextTab);
+              tabRefs.current[nextTab]?.focus();
+            }}
+          >
             {value[0].toUpperCase() + value.slice(1)}
           </button>
         ))}
       </nav>
 
-      <section className="workspace-content" aria-label={`${tab} panel`}>
+      <section className="workspace-content" id={`workspace-panel-${tab}`} role="tabpanel" aria-labelledby={`workspace-tab-${tab}`} aria-label={`${tab} panel`} tabIndex={0}>
         {tab === 'communication' && <CommunicationShell room={room} records={records} historyReady={historyReady} connected={connected} visible={visible} composerState={composerState ?? EMPTY_COMPOSER} onComposerDraft={onComposerDraft ?? noopDraft} onSendMessage={onSendMessage} />}
+        {tab === 'files' && <FilesView roomId={room.room_id} records={records} />}
         {tab === 'events' && <ArchiveView records={records} mode="events" />}
         {tab === 'archive' && <ArchiveView records={records} mode="archive" />}
       </section>

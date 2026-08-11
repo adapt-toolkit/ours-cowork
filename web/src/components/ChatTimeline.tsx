@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type { CommunicationRecordDto } from '../api/types';
 import { newestRows, PROJECTION_PAGE_SIZE, projectChat, showEarlierCount } from '../state/roomModel';
+import { FileAttachment } from './FileAttachment';
 
 export function ChatTimeline({ roomId, records, historyReady, visible }: {
   roomId: string;
@@ -26,10 +27,13 @@ export function ChatTimeline({ roomId, records, historyReady, visible }: {
       setAnnouncement('');
       return;
     }
-    const additions = rows.filter((row) => row.seq > previous.maxSeq).length;
+    const addedRows = rows.filter((row) => row.seq > previous.maxSeq);
+    const additions = addedRows.length;
     observed.current = { roomId, maxSeq: Math.max(previous.maxSeq, maxSeq), ready: true };
     setAnnouncement(visible && additions > 0
-      ? `${additions} new ${additions === 1 ? 'message' : 'messages'}`
+      ? additions === 1
+        ? `1 new ${addedRows[0]?.type === 'file' ? 'attachment' : 'message'}`
+        : `${additions} new room items`
       : '');
   }, [historyReady, roomId, rows, visible]);
 
@@ -48,6 +52,11 @@ export function ChatTimeline({ roomId, records, historyReady, visible }: {
             <div className="chat-row__meta"><strong>Mission briefing</strong><RecordMeta seq={row.seq} at={row.at} /></div>
             <p className="chat-row__text">{row.text}</p>
           </li>
+        ) : row.type === 'file' ? (
+          <li className="chat-row chat-row--file" key={row.recordId}>
+            <div className="chat-row__meta"><strong>{row.author.display_name}</strong><span>{row.author.role}</span><RecordMeta seq={row.seq} at={row.at} /></div>
+            <FileAttachment file={row} />
+          </li>
         ) : (
           <li className={`chat-row chat-row--${row.speaker}`} key={row.recordId}>
             <div className="chat-row__meta"><strong>{row.author.display_name}</strong><span>{row.speaker === 'room' ? 'Room voice' : row.author.role}</span><RecordMeta seq={row.seq} at={row.at} /></div>
@@ -55,7 +64,7 @@ export function ChatTimeline({ roomId, records, historyReady, visible }: {
           </li>
         ))}
       </ul>
-      <p className="visually-hidden" role="status" aria-label="New room messages" aria-live="polite" aria-atomic="true">{announcement}</p>
+      <p className="visually-hidden" role="status" aria-label="New room items" aria-live="polite" aria-atomic="true">{announcement}</p>
     </div>
   );
 }

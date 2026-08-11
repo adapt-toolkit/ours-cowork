@@ -1,6 +1,7 @@
 import type {
   AuthorDto,
   CommunicationRecordDto,
+  FileRecordDto,
   MessageRecordDto,
   OperationalRecordDto,
   RoomDto,
@@ -8,6 +9,31 @@ import type {
 } from '../api/types';
 
 export const PROJECTION_PAGE_SIZE = 500;
+
+export interface FileRow {
+  type: 'file';
+  seq: number;
+  recordId: string;
+  fileId: string;
+  at: string;
+  author: AuthorDto;
+  filename: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  dataBase64: string;
+}
+
+export interface FileVersion extends FileRow {
+  version: number;
+}
+
+export interface FileGroup {
+  groupId: string;
+  filename: string;
+  latest: FileVersion;
+  versions: FileVersion[];
+}
 
 export type ChatRow =
   | {
@@ -26,7 +52,8 @@ export type ChatRow =
     at: string;
     author: AuthorDto;
     text: string;
-  };
+  }
+  | FileRow;
 
 export interface RoomCapabilities {
   canEditSettings: boolean;
@@ -50,8 +77,10 @@ export function mergeRecords(
 
 export function projectChat(records: readonly CommunicationRecordDto[]): ChatRow[] {
   return mergeRecords([], records)
-    .filter((record): record is MessageRecordDto => record.kind === 'message')
-    .map((record): ChatRow => record.category === 'briefing'
+    .filter((record): record is MessageRecordDto | FileRecordDto => record.kind === 'message' || record.kind === 'file')
+    .map((record): ChatRow => record.kind === 'file'
+      ? projectFile(record)
+      : record.category === 'briefing'
       ? {
           type: 'briefing',
           seq: record.seq,
@@ -71,9 +100,37 @@ export function projectChat(records: readonly CommunicationRecordDto[]): ChatRow
         });
 }
 
-export function projectEvents(records: readonly CommunicationRecordDto[]): OperationalRecordDto[] {
+export function projectEvents(records: readonly CommunicationRecordDto[]): Exclude<OperationalRecordDto, FileRecordDto>[] {
   return mergeRecords([], records)
-    .filter((record): record is OperationalRecordDto => record.kind !== 'message');
+    .filter((record): record is Exclude<OperationalRecordDto, FileRecordDto> => record.kind !== 'message' && record.kind !== 'file');
+}
+
+export function projectFiles(records: readonly CommunicationRecordDto[], roomId: string): FileRow[] {
+  return mergeRecords([], records.filter((record) => record.room_id === roomId))
+    .filter((record): record is FileRecordDto => record.kind === 'file')
+    .map(projectFile);
+}
+
+export function groupFiles(records: readonly CommunicationRecordDto[], roomId: string): FileGroup[] {
+  const byName = new Map<string, FileRow[]>();
+  for (const file of projectFiles(records, roomId)) {
+    const versions = byName.get(file.filename) ?? [];
+    versions.push(file);
+    byName.set(file.filename, versions);
+  }
+
+  return [...byName.entries()].map(([filename, files]) => {
+    const versions = files
+      .sort((left, right) => left.seq - right.seq)
+      .map((file, index): FileVersion => ({ ...file, version: index + 1 }))
+      .reverse();
+    return {
+      groupId: versions[0]!.fileId,
+      filename,
+      latest: versions[0]!,
+      versions,
+    };
+  }).sort((left, right) => right.latest.seq - left.latest.seq);
 }
 
 export function roomCapabilities(state: RoomState, connected = true): RoomCapabilities {
@@ -130,5 +187,21 @@ function mutableCapabilities(canMessage: boolean): RoomCapabilities {
     canMessage,
     canClose: true,
     canDelete: false,
+  };
+}
+
+function projectFile(record: FileRecordDto): FileRow {
+  return {
+    type: 'file',
+    seq: record.seq,
+    recordId: record.record_id,
+    fileId: record.file_id,
+    at: record.at,
+    author: record.author,
+    filename: record.filename,
+    mime: record.mime,
+    size: record.size,
+    sha256: record.sha256,
+    dataBase64: record.data_base64,
   };
 }

@@ -280,7 +280,12 @@ test('shipped web console creates, selects, invites, and sends through the real 
   assert(requests.every((url) => url.startsWith(origin)), `unexpected remote request: ${requests.find((url) => !url.startsWith(origin))}`);
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole('tab', { name: 'Files' }).click();
+  const roomContext = page.locator('aside[aria-label="Room context"]');
+  await page.getByRole('button', { name: 'Close context', exact: true }).click();
+  assert.equal(await roomContext.getAttribute('aria-hidden'), 'true');
+  const mobileFilesTab = page.getByRole('tab', { name: 'Files', exact: true });
+  await mobileFilesTab.click();
+  assert.equal(await mobileFilesTab.getAttribute('aria-selected'), 'true');
   await evidenceVersionsToggle.click();
   const mobileDownload = versions.getByRole('button', { name: 'Download evidence.html', exact: true }).first();
   assert((await mobileDownload.boundingBox()).height >= 44);

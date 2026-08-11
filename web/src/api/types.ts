@@ -246,7 +246,8 @@ export function isRoomDto(value: unknown): value is RoomDto {
 
   const exactPacketPending = value.state === 'provisioning'
     && value.status === 'packet_pending'
-    && value.identity_name === `cowork-room-${value.room_id}`
+    && (value.identity_name === `cowork-room-${value.room_id}`
+      || value.identity_name === `ours-cowork-room:${value.room_name}`)
     && value.invites.length === 0
     && value.seats.length === 0
     && value.activated_at === undefined

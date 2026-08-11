@@ -20,7 +20,9 @@ import {
   RoomV1Schema,
   UpdateRoomInputSchema,
   defaultRoomName,
+  legacyRoomIdentityName,
   migrateRoomV1,
+  roomIdentityName,
 } from '../src/contracts.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
@@ -132,6 +134,13 @@ test('room names trim, NFC-normalize, count Unicode code points, and reject cont
   assert.deepEqual(UpdateRoomInputSchema.parse({ name: '  Renamed  ' }), { name: 'Renamed' });
 });
 
+test('room identity names use the normalized friendly contract while preserving an explicit legacy helper', () => {
+  assert.equal(roomIdentityName('  Cafe\u0301 launch  '), 'ours-cowork-room:Café launch');
+  assert.equal(legacyRoomIdentityName(ROOM_ID), `cowork-room-${ROOM_ID}`);
+  assert.throws(() => roomIdentityName('   '));
+  assert.throws(() => legacyRoomIdentityName(ROOM_ID.toUpperCase()));
+});
+
 test('otherwise unnamed current rooms receive the deterministic display fallback', () => {
   const unnamed = room();
   delete unnamed.room_name;
@@ -225,6 +234,10 @@ test('only the exact packet-pending room sentinel may have an empty identity CID
     status: 'packet_pending',
   });
   assert.equal(RoomSchema.parse(pending).identity_cid, '');
+  assert.equal(RoomSchema.parse({
+    ...pending,
+    identity_name: roomIdentityName(pending.room_name),
+  }).identity_cid, '');
   assert.throws(() => RoomSchema.parse({ ...pending, status: undefined }));
   assert.throws(() => RoomSchema.parse({ ...pending, state: 'active', activated_at: AT }));
   assert.throws(() => RoomSchema.parse({ ...pending, identity_name: 'another-name' }));

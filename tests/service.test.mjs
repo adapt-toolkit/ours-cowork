@@ -144,8 +144,8 @@ class FakeRegistry {
     return packet;
   }
 
-  async restore(roomId, expectedCid) {
-    this.restoreCalls.push({ roomId, expectedCid });
+  async restore(roomId, expectedCid, identityName, bio) {
+    this.restoreCalls.push({ roomId, expectedCid, identityName, bio });
     if (this.restoreResult) {
       this.packets.set(roomId, this.restoreResult);
       return this.restoreResult;
@@ -186,16 +186,16 @@ test('create validates caller input first and provisions exactly one named room 
   const room = await create(f);
   assert.deepEqual(f.registry.createCalls, [{
     roomId: ROOM_ID,
-    identityName: `cowork-room-${ROOM_ID}`,
+    identityName: 'ours-cowork-room:Room 01jz6y7n',
     bio: `ours-cowork mission room ${ROOM_ID}`,
   }]);
-  assert.equal(room.identity_name, `cowork-room-${ROOM_ID}`);
+  assert.equal(room.identity_name, 'ours-cowork-room:Room 01jz6y7n');
   assert.equal(room.room_name, 'Room 01jz6y7n');
   assert.equal(room.identity_cid, `cid-room-${ROOM_ID}`);
   assert.equal(room.state, 'provisioning');
 });
 
-test('create normalizes friendly names, allows duplicates, and leaves technical identities keyed by room_id', async () => {
+test('create normalizes friendly names, allows duplicates, and freezes the initial announced identity', async () => {
   const store = new MemoryStore();
   const registry = new FakeRegistry();
   const ids = [ROOM_ID, '01jz6y7n8p9q0r1s2t3v4w5x70'];
@@ -211,8 +211,9 @@ test('create normalizes friendly names, allows duplicates, and leaves technical 
   assert.equal(first.room_name, 'Café launch');
   assert.equal(second.room_name, 'Café launch');
   assert.notEqual(first.room_id, second.room_id);
-  assert.equal(first.identity_name, `cowork-room-${first.room_id}`);
-  assert.equal(second.identity_name, `cowork-room-${second.room_id}`);
+  assert.equal(first.identity_name, 'ours-cowork-room:Café launch');
+  assert.equal(second.identity_name, 'ours-cowork-room:Café launch');
+  assert.notEqual(first.identity_cid, second.identity_cid, 'duplicate labels still have distinct authenticated identities');
   assert.deepEqual((await service.listRooms()).map((room) => room.room_name), ['Café launch', 'Café launch']);
 });
 
@@ -267,7 +268,12 @@ test('recoverRoom restores rather than creates when a packet exists behind the p
   assert.equal(recovered.identity_cid, restored.cid);
   assert.equal('status' in recovered, false);
   assert.equal(f.registry.createCalls.length, createCount);
-  assert.deepEqual(f.registry.restoreCalls, [{ roomId: ROOM_ID, expectedCid: undefined }]);
+  assert.deepEqual(f.registry.restoreCalls, [{
+    roomId: ROOM_ID,
+    expectedCid: undefined,
+    identityName: 'ours-cowork-room:Room 01jz6y7n',
+    bio: `ours-cowork mission room ${ROOM_ID}`,
+  }]);
 });
 
 test('recoverRoom never creates over an established CID when restore fails', async () => {
@@ -285,10 +291,36 @@ test('recoverRoom never creates over an established CID when restore fails', asy
     f.registry.restoreFailure = new Error(`injected ${state} restore failure`);
     const createCount = f.registry.createCalls.length;
     await assert.rejects(f.service.recoverRoom(ROOM_ID), new RegExp(`${state} restore failure`));
-    assert.deepEqual(f.registry.restoreCalls, [{ roomId: ROOM_ID, expectedCid: established.identity_cid }]);
+    assert.deepEqual(f.registry.restoreCalls, [{ roomId: ROOM_ID, expectedCid: established.identity_cid, identityName: undefined, bio: undefined }]);
     assert.equal(f.registry.createCalls.length, createCount, `${state} must be restore-only`);
     assert.deepEqual(await f.store.load(ROOM_ID), established, `${state} metadata must remain unchanged`);
   }
+});
+
+test('recoverRoom preserves an established legacy identity without rename or reprovisioning', async () => {
+  const f = fixture();
+  const created = await create(f);
+  const legacy = {
+    ...created,
+    identity_name: `cowork-room-${ROOM_ID}`,
+  };
+  await f.store.save(legacy);
+  f.registry.packets.clear();
+  f.registry.restoreResult = new FakePacket(legacy.identity_name, legacy.identity_cid);
+  const createCount = f.registry.createCalls.length;
+
+  const recovered = await f.service.recoverRoom(ROOM_ID);
+
+  assert.equal(recovered.identity_name, legacy.identity_name);
+  assert.equal(recovered.identity_cid, legacy.identity_cid);
+  assert.deepEqual(f.registry.restoreCalls, [{
+    roomId: ROOM_ID,
+    expectedCid: legacy.identity_cid,
+    identityName: undefined,
+    bio: undefined,
+  }]);
+  assert.equal(f.registry.createCalls.length, createCount);
+  assert.deepEqual(await f.store.load(ROOM_ID), legacy);
 });
 
 test('recoverRoom rejects a restored CID mismatch without changing established metadata', async () => {
@@ -306,7 +338,7 @@ test('recoverRoom rejects a restored CID mismatch without changing established m
     f.registry.restoreResult = new FakePacket(`cowork-room-${ROOM_ID}`, `cid-wrong-${state}`);
     const createCount = f.registry.createCalls.length;
     await assert.rejects(f.service.recoverRoom(ROOM_ID), /CID mismatch/i);
-    assert.deepEqual(f.registry.restoreCalls, [{ roomId: ROOM_ID, expectedCid: established.identity_cid }]);
+    assert.deepEqual(f.registry.restoreCalls, [{ roomId: ROOM_ID, expectedCid: established.identity_cid, identityName: undefined, bio: undefined }]);
     assert.equal(f.registry.createCalls.length, createCount);
     assert.deepEqual(await f.store.load(ROOM_ID), established);
   }

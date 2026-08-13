@@ -534,7 +534,7 @@ export class RoomService {
     const receipt = await this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'remove a participant from');
-      const seat = this.findRemovableSeat(room, request.participant);
+      const seat = this.findSeatForRemoval(room, request.participant);
       const notify = (request.notify ?? true) && !room.quiet_membership;
       return this.beginRemovalUnlocked(room, seat, notify);
     });
@@ -553,7 +553,7 @@ export class RoomService {
     const receipt = await this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'replace a participant in');
-      const seat = this.findRemovableSeat(room, request.participant);
+      const seat = this.findActiveSeat(room, request.participant);
       const notify = room.anonymous
         ? false
         : (request.notify ?? true) && !room.quiet_membership;
@@ -571,27 +571,57 @@ export class RoomService {
     return receipt;
   }
 
-  private findRemovableSeat(room: Room, participant: string): Seat {
-    const seat = room.seats.find((candidate) => candidate.state !== 'removed'
+  private findSeatForRemoval(room: Room, participant: string): Seat {
+    const matches = (candidate: Seat): boolean =>
+      candidate.identity === participant || candidate.participant_id === participant;
+    const seat = room.seats.find((candidate) => candidate.state !== 'removed' && matches(candidate))
+      ?? room.seats.find((candidate) => isCancelledExternalSeat(candidate) && matches(candidate));
+    if (!seat) {
+      throw new RoomServiceError(
+        `"${participant}" is not a pending, active, or recoverable cancelled participant of room "${room.room_id}"`,
+      );
+    }
+    return seat;
+  }
+
+  private findActiveSeat(room: Room, participant: string): Seat {
+    const seat = room.seats.find((candidate) => candidate.state === 'active'
       && (candidate.identity === participant || candidate.participant_id === participant));
     if (!seat) {
-      throw new RoomServiceError(`"${participant}" is not a pending or active participant of room "${room.room_id}"`);
+      throw new RoomServiceError(`"${participant}" is not an active participant of room "${room.room_id}"`);
     }
     return seat;
   }
 
   private async beginRemovalUnlocked(room: Room, seat: Seat, notify: boolean): Promise<RemovalReceipt> {
-    if (seat.state === 'pending') {
-      const removedAt = this.now();
+    if (seat.state === 'pending' || isCancelledExternalSeat(seat)) {
+      let cancelled = seat;
+      if (seat.state === 'pending') {
+        const removedAt = this.now();
+        cancelled = {
+          ...seat,
+          state: 'removed',
+          removed_at: removedAt,
+          removed_epoch: room.membership_epoch,
+        };
+      }
       const seats = room.seats.map((candidate): Seat => candidate.participant_id === seat.participant_id
-        ? {
-            ...candidate,
-            state: 'removed',
-            removed_at: removedAt,
-            removed_epoch: room.membership_epoch,
-          }
+        ? cancelled
         : candidate);
-      await this.store.save(RoomSchema.parse({ ...room, seats }));
+      if (seat.state === 'pending') await this.store.save(RoomSchema.parse({ ...room, seats }));
+      const established = this.packet(room.room_id).listContacts()
+        .some((contact) => contact.container_id === seat.identity);
+      if (established) {
+        const outcome = await this.packet(room.room_id).removeContact(seat.identity);
+        return {
+          room_id: room.room_id,
+          participant_id: seat.participant_id,
+          epoch: room.membership_epoch,
+          status: outcome.status,
+          notified: outcome.notified,
+          key_material_retained: true,
+        };
+      }
       return {
         room_id: room.room_id,
         participant_id: seat.participant_id,
@@ -1075,8 +1105,9 @@ export class RoomService {
     const existingCids = new Set(room.seats
       .filter((seat) => seat.state === 'active' || seat.state === 'pending')
       .map((seat) => seat.identity));
-    // A cid whose seats are all removed re-admits only through an invite
-    // minted after its latest removal — a deliberate operator re-invite (§5.3).
+    // Automatic forward admission of a removed cid requires an invite minted
+    // after its latest removal (§5.3). Explicit operator reverse admission is
+    // separately authorized by a new exact invite_redeemed provenance below.
     const lastRemovedAt = new Map<string, string>();
     for (const seat of room.seats) {
       if (seat.state !== 'removed' || seat.removed_at === undefined) continue;
@@ -1086,11 +1117,12 @@ export class RoomService {
       }
     }
     const activatedPending: Seat[] = [];
-    const seatsWithActivations = room.seats.map((seat): Seat => {
-      if (seat.state !== 'pending') return seat;
+    const seatsWithActivations = [...room.seats];
+    for (const [seatIndex, seat] of room.seats.entries()) {
+      if (seat.state !== 'pending') continue;
       const displayName = contactsByCid.get(seat.identity);
       const origin = origins[seat.identity];
-      if (displayName === undefined || origin === undefined) return seat;
+      if (displayName === undefined || origin === undefined) continue;
       const completedExternalRedemption = origin.via === 'invite_redeemed'
         && origin.invite_id === seat.invite_id;
       const fallbackInvite = (origin.via === 'invite_one_time' || origin.via === 'invite_public')
@@ -1099,14 +1131,14 @@ export class RoomService {
       const confirmedFallback = fallbackInvite !== undefined
         && fallbackInvite.state !== 'receipt_pending'
         && (fallbackInvite.recovery_of === undefined || fallbackInvite.recovery_confirmed === true);
-      if (!completedExternalRedemption && !confirmedFallback) return seat;
+      if (!completedExternalRedemption && !confirmedFallback) continue;
       const removedAt = lastRemovedAt.get(seat.identity);
-      if (fallbackInvite !== undefined && removedAt !== undefined && fallbackInvite.created_at <= removedAt) return seat;
+      if (fallbackInvite !== undefined && removedAt !== undefined && fallbackInvite.created_at <= removedAt) continue;
       const predecessor = fallbackInvite?.replaces_seat === undefined
         ? undefined
         : room.seats.find((candidate) =>
           candidate.participant_id === fallbackInvite.replaces_seat && candidate.state === 'removed');
-      if (fallbackInvite?.replaces_seat !== undefined && predecessor === undefined) return seat;
+      if (fallbackInvite?.replaces_seat !== undefined && predecessor === undefined) continue;
       const { alias: _alias, replaces_seat: _replacesSeat, ...base } = seat;
       const activated: Seat = {
         ...base,
@@ -1122,12 +1154,12 @@ export class RoomService {
           ? { alias: fallbackInvite === undefined
               ? _alias!
               : predecessor?.alias
-                ?? (fallbackInvite.role === seat.role ? _alias! : mintAlias(room.seats, fallbackInvite.role)) }
+                ?? (fallbackInvite.role === seat.role ? _alias! : mintAlias(seatsWithActivations, fallbackInvite.role)) }
           : {}),
       };
       activatedPending.push(activated);
-      return activated;
-    });
+      seatsWithActivations[seatIndex] = activated;
+    }
     const newSeats: Seat[] = [];
 
     for (const [cid, displayName] of contactsByCid) {
@@ -1489,6 +1521,13 @@ export class RoomService {
 
 function activeSeats(room: Room): Seat[] {
   return room.seats.filter((seat) => seat.state === 'active');
+}
+
+function isCancelledExternalSeat(seat: Seat): boolean {
+  return seat.state === 'removed'
+    && seat.accepted_at === undefined
+    && seat.requested_at !== undefined
+    && seat.invite_sha256 !== undefined;
 }
 
 /**

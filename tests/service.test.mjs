@@ -21,6 +21,11 @@ const TIMES = [
   '2026-08-02T10:11:17.000Z',
   '2026-08-02T10:11:18.000Z',
   '2026-08-02T10:11:19.000Z',
+  '2026-08-02T10:11:20.000Z',
+  '2026-08-02T10:11:21.000Z',
+  '2026-08-02T10:11:22.000Z',
+  '2026-08-02T10:11:23.000Z',
+  '2026-08-02T10:11:24.000Z',
 ];
 
 class MemoryStore {
@@ -130,7 +135,12 @@ class FakePacket {
   sendFile() { throw new Error('not used'); }
   async consumeInbox() { return { consumed: [], deferred: [] }; }
   async send() { return { status: 'queued', wire_id: 'wire' }; }
-  async removeContact() { return { status: 'queued', notified: true, key_material_retained: true }; }
+  async removeContact(contact) {
+    this.removeContactCalls = [...(this.removeContactCalls ?? []), contact];
+    this.contacts = this.contacts.filter((candidate) => candidate.container_id !== contact);
+    delete this.origins[contact];
+    return { status: 'queued', notified: true, key_material_retained: true };
+  }
   async sign() { return 'signature'; }
 }
 
@@ -318,7 +328,47 @@ test('a room-invite fallback activates the same pending seat with room role prov
   assert.equal(room.state, 'active');
 });
 
-test('pending external seats can be cancelled or replaced without gaining authority or bumping the epoch', async () => {
+test('same-role fallback activations mint distinct anonymous aliases in one recoverable reconciliation batch', async () => {
+  const f = fixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.', anonymous: true });
+  const fallback = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 2 });
+  const packet = f.registry.get(ROOM_ID);
+  packet.addResult = {
+    invite_id: 'external-a', container_id: 'AB'.repeat(32), inviter_name: 'Alice', pending_name: '',
+  };
+  const alice = await f.service.acceptExternalInvite(ROOM_ID, {
+    role: 'reviewer', invite: packInvite(Buffer.from('external alice')),
+  });
+  packet.addResult = {
+    invite_id: 'external-b', container_id: 'CD'.repeat(32), inviter_name: 'Bob', pending_name: '',
+  };
+  const bob = await f.service.acceptExternalInvite(ROOM_ID, {
+    role: 'reviewer', invite: packInvite(Buffer.from('external bob')),
+  });
+  packet.contacts = [
+    { name: 'Alice', container_id: alice.identity },
+    { name: 'Bob', container_id: bob.identity },
+  ];
+  packet.origins = {
+    [alice.identity]: { via: 'invite_public', invite_id: fallback.invite.invite_id, at: TIMES[4] },
+    [bob.identity]: { via: 'invite_public', invite_id: fallback.invite.invite_id, at: TIMES[5] },
+  };
+
+  let room = await f.service.reconcileRoom(ROOM_ID);
+  assert.deepEqual(room.seats.map((seat) => seat.alias).sort(), ['builder #1', 'builder #2']);
+  assert.deepEqual(room.seats.map((seat) => seat.role), ['builder', 'builder']);
+  assert.deepEqual(room.invites[0].accepted_cids.sort(), [alice.identity, bob.identity].sort());
+  assert.equal(room.state, 'active');
+  assert.equal(room.membership_epoch, 2);
+
+  room = await f.service.reconcileRoom(ROOM_ID);
+  await f.service.notifyRoom(ROOM_ID, 'contact_added');
+  const recovered = await f.service.showRoom(ROOM_ID);
+  assert.deepEqual(recovered.seats.map((seat) => seat.alias).sort(), ['builder #1', 'builder #2']);
+  assert.equal(recovered.membership_epoch, 2);
+});
+
+test('pending external seats can be cancelled without authority or epoch gain and cannot be replaced', async () => {
   const f = fixture();
   await create(f);
   const pending = await f.service.acceptExternalInvite(ROOM_ID, {
@@ -334,20 +384,58 @@ test('pending external seats can be cancelled or replaced without gaining author
   assert.equal(room.membership_epoch, 0);
   assert.equal((await f.store.read(ROOM_ID)).length, 0);
 
-  const g = fixture();
-  await create(g);
-  const replacePending = await g.service.acceptExternalInvite(ROOM_ID, {
+  const replacePending = await f.service.acceptExternalInvite(ROOM_ID, {
     role: 'reviewer', invite: packInvite(Buffer.from('replace me')),
   });
-  const replacement = await g.service.replaceParticipant(ROOM_ID, {
-    participant: replacePending.participant_id, mode: 'one_time',
-  });
-  room = await g.service.showRoom(ROOM_ID);
-  assert.equal(replacement.removal.status, 'cancelled_pending');
+  await assert.rejects(f.service.replaceParticipant(ROOM_ID, {
+    participant: replacePending.participant_id,
+  }), /not an active participant/i);
+  room = await f.service.showRoom(ROOM_ID);
   assert.equal(room.membership_epoch, 0);
+  assert.equal(room.seats.find((seat) => seat.participant_id === replacePending.participant_id).state, 'pending');
+  assert.equal(room.invites.length, 0, 'a never-authoritative seat cannot create replacement lineage');
+});
+
+test('late redemption after cancellation can be severed and safely re-accepted by the operator', async () => {
+  const f = fixture();
+  await create(f);
+  const packet = f.registry.get(ROOM_ID);
+  const firstSecret = packInvite(Buffer.from('cancel before completion'));
+  const cancelled = await f.service.acceptExternalInvite(ROOM_ID, { role: 'reviewer', invite: firstSecret });
+  assert.equal((await f.service.removeParticipant(ROOM_ID, {
+    participant: cancelled.participant_id,
+  })).status, 'cancelled_pending');
+
+  packet.contacts = [{ name: 'Late inviter', container_id: cancelled.identity }];
+  packet.origins[cancelled.identity] = {
+    via: 'invite_redeemed', invite_id: cancelled.invite_id, at: TIMES[3],
+  };
+  let room = await f.service.reconcileRoom(ROOM_ID);
   assert.equal(room.seats[0].state, 'removed');
-  assert.equal(replacement.invite.role, 'reviewer');
-  assert.equal(replacement.invite.replaces_seat, replacePending.participant_id);
+  packet.addResult = {
+    ...packet.addResult, invite_id: 'external-invite-2', container_id: cancelled.identity,
+  };
+  const secondSecret = packInvite(Buffer.from('operator retries after late completion'));
+  await assert.rejects(
+    f.service.acceptExternalInvite(ROOM_ID, { role: 'reviewer', invite: secondSecret }),
+    /already a contact|ambiguous/i,
+  );
+
+  const recovery = await f.service.removeParticipant(ROOM_ID, { participant: cancelled.participant_id });
+  assert.equal(recovery.status, 'queued');
+  assert.deepEqual(packet.removeContactCalls, [cancelled.identity]);
+  assert.equal(packet.contacts.length, 0);
+  assert.equal(packet.origins[cancelled.identity], undefined);
+
+  const readmitted = await f.service.acceptExternalInvite(ROOM_ID, { role: 'reviewer', invite: secondSecret });
+  packet.contacts = [{ name: 'Recovered inviter', container_id: readmitted.identity }];
+  packet.origins[readmitted.identity] = {
+    via: 'invite_redeemed', invite_id: readmitted.invite_id, at: TIMES[5],
+  };
+  room = await f.service.reconcileRoom(ROOM_ID);
+  assert.deepEqual(room.seats.map((seat) => seat.state), ['removed', 'active']);
+  assert.equal(room.seats[1].participant_id, readmitted.participant_id);
+  assert.equal(room.membership_epoch, 1);
 });
 
 test('create normalizes friendly names, allows duplicates, and freezes the initial announced identity', async () => {
@@ -1384,4 +1472,33 @@ test('a removed cid re-admits only through an invite minted after its removal', 
   assert.equal(seats.length, 2);
   assert.deepEqual(seats.map((seat) => seat.state).sort(), ['active', 'removed']);
   assert.notEqual(seats[0].participant_id, seats[1].participant_id);
+});
+
+test('an operator may explicitly re-admit a removed CID by accepting that peer exact new invite', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  const cid = 'AB'.repeat(32);
+  await admit(f, invite, cid, 'Alice');
+  const removed = (await f.service.showRoom(ROOM_ID)).seats[0];
+  await f.service.removeParticipant(ROOM_ID, { participant: removed.participant_id });
+
+  const packet = f.registry.get(ROOM_ID);
+  packet.addResult = {
+    invite_id: 'external-readmission', container_id: cid, inviter_name: 'Alice returns', pending_name: '',
+  };
+  const pending = await f.service.acceptExternalInvite(ROOM_ID, {
+    role: 'reviewer', invite: packInvite(Buffer.from('fresh operator-approved peer invite')),
+  });
+  packet.contacts = [{ name: 'Alice returns', container_id: cid }];
+  packet.origins[cid] = {
+    via: 'invite_redeemed', invite_id: pending.invite_id, at: '2026-08-02T10:56:00.000Z',
+  };
+
+  const room = await f.service.reconcileRoom(ROOM_ID);
+  const seats = room.seats.filter((seat) => seat.identity === cid);
+  assert.deepEqual(seats.map((seat) => seat.state), ['removed', 'active']);
+  assert.equal(seats[1].participant_id, pending.participant_id);
+  assert.equal(seats[1].role, 'reviewer');
+  assert.equal(seats[1].invite_id, 'external-readmission');
 });

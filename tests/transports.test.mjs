@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import {
+  createPrivateServiceRoutes,
   createServiceRoutes,
   MAX_REQUEST_BYTES,
   RpcDispatcher,
@@ -96,6 +97,33 @@ test('the exhaustive service route table marks every route auth:true', () => {
     'room.settings', 'room.show',
   ]);
   assert(Object.values(routes).every((route) => route.auth === true));
+  const privateRoutes = createPrivateServiceRoutes(service);
+  assert.deepEqual(Object.keys(privateRoutes), ['room.accept']);
+  assert(Object.values(privateRoutes).every((route) => route.auth === true));
+});
+
+test('external invite acceptance has strict params and is excluded from the ordinary route table', async () => {
+  const calls = [];
+  const service = new Proxy({}, {
+    get: (_target, method) => async (...args) => { calls.push([method, ...args]); return { state: 'pending' }; },
+  });
+  const ordinary = new RpcDispatcher(createServiceRoutes(service));
+  const privateDispatcher = new RpcDispatcher(createPrivateServiceRoutes(service));
+  const envelope = {
+    version: 1, id: 'accept', method: 'room.accept',
+    params: { room_id: 'r1', role: 'reviewer', invite: 'secret', expected_cid: 'AB'.repeat(32) },
+  };
+  assert.equal((await ordinary.dispatch(envelope)).error.code, 'method_not_found');
+  assert.deepEqual(await privateDispatcher.dispatch(envelope), {
+    version: 1, id: 'accept', result: { state: 'pending' },
+  });
+  assert.deepEqual(calls, [[
+    'acceptExternalInvite', 'r1',
+    { role: 'reviewer', invite: 'secret', expected_cid: 'AB'.repeat(32) },
+  ]]);
+  assert.equal((await privateDispatcher.dispatch({
+    ...envelope, params: { ...envelope.params, extra: true },
+  })).error.code, 'invalid_params');
 });
 
 test('phase-A verbs are reachable over authenticated RPC with strict params (spec §8.5)', async () => {
@@ -159,10 +187,13 @@ test('REST is unauthenticated, loopback-only, emits no CORS, and excludes daemon
     'daemon.status': { auth: true, run: async () => ({ running: true }) },
     'daemon.shutdown': { auth: true, run: async () => ({ accepted: true }) },
   };
+  const privateRoutes = {
+    'room.accept': { auth: true, run: async () => ({ state: 'pending' }) },
+  };
   const server = new TransportServer({
     socketPath,
     rest: { enabled: true, port: 0 },
-    unixDispatcher: new RpcDispatcher({ ...roomRoutes, ...controlRoutes }),
+    unixDispatcher: new RpcDispatcher({ ...roomRoutes, ...privateRoutes, ...controlRoutes }),
     restDispatcher: new RpcDispatcher(roomRoutes),
   });
   await server.start();
@@ -179,13 +210,15 @@ test('REST is unauthenticated, loopback-only, emits no CORS, and excludes daemon
   assert.deepEqual(rest.json, unix);
   assert.equal(rest.headers['access-control-allow-origin'], undefined);
 
-  for (const method of ['daemon.status', 'daemon.shutdown']) {
+  for (const method of ['daemon.status', 'daemon.shutdown', 'room.accept']) {
     const controlEnvelope = { version: 1, id: method, method, params: {} };
     const overHttp = await request(server.restAddress.port, { body: JSON.stringify(controlEnvelope) });
     assert.equal(overHttp.statusCode, 404);
     assert.equal(overHttp.json.error.code, 'method_not_found');
     const overUnix = JSON.parse(await unixRequest(socketPath, `${JSON.stringify(controlEnvelope)}\n`));
-    assert.deepEqual(overUnix.result, method === 'daemon.status' ? { running: true } : { accepted: true });
+    assert.deepEqual(overUnix.result, method === 'daemon.status'
+      ? { running: true }
+      : method === 'room.accept' ? { state: 'pending' } : { accepted: true });
   }
 });
 

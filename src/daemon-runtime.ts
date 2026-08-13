@@ -16,7 +16,7 @@ export { loadConfig } from './config.ts';
 import { PacketRegistry } from './packets.ts';
 import { RoomService } from './service.ts';
 import { CoworkStore } from './storage.ts';
-import { createServiceRoutes, RpcDispatcher, TransportServer } from './transports.ts';
+import { createPrivateServiceRoutes, createServiceRoutes, RpcDispatcher, TransportServer } from './transports.ts';
 import { createStaticWebHandler, loadWebAssets } from './web.ts';
 
 const FILE_MODE = 0o600;
@@ -78,7 +78,8 @@ export interface DaemonShutdownResult { requiresProcessExit: boolean }
 
 /** Packet notifications which may add durable room work. */
 export function isIntakeNotification(event: string): boolean {
-  return event === 'message_received' || event === 'file_received' || event === 'contact_accepted';
+  return event === 'message_received' || event === 'file_received'
+    || event === 'contact_accepted' || event === 'contact_added';
 }
 
 export class DaemonShutdownError extends AggregateError {
@@ -244,8 +245,8 @@ export class CoworkDaemon {
       const realService = this.service as RoomService;
       const serviceRoutes = createServiceRoutes(realService);
       const unixRoutes = this.options.control
-        ? { ...serviceRoutes, ...createDaemonControlRoutes(this.options.control) }
-        : serviceRoutes;
+        ? { ...serviceRoutes, ...createPrivateServiceRoutes(realService), ...createDaemonControlRoutes(this.options.control) }
+        : { ...serviceRoutes, ...createPrivateServiceRoutes(realService) };
       const unixDispatcher = new RpcDispatcher(unixRoutes);
       const restDispatcher = new RpcDispatcher(serviceRoutes);
       const staticHandler = createStaticWebHandler(loadWebAssets(

@@ -526,8 +526,16 @@ export function packInvite(raw: Buffer): string {
   }).toString('base64url');
 }
 
-export function unpackInvite(encoded: string): Buffer {
-  const compressed = Buffer.from(encoded.replace(/\s+/g, ''), 'base64url');
+export function unpackInvite(encoded: string, maximumBytes?: number): Buffer {
+  const normalized = encoded.replace(/\s+/g, '');
+  if ((maximumBytes !== undefined && Buffer.byteLength(encoded, 'utf8') > maximumBytes)
+    || normalized.length === 0
+    || !/^[A-Za-z0-9_-]+$/.test(normalized)) {
+    throw new Error('the invite blob is empty, oversized, or invalid base64url');
+  }
+  const compressed = Buffer.from(normalized, 'base64url');
   if (compressed.length === 0) throw new Error('the invite blob is empty or invalid base64url');
-  return Buffer.from(brotliDecompressSync(compressed));
+  return Buffer.from(maximumBytes === undefined
+    ? brotliDecompressSync(compressed)
+    : brotliDecompressSync(compressed, { maxOutputLength: maximumBytes }));
 }

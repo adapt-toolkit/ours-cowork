@@ -32,8 +32,9 @@ async function runCli(args, options = {}) {
   const child = spawn(process.execPath, nodeArgs, {
     cwd: ROOT,
     env: { ...process.env, ...options.env },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
   });
+  if (options.input !== undefined) child.stdin.end(options.input);
   let stdout = '';
   let stderr = '';
   child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
@@ -291,6 +292,54 @@ test('room commands send exactly one JSONL request over management.sock', async 
   }
 });
 
+test('room accept reads secrets only from secure files or bounded stdin and redacts output', async () => {
+  const secret = 'invite-material-that-must-not-be-echoed';
+  await withRpc({ result: {
+    room_id: 'room1', participant_id: 'p1', state: 'pending', role: 'reviewer',
+    identity: 'AB'.repeat(32), invite_id: 'i1', inviter_name: 'Peer', pending_name: '', requested_at: 'now',
+  } }, async (rpc) => {
+    const file = join(rpc.env.OURS_COWORK_STATE_DIR, 'invite.txt');
+    await writeFile(file, secret, { mode: 0o600 });
+    const fromFile = await runCli([
+      '--json', 'room', 'accept', 'room1', '--role', 'reviewer', '--invite-file', file,
+      '--expected-cid', 'ab'.repeat(32), '--replaces', '01jz6y7n8p9q0r1s2t3v4w5x70',
+    ], { env: rpc.env });
+    assert.equal(fromFile.code, 0, fromFile.stderr);
+    assert.equal(`${fromFile.stdout}${fromFile.stderr}`.includes(secret), false);
+    assert.deepEqual(rpc.requests[0].params, {
+      room_id: 'room1', role: 'reviewer', invite: secret,
+      expected_cid: 'ab'.repeat(32), replaces_seat: '01jz6y7n8p9q0r1s2t3v4w5x70',
+    });
+
+    const fromStdin = await runCli([
+      'room', 'accept', 'room1', '--role', 'builder', '--invite-stdin',
+    ], { env: rpc.env, input: secret });
+    assert.equal(fromStdin.code, 0, fromStdin.stderr);
+    assert.equal(`${fromStdin.stdout}${fromStdin.stderr}`.includes(secret), false);
+    assert.equal(rpc.requests[1].params.invite, secret);
+    assert.equal(rpc.requests[1].method, 'room.accept');
+  });
+});
+
+test('room accept rejects argv secrets, source ambiguity, insecure files, and oversized stdin before RPC', async () => {
+  await withRpc({ result: {} }, async (rpc) => {
+    const insecure = join(rpc.env.OURS_COWORK_STATE_DIR, 'insecure-invite.txt');
+    await writeFile(insecure, 'private material', { mode: 0o644 });
+    for (const [args, options] of [
+      [['room', 'accept', 'room1', '--role', 'r', '--invite', 'secret'], {}],
+      [['room', 'accept', 'room1', '--role', 'r'], {}],
+      [['room', 'accept', 'room1', '--role', 'r', '--invite-file', insecure], {}],
+      [['room', 'accept', 'room1', '--role', 'r', '--invite-file', insecure, '--invite-stdin'], { input: 'x' }],
+      [['room', 'accept', 'room1', '--role', 'r', '--invite-stdin'], { input: 'x'.repeat((48 * 1024) + 1) }],
+    ]) {
+      const result = await runCli(args, { env: rpc.env, ...options });
+      assert.notEqual(result.code, 0, args.join(' '));
+      assert.equal(`${result.stdout}${result.stderr}`.includes('private material'), false);
+    }
+    assert.equal(rpc.connections, 0);
+  });
+});
+
 test('management RPC accepts one maximum file history page after base64 expansion', async () => {
   const data_base64 = Buffer.alloc(2 * 1024 * 1024, 0xa5).toString('base64');
   await withRawRpc((socket) => {
@@ -323,7 +372,7 @@ test('room history follows byte-short pages until the requested record limit', a
 
 test('native mutations wait for one slow response while reads stay short and timeout is an honest unknown outcome', { timeout: 20_000 }, async () => {
   assert.equal(NATIVE_RPC_TIMEOUT_MS, 120_000);
-  for (const method of ['room.create', 'room.invite', 'room.revoke', 'room.message', 'room.close', 'room.recover', 'room.recover.confirm']) {
+  for (const method of ['room.create', 'room.invite', 'room.accept', 'room.revoke', 'room.message', 'room.close', 'room.recover', 'room.recover.confirm']) {
     assert.equal(rpcTimeoutForMethod(method), NATIVE_RPC_TIMEOUT_MS, method);
   }
   for (const method of ['room.list', 'room.show', 'room.participants', 'room.history', 'room.settings', 'room.delete', 'daemon.status']) {

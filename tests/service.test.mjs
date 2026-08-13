@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import { RoomService } from '../src/service.ts';
 import { MAX_HISTORY_PAGE_BYTES } from '../src/contracts.ts';
+import { packInvite } from '../src/adapt.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const MESSAGE_IDS = [
@@ -87,6 +88,13 @@ class FakePacket {
   contacts = [];
   origins = {};
   nextInvite = 1;
+  addCalls = [];
+  addResult = {
+    invite_id: 'external-invite-1',
+    container_id: 'AB'.repeat(32),
+    inviter_name: 'External inviter',
+    pending_name: '',
+  };
 
   constructor(name, cid) { this.name = name; this.cid = cid; }
 
@@ -95,6 +103,11 @@ class FakePacket {
     const invite_id = `core-invite-${this.nextInvite++}`;
     this.invites.push({ invite_id, mode });
     return { blob: `SECRET-BLOB-${invite_id}`, invite_id, reusable: mode === 'public' };
+  }
+
+  async addContact(invite) {
+    this.addCalls.push(invite);
+    return structuredClone(this.addResult);
   }
 
   async revokeInvite(inviteId) {
@@ -193,6 +206,65 @@ test('create validates caller input first and provisions exactly one named room 
   assert.equal(room.room_name, 'Room 01jz6y7n');
   assert.equal(room.identity_cid, `cid-room-${ROOM_ID}`);
   assert.equal(room.state, 'provisioning');
+});
+
+test('external acceptance persists a zero-authority pending seat and returns only redacted metadata', async () => {
+  const f = fixture();
+  await create(f);
+  const packet = f.registry.get(ROOM_ID);
+  const secret = packInvite(Buffer.from('decoded external invite bytes'));
+  const receipt = await f.service.acceptExternalInvite(ROOM_ID, {
+    role: 'reviewer', invite: secret, expected_cid: 'ab'.repeat(32),
+  });
+  assert.equal(receipt.state, 'pending');
+  assert.equal(receipt.identity, 'AB'.repeat(32));
+  assert.equal(receipt.role, 'reviewer');
+  assert.equal(JSON.stringify(receipt).includes(secret), false);
+  const stored = await f.store.load(ROOM_ID);
+  assert.equal(stored.state, 'provisioning');
+  assert.equal(stored.membership_epoch, 0);
+  assert.equal(stored.seats.length, 1);
+  assert.equal(stored.seats[0].state, 'pending');
+  assert.equal(stored.seats[0].accepted_at, undefined);
+  assert.match(stored.seats[0].invite_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(JSON.stringify(stored).includes(secret), false);
+  assert.equal(f.store.records.get(ROOM_ID).length, 0, 'pending seats receive no briefing or traffic intents');
+  assert.deepEqual(packet.addCalls, [secret]);
+});
+
+test('external expected-CID mismatch writes no seat and exact CID alone activates the same pending seat', async () => {
+  const f = fixture();
+  await create(f);
+  await f.service.setRoleBriefing(ROOM_ID, { role: 'reviewer', text: 'Review exactly.' });
+  const packet = f.registry.get(ROOM_ID);
+  const secret = packInvite(Buffer.from('different decoded invite bytes'));
+  await assert.rejects(
+    f.service.acceptExternalInvite(ROOM_ID, {
+      role: 'reviewer', invite: secret, expected_cid: 'CD'.repeat(32),
+    }),
+    /CID did not match/,
+  );
+  assert.equal((await f.store.load(ROOM_ID)).seats.length, 0);
+
+  const pending = await f.service.acceptExternalInvite(ROOM_ID, { role: 'reviewer', invite: secret });
+  const originalParticipant = pending.participant_id;
+  packet.contacts = [{ name: 'External inviter', container_id: 'EF'.repeat(32) }];
+  let room = await f.service.reconcileRoom(ROOM_ID);
+  assert.equal(room.seats[0].state, 'pending', 'same display name on another CID is not authority');
+  assert.equal(room.membership_epoch, 0);
+
+  packet.contacts.push({ name: 'Renamed after authentication', container_id: 'AB'.repeat(32) });
+  room = await f.service.reconcileRoom(ROOM_ID);
+  assert.equal(room.seats.length, 1);
+  assert.equal(room.seats[0].participant_id, originalParticipant);
+  assert.equal(room.seats[0].state, 'active');
+  assert.equal(room.seats[0].display_name, 'Renamed after authentication');
+  assert.equal(room.seats[0].role, 'reviewer');
+  assert.equal(room.membership_epoch, 1);
+  assert.equal(room.state, 'active');
+  const briefings = f.store.records.get(ROOM_ID).filter((record) => record.kind === 'message');
+  assert.deepEqual(briefings.map((record) => record.category), ['briefing', 'role_briefing']);
+  assert(briefings.every((record) => record.recipient_identities[0] === 'AB'.repeat(32)));
 });
 
 test('create normalizes friendly names, allows duplicates, and freezes the initial announced identity', async () => {

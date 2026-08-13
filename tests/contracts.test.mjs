@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import {
   AppendRecordSchema,
+  AcceptExternalInviteInputSchema,
   CommunicationRecordSchema,
   CreateRoomInputSchema,
   FileMimeSchema,
@@ -262,6 +263,23 @@ test('operator request schemas strictly reject caller-supplied authorship', () =
     assert.throws(() => CreateRoomInputSchema.parse({ ...create, [authorField]: 'forged' }));
     assert.throws(() => PostMessageInputSchema.parse({ ...post, [authorField]: 'forged' }));
   }
+});
+
+test('pending external seats require digest/request metadata and never duplicate authority by CID', () => {
+  const pending = seatV2({
+    accepted_at: undefined,
+    requested_at: AT,
+    invite_sha256: 'a'.repeat(64),
+    state: 'pending',
+  });
+  assert.equal(RoomSchema.parse(roomV2({ seats: [pending] })).seats[0].state, 'pending');
+  assert.throws(() => RoomSchema.parse(roomV2({ seats: [{ ...pending, requested_at: undefined }] })));
+  assert.throws(() => RoomSchema.parse(roomV2({ seats: [{ ...pending, accepted_at: AT }] })));
+  assert.throws(() => RoomSchema.parse(roomV2({ seats: [pending, seatV2({ participant_id: PID_2 })] })), /one pending or active/i);
+  assert.deepEqual(AcceptExternalInviteInputSchema.parse({
+    role: 'reviewer', invite: 'abc', expected_cid: 'ab'.repeat(32),
+  }), { role: 'reviewer', invite: 'abc', expected_cid: 'AB'.repeat(32) });
+  assert.throws(() => AcceptExternalInviteInputSchema.parse({ role: 'reviewer', invite: 'abc', expected_cid: 'nope' }));
 });
 
 test('communication records form a strict discriminated version-1 union', () => {

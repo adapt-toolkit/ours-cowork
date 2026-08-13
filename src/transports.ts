@@ -102,6 +102,7 @@ export interface RoomServiceApi {
   setRoleBriefing(roomId: string, input: unknown): Promise<unknown>;
   deleteRoleBriefing(roomId: string, input: unknown): Promise<unknown>;
   createInvite(roomId: string, input: unknown): Promise<unknown>;
+  acceptExternalInvite(roomId: string, input: unknown): Promise<unknown>;
   revokeInvite(roomId: string, inviteId: string): Promise<unknown>;
   recoverInvites(roomId: string): Promise<unknown>;
   confirmRecoveredInvite(roomId: string, recoveryOf: string, inviteId: string): Promise<unknown>;
@@ -142,6 +143,13 @@ const ParticipantReplaceParams = z.object({
   notify: z.boolean().optional(),
   mode: z.enum(['one_time', 'public']).optional(),
   min_accepts: z.number().optional(),
+}).strict();
+const ExternalInviteAcceptParams = z.object({
+  room_id: z.string(),
+  role: z.string(),
+  invite: z.string(),
+  expected_cid: z.string().optional(),
+  replaces_seat: z.string().optional(),
 }).strict();
 
 export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRouteTable {
@@ -207,6 +215,16 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
     'room.delete': { auth: true, run: (params) => {
       const { room_id, ...input } = z.object({ room_id: z.string(), confirm: z.unknown() }).strict().parse(params);
       return service.deleteRoom(room_id, input);
+    } },
+  } satisfies AuthenticatedRouteTable;
+}
+
+/** Secret-bearing mutation routes are deliberately available only to the Unix dispatcher. */
+export function createPrivateServiceRoutes(service: RoomServiceApi): AuthenticatedRouteTable {
+  return {
+    'room.accept': { auth: true, run: (params) => {
+      const { room_id, ...input } = ExternalInviteAcceptParams.parse(params);
+      return service.acceptExternalInvite(room_id, input);
     } },
   } satisfies AuthenticatedRouteTable;
 }

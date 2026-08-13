@@ -12,6 +12,7 @@ import {
   AdaptHost,
   AdaptObjectLifetime,
   Packet,
+  packInvite,
   unpackInvite,
   wireHandlers,
   withScope,
@@ -31,6 +32,13 @@ const DRIVER_SENTINEL = 'COWORK_PACKETS_DRIVER_SUCCESS';
 const DRIVER_FAILURE_SENTINEL = 'COWORK_PACKETS_DRIVER_FAILURE';
 const DRIVER_PROGRESS_SENTINEL = 'COWORK_PACKETS_DRIVER_PROGRESS';
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+
+test('invite decoding rejects invalid armor and decompression beyond its exact bound', () => {
+  assert.throws(() => unpackInvite('not+base64url', 48 * 1024), /invalid base64url/i);
+  const bomb = packInvite(Buffer.alloc((48 * 1024) + 1, 0x61));
+  assert.throws(() => unpackInvite(bomb, 48 * 1024));
+  assert.equal(unpackInvite(packInvite(Buffer.alloc(48 * 1024)), 48 * 1024).length, 48 * 1024);
+});
 
 async function unusedPort() {
   const server = createServer();
@@ -403,6 +411,27 @@ async function runPacketDriver() {
     wireHandlers(peer, { onSaveState: () => {}, onNotify: () => {} }, () => {});
     await withScopeAsync((lifetime) =>
       peer.mutatingTx('::a2a_messaging::set_my_name', { name: 'Peer' }, lifetime));
+    const reverseInvite = await withScopeAsync(async (lifetime) => {
+      const result = await peer.mutatingTx(
+        '::a2a_messaging::generate_invite', { mode: 'one_time' }, lifetime,
+      );
+      return {
+        blob: packInvite(Buffer.from(result.Reduce('invite').GetBinary())),
+        invite_id: result.Reduce('invite_id').Visualize(),
+      };
+    });
+    const reverseReceipt = await beta.addContact(reverseInvite.blob);
+    assert.deepEqual(Object.keys(reverseReceipt).sort(), [
+      'container_id', 'invite_id', 'inviter_name', 'pending_name',
+    ]);
+    assert.equal(reverseReceipt.invite_id, reverseInvite.invite_id);
+    assert.equal(reverseReceipt.container_id, peer.cid);
+    assert.equal(reverseReceipt.inviter_name, 'Peer');
+    await waitFor(
+      () => beta.listContacts().some((contact) => contact.container_id === peer.cid),
+      'reverse-admission completion by beta room',
+    );
+    progress('reverse-peer-connected');
     const invite = await gamma.mintInvite('public');
     await withScopeAsync(async (lifetime) => {
       await peer.mutatingTx('::a2a_messaging::add_contact', {

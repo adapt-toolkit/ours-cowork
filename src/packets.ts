@@ -7,11 +7,12 @@ import {
   AdaptHost,
   Packet,
   packInvite,
+  unpackInvite,
   wireHandlers,
   withScope,
   withScopeAsync,
 } from './adapt.ts';
-import { FileMimeSchema, FileNameSchema, MAX_FILE_BYTES } from './contracts.ts';
+import { FileMimeSchema, FileNameSchema, MAX_EXTERNAL_INVITE_BYTES, MAX_FILE_BYTES } from './contracts.ts';
 
 export type InviteMode = 'one_time' | 'public';
 export type RelayStatus = 'queued' | 'send_failed';
@@ -40,6 +41,12 @@ export interface RoomPacket {
   readonly name: string;
   readonly cid: string;
   mintInvite(mode: InviteMode): Promise<{ blob: string; invite_id: string; reusable: boolean }>;
+  addContact(invite: string): Promise<{
+    invite_id: string;
+    container_id: string;
+    inviter_name: string;
+    pending_name: string;
+  }>;
   revokeInvite(inviteId: string): Promise<{ revoked: boolean }>;
   listInvites(): Array<{ invite_id: string; mode: InviteMode }>;
   listContacts(): Array<{ name: string; container_id: string }>;
@@ -581,6 +588,31 @@ export class HostedRoomPacket implements RoomPacket {
         blob: packInvite(Buffer.from(result.Reduce('invite').GetBinary())),
         invite_id: result.Reduce('invite_id').Visualize(),
         reusable: booleanValue(result.Reduce('reusable')),
+      };
+    });
+  }
+
+  async addContact(invite: string): Promise<{
+    invite_id: string;
+    container_id: string;
+    inviter_name: string;
+    pending_name: string;
+  }> {
+    let decoded: Buffer;
+    try {
+      decoded = unpackInvite(invite, MAX_EXTERNAL_INVITE_BYTES);
+    } catch (error) {
+      throw new Error('external invite could not be decoded within the 48 KiB limit', { cause: error });
+    }
+    return withScopeAsync(async (lifetime) => {
+      const result = await this.packet.mutatingTx('::a2a_messaging::add_contact', {
+        invite: this.packet.newBinary(decoded, lifetime),
+      }, lifetime);
+      return {
+        invite_id: result.Reduce('invite_id').Visualize(),
+        container_id: result.Reduce('container_id').Visualize(),
+        inviter_name: result.Reduce('inviter_name').Visualize(),
+        pending_name: result.Reduce('pending').Visualize(),
       };
     });
   }

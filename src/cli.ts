@@ -9,7 +9,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { ensureRuntimeState, loadConfig, type CoworkConfig } from './config.ts';
-import { MAX_MANAGEMENT_RESPONSE_BYTES } from './contracts.ts';
+import { MAX_EXTERNAL_INVITE_BYTES, MAX_MANAGEMENT_RESPONSE_BYTES } from './contracts.ts';
 
 const EXIT = {
   success: 0,
@@ -74,6 +74,7 @@ class RpcTransportError extends CliError {
 const NATIVE_MUTATION_METHODS = new Set([
   'room.create',
   'room.invite',
+  'room.accept',
   'room.revoke',
   'room.message',
   'room.close',
@@ -122,6 +123,7 @@ Room commands:
   settings <room-id> [--name <display-name>] [--goal <text>] [--briefing <text>] [--status <text>] [--quiet-membership true|false]
   role-briefing <room-id> --role <label> (--text <text> | --delete)
   invite <room-id> [--role <label>] [--mode one_time|public] [--min-accepts <n>]
+  accept <room-id> --role <label> (--invite-file <path> | --invite-stdin) [--expected-cid <64-hex>] [--replaces <participant-id>]
   revoke <room-id> <invite-id>
   remove <room-id> <participant> [--silent]
   replace <room-id> <participant> [--mode one_time|public] [--min-accepts <n>] [--silent]
@@ -219,7 +221,7 @@ function loadCliConfig(): CoworkConfig {
   }
 }
 
-function roomRequest(command: string | undefined, args: string[]): { method: string; params: Record<string, unknown> } {
+async function roomRequest(command: string | undefined, args: string[]): Promise<{ method: string; params: Record<string, unknown> }> {
   if (!command) usageError('room requires a command');
   switch (command) {
     case 'create': {
@@ -277,6 +279,33 @@ function roomRequest(command: string | undefined, args: string[]): { method: str
         // Omitted role = the built-in "Participant" role (daemon-side default).
         ...(parsed.values['--role'] === undefined ? {} : { role: parsed.values['--role'] }),
         min_accepts: minimum,
+      } };
+    }
+    case 'accept': {
+      const parsed = parseOptions(
+        args,
+        ['--role', '--invite-file', '--expected-cid', '--replaces'],
+        ['--invite-stdin'],
+      );
+      const [roomId] = exactPositionals(parsed, 1, 'room accept');
+      const inviteFile = parsed.values['--invite-file'];
+      const inviteStdin = parsed.booleans.has('--invite-stdin');
+      if ((inviteFile === undefined ? 0 : 1) + (inviteStdin ? 1 : 0) !== 1) {
+        usageError('room accept requires exactly one of --invite-file or --invite-stdin');
+      }
+      const invite = inviteFile === undefined
+        ? await readBoundedStdin()
+        : readSecureInviteFile(inviteFile);
+      return { method: 'room.accept', params: {
+        room_id: roomId,
+        role: requiredFlag(parsed, '--role', 'room accept'),
+        invite,
+        ...(parsed.values['--expected-cid'] === undefined
+          ? {}
+          : { expected_cid: parsed.values['--expected-cid'] }),
+        ...(parsed.values['--replaces'] === undefined
+          ? {}
+          : { replaces_seat: parsed.values['--replaces'] }),
       } };
     }
     case 'remove': {
@@ -362,6 +391,74 @@ function roomRequest(command: string | undefined, args: string[]): { method: str
     default:
       usageError(`unknown room command: ${command}`);
   }
+}
+
+function readSecureInviteFile(path: string): string {
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  let fd: number | undefined;
+  try {
+    const observed = fs.lstatSync(path);
+    if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink !== 1
+      || (observed.mode & 0o777) !== 0o600
+      || (typeof process.getuid === 'function' && observed.uid !== process.getuid())) {
+      throw new Error('invite file must be an owned 0600 single-link regular file');
+    }
+    if (observed.size > MAX_EXTERNAL_INVITE_BYTES) throw new Error('invite input exceeds 48 KiB');
+    fd = fs.openSync(path, fs.constants.O_RDONLY | noFollow);
+    const opened = fs.fstatSync(fd);
+    const current = fs.lstatSync(path);
+    if (!opened.isFile() || opened.nlink !== 1 || (opened.mode & 0o777) !== 0o600
+      || (typeof process.getuid === 'function' && opened.uid !== process.getuid())
+      || current.isSymbolicLink() || current.dev !== opened.dev || current.ino !== opened.ino) {
+      throw new Error('invite file changed while opening');
+    }
+    const bytes = fs.readFileSync(fd);
+    if (bytes.length > MAX_EXTERNAL_INVITE_BYTES) throw new Error('invite input exceeds 48 KiB');
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch (error) {
+    throw new CliError(EXIT.invalidState, 'invalid_params',
+      error instanceof Error && /48 KiB/.test(error.message)
+        ? 'invite input exceeds 48 KiB'
+        : 'invite file is unavailable or insecure');
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function readBoundedStdin(): Promise<string> {
+  return new Promise((resolveInput, rejectInput) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    const fail = (): void => {
+      cleanup();
+      process.stdin.pause();
+      rejectInput(new CliError(EXIT.invalidState, 'invalid_params', 'invite input exceeds 48 KiB'));
+    };
+    const cleanup = (): void => {
+      process.stdin.off('data', onData);
+      process.stdin.off('end', onEnd);
+      process.stdin.off('error', onError);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += bytes.length;
+      if (size > MAX_EXTERNAL_INVITE_BYTES) { fail(); return; }
+      chunks.push(bytes);
+    };
+    const onEnd = (): void => {
+      cleanup();
+      try { resolveInput(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))); }
+      catch { rejectInput(new CliError(EXIT.invalidState, 'invalid_params', 'invite input is not valid UTF-8')); }
+    };
+    const onError = (): void => {
+      cleanup();
+      rejectInput(new CliError(EXIT.invalidState, 'invalid_params', 'could not read invite input'));
+    };
+    process.stdin.on('data', onData);
+    process.stdin.once('end', onEnd);
+    process.stdin.once('error', onError);
+    process.stdin.resume();
+  });
 }
 
 export function rpcCall(
@@ -895,7 +992,7 @@ async function execute(args: string[], output: Output): Promise<void> {
     return;
   }
   if (command === 'room') {
-    const request = roomRequest(args[1], args.slice(2));
+    const request = await roomRequest(args[1], args.slice(2));
     const config = loadCliConfig();
     const socketPath = join(config.stateDir, 'management.sock');
     const result = request.method === 'room.history'

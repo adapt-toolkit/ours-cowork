@@ -22,6 +22,7 @@ test('room intake wakes for messages, files, and contact admission only', () => 
   assert.equal(isIntakeNotification('message_received'), true);
   assert.equal(isIntakeNotification('file_received'), true);
   assert.equal(isIntakeNotification('contact_accepted'), true);
+  assert.equal(isIntakeNotification('contact_added'), true);
   assert.equal(isIntakeNotification('notification_registered'), false);
 });
 

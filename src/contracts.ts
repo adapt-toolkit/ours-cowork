@@ -11,6 +11,7 @@ export const MAX_FILE_BYTES = 2 * 1024 * 1024;
  */
 export const MAX_HISTORY_PAGE_BYTES = 3 * 1024 * 1024;
 export const MAX_MANAGEMENT_RESPONSE_BYTES = MAX_HISTORY_PAGE_BYTES + (1024 * 1024);
+export const MAX_EXTERNAL_INVITE_BYTES = 48 * 1024;
 const MAX_FILE_NAME_BYTES = 255;
 const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;
@@ -97,7 +98,7 @@ export const FileMimeSchema = z.string().refine(
 );
 
 export const RoomStateSchema = z.enum(['provisioning', 'active', 'closing', 'closed']);
-export const SeatStateSchema = z.enum(['active', 'removed']);
+export const SeatStateSchema = z.enum(['pending', 'active', 'removed']);
 export const InviteModeSchema = z.enum(['one_time', 'public']);
 
 /** Built-in role assigned when an invite omits one (owner amendment to spec OC table). */
@@ -124,7 +125,9 @@ export const SeatSchema = z.object({
   display_name: NonEmptyStringSchema,
   role: RoleSchema,
   invite_id: NonEmptyStringSchema,
-  accepted_at: Rfc3339Schema,
+  accepted_at: Rfc3339Schema.optional(),
+  requested_at: Rfc3339Schema.optional(),
+  invite_sha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   participant_id: LowerCrockfordUlidSchema,
   state: SeatStateSchema,
   alias: NonEmptyStringSchema.optional(),
@@ -133,7 +136,21 @@ export const SeatSchema = z.object({
   replaces_seat: LowerCrockfordUlidSchema.optional(),
   bounced_at: Rfc3339Schema.optional(),
 }).strict().superRefine((seat, context) => {
-  if (seat.state === 'removed') {
+  if (seat.state === 'pending') {
+    for (const field of ['requested_at', 'invite_sha256'] as const) {
+      if (seat[field] === undefined) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: [field], message: `pending seats require ${field}` });
+      }
+    }
+    for (const field of ['accepted_at', 'removed_at', 'removed_epoch', 'bounced_at'] as const) {
+      if (seat[field] !== undefined) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: [field], message: `${field} is forbidden on pending seats` });
+      }
+    }
+  } else if (seat.state === 'removed') {
+    if (seat.accepted_at === undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['accepted_at'], message: 'removed seats require accepted_at' });
+    }
     if (seat.removed_at === undefined) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -149,6 +166,9 @@ export const SeatSchema = z.object({
       });
     }
   } else {
+    if (seat.accepted_at === undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['accepted_at'], message: 'active seats require accepted_at' });
+    }
     for (const field of ['removed_at', 'removed_epoch', 'bounced_at'] as const) {
       if (seat[field] !== undefined) {
         context.addIssue({
@@ -158,6 +178,13 @@ export const SeatSchema = z.object({
         });
       }
     }
+  }
+  if ((seat.requested_at === undefined) !== (seat.invite_sha256 === undefined)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['invite_sha256'],
+      message: 'external admission metadata requires both requested_at and invite_sha256',
+    });
   }
 });
 
@@ -359,6 +386,7 @@ const CurrentRoomSchema = z.object({
   refineRoomLineage(room, context);
   const byParticipant = new Map<string, z.infer<typeof SeatSchema>>();
   const activeAliases = new Set<string>();
+  const authorizedCids = new Set<string>();
   for (const [index, seat] of room.seats.entries()) {
     if (byParticipant.has(seat.participant_id)) {
       context.addIssue({
@@ -368,6 +396,16 @@ const CurrentRoomSchema = z.object({
       });
     }
     byParticipant.set(seat.participant_id, seat);
+    if (seat.state === 'pending' || seat.state === 'active') {
+      if (authorizedCids.has(seat.identity)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['seats', index, 'identity'],
+          message: 'at most one pending or active seat may exist per CID',
+        });
+      }
+      authorizedCids.add(seat.identity);
+    }
     if (room.anonymous && seat.alias === undefined) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -495,6 +533,19 @@ export const RoleBriefingDeleteInputSchema = z.object({
 /** Caller-controlled operator message fields. The service assigns room authorship. */
 export const PostMessageInputSchema = z.object({
   text: MessageTextSchema,
+}).strict();
+
+export const ContainerIdSchema = z.string().regex(/^[0-9a-f]{64}$/i, 'must be a 64-character hexadecimal CID')
+  .transform((value) => value.toUpperCase());
+
+export const AcceptExternalInviteInputSchema = z.object({
+  role: RoleSchema,
+  invite: z.string().refine(
+    (value) => Buffer.byteLength(value, 'utf8') <= MAX_EXTERNAL_INVITE_BYTES,
+    `invite input must be at most ${MAX_EXTERNAL_INVITE_BYTES} UTF-8 bytes`,
+  ),
+  expected_cid: ContainerIdSchema.optional(),
+  replaces_seat: LowerCrockfordUlidSchema.optional(),
 }).strict();
 
 export const AuthorSnapshotSchema = z.object({

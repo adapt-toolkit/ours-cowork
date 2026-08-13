@@ -1,11 +1,16 @@
+import { createHash } from 'node:crypto';
+
 import { z } from 'zod';
 
 import {
+  AcceptExternalInviteInputSchema,
+  ContainerIdSchema,
   CreateRoomInputSchema,
   DEFAULT_ROLE,
   defaultRoomName,
   InviteModeSchema,
   LowerCrockfordUlidSchema,
+  MAX_EXTERNAL_INVITE_BYTES,
   MAX_HISTORY_PAGE_BYTES,
   PostMessageInputSchema,
   RoleBriefingDeleteInputSchema,
@@ -23,6 +28,7 @@ import {
   type RoomInvite,
   type Seat,
 } from './contracts.ts';
+import { unpackInvite } from './adapt.ts';
 import type { RoomPacket } from './packets.ts';
 import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
 import { IntakePump } from './intake.ts';
@@ -152,6 +158,20 @@ export interface RemovalReceipt {
 
 export interface ReplacementReceipt extends InviteReceipt {
   removal: RemovalReceipt;
+}
+
+export interface ExternalInviteReceipt {
+  room_id: string;
+  participant_id: string;
+  state: 'pending' | 'active';
+  role: string;
+  identity: string;
+  invite_id: string;
+  inviter_name: string;
+  pending_name: string;
+  requested_at: string;
+  accepted_at?: string;
+  replaces_seat?: string;
 }
 
 export class RoomServiceError extends Error {
@@ -384,6 +404,84 @@ export class RoomService {
         min_accepts: request.min_accepts,
       });
     });
+  }
+
+  /** Redeem an external invite without retaining its secret-bearing bytes. */
+  async acceptExternalInvite(roomId: string, input: unknown): Promise<ExternalInviteReceipt> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = AcceptExternalInviteInputSchema.parse(input);
+    let decoded: Buffer;
+    try {
+      decoded = unpackInvite(request.invite, MAX_EXTERNAL_INVITE_BYTES);
+    } catch {
+      throw new RoomServiceError('external invite is invalid or exceeds the 48 KiB decoded limit');
+    }
+    const digest = createHash('sha256').update(decoded).digest('hex');
+    const receipt = await this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'accept an external invite for');
+      const predecessor = request.replaces_seat === undefined
+        ? undefined
+        : room.seats.find((seat) => seat.participant_id === request.replaces_seat);
+      if (request.replaces_seat !== undefined
+        && (!predecessor || predecessor.state !== 'removed' || predecessor.role !== request.role)) {
+        throw new RoomServiceError('external replacement must reference a removed seat with the configured role');
+      }
+      if (predecessor && room.seats.some((seat) => seat.replaces_seat === predecessor.participant_id
+        && (seat.state === 'pending' || seat.state === 'active'))) {
+        throw new RoomServiceError('external replacement seat already has a pending or active successor');
+      }
+
+      let added: Awaited<ReturnType<RoomPacket['addContact']>>;
+      try {
+        added = await this.packet(id).addContact(request.invite);
+      } catch {
+        throw new RoomServiceError('external invite was rejected');
+      }
+      const cid = ContainerIdSchema.parse(added.container_id);
+      if (request.expected_cid !== undefined && cid !== request.expected_cid) {
+        throw new RoomServiceError('external invite inviter CID did not match --expected-cid');
+      }
+      if (room.seats.some((seat) => seat.identity === cid
+        && (seat.state === 'pending' || seat.state === 'active'))) {
+        throw new RoomServiceError('external inviter already has a pending or active seat in this room');
+      }
+      const requestedAt = this.now();
+      const participantId = LowerCrockfordUlidSchema.parse(generateUlid());
+      const seated = room.seats;
+      const pending = {
+        identity: cid,
+        display_name: added.inviter_name,
+        role: request.role,
+        invite_id: added.invite_id,
+        requested_at: requestedAt,
+        invite_sha256: digest,
+        participant_id: participantId,
+        state: 'pending' as const,
+        ...(predecessor === undefined ? {} : { replaces_seat: predecessor.participant_id }),
+        ...(room.anonymous
+          ? { alias: predecessor?.alias ?? mintAlias(seated, request.role) }
+          : {}),
+      };
+      await this.store.save(RoomSchema.parse({ ...room, seats: [...room.seats, pending] }));
+      const reconciled = await this.reconcileUnlocked(await this.store.load(id), this.packet(id));
+      const seat = reconciled.seats.find((candidate) => candidate.participant_id === participantId)!;
+      return {
+        room_id: id,
+        participant_id: participantId,
+        state: seat.state as 'pending' | 'active',
+        role: seat.role,
+        identity: seat.identity,
+        invite_id: seat.invite_id,
+        inviter_name: added.inviter_name,
+        pending_name: added.pending_name,
+        requested_at: requestedAt,
+        ...(seat.accepted_at === undefined ? {} : { accepted_at: seat.accepted_at }),
+        ...(seat.replaces_seat === undefined ? {} : { replaces_seat: seat.replaces_seat }),
+      };
+    });
+    await this.intake.resumePending(id);
+    return receipt;
   }
 
   private async mintInviteUnlocked(
@@ -949,7 +1047,7 @@ export class RoomService {
     const origins = packet.listContactOrigins();
     const inviteById = new Map(room.invites.map((invite) => [invite.invite_id, invite]));
     const existingCids = new Set(room.seats
-      .filter((seat) => seat.state === 'active')
+      .filter((seat) => seat.state === 'active' || seat.state === 'pending')
       .map((seat) => seat.identity));
     // A cid whose seats are all removed re-admits only through an invite
     // minted after its latest removal — a deliberate operator re-invite (§5.3).
@@ -961,6 +1059,20 @@ export class RoomService {
         lastRemovedAt.set(seat.identity, seat.removed_at);
       }
     }
+    const activatedPending: Seat[] = [];
+    const seatsWithActivations = room.seats.map((seat): Seat => {
+      if (seat.state !== 'pending') return seat;
+      const displayName = contactsByCid.get(seat.identity);
+      if (displayName === undefined) return seat;
+      const activated: Seat = {
+        ...seat,
+        state: 'active',
+        display_name: displayName,
+        accepted_at: this.now(),
+      };
+      activatedPending.push(activated);
+      return activated;
+    });
     const newSeats: Seat[] = [];
 
     for (const [cid, displayName] of contactsByCid) {
@@ -973,7 +1085,7 @@ export class RoomService {
         || (invite.recovery_of !== undefined && invite.recovery_confirmed !== true)) continue;
       const removedAt = lastRemovedAt.get(cid);
       if (removedAt !== undefined && invite.created_at <= removedAt) continue;
-      const seated = [...room.seats, ...newSeats];
+      const seated = [...seatsWithActivations, ...newSeats];
       const predecessor = invite.replaces_seat === undefined
         ? undefined
         : seated.find((seat) => seat.participant_id === invite.replaces_seat && seat.state === 'removed');
@@ -996,9 +1108,10 @@ export class RoomService {
       existingCids.add(cid);
     }
 
-    const seats = [...room.seats, ...newSeats];
+    const seats = [...seatsWithActivations, ...newSeats];
     const acceptedByInvite = new Map<string, string[]>();
     for (const seat of seats) {
+      if (seat.state === 'pending' || seat.invite_sha256 !== undefined) continue;
       const accepted = acceptedByInvite.get(seat.invite_id) ?? [];
       if (!accepted.includes(seat.identity)) accepted.push(seat.identity);
       acceptedByInvite.set(seat.invite_id, accepted);
@@ -1029,7 +1142,7 @@ export class RoomService {
       ...room,
       seats,
       invites,
-      membership_epoch: room.membership_epoch + newSeats.length,
+      membership_epoch: room.membership_epoch + activatedPending.length + newSeats.length,
     });
     // Re-drive any removal whose intent has no terminal result (INV-R5).
     const journal = await this.store.read(next.room_id);
@@ -1045,11 +1158,12 @@ export class RoomService {
     const requirementsMet = invites
       .filter((invite) => invite.state !== 'revoked')
       .every((invite) => invite.accepted_cids.length >= invite.min_accepts);
-    if (next.state === 'provisioning' && seats.length > 0 && requirementsMet) {
+    const admitted = [...activatedPending, ...newSeats];
+    if (next.state === 'provisioning' && activeSeats(next).length > 0 && requirementsMet) {
       const activationAt = await this.ensureActivationBriefing(next, activeSeats(next));
       next = RoomSchema.parse({ ...next, state: 'active', activated_at: activationAt });
-    } else if (next.state === 'active' && newSeats.length > 0) {
-      await this.ensureActivationBriefing(next, newSeats);
+    } else if (next.state === 'active' && admitted.length > 0) {
+      await this.ensureActivationBriefing(next, admitted);
     }
     return this.store.save(next);
   }

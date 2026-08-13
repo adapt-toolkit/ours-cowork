@@ -151,7 +151,7 @@ export interface RemovalReceipt {
   room_id: string;
   participant_id: string;
   epoch: number;
-  status: RelayStatus;
+  status: RelayStatus | 'cancelled_pending';
   notified: boolean;
   key_material_retained: true;
 }
@@ -420,6 +420,9 @@ export class RoomService {
     const receipt = await this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'accept an external invite for');
+      const contactsBeforeRedemption = new Set(
+        this.packet(id).listContacts().map((contact) => contact.container_id),
+      );
       const predecessor = request.replaces_seat === undefined
         ? undefined
         : room.seats.find((seat) => seat.participant_id === request.replaces_seat);
@@ -441,6 +444,9 @@ export class RoomService {
       const cid = ContainerIdSchema.parse(added.container_id);
       if (request.expected_cid !== undefined && cid !== request.expected_cid) {
         throw new RoomServiceError('external invite inviter CID did not match --expected-cid');
+      }
+      if (contactsBeforeRedemption.has(cid)) {
+        throw new RoomServiceError('external invite inviter is already a contact; redemption provenance is ambiguous');
       }
       if (room.seats.some((seat) => seat.identity === cid
         && (seat.state === 'pending' || seat.state === 'active'))) {
@@ -528,7 +534,7 @@ export class RoomService {
     const receipt = await this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'remove a participant from');
-      const seat = this.findActiveSeat(room, request.participant);
+      const seat = this.findRemovableSeat(room, request.participant);
       const notify = (request.notify ?? true) && !room.quiet_membership;
       return this.beginRemovalUnlocked(room, seat, notify);
     });
@@ -547,7 +553,7 @@ export class RoomService {
     const receipt = await this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'replace a participant in');
-      const seat = this.findActiveSeat(room, request.participant);
+      const seat = this.findRemovableSeat(room, request.participant);
       const notify = room.anonymous
         ? false
         : (request.notify ?? true) && !room.quiet_membership;
@@ -565,16 +571,36 @@ export class RoomService {
     return receipt;
   }
 
-  private findActiveSeat(room: Room, participant: string): Seat {
-    const seat = room.seats.find((candidate) => candidate.state === 'active'
+  private findRemovableSeat(room: Room, participant: string): Seat {
+    const seat = room.seats.find((candidate) => candidate.state !== 'removed'
       && (candidate.identity === participant || candidate.participant_id === participant));
     if (!seat) {
-      throw new RoomServiceError(`"${participant}" is not an active participant of room "${room.room_id}"`);
+      throw new RoomServiceError(`"${participant}" is not a pending or active participant of room "${room.room_id}"`);
     }
     return seat;
   }
 
   private async beginRemovalUnlocked(room: Room, seat: Seat, notify: boolean): Promise<RemovalReceipt> {
+    if (seat.state === 'pending') {
+      const removedAt = this.now();
+      const seats = room.seats.map((candidate): Seat => candidate.participant_id === seat.participant_id
+        ? {
+            ...candidate,
+            state: 'removed',
+            removed_at: removedAt,
+            removed_epoch: room.membership_epoch,
+          }
+        : candidate);
+      await this.store.save(RoomSchema.parse({ ...room, seats }));
+      return {
+        room_id: room.room_id,
+        participant_id: seat.participant_id,
+        epoch: room.membership_epoch,
+        status: 'cancelled_pending',
+        notified: false,
+        key_material_retained: true,
+      };
+    }
     const intent = await this.store.append(room.room_id, {
       version: 1,
       kind: 'membership_intent',
@@ -1063,12 +1089,41 @@ export class RoomService {
     const seatsWithActivations = room.seats.map((seat): Seat => {
       if (seat.state !== 'pending') return seat;
       const displayName = contactsByCid.get(seat.identity);
-      if (displayName === undefined) return seat;
+      const origin = origins[seat.identity];
+      if (displayName === undefined || origin === undefined) return seat;
+      const completedExternalRedemption = origin.via === 'invite_redeemed'
+        && origin.invite_id === seat.invite_id;
+      const fallbackInvite = (origin.via === 'invite_one_time' || origin.via === 'invite_public')
+        ? inviteById.get(origin.invite_id)
+        : undefined;
+      const confirmedFallback = fallbackInvite !== undefined
+        && fallbackInvite.state !== 'receipt_pending'
+        && (fallbackInvite.recovery_of === undefined || fallbackInvite.recovery_confirmed === true);
+      if (!completedExternalRedemption && !confirmedFallback) return seat;
+      const removedAt = lastRemovedAt.get(seat.identity);
+      if (fallbackInvite !== undefined && removedAt !== undefined && fallbackInvite.created_at <= removedAt) return seat;
+      const predecessor = fallbackInvite?.replaces_seat === undefined
+        ? undefined
+        : room.seats.find((candidate) =>
+          candidate.participant_id === fallbackInvite.replaces_seat && candidate.state === 'removed');
+      if (fallbackInvite?.replaces_seat !== undefined && predecessor === undefined) return seat;
+      const { alias: _alias, replaces_seat: _replacesSeat, ...base } = seat;
       const activated: Seat = {
-        ...seat,
+        ...base,
         state: 'active',
         display_name: displayName,
-        accepted_at: this.now(),
+        accepted_at: origin.at,
+        role: fallbackInvite?.role ?? seat.role,
+        invite_id: fallbackInvite?.invite_id ?? seat.invite_id,
+        ...(fallbackInvite === undefined
+          ? (_replacesSeat === undefined ? {} : { replaces_seat: _replacesSeat })
+          : (predecessor === undefined ? {} : { replaces_seat: predecessor.participant_id })),
+        ...(room.anonymous
+          ? { alias: fallbackInvite === undefined
+              ? _alias!
+              : predecessor?.alias
+                ?? (fallbackInvite.role === seat.role ? _alias! : mintAlias(room.seats, fallbackInvite.role)) }
+          : {}),
       };
       activatedPending.push(activated);
       return activated;
@@ -1111,7 +1166,7 @@ export class RoomService {
     const seats = [...seatsWithActivations, ...newSeats];
     const acceptedByInvite = new Map<string, string[]>();
     for (const seat of seats) {
-      if (seat.state === 'pending' || seat.invite_sha256 !== undefined) continue;
+      if (seat.state === 'pending' || !inviteById.has(seat.invite_id)) continue;
       const accepted = acceptedByInvite.get(seat.invite_id) ?? [];
       if (!accepted.includes(seat.identity)) accepted.push(seat.identity);
       acceptedByInvite.set(seat.invite_id, accepted);

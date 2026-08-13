@@ -136,6 +136,46 @@ describe('room DTO guards', () => {
     expect(isRoomListDto([daemonRoom])).toBe(true);
     expect(isParticipantListDto(daemonRoom.seats)).toBe(true);
     expect(isRoomDto({ ...daemonRoom, role_briefings: undefined })).toBe(false);
+
+    const externalPending = RoomSchema.parse({
+      ...daemonRoom,
+      state: 'provisioning',
+      activated_at: undefined,
+      membership_epoch: 0,
+      seats: [{
+        ...daemonRoom.seats[0]!,
+        state: 'pending',
+        accepted_at: undefined,
+        requested_at: AT,
+        invite_sha256: 'a'.repeat(64),
+      }],
+    });
+    expect(isRoomDto(externalPending)).toBe(true);
+    expect(isParticipantListDto(externalPending.seats)).toBe(true);
+
+    const externalActive = RoomSchema.parse({
+      ...daemonRoom,
+      membership_epoch: 1,
+      seats: [{
+        ...daemonRoom.seats[0]!,
+        requested_at: AT,
+        invite_sha256: 'a'.repeat(64),
+      }],
+    });
+    expect(isRoomDto(externalActive)).toBe(true);
+    expect(isRoomListDto([externalPending, externalActive])).toBe(true);
+
+    const externalCancelled = RoomSchema.parse({
+      ...externalPending,
+      seats: [{
+        ...externalPending.seats[0]!,
+        state: 'removed',
+        removed_at: AT,
+        removed_epoch: 0,
+      }],
+    });
+    expect(isRoomDto(externalCancelled)).toBe(true);
+    expect(isParticipantListDto(externalCancelled.seats)).toBe(true);
   });
 
   it('validates only browser-facing room, participant, and history shapes', () => {

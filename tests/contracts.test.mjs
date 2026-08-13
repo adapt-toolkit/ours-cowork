@@ -276,6 +276,11 @@ test('pending external seats require digest/request metadata and never duplicate
   assert.throws(() => RoomSchema.parse(roomV2({ seats: [{ ...pending, requested_at: undefined }] })));
   assert.throws(() => RoomSchema.parse(roomV2({ seats: [{ ...pending, accepted_at: AT }] })));
   assert.throws(() => RoomSchema.parse(roomV2({ seats: [pending, seatV2({ participant_id: PID_2 })] })), /one pending or active/i);
+  const cancelled = { ...pending, state: 'removed', removed_at: AT, removed_epoch: 0 };
+  assert.equal(RoomSchema.parse(roomV2({ seats: [cancelled] })).seats[0].accepted_at, undefined);
+  assert.throws(() => RoomSchema.parse(roomV2({ seats: [{
+    ...cancelled, requested_at: undefined, invite_sha256: undefined,
+  }] })), /accepted_at/i);
   assert.deepEqual(AcceptExternalInviteInputSchema.parse({
     role: 'reviewer', invite: 'abc', expected_cid: 'ab'.repeat(32),
   }), { role: 'reviewer', invite: 'abc', expected_cid: 'AB'.repeat(32) });

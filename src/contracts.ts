@@ -148,8 +148,12 @@ export const SeatSchema = z.object({
       }
     }
   } else if (seat.state === 'removed') {
-    if (seat.accepted_at === undefined) {
-      context.addIssue({ code: z.ZodIssueCode.custom, path: ['accepted_at'], message: 'removed seats require accepted_at' });
+    if (seat.accepted_at === undefined && seat.requested_at === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['accepted_at'],
+        message: 'removed seats require accepted_at unless they are cancelled external admissions',
+      });
     }
     if (seat.removed_at === undefined) {
       context.addIssue({

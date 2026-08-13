@@ -16,9 +16,11 @@ export interface ParticipantDto {
   display_name: string;
   role: string;
   invite_id: string;
-  accepted_at: string;
+  accepted_at?: string;
+  requested_at?: string;
+  invite_sha256?: string;
   participant_id?: string;
-  state?: 'active' | 'removed';
+  state?: 'pending' | 'active' | 'removed';
   alias?: string;
   removed_at?: string;
   removed_epoch?: number;
@@ -248,14 +250,19 @@ export function isRoomDto(value: unknown): value is RoomDto {
     || !isNonNegativeSafeInteger(value.membership_epoch))) return false;
 
   const inviteIds = new Set(value.invites.map((invite) => invite.invite_id));
-  if (inviteIds.size !== value.invites.length
-    || new Set(value.seats.map((seat) => seat.identity)).size !== value.seats.length) return false;
+  if (inviteIds.size !== value.invites.length) return false;
+  if (!v2 && new Set(value.seats.map((seat) => seat.identity)).size !== value.seats.length) return false;
 
   if (v2) {
     const seats = value.seats as ParticipantDto[];
     if (new Set(seats.map((seat) => seat.participant_id)).size !== seats.length) return false;
+    const authorizedCids = new Set<string>();
     const activeAliases = new Set<string>();
     for (const seat of seats) {
+      if (seat.state === 'pending' || seat.state === 'active') {
+        if (authorizedCids.has(seat.identity)) return false;
+        authorizedCids.add(seat.identity);
+      }
       if (value.anonymous ? seat.alias === undefined : seat.alias !== undefined) return false;
       if (seat.state === 'removed') {
         if (seat.removed_at === undefined || seat.removed_epoch === undefined
@@ -332,9 +339,14 @@ export function isRoomListDto(value: unknown): value is RoomDto[] {
 }
 
 export function isParticipantListDto(value: unknown): value is ParticipantDto[] {
-  return Array.isArray(value)
-    && value.every((participant) => isParticipant(participant))
-    && new Set(value.map((participant) => participant.identity)).size === value.length;
+  if (!Array.isArray(value) || !value.every((participant) => isParticipant(participant))) return false;
+  const v2Count = value.filter((participant) => participant.participant_id !== undefined).length;
+  if (v2Count !== 0 && v2Count !== value.length) return false;
+  const v2 = v2Count === value.length;
+  if (!v2) return new Set(value.map((participant) => participant.identity)).size === value.length;
+  if (new Set(value.map((participant) => participant.participant_id)).size !== value.length) return false;
+  const authorized = value.filter((participant) => participant.state === 'pending' || participant.state === 'active');
+  return new Set(authorized.map((participant) => participant.identity)).size === authorized.length;
 }
 
 export function isInviteReceiptDto(value: unknown): value is InviteReceiptDto {
@@ -526,22 +538,42 @@ function isParticipant(value: unknown, requireV2?: boolean): value is Participan
   if (!hasExactKeys(
     value,
     v2
-      ? ['identity', 'display_name', 'role', 'invite_id', 'accepted_at', 'participant_id', 'state']
+      ? ['identity', 'display_name', 'role', 'invite_id', 'participant_id', 'state']
       : ['identity', 'display_name', 'role', 'invite_id', 'accepted_at'],
-    v2 ? ['alias', 'removed_at', 'removed_epoch', 'replaces_seat', 'bounced_at'] : [],
+    v2 ? ['accepted_at', 'requested_at', 'invite_sha256', 'alias', 'removed_at', 'removed_epoch', 'replaces_seat', 'bounced_at'] : [],
   )) return false;
-  return isString(value.identity)
-    && isString(value.display_name)
-    && isUtf8Bounded(value.role, MAX_ROLE_BYTES)
-    && isString(value.invite_id)
-    && isStrictRfc3339(value.accepted_at)
-    && (!v2 || (isLowerCrockfordUlid(value.participant_id)
-      && (value.state === 'active' || value.state === 'removed')
+  if (!isString(value.identity)
+    || !isString(value.display_name)
+    || !isUtf8Bounded(value.role, MAX_ROLE_BYTES)
+    || !isString(value.invite_id)) return false;
+  if (!v2) return isStrictRfc3339(value.accepted_at);
+  if (!(isLowerCrockfordUlid(value.participant_id)
+      && (value.state === 'pending' || value.state === 'active' || value.state === 'removed')
+      && optionalStrictRfc3339(value.accepted_at)
+      && optionalStrictRfc3339(value.requested_at)
+      && (value.invite_sha256 === undefined || (typeof value.invite_sha256 === 'string' && /^[0-9a-f]{64}$/.test(value.invite_sha256)))
       && optionalString(value.alias)
       && optionalStrictRfc3339(value.removed_at)
       && (value.removed_epoch === undefined || isNonNegativeSafeInteger(value.removed_epoch))
       && (value.replaces_seat === undefined || isLowerCrockfordUlid(value.replaces_seat))
-      && optionalStrictRfc3339(value.bounced_at)));
+      && optionalStrictRfc3339(value.bounced_at))) return false;
+  if ((value.requested_at === undefined) !== (value.invite_sha256 === undefined)) return false;
+  if (value.state === 'pending') {
+    return value.requested_at !== undefined
+      && value.accepted_at === undefined
+      && value.removed_at === undefined
+      && value.removed_epoch === undefined
+      && value.bounced_at === undefined;
+  }
+  if (value.state === 'active') {
+    return value.accepted_at !== undefined
+      && value.removed_at === undefined
+      && value.removed_epoch === undefined
+      && value.bounced_at === undefined;
+  }
+  return value.removed_at !== undefined
+    && value.removed_epoch !== undefined
+    && (value.accepted_at !== undefined || value.requested_at !== undefined);
 }
 
 function isRoleBriefingMap(value: unknown): value is Record<string, RoleBriefingDto> {

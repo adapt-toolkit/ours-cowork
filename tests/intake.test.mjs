@@ -72,13 +72,11 @@ class FakePacket {
   fileInbox = [];
   sendCalls = [];
   sendFileCalls = [];
-  signCalls = [];
   consumeCalls = [];
   consumeFileCalls = [];
   nextSend = { status: 'queued', wire_id: 'wire-out' };
   beforeConsume;
   afterConsume;
-  beforeSign;
   beforeSend;
   beforeConsumeFile;
   afterConsumeFile;
@@ -111,12 +109,6 @@ class FakePacket {
     return { consumed, deferred };
   }
 
-  async sign(body) {
-    this.signCalls.push(body);
-    if (this.beforeSign) await this.beforeSign(body);
-    return 'stable-signature';
-  }
-
   async send(recipient, body) {
     this.sendCalls.push({ recipient, body });
     if (this.beforeSend) await this.beforeSend(recipient, body);
@@ -133,7 +125,6 @@ class FakePacket {
   revokeInvite() { throw new Error('not used'); }
   listInvites() { return []; }
   listContacts() { return []; }
-  listContactOrigins() { return {}; }
   removeContact() { throw new Error('not used'); }
 }
 
@@ -176,6 +167,7 @@ function incoming(overrides = {}) {
     text: 'Participant update',
     date: '2026-08-02T10:12:00.000Z',
     wire_id: 'wire-in-7',
+    reply_to: null,
     ...overrides,
   };
 }
@@ -190,6 +182,7 @@ function incomingFile(overrides = {}) {
     data: Buffer.from([0, 1, 2, 255]),
     date: '2026-08-02T10:12:30.000Z',
     wire_id: 'wire-file-in-9',
+    reply_to: null,
     ...overrides,
   };
 }
@@ -216,6 +209,20 @@ function fixture(options = {}) {
 function byKind(records, kind) { return records.filter((record) => record.kind === kind); }
 
 // ---- Durable file broadcast -------------------------------------------------
+
+test('intake preserves standard SDK reply references on archived messages and files', async () => {
+  const f = fixture();
+  f.packet.inbox.push(incoming({ reply_to: { wire_id: 'wire-parent-message', sentence: 2 } }));
+  f.packet.fileInbox.push(incomingFile({ reply_to: { wire_id: 'wire-parent-file' } }));
+
+  await f.pump.pump(ROOM_ID);
+
+  const records = await f.store.read(ROOM_ID);
+  assert.deepEqual(byKind(records, 'message')[0].source_reply_to, {
+    wire_id: 'wire-parent-message', sentence: 2,
+  });
+  assert.deepEqual(byKind(records, 'file')[0].source_reply_to, { wire_id: 'wire-parent-file' });
+});
 
 test('restart intake drains legacy invalid file metadata without archiving it or blocking later files', async () => {
   const f = fixture();
@@ -357,10 +364,10 @@ test('anonymous file metadata uses only the alias author and never leaks real se
   const [file] = byKind(await f.store.read(ROOM_ID), 'file');
   assert.equal(file.author.identity, 'cid-alice');
   assert.equal(file.author_alias.alias, 'builder #1');
-  for (const call of [...f.packet.sendCalls.map((send) => send.body), ...f.packet.signCalls]) {
+  for (const call of f.packet.sendCalls.map((send) => send.body)) {
     const bytes = Buffer.from(call, 'utf8');
     for (const leak of ['cid-alice', 'Alice', 'cid-bob', 'cid-cara', 'Untrusted current name']) {
-      assert.equal(bytes.includes(leak), false, `${leak} leaked into signed file metadata`);
+      assert.equal(bytes.includes(leak), false, `${leak} leaked into file metadata`);
     }
   }
   assert.deepEqual(JSON.parse(f.packet.sendCalls[0].body).author, {
@@ -396,8 +403,8 @@ test('canonical JSON recursively sorts keys and participant fan-out excludes its
     { status: 'queued', wire_id: 'wire-out' },
   ]);
 
-  const unsigned = JSON.parse(f.packet.signCalls[0]);
-  assert.deepEqual(unsigned, {
+  const envelope = JSON.parse(f.packet.sendCalls[0].body);
+  assert.deepEqual(envelope, {
     at: incoming().date,
     author: message.author,
     kind: 'room_msg',
@@ -406,10 +413,10 @@ test('canonical JSON recursively sorts keys and participant fan-out excludes its
     text: incoming().text,
     version: 1,
   });
-  assert.equal('signature' in unsigned, false);
-  assert.equal('recipient_identities' in unsigned, false);
+  assert.equal('signature' in envelope, false);
+  assert.equal('recipient_identities' in envelope, false);
   assert.deepEqual(Object.keys(JSON.parse(f.packet.sendCalls[0].body)).sort(),
-    ['at', 'author', 'kind', 'message_id', 'room_id', 'signature', 'text', 'version']);
+    ['at', 'author', 'kind', 'message_id', 'room_id', 'text', 'version']);
 });
 
 test('crash before message append leaves the input unread and creates no archive records', async () => {
@@ -514,7 +521,7 @@ test('crash after transport acceptance and before result fsync resends one stabl
   f.store.beforeAppend = undefined;
   await f.pump.resumePending(ROOM_ID);
   assert.equal(f.packet.sendCalls.length, 2, 'the result-less durable intent is deliberately retried');
-  assert.equal(f.packet.sendCalls[0].body, f.packet.sendCalls[1].body, 'retry keeps exact signed envelope stable');
+  assert.equal(f.packet.sendCalls[0].body, f.packet.sendCalls[1].body, 'retry keeps the canonical envelope byte-stable');
   assert.equal(JSON.parse(f.packet.sendCalls[0].body).message_id, MESSAGE_IDS[0]);
   const results = byKind(await f.store.read(ROOM_ID), 'relay_result');
   assert.equal(results.length, 1, 'one eventual terminal result belongs to the durable intent');
@@ -525,21 +532,10 @@ test('crash after transport acceptance and before result fsync resends one stabl
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 1);
 });
 
-test('sign and thrown send failures leave intents result-less and create no ghost results', async () => {
+test('thrown send failures leave intents result-less and create no ghost results', async () => {
   const f = fixture();
   f.store.rooms.set(ROOM_ID, room({ seats: room().seats.slice(0, 2) }));
   f.packet.inbox.push(incoming());
-  let failSign = true;
-  f.packet.beforeSign = () => {
-    if (failSign) {
-      failSign = false;
-      throw new Error('sign unavailable');
-    }
-  };
-  await assert.rejects(f.pump.pump(ROOM_ID), /sign unavailable/);
-  assert.equal(f.packet.sendCalls.length, 0);
-  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 0);
-
   let failSend = true;
   f.packet.beforeSend = () => {
     if (failSend) {
@@ -547,7 +543,7 @@ test('sign and thrown send failures leave intents result-less and create no ghos
       throw new Error('send outcome unknown');
     }
   };
-  await assert.rejects(f.pump.resumePending(ROOM_ID), /send outcome unknown/);
+  await assert.rejects(f.pump.pump(ROOM_ID), /send outcome unknown/);
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 0);
 
   await f.pump.resumePending(ROOM_ID);
@@ -565,14 +561,13 @@ test('an observed transport refusal appends a terminal send_failed result withou
   assert.equal('wire_id' in result, false);
 });
 
-test('non-seat and non-active messages are consumed but never archived, signed, or relayed', async () => {
+test('non-seat and non-active messages are consumed but never archived or relayed', async () => {
   for (const roomOverride of [{}, { state: 'provisioning', activated_at: undefined }]) {
     const f = fixture({ room: roomOverride });
     f.packet.inbox.push(incoming(roomOverride.state ? {} : { sender_id: 'cid-outsider' }));
     await f.pump.pump(ROOM_ID);
     assert.equal(f.packet.inbox.length, 0);
     assert.deepEqual(await f.store.read(ROOM_ID), []);
-    assert.equal(f.packet.signCalls.length, 0);
     assert.equal(f.packet.sendCalls.length, 0);
   }
 });
@@ -614,7 +609,7 @@ test('concurrent notify and pump calls serialize one archive message, intent, se
   assert.equal(byKind(records, 'relay_result').length, 1);
 });
 
-test('resumePending reconciles Task 5 briefing intents into signed room_briefing envelopes', async () => {
+test('resumePending reconciles Task 5 briefing intents into canonical room_briefing envelopes', async () => {
   const briefingId = MESSAGE_IDS[2];
   const f = fixture({
     records: [
@@ -631,9 +626,9 @@ test('resumePending reconciles Task 5 briefing intents into signed room_briefing
     ],
   });
   await f.pump.resumePending(ROOM_ID);
-  const unsigned = JSON.parse(f.packet.signCalls[0]);
-  assert.equal(unsigned.kind, 'room_briefing');
-  assert.equal(unsigned.message_id, briefingId);
+  const envelope = JSON.parse(f.packet.sendCalls[0].body);
+  assert.equal(envelope.kind, 'room_briefing');
+  assert.equal(envelope.message_id, briefingId);
   assert.equal(f.packet.sendCalls[0].recipient, 'cid-alice');
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 1);
 });
@@ -799,7 +794,7 @@ function anonymousRoom(overrides = {}) {
   };
 }
 
-test('anonymous rooms relay alias authors with zero real identity bytes in signed bodies (release-blocking pin)', async () => {
+test('anonymous rooms relay alias authors with zero real identity bytes in bodies (release-blocking pin)', async () => {
   const f = fixture({ room: anonymousRoom() });
   f.packet.inbox.push(incoming());
 
@@ -823,9 +818,9 @@ test('anonymous rooms relay alias authors with zero real identity bytes in signe
     alias: 'builder #1',
   });
 
-  // the relayed signed body carries only the room-scoped pseudonym
+  // the relayed body carries only the room-scoped pseudonym
   assert.equal(f.packet.sendCalls.length, 2);
-  for (const call of [...f.packet.sendCalls.map((send) => send.body), ...f.packet.signCalls]) {
+  for (const call of f.packet.sendCalls.map((send) => send.body)) {
     const bytes = Buffer.from(call, 'utf8');
     assert.equal(bytes.includes('cid-alice'), false, 'no author cid bytes in a relayed body');
     assert.equal(bytes.includes('Alice'), false, 'no author display-name bytes in a relayed body');
@@ -922,7 +917,7 @@ function roomWithRemovedAlice(overrides = {}) {
   };
 }
 
-test('a removed member gets exactly one content-free signed bounce and no archive residue', async () => {
+test('a removed member gets exactly one content-free bounce and no archive residue', async () => {
   const f = fixture({ room: roomWithRemovedAlice() });
   f.packet.inbox.push(incoming());
   await f.pump.pump(ROOM_ID);
@@ -937,7 +932,7 @@ test('a removed member gets exactly one content-free signed bounce and no archiv
   const bounce = JSON.parse(f.packet.sendCalls[0].body);
   assert.equal(bounce.kind, 'room_not_member');
   assert.equal(bounce.room_id, ROOM_ID);
-  assert.deepEqual(Object.keys(bounce).sort(), ['kind', 'room_id', 'signature', 'version']);
+  assert.deepEqual(Object.keys(bounce).sort(), ['kind', 'room_id', 'version']);
   for (const leak of ['cid-bob', 'cid-cara', 'Bob', 'Cara', 'builder #1', 'Alice']) {
     assert.equal(Buffer.from(f.packet.sendCalls[0].body, 'utf8').includes(leak), false, `${leak} leaked into the bounce`);
   }
@@ -982,7 +977,7 @@ test('relay intents addressed to a removed seat resolve as skipped_removed and a
 
 // ---- The outbound funnel (§8.3 pin coverage) --------------------------------
 
-test('there is exactly ONE packet.send call site in src/, and it is the signing funnel', async () => {
+test('there is exactly ONE packet.send call site in src/, and it is the canonical envelope funnel', async () => {
   // WHAT THIS GUARDS, and why a count is the right shape for it.
   //
   // The byte-level privacy pins assert that no real cid, contact display name or
@@ -1002,7 +997,7 @@ test('there is exactly ONE packet.send call site in src/, and it is the signing 
   // about behaviour that does not exist yet.
   //
   // If you are here because you added an outbound path: route it through
-  // `sendSignedBody` rather than raising the number. That is the whole point —
+  // `sendRoomBody` rather than raising the number. That is the whole point —
   // the funnel is what the pins already read, so going through it means your new
   // path is covered on the day you write it.
   const { readdirSync, readFileSync } = await import('node:fs');
@@ -1041,7 +1036,7 @@ test('there is exactly ONE packet.send call site in src/, and it is the signing 
       // `packet.send(` and `this.packet(...).send(` — the room-packet wire call.
       // `this.send(` / `this.child.send(` in src/daemon.ts are node IPC to the
       // supervised child process, not the ours wire, and are deliberately out of
-      // scope: they carry no signed body and no participant identity.
+      // scope: they carry no room body and no participant identity.
       if (/\bpacket\.send\s*\(/.test(line)) sites.push(`${file.slice(SRC.length + 1)}:${index + 1}`);
     });
   }
@@ -1049,25 +1044,23 @@ test('there is exactly ONE packet.send call site in src/, and it is the signing 
   assert.equal(
     sites.length,
     1,
-    'every signed body must leave through sendSignedBody.\n'
+    'every room body must leave through sendRoomBody.\n'
     + `  found: ${JSON.stringify(sites)}\n`
-    + '  If you added an outbound path, route it through sendSignedBody instead of\n'
+    + '  If you added an outbound path, route it through sendRoomBody instead of\n'
     + '  adding a site here — that is what puts it inside the anonymity pins.',
   );
   assert.match(sites[0], /^intake\.ts:\d+$/, `the one packet.send site moved outside intake.ts: ${sites[0]}`);
 
   // And the one site must actually BE the funnel, not merely the first match:
-  // a rename that moved the call out of sendSignedBody while keeping the count
+  // a rename that moved the call out of sendRoomBody while keeping the count
   // at one would satisfy the assertion above and defeat its purpose.
   const intake = readFileSync(join(SRC, 'intake.ts'), 'utf8');
-  const funnel = intake.slice(intake.indexOf('export async function sendSignedBody'));
+  const funnel = intake.slice(intake.indexOf('export async function sendRoomBody'));
   const funnelBody = funnel.slice(0, funnel.indexOf('\n}\n') + 3);
   assert.ok(
     /\bpacket\.send\s*\(/.test(funnelBody),
-    'the single packet.send call site must live inside sendSignedBody',
+    'the single packet.send call site must live inside sendRoomBody',
   );
-  assert.ok(
-    /packet\.sign\s*\(/.test(funnelBody),
-    'and sendSignedBody must be what signs it — an unsigned funnel is not the contract',
-  );
+  assert.doesNotMatch(funnelBody, /packet\.sign\s*\(/);
+  assert.match(funnelBody, /canonicalJson\s*\(/);
 });

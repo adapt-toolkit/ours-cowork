@@ -28,8 +28,7 @@ import {
   type RoomInvite,
   type Seat,
 } from './contracts.ts';
-import { unpackInvite } from './adapt.ts';
-import type { RoomPacket } from './packets.ts';
+import { unpackInvite, type RoomPacket } from './packets.ts';
 import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
 import { IntakePump } from './intake.ts';
 import { generateUlid } from './ulid.ts';
@@ -210,7 +209,7 @@ export class RoomService {
     const settings = CreateRoomInputSchema.parse(input);
     const roomId = LowerCrockfordUlidSchema.parse(this.nextRoomId());
     const roomName = settings.name ?? defaultRoomName(roomId);
-    const identityName = roomIdentityName(roomName);
+    const identityName = roomIdentityName(roomId);
     return this.lock(roomId, async () => {
       const provisional = RoomSchema.parse({
         version: 2,
@@ -295,7 +294,7 @@ export class RoomService {
         throw new RoomServiceError(`room packet "${id}" with established CID must be restored, not created`);
       }
       try {
-        packet = await this.packets.restore(id, room.identity_cid);
+        packet = await this.packets.restore(id, room.identity_cid, room.identity_name);
       } catch (error) {
         throw new RoomServiceError(
           `failed to restore established room packet "${id}": ${error instanceof Error ? error.message : String(error)}`,
@@ -398,6 +397,11 @@ export class RoomService {
     return this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'create an invite for');
+      if (room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
+        throw new RoomServiceError(
+          'standard SDK rooms permit one live invitation at a time so every accepted contact has unambiguous room admission metadata',
+        );
+      }
       return this.mintInviteUnlocked(room, {
         mode: request.mode,
         role: request.role ?? DEFAULT_ROLE,
@@ -494,6 +498,11 @@ export class RoomService {
     room: Room,
     request: { mode: InviteMode; role: string; min_accepts: number; replaces_seat?: string },
   ): Promise<InviteReceipt> {
+    if (room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
+      throw new RoomServiceError(
+        'standard SDK rooms permit one live invitation at a time; revoke or consume the current invitation first',
+      );
+    }
     const packet = this.packet(room.room_id);
     const minted = await packet.mintInvite(request.mode);
     const invite = RoomInviteSchema.parse({
@@ -901,7 +910,7 @@ export class RoomService {
       }
       const coreInvite = this.packet(id).listInvites().find((invite) => invite.invite_id === replacementId);
       if (!coreInvite || coreInvite.mode !== replacement.mode) {
-        throw new RoomServiceError('recovered invite is no longer present in packet state');
+        throw new RoomServiceError('recovered invite is no longer present in SDK identity state');
       }
       const confirmed: RoomInvite = {
         invite_id: replacement.invite_id,
@@ -1100,14 +1109,13 @@ export class RoomService {
     for (const contact of packet.listContacts()) {
       if (!contactsByCid.has(contact.container_id)) contactsByCid.set(contact.container_id, contact.name);
     }
-    const origins = packet.listContactOrigins();
     const inviteById = new Map(room.invites.map((invite) => [invite.invite_id, invite]));
     const existingCids = new Set(room.seats
       .filter((seat) => seat.state === 'active' || seat.state === 'pending')
       .map((seat) => seat.identity));
-    // Automatic forward admission of a removed cid requires an invite minted
-    // after its latest removal (§5.3). Explicit operator reverse admission is
-    // separately authorized by a new exact invite_redeemed provenance below.
+    // The public standard SDK intentionally does not expose custom actor
+    // contact-origin records. Cowork 1.0 therefore keeps at most one live room
+    // invite and assigns newly accepted contacts to that unambiguous descriptor.
     const lastRemovedAt = new Map<string, string>();
     for (const seat of room.seats) {
       if (seat.state !== 'removed' || seat.removed_at === undefined) continue;
@@ -1121,55 +1129,28 @@ export class RoomService {
     for (const [seatIndex, seat] of room.seats.entries()) {
       if (seat.state !== 'pending') continue;
       const displayName = contactsByCid.get(seat.identity);
-      const origin = origins[seat.identity];
-      if (displayName === undefined || origin === undefined) continue;
-      const completedExternalRedemption = origin.via === 'invite_redeemed'
-        && origin.invite_id === seat.invite_id;
-      const fallbackInvite = (origin.via === 'invite_one_time' || origin.via === 'invite_public')
-        ? inviteById.get(origin.invite_id)
-        : undefined;
-      const confirmedFallback = fallbackInvite !== undefined
-        && fallbackInvite.state !== 'receipt_pending'
-        && (fallbackInvite.recovery_of === undefined || fallbackInvite.recovery_confirmed === true);
-      if (!completedExternalRedemption && !confirmedFallback) continue;
-      const removedAt = lastRemovedAt.get(seat.identity);
-      if (fallbackInvite !== undefined && removedAt !== undefined && fallbackInvite.created_at <= removedAt) continue;
-      const predecessor = fallbackInvite?.replaces_seat === undefined
-        ? undefined
-        : room.seats.find((candidate) =>
-          candidate.participant_id === fallbackInvite.replaces_seat && candidate.state === 'removed');
-      if (fallbackInvite?.replaces_seat !== undefined && predecessor === undefined) continue;
+      if (displayName === undefined) continue;
       const { alias: _alias, replaces_seat: _replacesSeat, ...base } = seat;
       const activated: Seat = {
         ...base,
         state: 'active',
         display_name: displayName,
-        accepted_at: origin.at,
-        role: fallbackInvite?.role ?? seat.role,
-        invite_id: fallbackInvite?.invite_id ?? seat.invite_id,
-        ...(fallbackInvite === undefined
-          ? (_replacesSeat === undefined ? {} : { replaces_seat: _replacesSeat })
-          : (predecessor === undefined ? {} : { replaces_seat: predecessor.participant_id })),
-        ...(room.anonymous
-          ? { alias: fallbackInvite === undefined
-              ? _alias!
-              : predecessor?.alias
-                ?? (fallbackInvite.role === seat.role ? _alias! : mintAlias(seatsWithActivations, fallbackInvite.role)) }
-          : {}),
+        accepted_at: this.now(),
+        ...(_replacesSeat === undefined ? {} : { replaces_seat: _replacesSeat }),
+        ...(room.anonymous ? { alias: _alias! } : {}),
       };
       activatedPending.push(activated);
       seatsWithActivations[seatIndex] = activated;
     }
     const newSeats: Seat[] = [];
 
+    const eligibleInvites = room.invites.filter((invite) => invite.state === 'live'
+      && (invite.recovery_of === undefined || invite.recovery_confirmed === true));
+    const admissionInvite = eligibleInvites.length === 1 ? eligibleInvites[0] : undefined;
     for (const [cid, displayName] of contactsByCid) {
       if (existingCids.has(cid)) continue;
-      const origin = origins[cid];
-      if (!origin || (origin.via !== 'invite_one_time' && origin.via !== 'invite_public')) continue;
-      const invite = inviteById.get(origin.invite_id);
-      if (!invite
-        || invite.state === 'receipt_pending'
-        || (invite.recovery_of !== undefined && invite.recovery_confirmed !== true)) continue;
+      const invite = admissionInvite;
+      if (!invite) continue;
       const removedAt = lastRemovedAt.get(cid);
       if (removedAt !== undefined && invite.created_at <= removedAt) continue;
       const seated = [...seatsWithActivations, ...newSeats];
@@ -1182,7 +1163,7 @@ export class RoomService {
         display_name: displayName,
         role: invite.role,
         invite_id: invite.invite_id,
-        accepted_at: origin.at,
+        accepted_at: this.now(),
         participant_id: LowerCrockfordUlidSchema.parse(generateUlid()),
         state: 'active',
         ...(predecessor === undefined ? {} : { replaces_seat: predecessor.participant_id }),
@@ -1510,8 +1491,7 @@ export class RoomService {
     return room.identity_cid === ''
       && room.state === 'provisioning'
       && room.status === 'packet_pending'
-      && (room.identity_name === legacyRoomIdentityName(room.room_id)
-        || room.identity_name === roomIdentityName(room.room_name));
+      && room.identity_name === roomIdentityName(room.room_id);
   }
 
   private now(): string {

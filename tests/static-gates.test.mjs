@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { basename, extname, join, relative, resolve, sep } from 'node:path';
 import test from 'node:test';
 
@@ -206,14 +206,13 @@ test('web release gate detects standalone, remote URL, persistence, and source-m
     webReleaseViolations(normalized(path), readFileSync(path, 'utf8'))), []);
 });
 
-test('recursive owned-source discovery covers configs/scripts/tests/fixtures/MUFL and excludes only pinned third-party source', () => {
+test('recursive owned-source discovery covers configs, scripts, tests, and fixtures while excluding dependency trees', () => {
   const sourceFiles = discoverOwnedSource();
   const targets = sourceFiles.map(normalized);
   for (const expected of [
-    '.github/workflows/ci.yml', '.gitmodules', 'build.mjs', 'package.json', 'package-lock.json',
-    'scripts/compile-mufl.sh', 'src/daemon.ts', 'tests/e2e.test.mjs', 'mufl_code/actor.mu', 'mufl_code/config.mufl',
-    'mufl_code/protocol_container.mm', 'tests/fixtures/permissive-actor.mu',
-    'tests/fixtures/97473F4B9BC707583A5D699722D6DB11BF29E80222E3DDA016F09EB1208A2163.muflo', 'tsconfig.json',
+    '.github/workflows/ci.yml', 'build.mjs', 'package.json', 'package-lock.json',
+    'src/daemon.ts', 'src/ours-runtime.ts', 'tests/e2e.test.mjs',
+    'tests/sdk-runtime.test.mjs', 'tsconfig.json',
   ]) assert(targets.includes(expected), `source discovery omitted ${expected}`);
   assert(targets.every((path) => !path.startsWith('mufl_code/core/')));
   assert.deepEqual(sourceFiles.flatMap((path) => {
@@ -235,7 +234,7 @@ test('README and every operator document preserve the exact wording boundary', (
   assert.doesNotMatch(documentationFiles.map((path) => readFileSync(path, 'utf8')).join('\n'), /management-token/i);
 });
 
-test('built distribution remains standalone and contains one compiled packet', () => {
+test('built distribution remains standalone and delegates packet ownership to the public SDK', () => {
   const distFiles = filesBelow(join(ROOT, 'dist'), new Set(['.js', '.json']));
   assert.deepEqual(distFiles.flatMap((path) => boundaryViolations(normalized(path), readFileSync(path, 'utf8'))), []);
   assert.doesNotMatch(distFiles.map((path) => readFileSync(path, 'utf8')).join('\n'), /management-token/i);
@@ -246,8 +245,8 @@ test('built distribution remains standalone and contains one compiled packet', (
   assert.match(readFileSync(join(ROOT, 'dist', 'cli.js'), 'utf8'), /room_name/);
   assert.match(readFileSync(join(ROOT, 'dist', 'cli.js'), 'utf8'), /--name/);
   assert.match(readFileSync(join(ROOT, 'dist', 'web', 'assets', 'app.js'), 'utf8'), /room_name/);
-  const packets = filesBelow(join(ROOT, 'dist', 'mufl_code'), new Set(['.muflo']));
-  assert.equal(packets.length, 1);
+  assert.equal(existsSync(join(ROOT, 'dist', 'mufl_code')), false);
+  assert.match(readFileSync(join(ROOT, 'dist', 'daemon.js'), 'utf8'), /@ours\.network\/sdk\/daemon/);
 });
 
 test('npm dry-run pack list is the exact standalone release artifact', () => {
@@ -256,13 +255,12 @@ test('npm dry-run pack list is the exact standalone release artifact', () => {
   assert.equal(packs.length, 1);
   const paths = packs[0].files.map((file) => file.path).sort();
   assert.equal(paths.some((path) => path.startsWith('docs/superpowers/')), false);
-  const packetPaths = paths.filter((path) => /^dist\/mufl_code\/[0-9A-F]{64}\.muflo$/.test(path));
-  assert.equal(packetPaths.length, 1);
+  assert.equal(paths.some((path) => path.startsWith('dist/mufl_code/')), false);
   for (const required of WEB_RELEASE_ARTIFACTS) assert(paths.includes(required), `package omitted ${required}`);
-  assert.equal(paths.filter((path) => path.endsWith('.muflo')).length, 1);
+  assert.equal(paths.filter((path) => path.endsWith('.muflo')).length, 0);
   const expected = [
     'LICENSE', 'README.md', 'dist/cli.js', 'dist/daemon.js', 'package.json',
-    ...WEB_RELEASE_ARTIFACTS, ...DOC_NAMES, packetPaths[0],
+    ...WEB_RELEASE_ARTIFACTS, ...DOC_NAMES,
   ].sort();
   assert.deepEqual(paths, expected);
   assert.equal(paths.some((path) => /(?:^|\/)(?:src|tests)(?:\/|$)|secret|token|identity\.key|state_data\.bin/i.test(path)), false);
@@ -308,11 +306,11 @@ test('main runner rejects loaderless Node and undeclared direct loaders while co
   const suites = readdirSync(join(ROOT, 'tests'))
     .filter((name) => name.endsWith('.test.mjs'))
     .sort();
-  assert(suites.length >= 16, `main runner discovered only ${suites.length} native suites`);
+  assert(suites.length >= 15, `main runner discovered only ${suites.length} native suites`);
   for (const representative of [
-    'actor-protocol.test.mjs',
     'browser-smoke.test.mjs',
     'intake.test.mjs',
+    'sdk-runtime.test.mjs',
     'static-gates.test.mjs',
     'web-server.test.mjs',
   ]) {

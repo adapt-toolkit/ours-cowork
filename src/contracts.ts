@@ -74,11 +74,11 @@ export const RoomNameSchema = z.string()
     }
   });
 
-/** Authenticated announced-name contract for rooms created by current builds. */
-export const ROOM_IDENTITY_PREFIX = 'ours-cowork-room:';
+/** ASCII, globally unique SDK identity name for rooms created by vNext. */
+export const ROOM_IDENTITY_PREFIX = 'ours-cowork-';
 
-export function roomIdentityName(roomName: string): string {
-  return `${ROOM_IDENTITY_PREFIX}${RoomNameSchema.parse(roomName)}`;
+export function roomIdentityName(roomId: string): string {
+  return `${ROOM_IDENTITY_PREFIX}${LowerCrockfordUlidSchema.parse(roomId)}`;
 }
 
 /** Existing rooms retain this room-id-based identity name without migration. */
@@ -289,9 +289,7 @@ interface RoomLineageView {
 
 function refineRoomLineage(room: RoomLineageView, context: z.RefinementCtx): void {
   const pendingIdentityName = legacyRoomIdentityName(room.room_id);
-  const currentPendingIdentityName = room.room_name === undefined
-    ? undefined
-    : roomIdentityName(room.room_name);
+  const currentPendingIdentityName = roomIdentityName(room.room_id);
   const exactPacketPending = room.state === 'provisioning'
     && room.status === 'packet_pending'
     && (room.identity_name === pendingIdentityName || room.identity_name === currentPendingIdentityName)
@@ -588,6 +586,11 @@ export const AuthorAliasSchema = z.object({
   alias: NonEmptyStringSchema,
 }).strict();
 
+export const ReplyReferenceSchema = z.object({
+  wire_id: NonEmptyStringSchema,
+  sentence: PositiveSafeIntegerSchema.optional(),
+}).strict();
+
 const MessageShape = {
   kind: z.literal('message'),
   message_id: LowerCrockfordUlidSchema,
@@ -613,6 +616,7 @@ const MessageShape = {
   }),
   source_msg_id: z.number().int().nonnegative().safe().optional(),
   source_wire_id: NonEmptyStringSchema.optional(),
+  source_reply_to: ReplyReferenceSchema.optional(),
 } as const;
 
 const RelayIntentShape = {
@@ -661,6 +665,7 @@ const FileShape = {
   }),
   source_file_id: z.number().int().nonnegative().safe(),
   source_wire_id: NonEmptyStringSchema.optional(),
+  source_reply_to: ReplyReferenceSchema.optional(),
 } as const;
 
 const MembershipIntentShape = {

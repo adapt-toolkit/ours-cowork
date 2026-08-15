@@ -1,13 +1,12 @@
 import { build as esbuild } from 'esbuild';
-import { copyFile, mkdir, readdir, rm } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { mkdir, rm } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build as vite } from 'vite';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const dist = resolve(root, 'dist');
-const runtimeEntries = ['src/daemon.ts', 'src/cli.ts', 'dist/mufl_code'];
+const runtimeEntries = ['src/daemon.ts', 'src/cli.ts'];
 
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });
@@ -19,7 +18,7 @@ const shared = {
   target: 'node20',
   format: 'esm',
   banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
-  external: ['@adapt-toolkit/sdk', '@adapt-toolkit/sdk/*', '@adapt-toolkit/sdk-native'],
+  external: ['@ours.network/sdk', '@ours.network/sdk/*'],
   logLevel: 'info',
 };
 
@@ -31,19 +30,8 @@ const daemonBuild = await esbuild({
 });
 const daemonImports = Object.values(daemonBuild.metafile.outputs).flatMap((output) => output.imports);
 const eagerSdkImport = daemonImports.find(({ path, kind }) =>
-  path.startsWith('@adapt-toolkit/') && kind !== 'dynamic-import');
+  path.startsWith('@ours.network/sdk') && kind !== 'dynamic-import');
 if (eagerSdkImport) {
   throw new Error(`daemon supervisor eagerly imports SDK runtime: ${eagerSdkImport.path}`);
 }
 await esbuild({ ...shared, entryPoints: [resolve(root, runtimeEntries[1])], outfile: resolve(dist, 'cli.js') });
-
-const muflSource = resolve(root, 'mufl_code');
-if (existsSync(muflSource)) {
-  const packets = (await readdir(muflSource)).filter((name) => name.endsWith('.muflo'));
-  if (packets.length > 1) throw new Error('expected at most one compiled MUFL packet');
-  if (packets.length === 1) {
-    const destination = resolve(root, runtimeEntries[2]);
-    await mkdir(destination, { recursive: true });
-    await copyFile(resolve(muflSource, packets[0]), resolve(destination, packets[0]));
-  }
-}

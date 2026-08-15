@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const read = (file) => readFile(new URL(`../${file}`, import.meta.url), 'utf8');
@@ -10,21 +10,19 @@ test('package stays an independent cowork daemon', async () => {
 
   assert.equal(pkg.name, '@ours.network/cowork');
   assert.equal(pkg.bin['ours-cowork'], 'dist/cli.js');
-  assert.equal(dependencies['@adapt-toolkit/sdk'], '0.10.12');
-  assert.equal(dependencies['@adapt-toolkit/sdk-native'], '0.10.12');
+  assert.equal(dependencies['@ours.network/sdk'], '1.3.1');
+  assert.equal('@adapt-toolkit/sdk' in dependencies, false);
+  assert.equal('@adapt-toolkit/sdk-native' in dependencies, false);
   assert.equal(dependencies.zod, '^3.23.8');
   const forbiddenPackage = `@ours.network/${'mcp'}`;
   assert.equal(forbiddenPackage in dependencies, false);
 
-  const gitmodules = await read('.gitmodules');
-  assert.match(gitmodules, /\[submodule "mufl_code\/core"\]/);
-  assert.match(gitmodules, /path = mufl_code\/core/);
-  assert.match(gitmodules, /url = https:\/\/github\.com\/adapt-toolkit\/ours-mufl-core\.git/);
-  assert.equal((gitmodules.match(/^\[submodule /gm) ?? []).length, 1);
+  await assert.rejects(access(new URL('../.gitmodules', import.meta.url)));
 
   const build = await read('build.mjs');
   assert.match(build, /src\/daemon\.ts/);
   assert.match(build, /src\/cli\.ts/);
-  assert.match(build, /dist\/mufl_code/);
+  assert.match(build, /@ours\.network\/sdk/);
+  assert.doesNotMatch(build, /dist\/mufl_code/);
   assert.doesNotMatch(build, /src\/(?!daemon\.ts|cli\.ts)[\w/-]+\.ts/);
 });

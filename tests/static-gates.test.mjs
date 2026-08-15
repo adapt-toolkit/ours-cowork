@@ -293,6 +293,47 @@ test('CI repeats E2E and invokes the asserted release gate', () => {
   assert.match(workflow, /node-version:\s*20/);
 });
 
+test('nightly runs the release gates and publishes a prerelease without release or repository authority', () => {
+  // Comment lines are stripped first: the header documents the triggers and
+  // permissions this gate forbids, and only the directives may be asserted on.
+  const workflow = readFileSync(join(ROOT, '.github', 'workflows', 'nightly.yml'), 'utf8')
+    .split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
+  const publishJobAt = workflow.indexOf('\n  publish-nightly:');
+  assert(publishJobAt > 0, 'nightly workflow has no publish job');
+  const gateJob = workflow.slice(0, publishJobAt);
+
+  // The npm credential must never be reachable from a trigger that can carry
+  // unmerged code, and must never run alongside the gates that execute it.
+  assert.doesNotMatch(workflow, /pull_request/);
+  assert.doesNotMatch(gateJob, /\bsecrets\./);
+  assert.equal(workflow.match(/secrets\.NPM_TOKEN/g).length, 1);
+  assert.doesNotMatch(workflow, /secrets\.VERSION_BUMP_APP_(?:ID|PRIVATE_KEY)/);
+  assert.match(workflow, /^permissions:\n  contents: read$/m);
+  assert.doesNotMatch(workflow, /contents:\s*write|id-token:\s*write|packages:\s*write/);
+  assert.match(workflow, /if: github\.repository == 'adapt-toolkit\/ours-cowork'/);
+
+  // A nightly is a side channel: it may not move the dist-tag that
+  // .github/workflows/ci.yml publishes releases to.
+  const publishes = workflow.match(/npm publish[^\n]*/g);
+  assert.deepEqual(publishes, ['npm publish --access public --tag next']);
+  assert.match(workflow, /bash \.github\/workflows\/scripts\/nightly-version\.sh/);
+  assert(existsSync(join(ROOT, '.github', 'workflows', 'scripts', 'nightly-version.sh')));
+
+  // The gate job is the CI gate set, run against the prerelease tip that the
+  // publish job then reuses verbatim.
+  assert.match(gateJob, /ref: prerelease/);
+  assert.match(workflow, /ref: \$\{\{ needs\.test\.outputs\.sha \}\}/);
+  assert.match(gateJob, /COWORK_CHROME_PATH:\s*\/usr\/bin\/google-chrome/);
+  assert.match(gateJob, /for i in 1 2 3; do node --test tests\/e2e\.test\.mjs \|\| exit 1; done/);
+  for (const command of [
+    'npm run typecheck', 'npm run typecheck:web', 'npm run build',
+    'npm run test:release', 'npm test', 'npm run test:web', 'npm run test:browser',
+  ]) {
+    assert(gateJob.includes(command), `${command} missing from the nightly gate job`);
+  }
+  assert.match(workflow, /node-version:\s*20/);
+});
+
 test('main runner rejects loaderless Node and undeclared direct loaders while covering every native suite', () => {
   assert.match(mainTestRunnerViolations(
     'node --test --test-concurrency=1 tests/*.test.mjs',

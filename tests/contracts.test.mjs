@@ -135,10 +135,10 @@ test('room names trim, NFC-normalize, count Unicode code points, and reject cont
   assert.deepEqual(UpdateRoomInputSchema.parse({ name: '  Renamed  ' }), { name: 'Renamed' });
 });
 
-test('room identity names use the normalized friendly contract while preserving an explicit legacy helper', () => {
-  assert.equal(roomIdentityName('  Cafe\u0301 launch  '), 'ours-cowork-room:Café launch');
+test('room identity names use a globally unique ASCII SDK-safe contract', () => {
+  assert.equal(roomIdentityName(ROOM_ID), `ours-cowork-${ROOM_ID}`);
   assert.equal(legacyRoomIdentityName(ROOM_ID), `cowork-room-${ROOM_ID}`);
-  assert.throws(() => roomIdentityName('   '));
+  assert.throws(() => roomIdentityName(ROOM_ID.toUpperCase()));
   assert.throws(() => legacyRoomIdentityName(ROOM_ID.toUpperCase()));
 });
 
@@ -237,7 +237,7 @@ test('only the exact packet-pending room sentinel may have an empty identity CID
   assert.equal(RoomSchema.parse(pending).identity_cid, '');
   assert.equal(RoomSchema.parse({
     ...pending,
-    identity_name: roomIdentityName(pending.room_name),
+    identity_name: roomIdentityName(pending.room_id),
   }).identity_cid, '');
   assert.throws(() => RoomSchema.parse({ ...pending, status: undefined }));
   assert.throws(() => RoomSchema.parse({ ...pending, state: 'active', activated_at: AT }));
@@ -302,6 +302,7 @@ test('communication records form a strict discriminated version-1 union', () => 
     recipient_identities: ['cid-bob'],
     source_msg_id: 7,
     source_wire_id: 'wire-7',
+    source_reply_to: { wire_id: 'wire-parent', sentence: 2 },
   };
   assert.deepEqual(CommunicationRecordSchema.parse(message), message);
 
@@ -322,6 +323,7 @@ test('communication records form a strict discriminated version-1 union', () => 
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, category: 'system' }));
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, recipient_identities: ['cid-bob', 'cid-bob'] }));
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, recipient_identities: ['', 'cid-bob'] }));
+  assert.throws(() => CommunicationRecordSchema.parse({ ...message, source_reply_to: { wire_id: 'wire-parent', sentence: 0 } }));
   const { recipient_identities: _recipients, ...missingRecipients } = message;
   assert.throws(() => CommunicationRecordSchema.parse(missingRecipients));
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, extra: true }));
@@ -350,6 +352,7 @@ test('file archive records bind canonical bytes, size, digest, and one relay sub
     recipient_identities: ['cid-bob'],
     source_file_id: 7,
     source_wire_id: 'wire-file-7',
+    source_reply_to: { wire_id: 'wire-parent-file' },
   };
   assert.equal(CommunicationRecordSchema.parse(file).kind, 'file');
   assert.throws(() => CommunicationRecordSchema.parse({ ...file, size: bytes.length + 1 }), /size/i);

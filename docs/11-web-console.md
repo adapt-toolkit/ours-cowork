@@ -14,7 +14,7 @@ The console and HTTP room RPC have no authentication. They bind only to `127.0.0
 
 1. Choose Create room and enter the friendly Name, Goal, and Briefing. The name is shown in the room list, workspace header, and room details.
 2. Submit once. The new room is selected and its Invite panel opens.
-3. Add one invitation requirement at a time. Choose one-time or public mode and set the minimum acceptances for a public invite.
+3. Add one invitation requirement at a time. Choose one-time or public mode and set the minimum acceptances for a public invite. Revoke or consume it before creating another; the standard-SDK room keeps only one live invite so contact admission remains unambiguous.
 4. Copy every invite from its blocking receipt before choosing Done. The secret is shown once and is not retained in browser storage, the URL, logs, or durable room metadata.
 
 The room activates after its durable invitation requirements are satisfied. Participants shows admitted identities and their invite roles.

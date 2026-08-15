@@ -5,7 +5,6 @@ import * as nodeFs from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { AdaptHost } from './adapt.ts';
 import {
   ensureRuntimeState,
   loadConfig,
@@ -13,6 +12,7 @@ import {
   type RuntimeState,
 } from './config.ts';
 export { loadConfig } from './config.ts';
+import { EmbeddedOursHost } from './ours-runtime.ts';
 import { PacketRegistry } from './packets.ts';
 import { RoomService } from './service.ts';
 import { CoworkStore } from './storage.ts';
@@ -185,7 +185,7 @@ export class CoworkDaemon {
     this.options.onStage?.('post-lock');
     this.checkpoint();
     try {
-      this.host = this.options.host ?? new AdaptHost(config.brokerUrl, this.options.log);
+      this.host = this.options.host ?? new EmbeddedOursHost(config, this.options.log);
       this.store = this.options.store ?? new CoworkStore(config.stateDir);
 
       // The closure deliberately queues notifications until every recovery
@@ -193,7 +193,7 @@ export class CoworkDaemon {
       // they are exposed, but packet inbox state itself remains durable.
       let serviceRef: DaemonService | undefined = this.options.service;
       this.registry = this.options.registry ?? new PacketRegistry(
-        this.host as AdaptHost,
+        this.host as EmbeddedOursHost,
         config.stateDir,
         {
           log: this.options.log,

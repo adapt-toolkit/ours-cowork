@@ -36,7 +36,7 @@ interface NotificationState {
 }
 
 /**
- * Produce the byte-stable JSON representation signed by room packets.
+ * Produce the byte-stable JSON representation sent by room identities.
  * Arrays retain their order; keys of every object nested inside them are
  * sorted as well. Envelope values are already schema-controlled JSON values.
  */
@@ -47,10 +47,11 @@ export function canonicalJson(value: unknown): string {
 }
 
 /**
- * THE ONLY PLACE A SIGNED BODY CROSSES THE WIRE.
+ * THE ONLY PLACE A ROOM BODY CROSSES THE WIRE.
  *
- * Every outbound envelope is signed here, canonicalised here, and sent here.
- * That is not tidiness — it is what makes the anonymity pins mean something.
+ * Every outbound envelope is canonicalised and sent here. Standard SDK
+ * identities authenticate the transport; cowork 1.0 no longer reaches into a
+ * custom actor to add a second application-level signature.
  *
  * The byte-level privacy pins (§8.3) assert that no real cid, contact display
  * name or sender-claimed name appears in any relayed body of an anonymous room.
@@ -70,13 +71,12 @@ export function canonicalJson(value: unknown): string {
  * folding either in here would make the funnel a policy decision instead of a
  * choke point.
  */
-export async function sendSignedBody(
-  packet: Pick<RoomPacket, 'sign' | 'send'>,
+export async function sendRoomBody(
+  packet: Pick<RoomPacket, 'send'>,
   recipientIdentity: string,
   unsigned: Record<string, unknown>,
 ): Promise<Awaited<ReturnType<RoomPacket['send']>>> {
-  const signature = await packet.sign(canonicalJson(unsigned));
-  return packet.send(recipientIdentity, canonicalJson({ ...unsigned, signature }));
+  return packet.send(recipientIdentity, canonicalJson(unsigned));
 }
 
 /** Archive, consume, and relay participant messages for hosted room packets. */
@@ -103,7 +103,7 @@ export class IntakePump {
    */
   notify(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
-    // The unread item remains in packet state and is resumed on next boot.
+    // The unread item remains in SDK identity state and is resumed on next boot.
     if (!this.acceptingNotifications) return Promise.resolve();
     const existing = this.notifications.get(id);
     if (existing) {
@@ -190,8 +190,8 @@ export class IntakePump {
   ): Promise<void> {
     const parsedName = FileNameSchema.safeParse(item.filename);
     const parsedMime = FileMimeSchema.safeParse(item.mime);
-    // New actors reject this metadata before persistence. This defensive drain
-    // handles state exported by an older actor so one poison unread item cannot
+    // The current SDK boundary rejects this metadata before persistence. This
+    // defensive drain handles an older archived item so one poison unread item cannot
     // make every daemon restart fail at resumePending.
     if (!parsedName.success || !parsedMime.success) {
       await packet.consumeFileInbox([item.file_id]);
@@ -235,6 +235,7 @@ export class IntakePump {
         recipient_identities: recipientIdentities,
         source_file_id: item.file_id,
         ...(item.wire_id === '' ? {} : { source_wire_id: item.wire_id }),
+        ...(item.reply_to == null ? {} : { source_reply_to: item.reply_to }),
       });
       if (appended.kind !== 'file') throw new Error('storage returned the wrong participant file kind');
       file = appended;
@@ -250,9 +251,9 @@ export class IntakePump {
       (candidate) => candidate.identity === item.sender_id && candidate.state === 'active',
     );
     if (room.state !== 'active' || !seat) {
-      // Inbox entries are ordinary packet state, not an authorization source.
+      // Inbox entries are ordinary SDK identity state, not an authorization source.
       // Refused entries are deliberately drained without creating an archive
-      // message, intent, signature, or result.
+      // message, intent, wire send, or result.
       if (room.state === 'active') await this.bounceRemovedSender(roomId, room, packet, item);
       await packet.consumeInbox([item.msg_id]);
       return;
@@ -286,6 +287,7 @@ export class IntakePump {
         recipient_identities: recipientIdentities,
         source_msg_id: item.msg_id,
         ...(item.wire_id === '' ? {} : { source_wire_id: item.wire_id }),
+        ...(item.reply_to == null ? {} : { source_reply_to: item.reply_to }),
       });
       if (appended.kind !== 'message') throw new Error('storage returned the wrong participant message kind');
       message = appended;
@@ -296,7 +298,7 @@ export class IntakePump {
     // This is the irreversible packet effect. Every preceding append resolves
     // only after its file fsync, so both the message and the complete fan-out
     // exist durably first. HostedRoomPacket leaves IDs outside this snapshot
-    // unread in the same atomic actor transaction.
+    // unread through the SDK's selective consume/defer contract.
     await packet.consumeInbox([item.msg_id]);
   }
 
@@ -325,7 +327,7 @@ export class IntakePump {
     await this.store.save(RoomSchema.parse({ ...room, seats }));
     try {
       const unsigned = { version: 1 as const, kind: 'room_not_member' as const, room_id: roomId };
-      await sendSignedBody(packet, item.sender_id, unsigned);
+      await sendRoomBody(packet, item.sender_id, unsigned);
     } catch { /* best effort — the channel is severed or severing */ }
   }
 
@@ -433,7 +435,7 @@ export class IntakePump {
           display_name: file.author_alias.alias,
           role: file.author.role,
         };
-        const metadata = await sendSignedBody(packet, intent.recipient_identity, {
+        const metadata = await sendRoomBody(packet, intent.recipient_identity, {
           version: 1 as const,
           kind: 'room_file' as const,
           room_id: roomId,
@@ -503,7 +505,7 @@ export class IntakePump {
       // RoomPacket.send returns only an observed queued/refused outcome. A
       // thrown call remains result-less because its acceptance is unknown and
       // will deliberately be retried on restart with the stable message ID.
-      const outcome = await sendSignedBody(packet, intent.recipient_identity, unsigned);
+      const outcome = await sendRoomBody(packet, intent.recipient_identity, unsigned);
       const appended = await this.store.append(roomId, {
         version: 1,
         kind: 'relay_result',
@@ -526,6 +528,7 @@ export class IntakePump {
     if (!message) return undefined;
     const observedWireId = item.wire_id === '' ? undefined : item.wire_id;
     if (message.source_wire_id !== observedWireId
+      || !sameReply(message.source_reply_to, item.reply_to)
       || message.author.identity !== item.sender_id
       || message.text !== item.text
       || message.at !== item.date) {
@@ -541,6 +544,7 @@ export class IntakePump {
     const observedWireId = item.wire_id === '' ? undefined : item.wire_id;
     const bytes = Buffer.from(item.data);
     if (file.source_wire_id !== observedWireId
+      || !sameReply(file.source_reply_to, item.reply_to)
       || file.author.identity !== item.sender_id
       || file.filename !== item.filename
       || file.mime !== item.mime
@@ -565,6 +569,14 @@ export class IntakePump {
   private now(): string {
     return z.string().datetime({ offset: true }).parse(this.nowValue());
   }
+}
+
+function sameReply(
+  stored: { wire_id: string; sentence?: number } | undefined,
+  observed: { wire_id: string; sentence?: number } | null | undefined,
+): boolean {
+  if (stored === undefined || observed == null) return stored === undefined && observed == null;
+  return stored.wire_id === observed.wire_id && stored.sentence === observed.sentence;
 }
 
 function canonicalValue(value: unknown): unknown {

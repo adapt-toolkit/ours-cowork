@@ -10,6 +10,17 @@ The command safely starts the daemon only when it is absent, waits for `GET /` r
 
 The console and HTTP room RPC have no authentication. They bind only to `127.0.0.1`; both the `127.0.0.1` and `localhost` browser URLs are accepted. Do not use port forwarding, a reverse proxy, or another mechanism to expose this listener to other hosts.
 
+## API description
+
+The same loopback listener serves an OpenAPI 3.1 description of the room management REST API and a browser UI for it:
+
+- `http://127.0.0.1:3052/openapi.json` — the machine-readable document.
+- `http://127.0.0.1:3052/docs` — the UI that renders the document and can send requests.
+
+Both are read-only GET routes with no authentication, exactly like the console itself, and they are available whenever `rest.enabled` is true. They ship inside the daemon and load no remote assets, so they work on an offline host. Do not expose either route to another host.
+
+Every room operation is carried by the single route `POST /rpc` with the envelope `{ "version": 1, "id": ..., "method": ..., "params": ... }`; the document describes the seventeen methods the REST listener serves, discriminated on `method`. Operations that carry an invite secret are not part of it — they are reachable only over `management.sock`.
+
 ## Room setup
 
 1. Choose Create room and enter the friendly Name, Goal, and Briefing. The name is shown in the room list, workspace header, and room details.

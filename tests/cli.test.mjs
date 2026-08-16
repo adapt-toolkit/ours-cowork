@@ -749,6 +749,49 @@ test('generated service definitions execute the cowork CLI directly and uninstal
   }
 });
 
+test('an external service definition carries the real selection and never a credential', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'cowork-service-external-'));
+  const stateDir = join(home, 'state');
+  const daemonStateDir = join(home, 'shared-ours');
+  const binDir = join(home, 'bin');
+  await mkdir(stateDir, { mode: 0o700 });
+  await mkdir(daemonStateDir, { mode: 0o700 });
+  await mkdir(binDir, { mode: 0o700 });
+  for (const name of ['systemctl', 'loginctl']) {
+    const path = join(binDir, name);
+    await writeFile(path, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+    await chmod(path, 0o700);
+  }
+  // A real daemon token beside the selected state directory must stay there.
+  await writeFile(join(daemonStateDir, 'daemon-token'), `${'a1'.repeat(32)}\n`, { mode: 0o600 });
+  const env = {
+    HOME: home,
+    PATH: `${binDir}:${process.env.PATH}`,
+    OURS_COWORK_STATE_DIR: stateDir,
+    OURS_COWORK_DAEMON_ENDPOINT: 'http://127.0.0.1:3071/',
+    OURS_COWORK_DAEMON_STATE_DIR: daemonStateDir,
+  };
+  try {
+    const installed = await runCli(['install-service'], { env });
+    assert.equal(installed.code, 0, installed.stderr);
+    const unit = await readFile(join(home, '.config', 'systemd', 'user', 'ours-cowork.service'), 'utf8');
+    assert.match(unit, /^Environment="OURS_COWORK_DAEMON_MODE=external"$/m);
+    assert.match(unit, /^Environment="OURS_COWORK_DAEMON_ENDPOINT=http:\/\/127\.0\.0\.1:3071"$/m);
+    assert.match(unit, new RegExp(`^Environment="OURS_COWORK_DAEMON_STATE_DIR=${daemonStateDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"$`, 'm'));
+    assert.doesNotMatch(unit, TOKEN_PATTERN);
+    assert.doesNotMatch(unit, /management-token|Bearer|api[_-]?token/i);
+    // The embedded default still emits no daemon selection at all.
+    const embedded = await runCli(['install-service'], {
+      env: { HOME: home, PATH: `${binDir}:${process.env.PATH}`, OURS_COWORK_STATE_DIR: stateDir },
+    });
+    assert.equal(embedded.code, 0, embedded.stderr);
+    const plain = await readFile(join(home, '.config', 'systemd', 'user', 'ours-cowork.service'), 'utf8');
+    assert.doesNotMatch(plain, /OURS_COWORK_DAEMON_/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test('failed systemd and launchd unloads retain their service definitions and report failure', async () => {
   for (const platform of ['linux', 'darwin']) {
     const home = await mkdtemp(join(tmpdir(), `cowork-${platform}-uninstall-`));

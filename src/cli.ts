@@ -779,6 +779,13 @@ function serviceEnvironment(config: CoworkConfig): Record<string, string> {
     OURS_COWORK_BROKER_URL: config.brokerUrl,
     OURS_COWORK_STATE_DIR: config.stateDir,
     ...(config.rest.enabled ? { OURS_COWORK_REST_PORT: String(config.rest.port) } : {}),
+    // Endpoint and state directory only. The daemon's API token stays where the
+    // SDK finds it and never reaches a service definition.
+    ...(config.daemon === undefined ? {} : {
+      OURS_COWORK_DAEMON_MODE: config.daemon.mode,
+      ...(config.daemon.endpoint === undefined ? {} : { OURS_COWORK_DAEMON_ENDPOINT: config.daemon.endpoint }),
+      ...(config.daemon.stateDir === undefined ? {} : { OURS_COWORK_DAEMON_STATE_DIR: config.daemon.stateDir }),
+    }),
   };
 }
 

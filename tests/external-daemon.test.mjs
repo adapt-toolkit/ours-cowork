@@ -44,6 +44,7 @@ async function startFakeDaemon(t, options = {}) {
     writeFileSync(join(stateDir, 'daemon-token'), `${token}\n`, { mode: 0o600 });
   }
   const requests = [];
+  const polls = [];
   const waiting = new Set();
   const events = [];
 
@@ -87,9 +88,10 @@ async function startFakeDaemon(t, options = {}) {
     const notifications = /^\/identities\/([^/]+)\/notifications$/.exec(url.pathname);
     if (request.method === 'GET' && notifications) {
       if (!authorized()) return;
+      polls.push(url.searchParams.get('since'));
       const raw = url.searchParams.get('since');
       const since = raw === null || raw === 'tip' ? events.length : Number(raw);
-      const held = { since, send: (body) => send(200, body) };
+      const held = { since, send: (body) => send(200, body), response };
       waiting.add(held);
       request.once('aborted', () => waiting.delete(held));
       response.once('close', () => waiting.delete(held));
@@ -120,9 +122,20 @@ async function startFakeDaemon(t, options = {}) {
     token,
     stateDir,
     requests,
+    polls,
     endpoint: `http://127.0.0.1:${port}`,
+    /** Append without answering any held poll: an arrival nobody is watching. */
+    append(event) { events.push(event); },
     emit(event) { events.push(event); flush(); },
+    /** Break every held long poll the way a restarted daemon would. */
+    dropWatchers() {
+      for (const held of [...waiting]) {
+        waiting.delete(held);
+        held.response.destroy();
+      }
+    },
     get watching() { return waiting.size; },
+    get eventCount() { return events.length; },
   };
 }
 
@@ -193,6 +206,38 @@ test('the external selection needs both fields, normalizes them, and rejects unu
     );
   }
   assert.equal(CoworkConfigSchema.parse({ ...defaultConfig('/home/demo'), daemon: { mode: 'embedded' } }).daemon.mode, 'embedded');
+});
+
+test('a daemon API token is never offered over plaintext to another host', () => {
+  const accept = (endpoint) => CoworkConfigSchema.parse({
+    ...defaultConfig('/home/demo'),
+    daemon: { mode: 'external', endpoint, stateDir: '/home/demo/.ours' },
+  }).daemon.endpoint;
+
+  // Loopback stays ergonomic: the request never leaves the host.
+  assert.equal(accept('http://127.0.0.1:3050'), 'http://127.0.0.1:3050');
+  assert.equal(accept('http://127.5.6.7:3071'), 'http://127.5.6.7:3071');
+  assert.equal(accept('http://localhost:3050'), 'http://localhost:3050');
+  assert.equal(accept('http://LOCALHOST:3050'), 'http://localhost:3050');
+  assert.equal(accept('http://[::1]:3050'), 'http://[::1]:3050');
+  // TLS is accepted anywhere.
+  assert.equal(accept('https://rooms.example.test'), 'https://rooms.example.test');
+  assert.equal(accept('https://10.0.0.4:3071'), 'https://10.0.0.4:3071');
+
+  for (const endpoint of [
+    'http://10.0.0.4:3050',
+    'http://192.168.1.10:3050',
+    'http://rooms.example.test',
+    'http://rooms.example.test:3050',
+    'http://128.0.0.1:3050',
+    'http://[2001:db8::1]:3050',
+  ]) {
+    assert.throws(
+      () => accept(endpoint),
+      (error) => /https:\/\/ unless the daemon is on this host/.test(String(error)),
+      endpoint,
+    );
+  }
 });
 
 test('daemon environment overrides select, merge, and fail closed', (t) => {
@@ -349,18 +394,69 @@ test('a tracked identity long-polls the external daemon and stops when it is unt
   assert.deepEqual(seen, [IDENTITY]);
 });
 
+test('an arrival during a dropped watch is recovered, once, on reconnect', async (t) => {
+  pinSdkEnvironment(t);
+  const coworkStateDir = mkdtempSync(join(tmpdir(), 'cowork-external-resync-'));
+  t.after(() => rmSync(coworkStateDir, { recursive: true, force: true }));
+  const daemon = await startFakeDaemon(t);
+  const host = new ExternalOursHost(
+    CoworkConfigSchema.parse(externalConfig(coworkStateDir, daemon.endpoint, daemon.stateDir)),
+  );
+  await host.boot();
+  t.after(() => host.shutdown());
+
+  const seen = [];
+  host.onIdentityNotify((name) => seen.push(name));
+  host.trackIdentity(IDENTITY);
+  await waitFor(() => daemon.watching === 1, 'the first long poll to be held open');
+  assert.deepEqual(seen, []);
+
+  // The daemon goes away mid-poll and an arrival lands while nothing watches.
+  daemon.dropWatchers();
+  daemon.append({
+    event: 'message_received', sender_id: CID, sender_name: 'Peer', from: 'Peer',
+    msg_id: '1', wire_id: 'lost-in-the-gap', date: '2026-08-16T00:00:00Z',
+  });
+
+  // The replacement watch primes at the tip, so it can NEVER deliver that
+  // event. Anything the listener sees here is the reconnect resync.
+  await waitFor(() => seen.length >= 1, 'the reconnect resync to reach the listener');
+  assert.deepEqual(seen, [IDENTITY]);
+  await waitFor(() => daemon.watching === 1, 'the replacement long poll to be held open');
+  assert.deepEqual(daemon.polls, ['tip', 'tip']);
+
+  // Exactly one recovery, not a loop: a healthy reconnected watch stays quiet.
+  await new Promise((tick) => setTimeout(tick, 1_500));
+  assert.deepEqual(seen, [IDENTITY]);
+  assert.equal(daemon.polls.length, 2);
+
+  // And the replacement watch still delivers live traffic.
+  daemon.emit({
+    event: 'message_received', sender_id: CID, sender_name: 'Peer', from: 'Peer',
+    msg_id: '2', wire_id: 'after-recovery', date: '2026-08-16T00:00:02Z',
+  });
+  await waitFor(() => seen.length === 2, 'live traffic after the reconnect');
+  assert.deepEqual(seen, [IDENTITY, IDENTITY]);
+  assert.equal(daemon.eventCount, 2);
+});
+
 test('the packet registry tracks every hosted identity and releases each watch', async (t) => {
   const stateDir = mkdtempSync(join(tmpdir(), 'cowork-external-registry-'));
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
   const tracked = [];
   const untracked = [];
   const client = {
-    async chooseIdentity() { return { name: IDENTITY, cid: CID, switchedFrom: null }; },
+    removeFailure: undefined,
+    async chooseIdentity() {
+      if (client.chooseFailure) throw client.chooseFailure;
+      return { name: IDENTITY, cid: CID, switchedFrom: null };
+    },
+    async createIdentity() { return { info: { cid: CID } }; },
     async listContacts() { return { contacts: [] }; },
     async listInvites() { return []; },
     async listIncomingMessages() { return []; },
     async listIncomingFiles() { return []; },
-    async removeIdentity() {},
+    async removeIdentity() { if (client.removeFailure) throw client.removeFailure; },
     async releaseLease() { return { released: [IDENTITY] }; },
   };
   const host = {
@@ -373,16 +469,27 @@ test('the packet registry tracks every hosted identity and releases each watch',
   };
   const registry = new PacketRegistry(host, stateDir);
 
-  await registry.restore(ROOM_ID, CID, IDENTITY);
+  // create() provisions a brand new identity and must track it too.
+  client.chooseFailure = Object.assign(new Error('missing'), { code: 'NO_SUCH_IDENTITY' });
+  await registry.create(ROOM_ID, IDENTITY, 'room bio');
+  client.chooseFailure = undefined;
   assert.deepEqual(tracked, [IDENTITY]);
   assert.deepEqual(untracked, []);
   await registry.destroy(ROOM_ID);
   assert.deepEqual(untracked, [IDENTITY]);
 
   await registry.restore(ROOM_ID, CID, IDENTITY);
-  await registry.unhostAll();
   assert.deepEqual(tracked, [IDENTITY, IDENTITY]);
+  await registry.unhostAll();
   assert.deepEqual(untracked, [IDENTITY, IDENTITY]);
+
+  // A destroy that fails must still release the watch, or it polls an identity
+  // this registry has stopped answering for.
+  await registry.restore(ROOM_ID, CID, IDENTITY);
+  client.removeFailure = new Error('daemon refused removeIdentity');
+  await assert.rejects(registry.destroy(ROOM_ID), /failed to remove standard SDK identity/);
+  assert.deepEqual(tracked, [IDENTITY, IDENTITY, IDENTITY]);
+  assert.deepEqual(untracked, [IDENTITY, IDENTITY, IDENTITY]);
 });
 
 test('an external host starts no runtime: no listener, no owned state, no SDK environment', async (t) => {

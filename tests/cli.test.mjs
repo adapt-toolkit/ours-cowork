@@ -739,6 +739,13 @@ test('generated service definitions execute the cowork CLI directly and uninstal
     const externalDaemonPattern = new RegExp(`${['ours', 'mcp'].join('-')}|(?:^|[ /])\\.ours(?:[ /]|$)`, 'im');
     assert.doesNotMatch(unit, externalDaemonPattern);
     assert.doesNotMatch(unit, /management-token|Bearer/i);
+    // systemd's default start rate limit would turn "the thing I need is not up
+    // yet" into a permanently failed unit that stops retrying entirely.
+    assert.match(unit, /^\[Unit\][\s\S]*^StartLimitIntervalSec=0$/m);
+    assert.match(unit, /^Restart=on-failure$/m);
+    assert.match(unit, /^RestartSec=5$/m);
+    assert(unit.indexOf('StartLimitIntervalSec=0') < unit.indexOf('[Service]'),
+      'StartLimitIntervalSec belongs to the [Unit] section');
 
     await writeFile(join(stateDir, 'keep-me'), 'retained');
     const uninstalled = await runCli(['uninstall-service'], { env });
@@ -780,6 +787,11 @@ test('an external service definition carries the real selection and never a cred
     assert.match(unit, new RegExp(`^Environment="OURS_COWORK_DAEMON_STATE_DIR=${daemonStateDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"$`, 'm'));
     assert.doesNotMatch(unit, TOKEN_PATTERN);
     assert.doesNotMatch(unit, /management-token|Bearer|api[_-]?token/i);
+    // An external daemon may well come up after this unit; retrying forever at
+    // a bounded interval is the difference between eventual success and a unit
+    // that gave up during boot and never tried again.
+    assert.match(unit, /^StartLimitIntervalSec=0$/m);
+    assert.match(unit, /^RestartSec=5$/m);
     // The embedded default still emits no daemon selection at all.
     const embedded = await runCli(['install-service'], {
       env: { HOME: home, PATH: `${binDir}:${process.env.PATH}`, OURS_COWORK_STATE_DIR: stateDir },

@@ -35,6 +35,8 @@ To host the room identities on an ours daemon you already run, add the block and
 
 `endpoint` is the daemon's base URL — an `http`/`https` origin with no path, query, or credentials — and `stateDir` is the state directory that daemon owns. Point both at your common daemon (`http://127.0.0.1:3050` with `~/.ours`), or at a dedicated daemon on its own port with its own isolated state directory and service. Both fields are required together: an API token belongs to one state directory, and the SDK refuses to offer it to an endpoint that was not chosen just as deliberately.
 
+`http://` is accepted only for a daemon on this host — `localhost`, any `127.0.0.0/8` address, or `[::1]`. Any other host requires `https://`, and a plaintext remote endpoint is rejected when the configuration is read, before a token is looked up. The API token is a bearer credential; cowork will not put one on the wire in the clear.
+
 Cowork never asks for that token. It reads the daemon's own `daemon-token` file inside the state directory you named, or `OURS_API_TOKEN` when you set one. Tokens are never written into cowork's config file, its logs, or a generated service definition.
 
 At startup cowork asks the endpoint which state directory it owns before sending any credential. If the endpoint is unreachable, is not an ours daemon, or owns a different state directory, startup fails and cowork stays stopped. It does not start a runtime of its own instead. `mode: "embedded"` states the default explicitly and rejects the two other fields.

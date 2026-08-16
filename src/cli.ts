@@ -843,17 +843,24 @@ function installSystemd(config: CoworkConfig): string {
   const environment = Object.entries(serviceEnvironment(config))
     .map(([key, value]) => `Environment=${systemdValueQuote(`${key}=${value}`)}`)
     .join('\n');
+  // systemd's default start rate limit (5 starts per 10s) turns a dependency
+  // that is merely not ready yet into a permanently failed unit that no longer
+  // retries. Cowork can legitimately fail to start for a while — the broker or,
+  // in external daemon mode, the selected ours daemon may come up after this
+  // unit — so the rate limit is disabled and the retry interval carries the
+  // bound instead. Restart stays on-failure, so a clean stop is still final.
   const unit = `[Unit]
 Description=ours-cowork standalone mission-room daemon
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=${systemdExecutableQuote(SELF)} serve
 ${environment}
 Restart=on-failure
-RestartSec=2
+RestartSec=5
 
 [Install]
 WantedBy=default.target

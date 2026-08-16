@@ -20,7 +20,8 @@ const NO_FOLLOW = nodeFs.constants.O_NOFOLLOW ?? 0;
 export const CoworkDaemonSchema = z.object({
   mode: z.enum(['embedded', 'external']),
   endpoint: z.string().url()
-    .refine(isDaemonEndpoint, 'daemon.endpoint must be an http(s) origin with no credentials, path, query, or fragment')
+    .refine(isDaemonOrigin, 'daemon.endpoint must be an http(s) origin with no credentials, path, query, or fragment')
+    .refine(isConfidentialDaemonEndpoint, 'daemon.endpoint must use https:// unless the daemon is on this host (http:// is allowed only for localhost, 127.0.0.0/8, or [::1])')
     .transform(normalizeDaemonEndpoint)
     .optional(),
   stateDir: z.string().min(1).transform((value) => resolve(value)).optional(),
@@ -192,13 +193,35 @@ function mergeDaemonSelection(
   };
 }
 
-function isDaemonEndpoint(value: string): boolean {
+function isDaemonOrigin(value: string): boolean {
   let url: URL;
   try { url = new URL(value); } catch { return false; }
   return (url.protocol === 'http:' || url.protocol === 'https:')
     && url.username === '' && url.password === ''
     && url.search === '' && url.hash === ''
     && (url.pathname === '' || url.pathname === '/');
+}
+
+/**
+ * A daemon's API token is a bearer credential, so cleartext is acceptable only
+ * where the request never leaves the host. `https` is accepted anywhere; `http`
+ * only to a loopback address.
+ */
+function isConfidentialDaemonEndpoint(value: string): boolean {
+  let url: URL;
+  try { url = new URL(value); } catch { return false; }
+  return url.protocol === 'https:' || isLoopbackHost(url.hostname);
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  // Node's WHATWG URL keeps IPv6 literals bracketed in `hostname` as well.
+  const host = hostname.toLowerCase().replace(/^\[(.*)\]$/, '$1');
+  if (host === 'localhost') return true;
+  if (host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
+  const octets = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!octets) return false;
+  const parts = octets.slice(1).map(Number);
+  return parts.every((part) => part <= 255) && parts[0] === 127;
 }
 
 /** Idempotent: the SDK compares base URLs verbatim, so one spelling must win. */

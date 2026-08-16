@@ -240,19 +240,47 @@ export class ExternalOursHost implements OursRuntimeHost {
     watcher.controller.abort();
   }
 
-  /** Long-poll one identity forever, reconnecting with bounded backoff. */
+  /**
+   * Long-poll one identity forever, reconnecting with bounded backoff.
+   *
+   * A watch primes at the daemon's tip, so a reconnected watch never replays
+   * what arrived while it was down. Losing those arrivals would be silent, so
+   * every reconnect announces the identity once. The consumer's reaction to an
+   * announcement is a full state refresh, which is exactly the recovery this
+   * needs; it is idempotent and self-coalescing, so the extra announcement can
+   * only cost one refresh.
+   *
+   * ORDER IS LOAD-BEARING. The resync is issued only AFTER the replacement
+   * watch's request is already in flight, because that request is what fixes
+   * the new tip. Announcing first would read the inbox at T0 and fix the tip at
+   * T1 > T0, and anything arriving in between would be in neither — the very
+   * gap this exists to close. This way every arrival lands in the refresh, on
+   * the stream, or (harmlessly) in both.
+   */
   private async follow(identityName: string, signal: AbortSignal): Promise<void> {
     let backoffMs = WATCH_RETRY_MIN_MS;
+    let resyncPending = false;
     while (!signal.aborted) {
       const client = this.watchClient;
       if (!client) return;
       try {
-        for await (const _event of client.watchNotifications(identityName, { signal })) {
+        const stream = client.watchNotifications(identityName, { signal });
+        // Starts the long poll; the tip is fixed by the daemon handling it.
+        let step = stream.next();
+        if (resyncPending) {
+          resyncPending = false;
+          this.announce(identityName);
+        }
+        for (let settled = await step; !settled.done; settled = await step) {
           backoffMs = WATCH_RETRY_MIN_MS;
           this.announce(identityName);
+          step = stream.next();
         }
       } catch (error) {
         if (signal.aborted) return;
+        // One resync per reconnection, not per failure: the backoff below is
+        // what bounds how often a daemon that stays down is retried at all.
+        resyncPending = true;
         this.log(`[${identityName}] external ours daemon notification watch failed:`, error);
       }
       if (signal.aborted) return;

@@ -176,10 +176,13 @@ export class PacketRegistry {
     try {
       await packet.destroy();
       this.packets.delete(roomId);
-      this.untrack(roomId);
       return [];
     } catch (error) {
       throw new Error(`failed to remove standard SDK identity for room "${roomId}"`, { cause: error });
+    } finally {
+      // A failed destroy must not leave a watch polling an identity this
+      // registry has stopped answering for.
+      this.untrack(roomId);
     }
   }
 

@@ -88,6 +88,7 @@ export class LegacyCoworkStateError extends Error {
 /** Standard-SDK identities owned by the one embedded runtime. */
 export class PacketRegistry {
   private readonly packets = new Map<string, SdkRoomPacket>();
+  private readonly trackers = new Map<string, () => void>();
   private readonly host: OursRuntimeClientFactory;
   private readonly stateDir: string;
   private readonly fs: typeof fs;
@@ -138,6 +139,7 @@ export class PacketRegistry {
       const packet = new SdkRoomPacket(identityName, cid, client);
       await packet.refresh();
       this.packets.set(roomId, packet);
+      this.track(roomId, identityName);
       return packet;
     } catch (error) {
       await client.releaseLease().catch(() => {});
@@ -159,6 +161,7 @@ export class PacketRegistry {
       const packet = new SdkRoomPacket(identityName, bound.cid, client);
       await packet.refresh();
       this.packets.set(roomId, packet);
+      this.track(roomId, identityName);
       return packet;
     } catch (error) {
       await client.releaseLease().catch(() => {});
@@ -173,6 +176,7 @@ export class PacketRegistry {
     try {
       await packet.destroy();
       this.packets.delete(roomId);
+      this.untrack(roomId);
       return [];
     } catch (error) {
       throw new Error(`failed to remove standard SDK identity for room "${roomId}"`, { cause: error });
@@ -181,12 +185,31 @@ export class PacketRegistry {
 
   async unhostAll(): Promise<void> {
     this.unsubscribe();
+    for (const roomId of [...this.trackers.keys()]) this.untrack(roomId);
     const errors: unknown[] = [];
     for (const [roomId, packet] of [...this.packets]) {
       try { await packet.close(); } catch (error) { errors.push(error); }
       this.packets.delete(roomId);
     }
     if (errors.length) throw new AggregateError(errors, 'failed to release room SDK leases');
+  }
+
+  /**
+   * Hosts that watch the runtime from outside need to be told which identities
+   * exist; an embedded host omits `trackIdentity` and keeps its own callback.
+   */
+  private track(roomId: string, identityName: string): void {
+    const dispose = this.host.trackIdentity?.(identityName);
+    if (dispose) this.trackers.set(roomId, dispose);
+  }
+
+  private untrack(roomId: string): void {
+    const dispose = this.trackers.get(roomId);
+    if (!dispose) return;
+    this.trackers.delete(roomId);
+    try { dispose(); } catch (error) {
+      this.log(`failed to stop the notification watch for room "${roomId}":`, error);
+    }
   }
 
   private assertNoLegacyState(roomId: string): void {

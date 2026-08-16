@@ -779,6 +779,13 @@ function serviceEnvironment(config: CoworkConfig): Record<string, string> {
     OURS_COWORK_BROKER_URL: config.brokerUrl,
     OURS_COWORK_STATE_DIR: config.stateDir,
     ...(config.rest.enabled ? { OURS_COWORK_REST_PORT: String(config.rest.port) } : {}),
+    // Endpoint and state directory only. The daemon's API token stays where the
+    // SDK finds it and never reaches a service definition.
+    ...(config.daemon === undefined ? {} : {
+      OURS_COWORK_DAEMON_MODE: config.daemon.mode,
+      ...(config.daemon.endpoint === undefined ? {} : { OURS_COWORK_DAEMON_ENDPOINT: config.daemon.endpoint }),
+      ...(config.daemon.stateDir === undefined ? {} : { OURS_COWORK_DAEMON_STATE_DIR: config.daemon.stateDir }),
+    }),
   };
 }
 
@@ -836,17 +843,24 @@ function installSystemd(config: CoworkConfig): string {
   const environment = Object.entries(serviceEnvironment(config))
     .map(([key, value]) => `Environment=${systemdValueQuote(`${key}=${value}`)}`)
     .join('\n');
+  // systemd's default start rate limit (5 starts per 10s) turns a dependency
+  // that is merely not ready yet into a permanently failed unit that no longer
+  // retries. Cowork can legitimately fail to start for a while — the broker or,
+  // in external daemon mode, the selected ours daemon may come up after this
+  // unit — so the rate limit is disabled and the retry interval carries the
+  // bound instead. Restart stays on-failure, so a clean stop is still final.
   const unit = `[Unit]
 Description=ours-cowork standalone mission-room daemon
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=${systemdExecutableQuote(SELF)} serve
 ${environment}
 Restart=on-failure
-RestartSec=2
+RestartSec=5
 
 [Install]
 WantedBy=default.target

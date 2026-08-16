@@ -23,9 +23,16 @@ cd "$(git rev-parse --show-toplevel)"
 emit() { [[ -n "${GITHUB_OUTPUT:-}" ]] && printf '%s\n' "$1" >> "$GITHUB_OUTPUT" || true; }
 log() { printf '[nightly] %s\n' "$*"; }
 
+# `version` is emitted on BOTH paths. On the skip path it names the version
+# this commit ALREADY has, because the dist-tag reconciliation that follows has
+# to be able to repair an alias whose write failed in an earlier run — and it
+# can only do that if it is told which version to point at without republishing
+# anything.
 no_publish() {
   log "no publish: $1"
   emit "publish=false"
+  emit "version=$2"
+  log "existing version: $2"
   exit 0
 }
 
@@ -34,12 +41,20 @@ stamp=${NIGHTLY_DATE:-$(date -u +%Y%m%d)}
 log "prerelease tip: $short_sha"
 
 published_versions=$(npm view @ours.network/cowork versions --json 2>/dev/null || echo '[]')
-if node -e '
-  const all = JSON.parse(process.argv[1]);
+# One commit can carry more than one nightly: a rerun on a later day produces
+# the same short SHA with a different date stamp. Take the highest, so the
+# resolved version is deterministic rather than registry-order dependent.
+existing=$(node -e '
+  let all;
+  try { all = JSON.parse(process.argv[1]); } catch { all = []; }
   const versions = Array.isArray(all) ? all : [all];
-  process.exit(versions.some((version) => version.endsWith(`.${process.argv[2]}`)) ? 0 : 1);
-' "$published_versions" "$short_sha"; then
-  no_publish "commit $short_sha already has a published nightly"
+  const suffix = `.${process.argv[2]}`;
+  for (const version of versions) {
+    if (typeof version === "string" && version.endsWith(suffix)) process.stdout.write(`${version}\n`);
+  }
+' "$published_versions" "$short_sha" | sort -V | tail -1)
+if [[ -n "$existing" ]]; then
+  no_publish "commit $short_sha already has a published nightly" "$existing"
 fi
 
 local_version=$(node -p "require('./package.json').version")

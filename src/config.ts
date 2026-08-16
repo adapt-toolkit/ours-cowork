@@ -8,6 +8,47 @@ const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
 const NO_FOLLOW = nodeFs.constants.O_NOFOLLOW ?? 0;
 
+/**
+ * Which ours runtime hosts the room identities.
+ *
+ * Omitting the whole block keeps the historical behavior: cowork owns one
+ * embedded standard-SDK runtime below its own state directory. `external`
+ * names an already-running daemon instead, and both of its fields are
+ * mandatory because the SDK refuses to send a daemon's API token to an
+ * endpoint whose state directory was not chosen just as deliberately.
+ */
+export const CoworkDaemonSchema = z.object({
+  mode: z.enum(['embedded', 'external']),
+  endpoint: z.string().url()
+    .refine(isDaemonOrigin, 'daemon.endpoint must be an http(s) origin with no credentials, path, query, or fragment')
+    .refine(isConfidentialDaemonEndpoint, 'daemon.endpoint must use https:// unless the daemon is on this host (http:// is allowed only for localhost, 127.0.0.0/8, or [::1])')
+    .transform(normalizeDaemonEndpoint)
+    .optional(),
+  stateDir: z.string().min(1).transform((value) => resolve(value)).optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.mode === 'external') {
+    for (const field of ['endpoint', 'stateDir'] as const) {
+      if (value[field] === undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [field],
+          message: `daemon.${field} is required when daemon.mode is "external"`,
+        });
+      }
+    }
+    return;
+  }
+  for (const field of ['endpoint', 'stateDir'] as const) {
+    if (value[field] !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [field],
+        message: `daemon.${field} is only valid when daemon.mode is "external"`,
+      });
+    }
+  }
+});
+
 export const CoworkConfigSchema = z.object({
   version: z.literal(1),
   brokerUrl: z.string().url().refine((value) => {
@@ -19,9 +60,18 @@ export const CoworkConfigSchema = z.object({
     enabled: z.boolean(),
     port: z.number().int().min(1).max(65_535),
   }).strict(),
+  // Absent unless an operator selected a daemon explicitly, so an untouched
+  // deployment keeps producing byte-identical effective configuration.
+  daemon: CoworkDaemonSchema.optional(),
 }).strict();
 
 export type CoworkConfig = z.infer<typeof CoworkConfigSchema>;
+export type CoworkDaemonSelection = z.infer<typeof CoworkDaemonSchema>;
+
+/** The effective runtime owner. An absent block has always meant embedded. */
+export function daemonMode(config: Pick<CoworkConfig, 'daemon'>): 'embedded' | 'external' {
+  return config.daemon?.mode ?? 'embedded';
+}
 
 export interface RuntimeState {
   socketPath: string;
@@ -34,6 +84,9 @@ export interface ConfigEnvironment {
   OURS_COWORK_BROKER_URL?: string;
   OURS_COWORK_STATE_DIR?: string;
   OURS_COWORK_REST_PORT?: string;
+  OURS_COWORK_DAEMON_MODE?: string;
+  OURS_COWORK_DAEMON_ENDPOINT?: string;
+  OURS_COWORK_DAEMON_STATE_DIR?: string;
 }
 
 export interface ConfigIo {
@@ -87,6 +140,7 @@ export function loadConfig(
   const restPort = env.OURS_COWORK_REST_PORT === undefined
     ? undefined
     : parsePort(env.OURS_COWORK_REST_PORT);
+  const daemon = mergeDaemonSelection(env, file.daemon);
   try {
     return CoworkConfigSchema.parse({
       version: 1,
@@ -96,10 +150,84 @@ export function loadConfig(
         enabled: restPort === undefined ? file.rest.enabled : true,
         port: restPort ?? file.rest.port,
       },
+      ...(daemon === undefined ? {} : { daemon }),
     });
   } catch (error) {
     throw new CoworkConfigError('invalid effective cowork config', { cause: error });
   }
+}
+
+/**
+ * Merge the three daemon overrides over the config file's block. Absent from
+ * both leaves the key off the effective config entirely, which is what keeps an
+ * upgraded but unconfigured deployment on the embedded runtime.
+ */
+function mergeDaemonSelection(
+  env: ConfigEnvironment,
+  file: CoworkDaemonSelection | undefined,
+): CoworkDaemonSelection | undefined {
+  const mode = env.OURS_COWORK_DAEMON_MODE;
+  const endpoint = env.OURS_COWORK_DAEMON_ENDPOINT;
+  const stateDir = env.OURS_COWORK_DAEMON_STATE_DIR;
+  if (mode === undefined && endpoint === undefined && stateDir === undefined) return file;
+  if (mode !== undefined && mode !== 'embedded' && mode !== 'external') {
+    throw new CoworkConfigError('OURS_COWORK_DAEMON_MODE must be "embedded" or "external"');
+  }
+  // An endpoint or state directory without any mode selects external, the same
+  // way OURS_COWORK_REST_PORT alone enables the REST host.
+  const effectiveMode = mode ?? file?.mode ?? 'external';
+  if (effectiveMode === 'embedded') {
+    if (endpoint !== undefined || stateDir !== undefined) {
+      throw new CoworkConfigError(
+        'OURS_COWORK_DAEMON_ENDPOINT and OURS_COWORK_DAEMON_STATE_DIR require daemon mode "external"',
+      );
+    }
+    return { mode: 'embedded' };
+  }
+  const effectiveEndpoint = endpoint ?? file?.endpoint;
+  const effectiveStateDir = stateDir ?? file?.stateDir;
+  return {
+    mode: 'external',
+    ...(effectiveEndpoint === undefined ? {} : { endpoint: effectiveEndpoint }),
+    ...(effectiveStateDir === undefined ? {} : { stateDir: effectiveStateDir }),
+  };
+}
+
+function isDaemonOrigin(value: string): boolean {
+  let url: URL;
+  try { url = new URL(value); } catch { return false; }
+  return (url.protocol === 'http:' || url.protocol === 'https:')
+    && url.username === '' && url.password === ''
+    && url.search === '' && url.hash === ''
+    && (url.pathname === '' || url.pathname === '/');
+}
+
+/**
+ * A daemon's API token is a bearer credential, so cleartext is acceptable only
+ * where the request never leaves the host. `https` is accepted anywhere; `http`
+ * only to a loopback address.
+ */
+function isConfidentialDaemonEndpoint(value: string): boolean {
+  let url: URL;
+  try { url = new URL(value); } catch { return false; }
+  return url.protocol === 'https:' || isLoopbackHost(url.hostname);
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  // Node's WHATWG URL keeps IPv6 literals bracketed in `hostname` as well.
+  const host = hostname.toLowerCase().replace(/^\[(.*)\]$/, '$1');
+  if (host === 'localhost') return true;
+  if (host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
+  const octets = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!octets) return false;
+  const parts = octets.slice(1).map(Number);
+  return parts.every((part) => part <= 255) && parts[0] === 127;
+}
+
+/** Idempotent: the SDK compares base URLs verbatim, so one spelling must win. */
+function normalizeDaemonEndpoint(value: string): string {
+  const url = new URL(value);
+  return `${url.protocol}//${url.host}`;
 }
 
 /** Establish and verify every host-owned runtime path before a wrapper starts. */

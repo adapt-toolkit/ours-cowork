@@ -306,16 +306,26 @@ test('nightly runs the release gates and publishes a prerelease without release 
   // unmerged code, and must never run alongside the gates that execute it.
   assert.doesNotMatch(workflow, /pull_request/);
   assert.doesNotMatch(gateJob, /\bsecrets\./);
-  assert.equal(workflow.match(/secrets\.NPM_TOKEN/g).length, 1);
+  // Publishing and aliasing each need the credential, and both must live in
+  // the publish job — which is the property the old single-use count stood in
+  // for, asserted directly instead of by arithmetic.
+  const credentialUses = [...workflow.matchAll(/secrets\.NPM_TOKEN/g)].map((match) => match.index);
+  assert.equal(credentialUses.length, 2);
+  assert(credentialUses.every((at) => at > publishJobAt), 'the npm credential escaped the publish job');
   assert.doesNotMatch(workflow, /secrets\.VERSION_BUMP_APP_(?:ID|PRIVATE_KEY)/);
   assert.match(workflow, /^permissions:\n  contents: read$/m);
   assert.doesNotMatch(workflow, /contents:\s*write|id-token:\s*write|packages:\s*write/);
   assert.match(workflow, /if: github\.repository == 'adapt-toolkit\/ours-cowork'/);
 
   // A nightly is a side channel: it may not move the dist-tag that
-  // .github/workflows/ci.yml publishes releases to.
+  // .github/workflows/ci.yml publishes releases to. `nightly` is canonical and
+  // `next` is a compatibility alias applied with dist-tag, never a second
+  // publish — tests/dist-tags.test.mjs owns that contract in full.
   const publishes = workflow.match(/npm publish[^\n]*/g);
-  assert.deepEqual(publishes, ['npm publish --access public --tag next']);
+  assert.deepEqual(publishes, ['npm publish --access public --tag nightly']);
+  assert.deepEqual(workflow.match(/npm dist-tag[^\n]*/g), [
+    'npm dist-tag add @ours.network/cowork@${{ steps.version.outputs.version }} next',
+  ]);
   assert.match(workflow, /bash \.github\/workflows\/scripts\/nightly-version\.sh/);
   assert(existsSync(join(ROOT, '.github', 'workflows', 'scripts', 'nightly-version.sh')));
 

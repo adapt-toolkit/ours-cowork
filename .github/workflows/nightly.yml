@@ -3,9 +3,22 @@ name: Nightly
 # Full gate set against the `prerelease` branch -> nightly npm prerelease.
 #
 # This workflow never moves the `latest` dist-tag. It publishes
-# X.Y.Z-nightly.<date>.<sha> under the `next` dist-tag, so
+# X.Y.Z-nightly.<date>.<sha> under the CANONICAL `nightly` dist-tag, so
 # `npm install @ours.network/cowork` keeps resolving to the release line that
-# .github/workflows/ci.yml owns, and `@next` opts into the prerelease line.
+# .github/workflows/ci.yml owns, and `@nightly` opts into the prerelease line.
+# That tag is the one every other ours service already uses.
+#
+# `next` is retained as a COMPATIBILITY ALIAS of the same version, because it
+# was this package's prerelease tag first and consumers already pinned to it
+# would otherwise freeze on the last version published before the rename.
+#
+# The alias is applied with `npm dist-tag add`, never with a second publish,
+# and it runs on BOTH paths — including the same-commit rerun where
+# nightly-version.sh reports publish=false. That is what repairs a run whose
+# alias write failed: the version output names the already-published version,
+# so a retry points `next` at it without republishing. The step is not allowed
+# to swallow its own failure, so a broken alias fails the run and stays
+# visible instead of silently persisting.
 #
 # Trust boundary: the only triggers are repository-controlled (a schedule, a
 # push to `prerelease`, and manual dispatch). There is deliberately no
@@ -110,13 +123,20 @@ jobs:
           NODE
       - name: Publish @ours.network/cowork nightly
         if: steps.version.outputs.publish == 'true'
-        run: npm publish --access public --tag next
+        run: npm publish --access public --tag nightly
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Deliberately NOT gated on publish, and deliberately without `|| true`:
+      # this is the step that repairs a previous run whose alias write failed,
+      # on the same-commit path where nothing is published at all.
+      - name: Alias the compatibility next dist-tag
+        run: npm dist-tag add @ours.network/cowork@${{ steps.version.outputs.version }} next
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Summary
         run: |
           if [ "${{ steps.version.outputs.publish }}" = 'true' ]; then
-            echo "Published @ours.network/cowork@${{ steps.version.outputs.version }} to the next dist-tag" >> "$GITHUB_STEP_SUMMARY"
+            echo "Published @ours.network/cowork@${{ steps.version.outputs.version }} to the canonical nightly dist-tag and aliased the compatibility next dist-tag to the same version" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "Prerelease tip ${{ needs.test.outputs.sha }} already has a nightly; gates passed, nothing to publish" >> "$GITHUB_STEP_SUMMARY"
+            echo "Prerelease tip ${{ needs.test.outputs.sha }} already has @ours.network/cowork@${{ steps.version.outputs.version }} on the canonical nightly dist-tag; gates passed, nothing published, and the compatibility next dist-tag was reconciled to that existing version" >> "$GITHUB_STEP_SUMMARY"
           fi

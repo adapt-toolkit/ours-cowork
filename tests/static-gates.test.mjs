@@ -212,9 +212,15 @@ test('recursive owned-source discovery covers configs/scripts/tests/fixtures/MUF
   for (const expected of [
     '.github/workflows/ci.yml', '.gitmodules', 'build.mjs', 'package.json', 'package-lock.json',
     'scripts/compile-mufl.sh', 'src/daemon.ts', 'tests/e2e.test.mjs', 'mufl_code/actor.mu', 'mufl_code/config.mufl',
-    'mufl_code/protocol_container.mm', 'tests/fixtures/permissive-actor.mu',
-    'tests/fixtures/97473F4B9BC707583A5D699722D6DB11BF29E80222E3DDA016F09EB1208A2163.muflo', 'tsconfig.json',
+    'mufl_code/protocol_container.mm', 'tests/fixtures/permissive-actor.mu', 'tsconfig.json',
   ]) assert(targets.includes(expected), `source discovery omitted ${expected}`);
+  // The compiled fixture is named after its content hash, so pinning the literal
+  // name made this gate fail on any edit to permissive-actor.mu. Assert the
+  // shape instead: discovery must still reach compiled MUFL under tests/fixtures.
+  assert(
+    targets.some((path) => /^tests\/fixtures\/[0-9A-F]{64}\.muflo$/.test(path)),
+    'source discovery omitted the compiled permissive fixture packet',
+  );
   assert(targets.every((path) => !path.startsWith('mufl_code/core/')));
   assert.deepEqual(sourceFiles.flatMap((path) => {
     const target = normalized(path);

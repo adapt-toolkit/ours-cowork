@@ -190,6 +190,8 @@ function incomingFile(overrides = {}) {
     data: Buffer.from([0, 1, 2, 255]),
     date: '2026-08-02T10:12:30.000Z',
     wire_id: 'wire-file-in-9',
+    reject_reason: '',
+    reject_bytes: 0,
     ...overrides,
   };
 }
@@ -214,10 +216,14 @@ function fixture(options = {}) {
 }
 
 function byKind(records, kind) { return records.filter((record) => record.kind === kind); }
+function unique(values) { return [...new Set(values)]; }
 
 // ---- Durable file broadcast -------------------------------------------------
 
-test('restart intake drains legacy invalid file metadata without archiving it or blocking later files', async () => {
+test('restart intake reports invalid file metadata to its sender without blocking later files', async () => {
+  // State exported by an actor that predates rejection reporting carries no
+  // reason, so the reason is re-derived here. Either way the item is consumed:
+  // a refused file must never become a poison item that fails every restart.
   const f = fixture();
   f.packet.fileInbox.push(
     incomingFile({ file_id: 8, filename: '../poison.bin' }),
@@ -229,10 +235,36 @@ test('restart intake drains legacy invalid file metadata without archiving it or
 
   assert.deepEqual(f.packet.consumeFileCalls, [[8], [9], [10]]);
   assert.deepEqual(f.packet.fileInbox, []);
-  const files = byKind(await f.store.read(ROOM_ID), 'file');
+  const records = await f.store.read(ROOM_ID);
+  const files = byKind(records, 'file');
   assert.equal(files.length, 1);
   assert.equal(files[0].filename, 'after-restart.bin');
-  assert.equal(JSON.stringify(await f.store.read(ROOM_ID)).includes('poison.bin'), false);
+
+  const refusals = byKind(records, 'file_rejected');
+  assert.deepEqual(refusals.map((record) => [record.source_file_id, record.reason]), [
+    [8, 'invalid_filename'],
+    [9, 'invalid_mime'],
+  ]);
+  // No payload is retained, and no refused file is relayed to anyone. The one
+  // valid file still fans out normally.
+  assert.equal(refusals.every((record) => record.data_base64 === undefined), true);
+  const refusedIds = new Set(refusals.map((record) => record.file_id));
+  assert.equal(byKind(records, 'relay_intent').some((intent) => refusedIds.has(intent.file_id)), false);
+  assert.deepEqual(
+    unique(f.packet.sendFileCalls.map((call) => call.filename)),
+    ['after-restart.bin'],
+  );
+
+  // The sender is told. That is the whole point.
+  const bounces = f.packet.sendCalls
+    .map((call) => ({ recipient: call.recipient, body: JSON.parse(call.body) }))
+    .filter(({ body }) => body.kind === 'room_file_rejected');
+  assert.deepEqual(bounces.map(({ recipient, body }) => [recipient, body.reason]), [
+    ['cid-alice', 'invalid_filename'],
+    ['cid-alice', 'invalid_mime'],
+  ]);
+  assert.equal(bounces[0].body.wire_id, 'wire-file-in-9');
+  assert.equal(bounces[0].body.limit, 2_000_000);
 });
 
 test('participant files archive bytes before consume and relay metadata + core bytes to every other seat', async () => {
@@ -340,14 +372,53 @@ test('a file intent frozen before seat removal resolves skipped_removed without 
   assert.equal(f.packet.sendFileCalls.length, 1, 'terminal skip and queue results suppress every later retry');
 });
 
-test('oversized files fail loudly without archive, consume, or relay effects', async () => {
+test('an over-limit file is refused, told to its sender, and recorded in history', async () => {
+  // The actor already dropped the payload and recorded what arrived, so the
+  // reported size is larger than anything the inbox item still carries.
   const f = fixture();
-  f.packet.fileInbox.push(incomingFile({ data: Buffer.alloc(2 * 1024 * 1024 + 1) }));
-  await assert.rejects(f.pump.pump(ROOM_ID), /at most 2097152 bytes \(2 MiB\)/);
-  assert.deepEqual(await f.store.read(ROOM_ID), []);
-  assert.equal(f.packet.fileInbox.length, 1);
-  assert.equal(f.packet.consumeFileCalls.length, 0);
+  f.packet.fileInbox.push(incomingFile({
+    data: Buffer.alloc(0),
+    reject_reason: 'too_large',
+    reject_bytes: 2_097_152,
+  }));
+
+  await f.pump.pump(ROOM_ID);
+
+  const [refusal] = byKind(await f.store.read(ROOM_ID), 'file_rejected');
+  assert.equal(refusal.reason, 'too_large');
+  assert.equal(refusal.size, 2_097_152);
+  assert.equal(refusal.limit, 2_000_000);
+  assert.equal(refusal.filename, 'evidence.bin');
+  assert.deepEqual(refusal.author, { identity: 'cid-alice', display_name: 'Alice', role: 'builder' });
+  assert.equal(refusal.source_file_id, 9);
+  assert.equal(refusal.source_wire_id, 'wire-file-in-9');
+
+  // Nobody else sees it, and the item does not jam the inbox.
   assert.equal(f.packet.sendFileCalls.length, 0);
+  assert.deepEqual(byKind(await f.store.read(ROOM_ID), 'relay_intent'), []);
+  assert.deepEqual(f.packet.consumeFileCalls, [[9]]);
+
+  const bounce = JSON.parse(f.packet.sendCalls.at(-1).body);
+  assert.equal(f.packet.sendCalls.at(-1).recipient, 'cid-alice');
+  assert.equal(bounce.kind, 'room_file_rejected');
+  assert.equal(bounce.reason, 'too_large');
+  assert.equal(bounce.size, 2_097_152);
+  assert.equal(bounce.limit, 2_000_000);
+  assert.equal(bounce.filename, 'evidence.bin');
+  assert.equal(bounce.wire_id, 'wire-file-in-9');
+  assert.equal(typeof bounce.signature, 'string');
+});
+
+test('a refusal is appended once when the pump re-runs after a crash before consume', async () => {
+  const f = fixture();
+  f.packet.fileInbox.push(incomingFile({ reject_reason: 'too_large', reject_bytes: 2_000_001, data: Buffer.alloc(0) }));
+  await f.pump.pump(ROOM_ID);
+  // Put the same item back, exactly as a restart before the consume would.
+  f.packet.fileInbox.push(incomingFile({ reject_reason: 'too_large', reject_bytes: 2_000_001, data: Buffer.alloc(0) }));
+  await f.pump.resumePending(ROOM_ID);
+
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'file_rejected').length, 1);
+  assert.deepEqual(f.packet.consumeFileCalls, [[9], [9]]);
 });
 
 test('anonymous file metadata uses only the alias author and never leaks real seat or claimed names', async () => {

@@ -33,9 +33,36 @@ application actor loads libraries
         fn _save_state (_) = (transaction::action::return_data ($kind -> $save_state)).
         fn _return_data (payload: any) = (transaction::action::return_data ($kind -> $data, $payload -> payload)).
 
+        // Minimal inbound message store. It exists so a test can observe what a
+        // ROOM tells this peer — in particular a room_file_rejected bounce, which
+        // is the only place a sender learns its file was refused.
+        metadef peer_message_t: (
+            $msg_id      -> int,
+            $sender_id   -> global_id,
+            $sender_name -> str,
+            $text        -> str,
+            $status      -> str
+        ).
+        messages is peer_message_t[] = [].
+        next_peer_msg_seq is int = 1.
+
         a2a_messaging::init (
             $_read_or_abort -> _read_or_abort,
-            $on_message_received -> fn (_: any) -> transaction::action::type[] { return [ _save_state NIL ]. },
+            $on_message_received -> fn (arg: any) -> transaction::action::type[]
+            {
+                mid = next_peer_msg_seq.
+                next_peer_msg_seq -> next_peer_msg_seq + 1.
+                sender_name is str = "".
+                if (arg $sender_name) != NIL { sender_name -> (arg $sender_name) safe str. }
+                messages (_count messages|) -> (
+                    $msg_id      -> mid,
+                    $sender_id   -> (arg $sender_id) safe global_id,
+                    $sender_name -> sender_name,
+                    $text        -> (arg $text) safe str,
+                    $status      -> "unread"
+                ).
+                return [ _save_state NIL ].
+            },
             $on_message_sent -> fn (_: any) -> transaction::action::type[] { return []. },
             $on_contact_removed -> fn (_: any) -> transaction::action::type[] { return []. },
             $on_file_received -> fn (_: any) -> transaction::action::type[] { return [ _save_state NIL ]. },
@@ -77,6 +104,11 @@ application actor loads libraries
     }
 
     trn __init _ { return transaction::success []. }
+
+    trn readonly list_incoming_messages _
+    {
+        return messages.
+    }
 
     trn call_external_sign _:($target -> target: global_id, $canonical_json -> canonical_json: str)
     {

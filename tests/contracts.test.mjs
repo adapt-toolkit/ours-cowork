@@ -149,8 +149,13 @@ test('otherwise unnamed current rooms receive the deterministic display fallback
   assert.equal(defaultRoomName(ROOM_ID), 'Room 01jz6y7n');
 });
 
-test('file policy is opaque binary with path-free names, bounded MIME metadata, and a 2 MiB ceiling', () => {
-  assert.equal(MAX_FILE_BYTES, 2_097_152);
+test('file policy is opaque binary with path-free names, bounded MIME metadata, and a 2,000,000-byte ceiling', () => {
+  // Deliberately BELOW 2 MiB. The pinned core budgets an unacknowledged file
+  // for redrive against the serialized envelope, not the payload, so a payload
+  // at 2,097,152 always fell outside the guarantee the documented maximum
+  // existed to protect.
+  assert.equal(MAX_FILE_BYTES, 2_000_000);
+  assert.ok(MAX_FILE_BYTES < 2_097_152);
   assert.equal(FileNameSchema.parse('evidence.tar.gz'), 'evidence.tar.gz');
   for (const invalid of ['', '.', '..', '../secret', 'a/b', 'a\\b', 'x'.repeat(256)]) {
     assert.throws(() => FileNameSchema.parse(invalid), invalid);

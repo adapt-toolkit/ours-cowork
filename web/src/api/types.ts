@@ -163,6 +163,21 @@ export interface FileRecordDto extends RecordCommonDto {
   source_wire_id?: string;
 }
 
+/** A file the room refused: no payload, no fan-out, auditable in history. */
+export interface FileRejectedRecordDto extends RecordCommonDto {
+  kind: 'file_rejected';
+  file_id: string;
+  author: AuthorDto;
+  author_alias?: AuthorAliasDto;
+  filename: string;
+  mime: string;
+  size: number;
+  limit: number;
+  reason: 'too_large' | 'invalid_filename' | 'invalid_mime';
+  source_file_id: number;
+  source_wire_id?: string;
+}
+
 export interface MembershipIntentRecordDto extends RecordCommonDto {
   kind: 'membership_intent';
   action: 'remove';
@@ -201,6 +216,7 @@ export interface CloseNoticeResultRecordDto extends RecordCommonDto {
 
 export type OperationalRecordDto =
   | FileRecordDto
+  | FileRejectedRecordDto
   | RelayIntentRecordDto
   | RelayResultRecordDto
   | MembershipIntentRecordDto
@@ -217,7 +233,10 @@ const RELAY_STATUSES = new Set<unknown>(['queued', 'send_failed', 'skipped_remov
 const DELIVERY_STATUSES = new Set<unknown>(['queued', 'send_failed']);
 const LOWER_CROCKFORD_ULID = /^[0-7][0-9a-hjkmnp-tv-z]{25}$/;
 const MAX_TEXT_BYTES = 262_144;
-const MAX_FILE_BYTES = 2 * 1024 * 1024;
+// Reading stays permissive: rooms that ran before the accepted maximum came
+// down to 2,000,000 hold records up to the old 2 MiB limit.
+const MAX_ARCHIVED_FILE_BYTES = 2 * 1024 * 1024;
+const FILE_REJECTION_REASONS = new Set<unknown>(['too_large', 'invalid_filename', 'invalid_mime']);
 const MAX_FILE_NAME_BYTES = 255;
 const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;
@@ -462,7 +481,7 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
         && isFileName(value.filename)
         && isUtf8Within(value.mime, MAX_MIME_BYTES)
         && isNonNegativeSafeInteger(value.size)
-        && value.size <= MAX_FILE_BYTES
+        && value.size <= MAX_ARCHIVED_FILE_BYTES
         && typeof value.sha256 === 'string'
         && /^[0-9a-f]{64}$/.test(value.sha256)
         && decodedSize === value.size
@@ -470,6 +489,20 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
         && isNonNegativeSafeInteger(value.source_file_id)
         && optionalString(value.source_wire_id);
     }
+    case 'file_rejected':
+      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'file_id', 'author', 'filename', 'mime', 'size', 'limit', 'reason', 'source_file_id'], ['author_alias', 'source_wire_id'])
+        && isLowerCrockfordUlid(value.file_id)
+        && isAuthor(value.author)
+        && (value.author_alias === undefined || isAuthorAlias(value.author_alias))
+        // Refused metadata is bounded but deliberately not schema-valid: it is
+        // exactly the metadata the room would not accept.
+        && isUtf8Within(value.filename, MAX_FILE_NAME_BYTES)
+        && isUtf8Within(value.mime, MAX_MIME_BYTES)
+        && isNonNegativeSafeInteger(value.size)
+        && isPositiveSafeInteger(value.limit)
+        && FILE_REJECTION_REASONS.has(value.reason)
+        && isNonNegativeSafeInteger(value.source_file_id)
+        && optionalString(value.source_wire_id);
     case 'membership_intent':
       return hasExactKeys(
         value,

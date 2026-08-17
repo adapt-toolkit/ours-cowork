@@ -9,8 +9,15 @@
 // 2026-08-10 FILE POLICY HISTORY: the first room packet deliberately refused
 // every inbound and outbound file because cowork had no durable relay ledger.
 // The owner overturned that refusal once archive-before-consume file fan-out was
-// designed. Files are now opaque bytes with filename/MIME metadata, capped at
-// 2 MiB so the pinned core can retain an unacknowledged send for crash redrive.
+// designed. Files are now opaque bytes with filename/MIME metadata, capped so
+// the pinned core can retain an unacknowledged send for crash redrive.
+//
+// 2026-08-17: that cap was 2 MiB exactly, which is the core's redrive budget for
+// the whole SERIALIZED envelope, not for the payload — so a file at the
+// documented maximum always fell outside the guarantee the maximum existed to
+// protect. The accepted payload maximum is now 2,000,000 bytes (see
+// max_file_bytes), and inbound refusals are reported to the sender instead of
+// aborting the inbound transaction.
 
 application actor loads libraries
     identity_proof_document,
@@ -46,19 +53,34 @@ application actor loads libraries
             $wire_id     -> str,
             $reply_to    -> a2a_protocol::reply_ref_t+
         ).
+        // $reject_reason/$reject_bytes are NIL on an accepted file. They are set
+        // when the room refused the file: the record is then deposited with an
+        // EMPTY $data (the refused payload is never made durable) so the host can
+        // tell the sender what happened. Both are nullable, so state exported by
+        // an actor that predates them still imports.
         metadef file_t: (
-            $file_id     -> int,
-            $sender_id   -> global_id,
-            $sender_name -> str,
-            $filename    -> str,
-            $mime        -> str,
-            $data        -> bin,
-            $date        -> time,
-            $status      -> str,
-            $wire_id     -> str,
-            $reply_to    -> a2a_protocol::reply_ref_t+
+            $file_id       -> int,
+            $sender_id     -> global_id,
+            $sender_name   -> str,
+            $filename      -> str,
+            $mime          -> str,
+            $data          -> bin,
+            $date          -> time,
+            $status        -> str,
+            $wire_id       -> str,
+            $reply_to      -> a2a_protocol::reply_ref_t+,
+            $reject_reason -> str+,
+            $reject_bytes  -> int+
         ).
-        max_file_bytes is int = 2097152.
+        // The ACCEPTED payload maximum. Deliberately below the pinned core's
+        // unacked_file_entry_max_bytes (2097152), which it measures against the
+        // SERIALIZED envelope — filename, mime, data, wire_id, reply_to, pv — not
+        // the payload. A payload at 2097152 therefore always exceeded the core's
+        // redrive budget and was silently not retained for automatic resend. At
+        // 2000000 every accepted file clears that budget with room to spare for
+        // metadata (up to 510 bytes of filename + MIME) and fixed framing, so
+        // "accepted" now really does mean "retained for redrive on every leg".
+        max_file_bytes is int = 2000000.
         max_file_name_bytes is int = 255.
         max_file_mime_bytes is int = 255.
 
@@ -99,6 +121,9 @@ application actor loads libraries
             return mid.
         }
 
+        // A refused inbound file deposits an EMPTY payload with a reason. The
+        // refused bytes are never written into durable packet state; only the
+        // metadata the host needs to tell the sender what was refused is kept.
         fn deposit_file (
             sender_id: global_id,
             sender_name: str,
@@ -107,44 +132,73 @@ application actor loads libraries
             data: bin,
             file_date: time,
             wire_id: str,
-            reply_to: a2a_protocol::reply_ref_t+
+            reply_to: a2a_protocol::reply_ref_t+,
+            reject_reason: str
         ) -> int
         {
-            abort "Room files must be at most 2097152 bytes (2 MiB)." when (_binlen data) > max_file_bytes.
             fid = next_file_seq.
             next_file_seq -> next_file_seq + 1.
+            kept is bin = data.
+            kept_name is str = filename.
+            kept_mime is str = mime.
+            reason is str+ = NIL.
+            reject_bytes is int+ = NIL.
+            if reject_reason != ""
+            {
+                kept -> _hex_string_to_binary "".
+                reason -> reject_reason.
+                reject_bytes -> _binlen data.
+                // A refused file is the one path where unvalidated metadata
+                // reaches durable state. Keep it only while it is inside the
+                // bound it failed some OTHER check against; an over-long name or
+                // MIME is dropped rather than persisted at the sender's chosen
+                // length.
+                if (_strlen filename) > max_file_name_bytes { kept_name -> "". }
+                if (_strlen mime) > max_file_mime_bytes { kept_mime -> "". }
+            }
             files (_count files|) -> (
-                $file_id     -> fid,
-                $sender_id   -> sender_id,
-                $sender_name -> sender_name,
-                $filename    -> filename,
-                $mime        -> mime,
-                $data        -> data,
-                $date        -> file_date,
-                $status      -> "unread",
-                $wire_id     -> wire_id,
-                $reply_to    -> reply_to
+                $file_id       -> fid,
+                $sender_id     -> sender_id,
+                $sender_name   -> sender_name,
+                $filename      -> kept_name,
+                $mime          -> kept_mime,
+                $data          -> kept,
+                $date          -> file_date,
+                $status        -> "unread",
+                $wire_id       -> wire_id,
+                $reply_to      -> reply_to,
+                $reject_reason -> reason,
+                $reject_bytes  -> reject_bytes
             ).
             return fid.
         }
 
-        // Keep this boundary identical to FileNameSchema/FileMimeSchema in
-        // src/contracts.ts. Invalid metadata must abort before deposit_file can
-        // make an unread item durable, otherwise one poison item can block every
-        // startup resume pass.
-        fn validate_file_metadata (filename: str, mime: str) -> bool
+        // Keep this boundary identical to FileNameSchema/FileMimeSchema and
+        // MAX_FILE_BYTES in src/contracts.ts.
+        //
+        // 2026-08-17: this used to `abort`, which rolled back the whole inbound
+        // transaction. That destroyed the sender correlation the actor was
+        // holding ($sender_id) and took the delivered receipt with it, so a
+        // refused file looked like SUCCESS to its sender and left no trace in
+        // room history — the host journal was the only place the refusal
+        // existed. It now returns a reason instead, and the transaction commits
+        // with an empty-payload rejection record that the host bounces to the
+        // sender and appends to the archive. Returns "" when the file is
+        // acceptable.
+        fn file_reject_reason (filename: str, mime: str, data: bin) -> str
         {
-            abort "Room file name must be at least 1 UTF-8 byte." when (_strlen filename) < 1.
-            abort "Room file name must be at most 255 UTF-8 bytes." when (_strlen filename) > max_file_name_bytes.
-            abort "Room file name must not be a relative path token." when filename == "." || filename == "..".
+            if (_strlen filename) < 1 { return "invalid_filename". }
+            if (_strlen filename) > max_file_name_bytes { return "invalid_filename". }
+            if filename == "." || filename == ".." { return "invalid_filename". }
             path_character is bool = FALSE.
             sc filename -- ( -> character)
             {
                 if character == "/" || character == "\\" || character == "\0" { path_character -> TRUE. }
             }
-            abort "Room file name must be a single path-free name." when path_character.
-            abort "Room file MIME metadata must be at most 255 UTF-8 bytes." when (_strlen mime) > max_file_mime_bytes.
-            return TRUE.
+            if path_character { return "invalid_filename". }
+            if (_strlen mime) > max_file_mime_bytes { return "invalid_mime". }
+            if (_binlen data) > max_file_bytes { return "too_large". }
+            return "".
         }
 
         a2a_messaging::init (
@@ -169,7 +223,16 @@ application actor loads libraries
             $on_message_sent -> fn (_: any) -> transaction::action::type[] { return []. },
             $on_contact_removed -> fn (_: any) -> transaction::action::type[] { return []. },
             // 2026-08-10: positive successor to the deliberate blanket refusal
-            // above. Unknown senders and >2 MiB inputs still fail closed.
+            // above.
+            //
+            // 2026-08-17: an unknown sender still fails closed — there is no
+            // contact to answer, so there is nothing an abort can destroy. An
+            // over-limit or badly-named file does NOT abort any more. Aborting
+            // rolled back the delivered receipt along with the deposit, so the
+            // sender got SUCCESS for a file the room had refused and nobody
+            // received; the only record was a host-journal line. The refusal is
+            // now committed as an empty-payload record which the host bounces to
+            // the sender and appends to room history.
             $on_file_received -> fn (arg: any) -> transaction::action::type[]
             {
                 abort "File from an unknown sender was rejected." when (arg $sender_name) == NIL.
@@ -178,23 +241,23 @@ application actor loads libraries
                 filename = (arg $filename) safe str.
                 mime is str = "".
                 if (arg $mime) != NIL { mime -> (arg $mime) safe str. }
-                validate_file_metadata filename mime.
                 data = (arg $data) safe bin.
                 file_date = (arg $date) safe time.
                 wire_id is str = "".
                 if (arg $wire_id) != NIL { wire_id -> (arg $wire_id) safe str. }
                 reply_to is a2a_protocol::reply_ref_t+ = NIL.
                 if (arg $reply_to) != NIL { reply_to -> (arg $reply_to) safe a2a_protocol::reply_ref_t. }
-                fid = deposit_file sender_id sender_name filename mime data file_date wire_id reply_to.
+                reject_reason = file_reject_reason filename mime data.
+                fid = deposit_file sender_id sender_name filename mime data file_date wire_id reply_to reject_reason.
                 return [
-                    _notify_agent ($event -> $file_received, $sender_name -> sender_name, $file_id -> fid, $wire_id -> wire_id, $filename -> filename, $mime -> mime, $bytes -> _binlen data, $date -> file_date),
+                    _notify_agent ($event -> $file_received, $sender_name -> sender_name, $file_id -> fid, $wire_id -> wire_id, $filename -> filename, $mime -> mime, $bytes -> _binlen data, $date -> file_date, $rejected -> reject_reason),
                     _save_state NIL
                 ].
             },
             $on_file_sent -> fn (arg: any) -> transaction::action::type[]
             {
                 data = (arg $data) safe bin.
-                abort "Room files must be at most 2097152 bytes (2 MiB)." when (_binlen data) > max_file_bytes.
+                abort "Room files must be at most 2000000 bytes." when (_binlen data) > max_file_bytes.
                 return [].
             },
             $on_receipt_received -> fn (_: any) -> transaction::action::type[] { return []. }
@@ -324,7 +387,8 @@ application actor loads libraries
                     $sender_name -> f $sender_name, $filename -> f $filename,
                     $mime -> f $mime, $data -> f $data, $date -> f $date,
                     $status -> "processed", $wire_id -> f $wire_id,
-                    $reply_to -> f $reply_to
+                    $reply_to -> f $reply_to,
+                    $reject_reason -> f $reject_reason, $reject_bytes -> f $reject_bytes
                 ).
                 fresh (_count fresh|) -> processed.
                 updated (_count updated|) -> processed.
@@ -361,7 +425,8 @@ application actor loads libraries
                         $sender_name -> f $sender_name, $filename -> f $filename,
                         $mime -> f $mime, $data -> f $data, $date -> f $date,
                         $status -> "processed", $wire_id -> f $wire_id,
-                        $reply_to -> f $reply_to
+                        $reply_to -> f $reply_to,
+                        $reject_reason -> f $reject_reason, $reject_bytes -> f $reject_bytes
                     ).
                 }
                 else
@@ -499,7 +564,8 @@ application actor loads libraries
                     $sender_name -> f $sender_name, $filename -> f $filename,
                     $mime -> f $mime, $data -> f $data, $date -> f $date,
                     $status -> "ready_to_delete", $wire_id -> f $wire_id,
-                    $reply_to -> f $reply_to
+                    $reply_to -> f $reply_to,
+                    $reject_reason -> f $reject_reason, $reject_bytes -> f $reject_bytes
                 ).
                 promoted -> promoted + 1.
             }

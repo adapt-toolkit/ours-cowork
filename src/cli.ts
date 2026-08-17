@@ -1101,4 +1101,26 @@ async function main(): Promise<void> {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === SELF) void main();
+/**
+ * Decide whether this module is the program being run.
+ *
+ * The npm `bin` entry is a symlink, and `path.resolve` does not dereference
+ * one: invoked through `ours-cowork`, argv[1] is the bin path while
+ * `import.meta.url` is already the dist realpath. A plain equality check is
+ * therefore false for every installed invocation, which silently skipped
+ * `main()` and made even an invalid command exit 0 with no output. Compare
+ * through symlinks so the installed entry point runs.
+ */
+export function isProgramEntry(invokedPath: string | undefined, self: string = SELF): boolean {
+  if (!invokedPath) return false;
+  const invoked = resolve(invokedPath);
+  if (invoked === self) return true;
+  try {
+    return fs.realpathSync(invoked) === fs.realpathSync(self);
+  } catch {
+    // An unreadable or missing argv[1] is not this module.
+    return false;
+  }
+}
+
+if (isProgramEntry(process.argv[1])) void main();

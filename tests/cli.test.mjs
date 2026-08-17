@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -10,6 +10,7 @@ import test from 'node:test';
 import {
   NATIVE_RPC_TIMEOUT_MS,
   browserOpenCommand,
+  isProgramEntry,
   openWebConsole,
   rpcCall,
   rpcTimeoutForMethod,
@@ -837,4 +838,33 @@ test('service install rejects control characters before creating or replacing a 
       await rm(home, { recursive: true, force: true });
     }
   }
+});
+
+test('the CLI runs when invoked through its npm bin symlink', async () => {
+  // The installed entry point is a symlink (`bin/ours-cowork` ->
+  // `dist/cli.js`). path.resolve does not dereference it, so a plain
+  // argv[1] === import.meta.url comparison skipped main() entirely and made
+  // every command — including invalid ones — exit 0 with no output.
+  const home = await mkdtemp(join(tmpdir(), 'cowork-bin-symlink-'));
+  const link = join(home, 'ours-cowork');
+  try {
+    await symlink(CLI, link);
+
+    const invalid = await runCli(['definitely-not-a-command'], { cli: link });
+    assert.equal(invalid.code, 2);
+    assert.match(invalid.stderr, /unknown command: definitely-not-a-command/);
+
+    const usage = await runCli([], { cli: link });
+    assert.equal(usage.code, 0);
+    assert.match(usage.stdout, /standalone mission-room daemon/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('isProgramEntry accepts a symlinked invocation and rejects an unrelated one', () => {
+  assert.equal(isProgramEntry(undefined, CLI), false);
+  assert.equal(isProgramEntry(CLI, CLI), true);
+  assert.equal(isProgramEntry(join(ROOT, 'dist', 'daemon.js'), CLI), false);
+  assert.equal(isProgramEntry(join(ROOT, 'dist', 'does-not-exist.js'), CLI), false);
 });

@@ -3,7 +3,34 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 
 const MAX_TEXT_BYTES = 262_144;
-export const MAX_FILE_BYTES = 2 * 1024 * 1024;
+/**
+ * The ACCEPTED file payload maximum.
+ *
+ * Not 2 MiB. The pinned core budgets an unacknowledged file for automatic
+ * redrive against `unacked_file_entry_max_bytes` (2,097,152) measured on the
+ * SERIALIZED envelope — filename, mime, data, wire_id, reply_to, pv — not on
+ * the payload. A 2,097,152-byte payload therefore always exceeded the budget,
+ * so a file at the documented maximum was never retained for automatic resend:
+ * the documented limit sat outside the guarantee it existed to protect.
+ *
+ * 2,000,000 leaves ~97 KiB of headroom, far beyond the 510 bytes of filename +
+ * MIME plus fixed framing an envelope can add, so the contract "accepted =>
+ * every leg is retained for automatic redrive" is now true for every accepted
+ * file. Keep this identical to `max_file_bytes` in mufl_code/actor.mu.
+ *
+ * Raising the ceiling is a separate project: it needs the whole response-cap
+ * chain raised (file -> base64 -> history page -> management response -> CLI
+ * cap) plus an archive retention policy and chunking.
+ */
+export const MAX_FILE_BYTES = 2_000_000;
+/**
+ * The largest file an archive may CONTAIN, as opposed to the largest this build
+ * accepts. Rooms that ran before the accepted maximum came down to 2,000,000
+ * hold records up to the old 2 MiB limit; validating them against the new,
+ * smaller limit would make their history unreadable. Reading stays permissive,
+ * admission does not.
+ */
+export const MAX_ARCHIVED_FILE_BYTES = 2 * 1024 * 1024;
 /**
  * History remains an array-shaped public response, but each daemon page is
  * byte-bounded.  Three MiB fits one maximum-size file record after base64
@@ -95,6 +122,24 @@ export const FileNameSchema = utf8Bounded('file name', MAX_FILE_NAME_BYTES)
 export const FileMimeSchema = z.string().refine(
   (value) => Buffer.byteLength(value, 'utf8') <= MAX_MIME_BYTES,
   `file MIME metadata must be at most ${MAX_MIME_BYTES} UTF-8 bytes`,
+);
+
+/** Why a room refused an inbound file. Mirrors `file_reject_reason` in the actor. */
+export const FileRejectionReasonSchema = z.enum(['too_large', 'invalid_filename', 'invalid_mime']);
+
+/**
+ * The metadata of a REFUSED file, which by definition may be exactly what
+ * FileNameSchema/FileMimeSchema reject. It is still length-bounded: the actor
+ * drops a name or MIME that exceeds its byte bound rather than persisting one
+ * at the sender's chosen length, so both may be empty here.
+ */
+const RejectedFileNameSchema = z.string().refine(
+  (value) => Buffer.byteLength(value, 'utf8') <= MAX_FILE_NAME_BYTES,
+  `rejected file name must be at most ${MAX_FILE_NAME_BYTES} UTF-8 bytes`,
+);
+const RejectedFileMimeSchema = z.string().refine(
+  (value) => Buffer.byteLength(value, 'utf8') <= MAX_MIME_BYTES,
+  `rejected file MIME metadata must be at most ${MAX_MIME_BYTES} UTF-8 bytes`,
 );
 
 export const RoomStateSchema = z.enum(['provisioning', 'active', 'closing', 'closed']);
@@ -643,7 +688,7 @@ const FileShape = {
   author_alias: AuthorAliasSchema.optional(),
   filename: FileNameSchema,
   mime: FileMimeSchema,
-  size: z.number().int().nonnegative().max(MAX_FILE_BYTES),
+  size: z.number().int().nonnegative().max(MAX_ARCHIVED_FILE_BYTES),
   sha256: z.string().regex(/^[0-9a-f]{64}$/),
   data_base64: z.string(),
   recipient_identities: z.array(NonEmptyStringSchema).superRefine((identities, context) => {
@@ -659,6 +704,26 @@ const FileShape = {
       seen.add(identity);
     }
   }),
+  source_file_id: z.number().int().nonnegative().safe(),
+  source_wire_id: NonEmptyStringSchema.optional(),
+} as const;
+
+/**
+ * A file the room refused. There is no payload and no fan-out: the point of the
+ * record is that the refusal is auditable in room history rather than existing
+ * only as a host-journal line the sender never sees. `size` is what actually
+ * arrived and may exceed `limit`.
+ */
+const FileRejectedShape = {
+  kind: z.literal('file_rejected'),
+  file_id: LowerCrockfordUlidSchema,
+  author: AuthorSnapshotSchema,
+  author_alias: AuthorAliasSchema.optional(),
+  filename: RejectedFileNameSchema,
+  mime: RejectedFileMimeSchema,
+  size: z.number().int().nonnegative().safe(),
+  limit: PositiveSafeIntegerSchema,
+  reason: FileRejectionReasonSchema,
   source_file_id: z.number().int().nonnegative().safe(),
   source_wire_id: NonEmptyStringSchema.optional(),
 } as const;
@@ -701,6 +766,7 @@ const CloseNoticeResultShape = {
 
 export const MessageRecordSchema = z.object({ ...RecordCommonShape, ...MessageShape }).strict();
 export const FileRecordSchema = z.object({ ...RecordCommonShape, ...FileShape }).strict();
+export const FileRejectedRecordSchema = z.object({ ...RecordCommonShape, ...FileRejectedShape }).strict();
 export const RelayIntentRecordSchema = z.object({ ...RecordCommonShape, ...RelayIntentShape }).strict();
 export const RelayResultRecordSchema = z.object({ ...RecordCommonShape, ...RelayResultShape }).strict();
 export const MembershipIntentRecordSchema = z.object({ ...RecordCommonShape, ...MembershipIntentShape }).strict();
@@ -711,6 +777,7 @@ export const CloseNoticeResultRecordSchema = z.object({ ...RecordCommonShape, ..
 const RawCommunicationRecordSchema = z.discriminatedUnion('kind', [
   MessageRecordSchema,
   FileRecordSchema,
+  FileRejectedRecordSchema,
   RelayIntentRecordSchema,
   RelayResultRecordSchema,
   MembershipIntentRecordSchema,
@@ -812,6 +879,7 @@ export const CommunicationRecordSchema = RawCommunicationRecordSchema.superRefin
 export const AppendRecordSchema = z.discriminatedUnion('kind', [
   z.object({ ...AppendCommonShape, ...MessageShape }).strict(),
   z.object({ ...AppendCommonShape, ...FileShape }).strict(),
+  z.object({ ...AppendCommonShape, ...FileRejectedShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayIntentShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayResultShape }).strict(),
   z.object({ ...AppendCommonShape, ...MembershipIntentShape }).strict(),
@@ -835,5 +903,6 @@ export type RoomV1 = z.infer<typeof RoomV1Schema>;
 export type RoleBriefing = z.infer<typeof RoleBriefingSchema>;
 export type MembershipNotice = z.infer<typeof MembershipNoticeSchema>;
 export type AuthorSnapshot = z.infer<typeof AuthorSnapshotSchema>;
+export type FileRejectionReason = z.infer<typeof FileRejectionReasonSchema>;
 export type CommunicationRecord = z.infer<typeof CommunicationRecordSchema>;
 export type AppendRecord = z.infer<typeof AppendRecordSchema>;

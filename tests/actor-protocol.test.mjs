@@ -91,6 +91,8 @@ function renderFiles(value) {
       data: Buffer.from(file.Reduce('data').GetBinary()),
       status: file.Reduce('status').Visualize(),
       wire_id: file.Reduce('wire_id').Visualize(),
+      reject_reason: file.Reduce('reject_reason').IsNil() ? '' : file.Reduce('reject_reason').Visualize(),
+      reject_bytes: file.Reduce('reject_bytes').IsNil() ? 0 : Number(file.Reduce('reject_bytes').Visualize()),
     });
   }
   return files;
@@ -391,23 +393,52 @@ test('minimal cowork actor speaks the real ours packet protocol', async (t) => {
     'permissive fixture contact acceptance',
   );
 
-  for (const [filename, mime] of [
-    ['../poison.bin', 'application/octet-stream'],
-    ['.', 'application/octet-stream'],
-    ['back\\slash.bin', 'application/octet-stream'],
-    ['€'.repeat(86), 'application/octet-stream'],
-    ['valid-name.bin', '€'.repeat(86)],
-  ]) {
-    const rejectsBefore = room.rejects.length;
+  // Invalid metadata used to ABORT the inbound transaction. That rolled back the
+  // delivered receipt with it, so the sender learned nothing. The refusal is now
+  // committed as an unread record with a reason and an EMPTY payload, which the
+  // host bounces and archives. The transaction itself must succeed.
+  const poisonPayload = Buffer.from('poison');
+  const invalidMetadata = [
+    ['../poison.bin', 'application/octet-stream', 'invalid_filename', '../poison.bin'],
+    ['.', 'application/octet-stream', 'invalid_filename', '.'],
+    ['back\\slash.bin', 'application/octet-stream', 'invalid_filename', 'back\\slash.bin'],
+    // Over the 255-byte name bound: the name itself is dropped rather than
+    // persisted at the sender's chosen length.
+    ['€'.repeat(86), 'application/octet-stream', 'invalid_filename', ''],
+    ['valid-name.bin', '€'.repeat(86), 'invalid_mime', 'valid-name.bin'],
+  ];
+  const rejectsBeforeMetadata = room.rejects.length;
+  for (const [index, [filename, mime]] of invalidMetadata.entries()) {
     await mutate(permissive, '::a2a_messaging::send_file', {
       contact: room.cid,
       filename,
       mime,
-      data: binary(permissive, Buffer.from('poison')),
+      data: binary(permissive, poisonPayload),
     });
-    await waitFor(() => room.rejects.length > rejectsBefore, `invalid file metadata rejection: ${JSON.stringify(filename)}`);
+    await waitFor(
+      () => fileInbox(room).filter((file) => file.reject_reason !== '').length > index,
+      `committed file rejection: ${JSON.stringify(filename)}`,
+    );
   }
-  assert.deepEqual(fileInbox(room), [], 'invalid metadata must abort before the room actor persists an unread file');
+  assert.equal(
+    room.rejects.length,
+    rejectsBeforeMetadata,
+    'a refused file must not abort its inbound transaction any more',
+  );
+  const refused = fileInbox(room);
+  assert.equal(refused.length, invalidMetadata.length);
+  for (const [index, [, , reason, expectedName]] of invalidMetadata.entries()) {
+    assert.equal(refused[index].reject_reason, reason);
+    assert.equal(refused[index].reject_bytes, poisonPayload.length);
+    assert.equal(refused[index].filename, expectedName);
+    assert.equal(refused[index].data.length, 0, 'a refused payload must never be persisted');
+    assert.equal(refused[index].sender_id, permissive.cid);
+  }
+  // Drain them so the positive file assertions below start from an empty inbox.
+  await mutate(room, '::actor::consume_files', {
+    expected_ids: refused.map((file) => file.file_id),
+  });
+  assert.deepEqual(fileInbox(room).filter((file) => file.status === 'unread'), []);
 
   // The fixture is an actual notification service. Registering exercises the
   // cowork actor's client-confirm hook and leaves core-owned client state that
@@ -423,7 +454,7 @@ test('minimal cowork actor speaks the real ours packet protocol', async (t) => {
 
   // Historical note: this block used to prove that both outgoing and incoming
   // files were deliberately refused. The durable archive/intent ledger now
-  // makes those paths positive while retaining an explicit 2 MiB policy.
+  // makes those paths positive while retaining an explicit size policy.
   const roomToBob = Buffer.from([0, 1, 2, 255, 42]);
   await mutate(room, '::a2a_messaging::send_file', {
     contact: bob.cid,
@@ -464,9 +495,9 @@ test('minimal cowork actor speaks the real ours packet protocol', async (t) => {
       contact: bob.cid,
       filename: 'too-large.bin',
       mime: 'application/octet-stream',
-      data: binary(room, Buffer.alloc((2 * 1024 * 1024) + 1)),
+      data: binary(room, Buffer.alloc(2_000_001)),
     }),
-    /at most 2097152 bytes/,
+    /at most 2000000 bytes/,
   );
 
   // A real encrypted peer call arrives with external origin and must not reach

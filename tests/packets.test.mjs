@@ -216,8 +216,8 @@ test('hosted file sends pass opaque bytes to core and reject oversized input bef
   assert.equal('path' in calls[0].target, false);
 
   await assert.rejects(
-    hosted.sendFile('cid-peer', 'too-large.bin', '', Buffer.alloc((2 * 1024 * 1024) + 1)),
-    /at most 2097152 bytes/,
+    hosted.sendFile('cid-peer', 'too-large.bin', '', Buffer.alloc(2_000_001)),
+    /at most 2000000 bytes/,
   );
   assert.equal(calls.length, 1, 'oversized data never reaches the native mutation');
 });

@@ -13,6 +13,9 @@ const THIS_FILE = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(THIS_FILE), '..');
 const CLI = join(ROOT, 'dist', 'cli.js');
 const UNIT_DIR = join(ROOT, 'mufl_code');
+// The cowork actor refuses to SEND an over-limit file, so proving the receive
+// side needs a peer that does not. The permissive fixture is exactly that.
+const PERMISSIVE_UNIT_DIR = join(ROOT, 'tests', 'fixtures');
 const SUCCESS = 'COWORK_E2E_DRIVER_SUCCESS';
 const FAILURE = 'COWORK_E2E_DRIVER_FAILURE';
 const NATIVE_CLI_TIMEOUT_MS = 125_000;
@@ -257,6 +260,8 @@ if (process.argv.includes('--e2e-driver')) {
       assert(existsSync(CLI), 'build the daemon and CLI before running E2E');
       const unitFile = readdirSync(UNIT_DIR).find((name) => name.endsWith('.muflo'));
       assert(unitFile, 'compile the cowork packet before running E2E');
+      const permissiveUnitFile = readdirSync(PERMISSIVE_UNIT_DIR).find((name) => name.endsWith('.muflo'));
+      assert(permissiveUnitFile, 'compile the permissive fixture packet before running E2E');
       const port = await unusedPort();
       const configPath = join(stateDir, 'config.json');
       writeFileSync(configPath, JSON.stringify({
@@ -298,10 +303,16 @@ if (process.argv.includes('--e2e-driver')) {
         hash: unitFile.slice(0, -'.muflo'.length),
         bytes: new Uint8Array(readFileSync(join(UNIT_DIR, unitFile))),
       };
-      const [alice, bob, charlie] = await Promise.all([
+      const permissiveUnit = {
+        dir: PERMISSIVE_UNIT_DIR,
+        hash: permissiveUnitFile.slice(0, -'.muflo'.length),
+        bytes: new Uint8Array(readFileSync(join(PERMISSIVE_UNIT_DIR, permissiveUnitFile))),
+      };
+      const [alice, bob, charlie, mallory] = await Promise.all([
         createPeer('Alice', `e2e-alice-${Date.now()}`, unit, PacketWrapperConfigurator, object_to_adapt_value),
         createPeer('Bob', `e2e-bob-${Date.now()}`, unit, PacketWrapperConfigurator, object_to_adapt_value),
         createPeer('Charlie', `e2e-charlie-${Date.now()}`, unit, PacketWrapperConfigurator, object_to_adapt_value),
+        createPeer('Mallory', `e2e-mallory-${Date.now()}`, permissiveUnit, PacketWrapperConfigurator, object_to_adapt_value),
       ]);
       stage('participants-ready');
 
@@ -484,6 +495,60 @@ if (process.argv.includes('--e2e-driver')) {
         && Number.isSafeInteger(record.source_file_id)));
       const archivedFileSnapshot = structuredClone(archivedFiles);
       stage('files-relayed-both-directions');
+
+      // THE REFUSAL PATH, in its own room so it perturbs nothing above.
+      // A sender must LEARN that its file was refused. Before this, the room
+      // aborted the inbound transaction: the sender saw SUCCESS, nobody
+      // received the file, and the only trace was a line in the host journal.
+      // Mallory runs the permissive fixture so it can actually put an
+      // over-limit file on the wire; the cowork actor refuses to send one.
+      const refusalRoom = await runCli(['room', 'create', '--goal', 'Prove file refusal is reported', '--briefing', 'Refusal proof briefing']);
+      const refusalRoomId = refusalRoom.room_id;
+      const refusalRoomCid = refusalRoom.identity_cid;
+      const refusalInvite = await runCli(['room', 'invite', refusalRoomId, '--mode', 'public', '--role', 'unbounded', '--min-accepts', '2']);
+      await Promise.all([joinInvite(mallory, refusalInvite.blob), joinInvite(alice, refusalInvite.blob)]);
+      await waitFor(async () => (await runCli(['room', 'show', refusalRoomId])).state === 'active', 'refusal room activated');
+
+      const overLimit = Buffer.alloc(2_000_001, 0x5a);
+      await sendFile(mallory, refusalRoomCid, 'over-limit.bin', 'application/octet-stream', overLimit);
+
+      const refusal = await waitFor(
+        () => roomEnvelopes(mallory).find((message) => message.kind === 'room_file_rejected'),
+        'the SENDER learns its over-limit file was refused',
+      );
+      assert.equal(refusal.sender_id, refusalRoomCid);
+      assert.equal(refusal.reason, 'too_large');
+      assert.equal(refusal.size, overLimit.length);
+      assert.equal(refusal.limit, 2_000_000);
+      assert.equal(refusal.filename, 'over-limit.bin');
+      assert.equal(refusal.room_id, refusalRoomId);
+      assert.equal(typeof refusal.signature, 'string');
+
+      // ...and the refusal is auditable in room history, not only in a journal.
+      const [refusalRecord] = await waitFor(async () => {
+        const history = await runCli(['room', 'history', refusalRoomId, '--after', '0', '--limit', '1000']);
+        const rejected = history.filter((record) => record.kind === 'file_rejected');
+        return rejected.length === 1 ? rejected : undefined;
+      }, 'file_rejected record in room history');
+      assert.equal(refusalRecord.reason, 'too_large');
+      assert.equal(refusalRecord.size, overLimit.length);
+      assert.equal(refusalRecord.limit, 2_000_000);
+      assert.equal(refusalRecord.author.identity, mallory.cid);
+      assert.equal(refusalRecord.author.role, 'unbounded');
+      assert.equal(refusalRecord.data_base64, undefined, 'a refused payload is never archived');
+
+      // Nobody sees a refused file.
+      const refusalHistory = await runCli(['room', 'history', refusalRoomId, '--after', '0', '--limit', '1000']);
+      assert.deepEqual(refusalHistory.filter((record) => record.kind === 'file'), []);
+      assert.equal(alice.fileInbox().some((file) => file.filename === 'over-limit.bin'), false);
+      assert.equal(roomEnvelopes(alice).some((message) => message.filename === 'over-limit.bin'), false);
+
+      // The room keeps working: a refusal does not jam the inbox.
+      await send(mallory, refusalRoomCid, 'still talking after a refusal');
+      await waitFor(() => roomEnvelopes(alice).some((message) =>
+        message.text === 'still talking after a refusal'
+        && message.author.identity === mallory.cid), 'room still accepts traffic after a refusal');
+      stage('over-limit-file-refused-and-reported');
 
       const operatorRecord = await runCli(['room', 'message', roomId, '--text', 'operator voice']);
       assert.equal(operatorRecord.author.identity, roomCid);

@@ -35,6 +35,15 @@ export interface FileInboxItem {
   data: Buffer;
   date: string;
   wire_id: string;
+  /**
+   * Empty when the room accepted the file. Otherwise the reason it refused it,
+   * in which case `data` is empty and `reject_bytes` is what actually arrived.
+   * The actor deliberately commits this instead of aborting: an abort rolled
+   * back the delivered receipt too, so the sender saw success for a file nobody
+   * received.
+   */
+  reject_reason: string;
+  reject_bytes: number;
 }
 
 export interface RoomPacket {
@@ -718,7 +727,7 @@ export class HostedRoomPacket implements RoomPacket {
     const validName = FileNameSchema.parse(filename);
     const validMime = FileMimeSchema.parse(mime);
     if (data.length > MAX_FILE_BYTES) {
-      throw new RangeError(`room files must be at most ${MAX_FILE_BYTES} bytes (2 MiB)`);
+      throw new RangeError(`room files must be at most ${MAX_FILE_BYTES} bytes`);
     }
     return withScopeAsync(async (lifetime) => {
       const result = await this.packet.mutatingTx(
@@ -818,6 +827,8 @@ function renderFileInbox(value: AdaptValue): RenderedFileInbox[] {
       date: adaptTimeToRfc3339(file.Reduce('date').Visualize()),
       status: file.Reduce('status').Visualize(),
       wire_id: file.Reduce('wire_id').Visualize(),
+      reject_reason: nilString(file.Reduce('reject_reason')),
+      reject_bytes: nilInteger(file.Reduce('reject_bytes')),
     });
   }
   return output;
@@ -858,6 +869,13 @@ function strictBooleanValue(value: AdaptValue, label: string): boolean {
 
 function nilString(value: AdaptValue): string {
   return value.IsNil() ? '' : value.Visualize();
+}
+
+/** Absent on every file record written before rejection reporting existed. */
+function nilInteger(value: AdaptValue): number {
+  if (value.IsNil()) return 0;
+  const decoded = Number(value.Visualize());
+  return Number.isFinite(decoded) ? decoded : 0;
 }
 
 /** Normalize the SDK's native TIME visualization into the host storage contract. */

@@ -6,11 +6,14 @@ import {
   LowerCrockfordUlidSchema,
   FileMimeSchema,
   FileNameSchema,
+  FileRejectionReasonSchema,
   MAX_FILE_BYTES,
   Rfc3339Schema,
   RoomSchema,
   type CommunicationRecord,
+  type FileRejectionReason,
   type Room,
+  type Seat,
 } from './contracts.ts';
 import type { FileInboxItem, InboxItem, RoomPacket } from './packets.ts';
 import type { CoworkStore, RoomMutex } from './storage.ts';
@@ -19,6 +22,7 @@ import { generateUlid } from './ulid.ts';
 type IntakeStore = Pick<CoworkStore, 'mutex' | 'load' | 'save' | 'append' | 'read'>;
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 type FileRecord = Extract<CommunicationRecord, { kind: 'file' }>;
+type FileRejectedRecord = Extract<CommunicationRecord, { kind: 'file_rejected' }>;
 type RelayIntentRecord = Extract<CommunicationRecord, { kind: 'relay_intent' }>;
 
 export interface IntakePacketRegistry {
@@ -190,16 +194,6 @@ export class IntakePump {
   ): Promise<void> {
     const parsedName = FileNameSchema.safeParse(item.filename);
     const parsedMime = FileMimeSchema.safeParse(item.mime);
-    // New actors reject this metadata before persistence. This defensive drain
-    // handles state exported by an older actor so one poison unread item cannot
-    // make every daemon restart fail at resumePending.
-    if (!parsedName.success || !parsedMime.success) {
-      await packet.consumeFileInbox([item.file_id]);
-      return;
-    }
-    if (item.data.length > MAX_FILE_BYTES) {
-      throw new RangeError(`room files must be at most ${MAX_FILE_BYTES} bytes (2 MiB)`);
-    }
     const room = await this.store.load(roomId);
     const seat = room.seats.find(
       (candidate) => candidate.identity === item.sender_id && candidate.state === 'active',
@@ -207,6 +201,23 @@ export class IntakePump {
     if (room.state !== 'active' || !seat) {
       if (room.state === 'active') await this.bounceRemovedSender(roomId, room, packet, item);
       await packet.consumeFileInbox([item.file_id]);
+      return;
+    }
+
+    // Refusal is decided HERE, not in the actor, because this is the last point
+    // that still holds the sender: the actor used to abort, and the abort took
+    // the sender correlation and the delivered receipt down with it, so the
+    // sender saw success for a file the room had thrown away.
+    //
+    // The actor's reason is authoritative — it saw the payload before dropping
+    // it — and these local checks re-derive one for state exported by an older
+    // actor, which deposited nothing at all on refusal but could still be
+    // holding an item this build considers out of bounds. Either way the item is
+    // consumed, so no refused file can become a poison item that fails every
+    // resumePending.
+    const rejection = rejectionOf(item, parsedName.success, parsedMime.success);
+    if (rejection || !parsedName.success || !parsedMime.success) {
+      await this.rejectFile(roomId, packet, item, seat, room, rejection ?? 'invalid_filename');
       return;
     }
     const records = await this.store.read(roomId);
@@ -241,6 +252,74 @@ export class IntakePump {
     }
 
     await this.completeFileIntents(roomId, file);
+    await packet.consumeFileInbox([item.file_id]);
+  }
+
+  /**
+   * Refuse one inbound file so that the sender LEARNS it was refused.
+   *
+   * Order is the point. The archive record is appended (and fsynced) first, so
+   * the refusal is auditable even if the bounce never reaches the wire; the
+   * bounce is best-effort exactly like the removed-seat bounce; the inbox item
+   * is consumed last, so a crash anywhere re-runs the whole refusal instead of
+   * losing it. `findSourceFileRejection` makes the re-run append-once.
+   *
+   * Nothing is relayed: this is the "failure => nobody sees the file" half of
+   * the contract. Full "success => everyone sees it" atomicity is NOT
+   * achievable here — the core returns at local commit and never observes
+   * delivery — and is deliberately not attempted.
+   */
+  private async rejectFile(
+    roomId: string,
+    packet: RoomPacket,
+    item: FileInboxItem,
+    seat: Seat,
+    room: Room,
+    reason: FileRejectionReason,
+  ): Promise<void> {
+    const records = await this.store.read(roomId);
+    let rejected = this.findSourceFileRejection(records, item);
+    if (!rejected) {
+      const appended = await this.store.append(roomId, {
+        version: 1,
+        kind: 'file_rejected',
+        room_id: roomId,
+        at: Rfc3339Schema.parse(item.date),
+        file_id: LowerCrockfordUlidSchema.parse(this.nextMessageId()),
+        author: { identity: seat.identity, display_name: seat.display_name, role: seat.role },
+        ...(room.anonymous && seat.alias !== undefined
+          ? { author_alias: { participant_id: seat.participant_id, alias: seat.alias } }
+          : {}),
+        filename: item.filename,
+        mime: item.mime,
+        // The actor drops the refused payload, so its recorded length is the
+        // only surviving statement of what actually arrived.
+        size: (item.reject_bytes ?? 0) > 0 ? item.reject_bytes : item.data.length,
+        limit: MAX_FILE_BYTES,
+        reason,
+        source_file_id: item.file_id,
+        ...(item.wire_id === '' ? {} : { source_wire_id: item.wire_id }),
+      });
+      if (appended.kind !== 'file_rejected') {
+        throw new Error('storage returned the wrong file rejection record kind');
+      }
+      rejected = appended;
+    }
+
+    try {
+      await sendSignedBody(packet, item.sender_id, {
+        version: 1 as const,
+        kind: 'room_file_rejected' as const,
+        room_id: roomId,
+        file_id: rejected.file_id,
+        filename: rejected.filename,
+        size: rejected.size,
+        limit: rejected.limit,
+        reason: rejected.reason,
+        ...(rejected.source_wire_id === undefined ? {} : { wire_id: rejected.source_wire_id }),
+      });
+    } catch { /* best effort — the archive record is the durable statement */ }
+
     await packet.consumeFileInbox([item.file_id]);
   }
 
@@ -534,6 +613,26 @@ export class IntakePump {
     return message;
   }
 
+  /**
+   * The append-once handle for a refusal that is being re-run after a crash
+   * between the archive append and the inbox consume.
+   */
+  private findSourceFileRejection(
+    records: CommunicationRecord[],
+    item: FileInboxItem,
+  ): FileRejectedRecord | undefined {
+    const rejected = records.find((record): record is FileRejectedRecord =>
+      record.kind === 'file_rejected' && record.source_file_id === item.file_id);
+    if (!rejected) return undefined;
+    const observedWireId = item.wire_id === '' ? undefined : item.wire_id;
+    if (rejected.source_wire_id !== observedWireId
+      || rejected.author.identity !== item.sender_id
+      || rejected.at !== item.date) {
+      throw new Error(`file inbox source ${item.file_id} does not match its durable rejection record`);
+    }
+    return rejected;
+  }
+
   private findSourceFile(records: CommunicationRecord[], item: FileInboxItem): FileRecord | undefined {
     const file = records.find((record): record is FileRecord =>
       record.kind === 'file' && record.source_file_id === item.file_id);
@@ -578,6 +677,34 @@ function canonicalValue(value: unknown): unknown {
     return output;
   }
   return value;
+}
+
+/**
+ * Decide whether an inbox item is a refusal, preferring the actor's own reason.
+ *
+ * The actor sets `reject_reason` at the moment it refuses, before it drops the
+ * payload, so it is the only witness to why. The local checks exist for state
+ * exported by an actor that predates rejection reporting: such an item carries
+ * no reason and its payload is intact, so it is re-judged against the current
+ * bounds here rather than being drained in silence.
+ */
+function rejectionOf(
+  item: FileInboxItem,
+  validName: boolean,
+  validMime: boolean,
+): FileRejectionReason | undefined {
+  // `?? ''` because an older host build, or a test fake, may not carry the
+  // field at all; absent is "the actor said nothing", not "rejected".
+  const declaredReason = item.reject_reason ?? '';
+  if (declaredReason !== '') {
+    const declared = FileRejectionReasonSchema.safeParse(declaredReason);
+    // An unrecognised reason is still a refusal; only its label is unusable.
+    return declared.success ? declared.data : 'too_large';
+  }
+  if (!validName) return 'invalid_filename';
+  if (!validMime) return 'invalid_mime';
+  if (item.data.length > MAX_FILE_BYTES) return 'too_large';
+  return undefined;
 }
 
 function unique(values: string[]): string[] {

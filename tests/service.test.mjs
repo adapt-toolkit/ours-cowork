@@ -1075,6 +1075,9 @@ test('projections update settings and page numeric history without exposing invi
 test('history returns byte-bounded short pages whose last sequence is a usable continuation cursor', async () => {
   const f = fixture();
   await create(f);
+  // Deliberately the OLD 2 MiB maximum, not the current 2,000,000-byte one:
+  // rooms that ran before the accepted limit came down hold records this large
+  // and their history must stay readable.
   const bytes = Buffer.alloc(2 * 1024 * 1024, 0xa5);
   const base64 = bytes.toString('base64');
   const records = f.store.records.get(ROOM_ID);

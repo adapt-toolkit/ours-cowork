@@ -22,7 +22,7 @@ Ordinary ours-mcp identities can join only as remote participants over the ours 
 Active participants can also send files through the room packet. Cowork treats
 them as opaque bytes, archives them before consuming packet state, and relays a
 signed metadata envelope plus the core binary file to every other active seat.
-Files are limited to 2 MiB; larger inputs fail loudly instead of weakening
+Files are limited to 2,000,000 bytes; larger inputs are refused loudly — and the sender is told — instead of weakening
 crash recovery guarantees.
 
 The release package contains the standalone daemon, operator CLI, compiled room packet, deterministic web assets, and all eleven offline operator topics. It has no dependency on another agent daemon.

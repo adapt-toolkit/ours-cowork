@@ -32,7 +32,7 @@ function pinSdkEnvironment(t) {
 }
 
 /**
- * A stand-in for an already-running ours daemon: only the routes SDK 1.3.1's
+ * A stand-in for an already-running ours daemon: only the routes SDK 1.5.2's
  * client actually uses, with the same token header and the same long-poll
  * notification contract.
  */
@@ -70,12 +70,12 @@ async function startFakeDaemon(t, options = {}) {
       return false;
     };
     if (request.method === 'GET' && url.pathname === '/state-dir') {
-      send(200, { stateDir: reportedStateDir, version: '1.3.1', compat: 1 });
+      send(200, { stateDir: reportedStateDir, version: '1.5.2', compat: 1 });
       return;
     }
     if (request.method === 'GET' && (url.pathname === '/version' || url.pathname === '/info')) {
       send(200, {
-        name: 'ours', version: '1.3.1', compat: 1, protocol: 1,
+        name: 'ours', version: '1.5.2', compat: 1, protocol: 1,
         pid: process.pid, stateDir: reportedStateDir,
       });
       return;

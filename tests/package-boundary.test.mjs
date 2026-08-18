@@ -10,7 +10,7 @@ test('package stays an independent cowork daemon', async () => {
 
   assert.equal(pkg.name, '@ours.network/cowork');
   assert.equal(pkg.bin['ours-cowork'], 'dist/cli.js');
-  assert.equal(dependencies['@ours.network/sdk'], '1.5.2');
+  assert.equal(dependencies['@ours.network/sdk'], '1.7.0');
   assert.equal('@adapt-toolkit/sdk' in dependencies, false);
   assert.equal('@adapt-toolkit/sdk-native' in dependencies, false);
   assert.equal(dependencies.zod, '^3.23.8');

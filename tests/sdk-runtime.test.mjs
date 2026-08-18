@@ -304,7 +304,7 @@ test('embedded host boots the standard SDK with private owned state and closes i
   const marker = stdout.split('\n').find((line) => line.startsWith('COWORK_SDK_RESULT '));
   assert(marker, stdout);
   const result = JSON.parse(marker.slice('COWORK_SDK_RESULT '.length));
-  assert.equal(result.info.version, '1.3.1');
+  assert.equal(result.info.version, '1.5.2');
   assert.deepEqual(result.stopped, { requiresProcessExit: true });
   assert.deepEqual(result.after, result.before);
   assert.equal(result.owned, join(stateDir, 'ours-sdk'));

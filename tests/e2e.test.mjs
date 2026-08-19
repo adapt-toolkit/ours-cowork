@@ -104,6 +104,7 @@ if (process.argv.includes('--e2e-driver')) {
     let brokerExit;
     let wrapper;
     let env;
+    let restPort;
     let completed = false;
     let driverFailure;
     const stage = (name) => process.stdout.write(`COWORK_E2E_STAGE ${name}\n`);
@@ -149,6 +150,30 @@ if (process.argv.includes('--e2e-driver')) {
       if (result.code !== 0 || body.ok !== true) {
         throw new Error(`CLI failed (${args.join(' ')}): exit=${result.code} ${stdout}\n${stderr}`);
       }
+      return body.result;
+    }
+
+    /**
+     * Issue one request exactly as the web console does: the single POST /rpc
+     * envelope against the loopback REST listener. Node's fetch sets Host to the
+     * requested authority, which is the authority check the listener enforces, so
+     * this exercises the same gate a same-origin browser passes.
+     */
+    async function panelRpc(method, params, expectedErrorMessage) {
+      const response = await fetch(`http://127.0.0.1:${restPort}/rpc`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ version: 1, id: `panel-${method}`, method, params }),
+      });
+      const body = await response.json();
+      assert.equal(body.version, 1);
+      assert.equal(body.id, `panel-${method}`);
+      if (expectedErrorMessage !== undefined) {
+        assert(body.error, `${method} unexpectedly succeeded: ${JSON.stringify(body.result)}`);
+        assert.match(body.error.message, expectedErrorMessage);
+        return body.error;
+      }
+      assert.equal(body.error, undefined, `${method} failed: ${JSON.stringify(body.error)}`);
       return body.result;
     }
 
@@ -258,12 +283,16 @@ if (process.argv.includes('--e2e-driver')) {
       const unitFile = readdirSync(UNIT_DIR).find((name) => name.endsWith('.muflo'));
       assert(unitFile, 'compile the cowork packet before running E2E');
       const port = await unusedPort();
+      // The web console has no transport of its own: it posts to the loopback REST
+      // listener. Enabling it on an unused port is what makes the panel's own
+      // request path, not just the CLI, reachable from this driver.
+      restPort = await unusedPort();
       const configPath = join(stateDir, 'config.json');
       writeFileSync(configPath, JSON.stringify({
         version: 1,
         brokerUrl: `ws://127.0.0.1:${port}`,
         stateDir,
-        rest: { enabled: false, port: 3052 },
+        rest: { enabled: true, port: restPort },
       }), { mode: 0o600 });
       env = {
         ...process.env,
@@ -491,6 +520,39 @@ if (process.argv.includes('--e2e-driver')) {
       await waitFor(() => [alice, bob].every((peer) => roomEnvelopes(peer).some((message) =>
         message.text === 'operator voice' && message.author.identity === roomCid)), 'operator voice fan-out');
       stage('operator-relayed');
+
+      // The console's "send as" control: discover the room's registered roles over
+      // room.show, then author under one over room.say. Registration stays a CLI
+      // act — the panel never mints or registers anything.
+      const beforeRegistration = await panelRpc('room.show', { room_id: roomId });
+      assert.deepEqual(beforeRegistration.rest_roles, [], 'a room registers no REST role on its own');
+      await panelRpc('room.say', { room_id: roomId, role: 'Reviewer', text: 'must not be authored' }, /not registered for REST authorship/);
+
+      await runCli(['room', 'rest-role', roomId, '--role', 'Reviewer']);
+      const afterRegistration = await panelRpc('room.show', { room_id: roomId });
+      assert.deepEqual(afterRegistration.rest_roles, ['Reviewer'], 'the panel discovers the registered role from room.show');
+
+      const roleRecord = await panelRpc('room.say', { room_id: roomId, role: 'Reviewer', text: 'role voice from the panel' });
+      // The daemon signs as the room; the role is the label, and the console
+      // validates exactly this shape before it clears the composer.
+      assert.equal(roleRecord.author.identity, roomCid);
+      assert.equal(roleRecord.author.display_name, 'Reviewer');
+      assert.equal(roleRecord.author.role, 'Reviewer');
+      await waitFor(() => [alice, bob].every((peer) => roomEnvelopes(peer).some((message) =>
+        message.text === 'role voice from the panel'
+        && message.sender_id === roomCid
+        && message.author.identity === roomCid
+        && message.author.display_name === 'Reviewer'
+        && message.author.role === 'Reviewer')), 'role-authored fan-out arrives as the room identity labelled Reviewer');
+
+      // Unregistering is the whole revocation: the next attempt is refused with no
+      // secret to expire and the already-relayed message left exactly as posted.
+      await runCli(['room', 'rest-role', roomId, '--role', 'Reviewer', '--remove']);
+      assert.deepEqual((await panelRpc('room.show', { room_id: roomId })).rest_roles, []);
+      await panelRpc('room.say', { room_id: roomId, role: 'Reviewer', text: 'must not be authored after removal' }, /not registered for REST authorship/);
+      assert(roomEnvelopes(alice).some((message) => message.text === 'role voice from the panel'
+        && message.author.role === 'Reviewer'), 'unregistering a role does not retract what it already sent');
+      stage('role-authored-relayed');
 
       const firstPage = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '2']);
       assert.equal(firstPage.length, 2);

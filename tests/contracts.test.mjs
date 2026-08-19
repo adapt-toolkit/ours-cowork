@@ -39,6 +39,7 @@ function room(overrides = {}) {
     identity_cid: 'cid-room',
     mission: { goal: 'Ship it', briefing: 'Work together.', briefing_version: 1 },
     role_briefings: {},
+    rest_roles: [],
     anonymous: false,
     quiet_membership: false,
     membership_epoch: 0,
@@ -147,6 +148,28 @@ test('otherwise unnamed current rooms receive the deterministic display fallback
   delete unnamed.room_name;
   assert.equal(RoomSchema.parse(unnamed).room_name, defaultRoomName(ROOM_ID));
   assert.equal(defaultRoomName(ROOM_ID), 'Room 01jz6y7n');
+});
+
+test('each additive v2 default is injected independently of the others', () => {
+  // The regression this guards: room_name and rest_roles were added at different
+  // times, so a single guarded early-return would default whichever field it was
+  // written for and silently skip the other on every room that already has it.
+  const named = room();
+  delete named.rest_roles;
+  assert.deepEqual(RoomSchema.parse(named).rest_roles, []);
+  assert.equal(RoomSchema.parse(named).room_name, 'Release room');
+
+  const unnamed = room();
+  delete unnamed.room_name;
+  delete unnamed.rest_roles;
+  const both = RoomSchema.parse(unnamed);
+  assert.deepEqual(both.rest_roles, []);
+  assert.equal(both.room_name, defaultRoomName(ROOM_ID));
+
+  // an explicit value is never overwritten by the default
+  assert.deepEqual(RoomSchema.parse(room({ rest_roles: ['Reviewer'] })).rest_roles, ['Reviewer']);
+  assert.throws(() => RoomSchema.parse(room({ rest_roles: ['x'.repeat(257)] })));
+  assert.throws(() => RoomSchema.parse(room({ rest_roles: 'Reviewer' })));
 });
 
 test('file policy is opaque binary with path-free names, bounded MIME metadata, and a 2 MiB ceiling', () => {
@@ -394,6 +417,7 @@ function roomV2(overrides = {}) {
     identity_cid: 'cid-room',
     mission: { goal: 'Ship it', briefing: 'Work together.', briefing_version: 1 },
     role_briefings: {},
+    rest_roles: [],
     anonymous: false,
     quiet_membership: false,
     membership_epoch: 0,
@@ -529,6 +553,7 @@ test('migrateRoomV1 maps v1 rooms onto additive v2 defaults', () => {
   assert.equal(migrated.quiet_membership, false);
   assert.equal(migrated.membership_epoch, 0);
   assert.deepEqual(migrated.role_briefings, {});
+  assert.deepEqual(migrated.rest_roles, []);
   assert.equal(migrated.mission.briefing_version, 1);
   assert.equal(migrated.mission.goal, 'Ship it');
   assert.equal(migrated.seats[0].participant_id, PID_1);

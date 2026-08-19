@@ -152,6 +152,7 @@ function room(overrides = {}) {
     identity_cid: 'cid-room',
     mission: { goal: 'Ship', briefing: 'Read the mission.', briefing_version: 1 },
     role_briefings: {},
+    rest_roles: [],
     anonymous: false,
     quiet_membership: false,
     membership_epoch: 3,
@@ -866,6 +867,29 @@ test('room-voice messages in anonymous rooms carry the room author and no seat i
       assert.equal(Buffer.from(call.body, 'utf8').includes(leak), false, `${leak} leaked into a room-voice body`);
     }
   }
+});
+
+test('role-authored messages in anonymous rooms inherit the room-voice exemption from aliasing', async () => {
+  // A REST role is room-side authorship, so it takes the same unaliased path the
+  // room's own voice already takes here. The alias invariants constrain SEATS;
+  // there is no seat to substitute, so INV-R3/INV-R4 have nothing to apply to.
+  const f = fixture({ room: anonymousRoom({ rest_roles: ['Bot'] }) });
+  await f.service.postAsRole(ROOM_ID, { role: 'Bot', text: 'Scripted update.' });
+  assert.equal(f.packet.sendCalls.length, 3);
+  for (const call of f.packet.sendCalls) {
+    const body = JSON.parse(call.body);
+    assert.deepEqual(body.author, { identity: 'cid-room', display_name: 'Bot', role: 'Bot' });
+    assert.equal('author_alias' in body, false);
+    // No `via` marker and no other new field: author.identity + author.role already
+    // discriminate, so the relayed key set stays exactly what it pins above.
+    assert.deepEqual(Object.keys(body).sort(),
+      ['at', 'author', 'kind', 'message_id', 'room_id', 'signature', 'text', 'version']);
+    for (const leak of ['cid-alice', 'cid-bob', 'cid-cara', 'Alice', 'Bob', 'Cara', 'builder #1']) {
+      assert.equal(Buffer.from(call.body, 'utf8').includes(leak), false, `${leak} leaked into a role body`);
+    }
+  }
+  const [message] = byKind(await f.store.read(ROOM_ID), 'message');
+  assert.equal(message.author_alias, undefined);
 });
 
 test('history views: participant redacts to alias form and drops identities; operator keeps both', async () => {

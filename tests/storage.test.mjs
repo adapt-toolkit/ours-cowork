@@ -20,6 +20,7 @@ function room(overrides = {}) {
     identity_cid: 'cid-room',
     mission: { goal: 'Ship it', briefing: 'Work together.', briefing_version: 1 },
     role_briefings: {},
+    rest_roles: [],
     anonymous: false,
     quiet_membership: false,
     membership_epoch: 0,
@@ -828,4 +829,44 @@ test('the .v1.bak is re-loadable: restoring it migrates again, with FRESH partic
     'participant ids are RE-MINTED — restoring is not a rollback; in an anonymous room every '
     + 'participant gets a new on-wire pseudonymous identity',
   );
+});
+
+test('legacy v2 metadata gains rest_roles whether or not it already carries a room name', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore();
+  t.after(cleanup);
+
+  // The named case is the one a guarded early-return would miss: room_name is
+  // present, so a default injected inside that guard never runs.
+  const named = room();
+  delete named.rest_roles;
+  const roomDir = join(stateDir, 'rooms', ROOM_ID);
+  fs.mkdirSync(roomDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(roomDir, 'room.json'), `${JSON.stringify(named)}\n`, { mode: 0o600 });
+  writeFileSync(join(roomDir, 'archive.jsonl'), '', { mode: 0o600 });
+  const loaded = await store.load(ROOM_ID);
+  assert.equal(loaded.room_name, 'Release room');
+  assert.deepEqual(loaded.rest_roles, []);
+
+  const unnamed = room();
+  delete unnamed.room_name;
+  delete unnamed.rest_roles;
+  writeFileSync(join(roomDir, 'room.json'), `${JSON.stringify(unnamed)}\n`, { mode: 0o600 });
+  const defaulted = await store.load(ROOM_ID);
+  assert.equal(defaulted.room_name, 'Room 01jz6y7n');
+  assert.deepEqual(defaulted.rest_roles, []);
+
+  // and a saved value survives the round trip
+  const saved = await store.save({ ...defaulted, rest_roles: ['Reviewer'] });
+  assert.deepEqual(saved.rest_roles, ['Reviewer']);
+  assert.deepEqual((await store.load(ROOM_ID)).rest_roles, ['Reviewer']);
+});
+
+test('a room with REST roles still deletes, so nothing was written outside room.json', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore();
+  t.after(cleanup);
+  await store.create(room({ state: 'closed', closed_at: AT, rest_roles: ['Reviewer', 'Bot'] }));
+  const roomDir = join(stateDir, 'rooms', ROOM_ID);
+  assert.deepEqual(fs.readdirSync(roomDir).sort(), ['archive.jsonl', 'room.json']);
+  await store.delete(ROOM_ID);
+  assert.equal(fs.existsSync(roomDir), false);
 });

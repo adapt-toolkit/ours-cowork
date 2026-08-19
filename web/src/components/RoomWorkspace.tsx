@@ -11,7 +11,7 @@ import { roomTitle } from './RoomRail';
 const WORKSPACE_TABS = ['communication', 'files', 'events', 'archive'] as const;
 type WorkspaceTab = typeof WORKSPACE_TABS[number];
 
-export function RoomWorkspace({ room, records = [], historyReady = false, connected, visible = true, composerState, onComposerDraft, onOpenRooms, onOpenContext, onSettings, onSendMessage = unavailable }: {
+export function RoomWorkspace({ room, records = [], historyReady = false, connected, visible = true, composerState, onComposerDraft, onComposerSendAsRole, onOpenRooms, onOpenContext, onSettings, onSendMessage = unavailable }: {
   room?: RoomDto;
   records?: readonly CommunicationRecordDto[];
   historyReady?: boolean;
@@ -19,6 +19,7 @@ export function RoomWorkspace({ room, records = [], historyReady = false, connec
   visible?: boolean;
   composerState?: RoomComposerState;
   onComposerDraft?(value: string): void;
+  onComposerSendAsRole?(role: string | undefined): void;
   onOpenRooms(): void;
   onOpenContext(): void;
   onSettings(trigger: HTMLButtonElement): void;
@@ -91,7 +92,7 @@ export function RoomWorkspace({ room, records = [], historyReady = false, connec
       </nav>
 
       <section className="workspace-content" id={`workspace-panel-${tab}`} role="tabpanel" aria-labelledby={`workspace-tab-${tab}`} aria-label={`${tab} panel`} tabIndex={0}>
-        {tab === 'communication' && <CommunicationShell room={room} records={records} historyReady={historyReady} connected={connected} visible={visible} composerState={composerState ?? EMPTY_COMPOSER} onComposerDraft={onComposerDraft ?? noopDraft} onSendMessage={onSendMessage} />}
+        {tab === 'communication' && <CommunicationShell room={room} records={records} historyReady={historyReady} connected={connected} visible={visible} composerState={composerState ?? EMPTY_COMPOSER} onComposerDraft={onComposerDraft ?? noopDraft} onComposerSendAsRole={onComposerSendAsRole} onSendMessage={onSendMessage} />}
         {tab === 'files' && <FilesView roomId={room.room_id} records={records} />}
         {tab === 'events' && <ArchiveView records={records} mode="events" />}
         {tab === 'archive' && <ArchiveView records={records} mode="archive" />}
@@ -100,7 +101,7 @@ export function RoomWorkspace({ room, records = [], historyReady = false, connec
   );
 }
 
-function CommunicationShell({ room, records, historyReady, connected, visible, composerState, onComposerDraft, onSendMessage }: { room: RoomDto; records: readonly CommunicationRecordDto[]; historyReady: boolean; connected: boolean; visible: boolean; composerState: RoomComposerState; onComposerDraft(value: string): void; onSendMessage(text: string): Promise<void> }) {
+function CommunicationShell({ room, records, historyReady, connected, visible, composerState, onComposerDraft, onComposerSendAsRole, onSendMessage }: { room: RoomDto; records: readonly CommunicationRecordDto[]; historyReady: boolean; connected: boolean; visible: boolean; composerState: RoomComposerState; onComposerDraft(value: string): void; onComposerSendAsRole?(role: string | undefined): void; onSendMessage(text: string): Promise<void> }) {
   const archivedBriefing = records.some((record) => record.kind === 'message' && record.category === 'briefing');
   return (
     <div className="communication-shell">
@@ -110,7 +111,7 @@ function CommunicationShell({ room, records, historyReady, connected, visible, c
       </article>}
       {room.state !== 'active' && <p className={`lifecycle-separator lifecycle-separator--${room.state}`}>{room.state === 'provisioning' ? 'Room setup in progress · messaging begins after activation' : room.state === 'closing' ? 'Room closure in progress · mutations are disabled' : 'Room closed · read-only local archive'}</p>}
       <ChatTimeline roomId={room.room_id} records={records} historyReady={historyReady} visible={visible} />
-      <RoomComposer roomState={room.state} connected={connected} state={composerState} onDraftChange={onComposerDraft} onSend={onSendMessage} />
+      <RoomComposer roomState={room.state} connected={connected} state={composerState} restRoles={room.rest_roles ?? []} onDraftChange={onComposerDraft} onSendAsRoleChange={onComposerSendAsRole} onSend={onSendMessage} />
     </div>
   );
 }

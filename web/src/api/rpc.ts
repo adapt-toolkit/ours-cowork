@@ -6,6 +6,7 @@ const NATIVE_MUTATION_METHODS = new Set([
   'room.invite',
   'room.revoke',
   'room.message',
+  'room.say',
   'room.close',
   'room.recover',
   'room.recover.confirm',

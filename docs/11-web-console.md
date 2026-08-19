@@ -40,6 +40,12 @@ Files lists every validated file already loaded from the selected room's paged h
 
 Files never preview or interpret content. Download decodes the archive's canonical base64, verifies the declared size and SHA-256 in the browser, and only then downloads a short-lived `application/octet-stream` Blob. An integrity mismatch is blocked. The reported MIME is shown as metadata only, and unsafe control/format characters or trailing spaces/dots are replaced in the derived download name without changing the displayed or grouped filename. Loaded files remain readable and downloadable when a room is closed or the daemon is disconnected; deleting the room removes its entire local archive and UI, with no per-file deletion.
 
+## Sending as a registered role
+
+A room whose metadata lists at least one REST-addressable role shows a **Send as** control above the composer. It is a testing affordance, marked as one in the console, and it defaults to the room's own voice. The picker offers only the roles already registered for that room, and it never registers or removes one: use `ours-cowork room rest-role <room-id> --role <label>` for that, and see `ours-cowork docs messaging` for what a role is. Nothing is minted and nothing expires — registering the name is the enabling act, so there is no credential for the console to hold or display.
+
+Choosing a role sends over `room.say` instead of `room.message`. The daemon still signs as the room, so the archive and every participant show the room's identity with the role as its label; the selected role is repeated in the placeholder and on the send button so the active author is visible before you send. The selection stays with its own room across navigation. If the role is unregistered while it is selected, the console refuses the send and keeps the draft rather than silently falling back to the room's own voice.
+
 Room list and connection health poll every five seconds. The selected room, participants, and new history poll every two seconds. Polling pauses while the page is hidden, coalesces overlapping cycles, and refreshes after confirmed mutations. Version one does not use push updates.
 
 Close requires the room title or exact ID and leaves the plaintext local archive. Delete is available only after close, requires the exact room ID, and removes local state only as described in the limitations topic.

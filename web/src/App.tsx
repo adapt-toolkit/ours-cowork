@@ -368,21 +368,37 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
       updateComposer(roomId, (current) => ({ ...current, error: 'Messaging is unavailable because the connection or room lifecycle changed. Your draft is retained.' }));
       return;
     }
+    // Re-check the role against the room the poller last returned, not against the
+    // list the picker was rendered from: a role unregistered over the CLI meanwhile
+    // must fail here rather than reach the daemon or fall back to the room's voice.
+    const sendAsRole = currentComposer.sendAsRole;
+    if (sendAsRole !== undefined && !(requestedRoom.rest_roles ?? []).includes(sendAsRole)) {
+      updateComposer(roomId, (current) => ({ ...current, error: `Role “${sendAsRole}” is no longer registered for REST authorship in this room. Your draft is retained.` }));
+      return;
+    }
     updateComposer(roomId, (current) => ({ ...current, pending: true, error: undefined }));
     try {
-      const result = await rpc.call('room.message', { room_id: roomId, text });
+      // Role authorship reuses the existing authenticated route; the daemon still
+      // signs as the room, so the expected author is the room identity carrying the
+      // role as both its label and display name (src/service.ts postAsRole).
+      const result = sendAsRole === undefined
+        ? await rpc.call('room.message', { room_id: roomId, text })
+        : await rpc.call('room.say', { room_id: roomId, role: sendAsRole, text });
+      const expectedDisplayName = sendAsRole ?? requestedRoom.identity_name;
+      const expectedRole = sendAsRole ?? 'room';
       if (!isCommunicationRecordDto(result)
         || result.kind !== 'message'
         || result.room_id !== roomId
         || result.category !== 'chat'
         || result.text !== text
         || result.author.identity !== requestedRoom.identity_cid
-        || result.author.display_name !== requestedRoom.identity_name
-        || result.author.role !== 'room') throw new Error('daemon returned invalid message confirmation');
+        || result.author.display_name !== expectedDisplayName
+        || result.author.role !== expectedRole) throw new Error('daemon returned invalid message confirmation');
       if (deletedRoomIdsRef.current.has(roomId)) return;
       updateComposer(roomId, (current) => ({
         draft: current.draft === text ? '' : current.draft,
         pending: false,
+        sendAsRole: current.sendAsRole,
       }));
       void loadHistoryPages(roomId).catch((failure) => reportFailure(failure, 'History refresh failed'));
     } catch (failure) {
@@ -437,7 +453,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   return (
     <div className="cowork-app">
       <RoomRail rooms={rooms} selectedRoomId={selectedRoomId} connected={connected} open={railOpen} sheet={roomSheet} onClose={() => setRailOpen(false)} onCreate={(trigger) => { createTrigger.current = trigger; setCreateOpen(true); }} onSelect={selectRoom} />
-      <RoomWorkspace room={activeRoom} records={activeRoom ? historyByRoom[activeRoom.room_id] ?? [] : []} historyReady={Boolean(activeRoom && historyReadyByRoom[activeRoom.room_id])} connected={connected === true} visible={!document.hidden} composerState={activeRoom ? composerByRoom[activeRoom.room_id] ?? EMPTY_COMPOSER : EMPTY_COMPOSER} onComposerDraft={activeRoom ? (draft) => updateComposer(activeRoom.room_id, (current) => ({ ...current, draft })) : undefined} onOpenRooms={() => setRailOpen(true)} onOpenContext={() => setContextOpen(true)} onSettings={(trigger) => { settingsTrigger.current = trigger; setSettingsOpen(true); }} onSendMessage={activeRoom ? (text) => sendMessage(activeRoom.room_id, text) : undefined} />
+      <RoomWorkspace room={activeRoom} records={activeRoom ? historyByRoom[activeRoom.room_id] ?? [] : []} historyReady={Boolean(activeRoom && historyReadyByRoom[activeRoom.room_id])} connected={connected === true} visible={!document.hidden} composerState={activeRoom ? composerByRoom[activeRoom.room_id] ?? EMPTY_COMPOSER : EMPTY_COMPOSER} onComposerDraft={activeRoom ? (draft) => updateComposer(activeRoom.room_id, (current) => ({ ...current, draft })) : undefined} onComposerSendAsRole={activeRoom ? (sendAsRole) => updateComposer(activeRoom.room_id, (current) => ({ ...current, sendAsRole, error: undefined })) : undefined} onOpenRooms={() => setRailOpen(true)} onOpenContext={() => setContextOpen(true)} onSettings={(trigger) => { settingsTrigger.current = trigger; setSettingsOpen(true); }} onSendMessage={activeRoom ? (text) => sendMessage(activeRoom.room_id, text) : undefined} />
       <RoomContext room={activeRoom} participants={participants} archiveCount={activeRoom ? historyByRoom[activeRoom.room_id]?.length ?? 0 : 0} connected={connected === true} tab={contextTab} open={contextOpen} drawer={contextDrawer} panelRef={contextPanel} onTab={setContextTab} onClose={() => setContextOpen(false)} onCreateInvite={activeRoom ? (input) => createInvite(activeRoom.room_id, input) : undefined} onRevokeInvite={activeRoom ? (inviteId) => revokeInvite(activeRoom.room_id, inviteId) : undefined} onRecoverInvites={activeRoom ? () => recoverInvites(activeRoom.room_id) : undefined} onRequestClose={(trigger) => { closeTrigger.current = trigger; setCloseOpen(true); }} onRequestDelete={(trigger) => { deleteTrigger.current = trigger; setDeleteOpen(true); }} />
       {((roomSheet && railOpen) || (contextDrawer && contextOpen)) && <button className="responsive-scrim" type="button" aria-label="Close open panel" onClick={() => { setRailOpen(false); setContextOpen(false); }} />}
 

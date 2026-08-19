@@ -93,6 +93,13 @@
 .composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .composer-footer small { color: var(--text-faint); font-size: 10px; }
 .composer-footer .primary-button { min-width: 112px; padding: 0 13px; }
+.composer-send-as { display: grid; grid-template-columns: auto auto 1fr; align-items: center; gap: 4px 9px; padding: 8px 10px; border: 1px dashed var(--line-strong); border-radius: var(--radius-sm); }
+.composer-send-as > label { font-size: 11px; font-weight: 650; }
+.composer-send-as select { padding: 5px 8px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--panel); color: var(--text); font: inherit; font-size: 11px; }
+.composer-send-as select:disabled { cursor: not-allowed; opacity: .55; }
+.composer-send-as small { grid-column: 1 / -1; color: var(--text-faint); font-size: 10px; line-height: 1.45; }
+.composer-send-as--role { border-color: var(--mint-dim); border-style: solid; }
+.composer-send-as--role > label, .composer-send-as--role select { color: var(--mint); }
 .record-list { max-width: 900px; margin: 0 auto; }
 .record-row { overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
 .record-row header { display: flex; align-items: center; gap: 9px; padding: 10px 12px; border-bottom: 1px solid var(--line); font-size: 10px; }

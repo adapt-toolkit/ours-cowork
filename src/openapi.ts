@@ -3,7 +3,7 @@
  *
  * The daemon exposes exactly one REST route — `POST /rpc` — carrying the
  * versioned RPC envelope, so the document models that route once and
- * discriminates the seventeen room-management methods through the envelope's
+ * discriminates the twenty room-management methods through the envelope's
  * `method` field. Nothing here may advertise an operation the REST dispatcher
  * does not actually serve: `room.accept` is deliberately absent because it is
  * reachable only over the private Unix socket.
@@ -46,6 +46,11 @@ const roomIdProperty: JsonSchema = {
 const roleProperty: JsonSchema = {
   type: 'string',
   description: 'Invite role. At most 256 UTF-8 bytes.',
+};
+const restRoleProperty: JsonSchema = {
+  type: 'string',
+  description: 'REST-addressable role name, matched by exact bytes. At most 256 UTF-8 bytes. '
+    + 'The name `room` is reserved for the room\'s own voice.',
 };
 const missionTextProperty = (what: string): JsonSchema => ({
   type: 'string',
@@ -288,6 +293,40 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     }, ['room_id', 'text']),
     result: 'The appended message record with its `seq` and `record_id`.',
     example: { room_id: EXAMPLE_ROOM_ID, text: 'Standup at 10:00.' },
+  },
+  {
+    method: 'room.say',
+    summary: 'Post a message as a registered role',
+    description: 'Appends a message authored under one of the room\'s REST-addressable roles and '
+      + 'relays it to active seats. The message carries the room\'s identity and the role as its '
+      + 'label; the role must already be registered with `room.role.rest.add`. A room with no '
+      + 'active seats accepts the message and relays it to nobody.',
+    params: params({
+      room_id: roomIdProperty,
+      role: restRoleProperty,
+      text: missionTextProperty('Message text'),
+    }, ['room_id', 'role', 'text']),
+    result: 'The appended message record with its `seq` and `record_id`.',
+    example: { room_id: EXAMPLE_ROOM_ID, role: 'Reviewer', text: 'Reviewed the release diff.' },
+  },
+  {
+    method: 'room.role.rest.add',
+    summary: 'Register a REST-addressable role',
+    description: 'Makes a role available to `room.say`. Registering an already-registered role '
+      + 'changes nothing. The name `room` is reserved for the room\'s own voice. A role may also '
+      + 'be held by a participant: a role is a display label, not a channel.',
+    params: params({ room_id: roomIdProperty, role: restRoleProperty }, ['room_id', 'role']),
+    result: 'The updated room record, including `rest_roles`.',
+    example: { room_id: EXAMPLE_ROOM_ID, role: 'Reviewer' },
+  },
+  {
+    method: 'room.role.rest.remove',
+    summary: 'Unregister a REST-addressable role',
+    description: 'Stops accepting `room.say` for this role. Removing a role that is not '
+      + 'registered changes nothing, and messages the role already authored are left untouched.',
+    params: params({ room_id: roomIdProperty, role: restRoleProperty }, ['room_id', 'role']),
+    result: 'The updated room record, including `rest_roles`.',
+    example: { room_id: EXAMPLE_ROOM_ID, role: 'Reviewer' },
   },
   {
     method: 'room.close',

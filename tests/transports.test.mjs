@@ -94,6 +94,7 @@ test('the exhaustive service route table marks every route auth:true', () => {
     'room.close', 'room.create', 'room.delete', 'room.history', 'room.invite', 'room.list',
     'room.message', 'room.participant.remove', 'room.participant.replace', 'room.participants',
     'room.recover', 'room.recover.confirm', 'room.revoke',
+    'room.role.rest.add', 'room.role.rest.remove', 'room.say',
     'room.settings', 'room.show',
   ]);
   assert(Object.values(routes).every((route) => route.auth === true));
@@ -172,6 +173,39 @@ test('phase-A verbs are reachable over authenticated RPC with strict params (spe
     const before = calls.length;
     const response = await send(method, params);
     assert.equal(response.error.code, 'invalid_params', method);
+    assert.equal(calls.length, before);
+  }
+});
+
+test('role-authorship verbs are reachable over REST with strict params and no new status codes', async () => {
+  const calls = [];
+  const service = new Proxy({}, {
+    get: (_target, method) => async (...args) => { calls.push([method, ...args]); return { ok: true }; },
+  });
+  const dispatcher = new RpcDispatcher(createServiceRoutes(service));
+  const send = (method, params) => dispatcher.dispatch({ version: 1, id: 'x', method, params });
+
+  await send('room.say', { room_id: 'r1', role: 'Reviewer', text: 'Reviewed.' });
+  assert.deepEqual(calls.at(-1), ['postAsRole', 'r1', { role: 'Reviewer', text: 'Reviewed.' }]);
+
+  await send('room.role.rest.add', { room_id: 'r1', role: 'Reviewer' });
+  assert.deepEqual(calls.at(-1), ['addRestRole', 'r1', { role: 'Reviewer' }]);
+
+  await send('room.role.rest.remove', { room_id: 'r1', role: 'Reviewer' });
+  assert.deepEqual(calls.at(-1), ['removeRestRole', 'r1', { role: 'Reviewer' }]);
+
+  // No author-like field of any spelling reaches the service: role is the only
+  // caller-controlled authorship input the transport will carry.
+  for (const [method, params] of [
+    ['room.say', { room_id: 'r1', role: 'Reviewer', text: 't', identity: 'cid-forged' }],
+    ['room.say', { room_id: 'r1', role: 'Reviewer', text: 't', display_name: 'Alice' }],
+    ['room.say', { room_id: 'r1', role: 'Reviewer', text: 't', author_alias: 'builder #1' }],
+    ['room.role.rest.add', { room_id: 'r1', role: 'Reviewer', expires_at: 'never' }],
+    ['room.role.rest.remove', { room_id: 'r1', role: 'Reviewer', tombstone: true }],
+  ]) {
+    const before = calls.length;
+    const response = await send(method, params);
+    assert.equal(response.error.code, 'invalid_params', JSON.stringify(params));
     assert.equal(calls.length, before);
   }
 });

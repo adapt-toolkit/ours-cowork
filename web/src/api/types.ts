@@ -55,6 +55,7 @@ export interface RoomDto {
   identity_cid: string;
   mission: MissionDto;
   role_briefings?: Record<string, RoleBriefingDto>;
+  rest_roles?: string[];
   anonymous?: boolean;
   quiet_membership?: boolean;
   membership_epoch?: number;
@@ -223,7 +224,7 @@ const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;
 const RECORD_COMMON_KEYS = ['version', 'room_id', 'seq', 'record_id', 'at', 'kind'] as const;
 const ROOM_V1_KEYS = ['version', 'room_id', 'room_name', 'identity_name', 'identity_cid', 'mission', 'state', 'invites', 'seats', 'created_at'] as const;
-const ROOM_V2_KEYS = [...ROOM_V1_KEYS, 'role_briefings', 'anonymous', 'quiet_membership', 'membership_epoch'] as const;
+const ROOM_V2_KEYS = [...ROOM_V1_KEYS, 'role_briefings', 'rest_roles', 'anonymous', 'quiet_membership', 'membership_epoch'] as const;
 
 export function isRoomDto(value: unknown): value is RoomDto {
   if (!isRecord(value) || (value.version !== 1 && value.version !== 2)) return false;
@@ -245,6 +246,7 @@ export function isRoomDto(value: unknown): value is RoomDto {
     || !optionalStrictRfc3339(value.closed_at)) return false;
 
   if (v2 && (!isRoleBriefingMap(value.role_briefings)
+    || !isRestRoleList(value.rest_roles)
     || typeof value.anonymous !== 'boolean'
     || typeof value.quiet_membership !== 'boolean'
     || !isNonNegativeSafeInteger(value.membership_epoch))) return false;
@@ -584,6 +586,10 @@ function isRoleBriefingMap(value: unknown): value is Record<string, RoleBriefing
     && isUtf8Bounded(briefing.text, MAX_TEXT_BYTES)
     && isPositiveSafeInteger(briefing.version)
     && isStrictRfc3339(briefing.updated_at));
+}
+
+function isRestRoleList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((role) => isUtf8Bounded(role, MAX_ROLE_BYTES) && role.length > 0);
 }
 
 function isRoomInvite(value: unknown): value is RoomInviteDto {

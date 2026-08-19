@@ -114,6 +114,9 @@ export interface RoomServiceApi {
   participants(roomId: string): Promise<unknown>;
   history(roomId: string, options: unknown): Promise<unknown>;
   postMessage(roomId: string, input: unknown): Promise<unknown>;
+  postAsRole(roomId: string, input: unknown): Promise<unknown>;
+  addRestRole(roomId: string, input: unknown): Promise<unknown>;
+  removeRestRole(roomId: string, input: unknown): Promise<unknown>;
   closeRoom(roomId: string): Promise<unknown>;
   deleteRoom(roomId: string, input: unknown): Promise<unknown>;
 }
@@ -133,6 +136,9 @@ const RoleBriefingSetParams = z.object({
   room_id: z.string(), role: z.string(), text: z.string(),
 }).strict();
 const RoleBriefingDeleteParams = z.object({
+  room_id: z.string(), role: z.string(),
+}).strict();
+const RestRoleParams = z.object({
   room_id: z.string(), role: z.string(),
 }).strict();
 const ParticipantRemoveParams = z.object({
@@ -211,6 +217,22 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
     'room.message': { auth: true, run: (params) => {
       const { room_id, ...input } = z.object({ room_id: z.string(), text: z.unknown() }).strict().parse(params);
       return service.postMessage(room_id, input);
+    } },
+    // Role authorship: served over REST, which is the point of the feature. No
+    // secret is ingested in either direction, so the Unix-only rule does not apply.
+    'room.say': { auth: true, run: (params) => {
+      const { room_id, ...input } = z.object({
+        room_id: z.string(), role: z.unknown(), text: z.unknown(),
+      }).strict().parse(params);
+      return service.postAsRole(room_id, input);
+    } },
+    'room.role.rest.add': { auth: true, run: (params) => {
+      const { room_id, ...input } = RestRoleParams.parse(params);
+      return service.addRestRole(room_id, input);
+    } },
+    'room.role.rest.remove': { auth: true, run: (params) => {
+      const { room_id, ...input } = RestRoleParams.parse(params);
+      return service.removeRestRole(room_id, input);
     } },
     'room.close': { auth: true, run: (params) => service.closeRoom(RoomIdParams.parse(params).room_id) },
     'room.delete': { auth: true, run: (params) => {

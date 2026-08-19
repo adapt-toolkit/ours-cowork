@@ -382,6 +382,13 @@ const CurrentRoomSchema = z.object({
   version: z.literal(2),
   mission: MissionSchema,
   role_briefings: z.record(RoleSchema, RoleBriefingSchema),
+  /**
+   * Roles a REST caller may author under (spec §3.1). A plain array of names:
+   * the role name IS the identifier, so there is nothing per-role to store.
+   * Not a seat, not a membership — no invariant here constrains it, because a
+   * role is a label and several speakers may share one.
+   */
+  rest_roles: z.array(RoleSchema),
   anonymous: z.boolean(),
   quiet_membership: z.boolean(),
   membership_epoch: z.number().int().nonnegative().safe(),
@@ -477,14 +484,25 @@ export function defaultRoomName(roomId: string): string {
 }
 
 /**
- * room_name was added additively to metadata v2. Accept an otherwise-valid
- * unnamed room long enough for storage to persist the deterministic fallback.
+ * room_name and rest_roles were added additively to metadata v2. Accept an
+ * otherwise-valid room missing either one long enough for the default to apply.
+ *
+ * TRAP: each default is injected independently. A single guard on the first
+ * field would skip the second on every room that already carries the first —
+ * i.e. every already-named room would load without rest_roles.
  */
 export const RoomSchema = z.preprocess((value) => {
-  if (typeof value !== 'object' || value === null || Object.hasOwn(value, 'room_name')) return value;
-  const roomId = (value as { room_id?: unknown }).room_id;
-  if (typeof roomId !== 'string' || !LowerCrockfordUlidSchema.safeParse(roomId).success) return value;
-  return { ...value, room_name: defaultRoomName(roomId) };
+  if (typeof value !== 'object' || value === null) return value;
+  const patch: Record<string, unknown> = {};
+  if (!Object.hasOwn(value, 'room_name')) {
+    const roomId = (value as { room_id?: unknown }).room_id;
+    if (typeof roomId === 'string' && LowerCrockfordUlidSchema.safeParse(roomId).success) {
+      patch.room_name = defaultRoomName(roomId);
+    }
+  }
+  if (!Object.hasOwn(value, 'rest_roles')) patch.rest_roles = [];
+  if (Object.keys(patch).length === 0) return value;
+  return { ...value, ...patch };
 }, CurrentRoomSchema);
 
 /** Additive v1 → v2 mapping (spec §7). Existing rooms keep their exact behavior. */
@@ -497,6 +515,7 @@ export function migrateRoomV1(
     version: 2,
     mission: { ...room.mission, briefing_version: 1 },
     role_briefings: {},
+    rest_roles: [],
     anonymous: false,
     quiet_membership: false,
     membership_epoch: 0,
@@ -537,6 +556,23 @@ export const RoleBriefingDeleteInputSchema = z.object({
 /** Caller-controlled operator message fields. The service assigns room authorship. */
 export const PostMessageInputSchema = z.object({
   text: MessageTextSchema,
+}).strict();
+
+/**
+ * Caller-controlled role-authored message fields (spec §4). `role` is the only
+ * authorship input a caller may supply; `identity` and `display_name` stay
+ * host-owned. Strict for the same reason PostMessageInputSchema is: the caller's
+ * object is parsed in full before any host-owned field is consulted, so every
+ * author-like spelling is rejected rather than ignored.
+ */
+export const PostAsRoleInputSchema = z.object({
+  role: RoleSchema,
+  text: MessageTextSchema,
+}).strict();
+
+/** Register or unregister one REST-addressable role (spec §3.2). */
+export const RestRoleInputSchema = z.object({
+  role: RoleSchema,
 }).strict();
 
 export const ContainerIdSchema = z.string().regex(/^[0-9a-f]{64}$/i, 'must be a 64-character hexadecimal CID')

@@ -136,6 +136,13 @@ describe('room DTO guards', () => {
     expect(isRoomListDto([daemonRoom])).toBe(true);
     expect(isParticipantListDto(daemonRoom.seats)).toBe(true);
     expect(isRoomDto({ ...daemonRoom, role_briefings: undefined })).toBe(false);
+    // rest_roles is part of the v2 room the daemon returns, and the guard is
+    // exact-key: an unlisted field is rejected, so a new one must be listed.
+    expect(daemonRoom.rest_roles).toEqual([]);
+    expect(isRoomDto({ ...daemonRoom, rest_roles: ['Reviewer'] })).toBe(true);
+    expect(isRoomDto({ ...daemonRoom, rest_roles: undefined })).toBe(false);
+    expect(isRoomDto({ ...daemonRoom, rest_roles: 'Reviewer' })).toBe(false);
+    expect(isRoomDto({ ...daemonRoom, rest_roles: [''] })).toBe(false);
 
     const externalPending = RoomSchema.parse({
       ...daemonRoom,

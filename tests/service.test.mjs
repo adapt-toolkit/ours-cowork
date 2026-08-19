@@ -1502,3 +1502,153 @@ test('an operator may explicitly re-admit a removed CID by accepting that peer e
   assert.equal(seats[1].role, 'reviewer');
   assert.equal(seats[1].invite_id, 'external-readmission');
 });
+
+// ---- REST role authorship (spec §4, §7) -------------------------------------
+
+/** An active room with one `builder` seat, ready for role-authored posts. */
+async function seatedRoom(f) {
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  return invite;
+}
+
+function chatOf(records) {
+  return records.filter((record) => record.kind === 'message' && record.category === 'chat');
+}
+
+test('a registered REST role authors under the room CID with the role as its display name', async () => {
+  const f = evolutionFixture();
+  await seatedRoom(f);
+  const registered = await f.service.addRestRole(ROOM_ID, { role: 'Reviewer' });
+  assert.deepEqual(registered.rest_roles, ['Reviewer']);
+
+  const appended = await f.service.postAsRole(ROOM_ID, { role: 'Reviewer', text: 'Reviewed the diff.' });
+  assert.equal(appended.kind, 'message');
+  assert.equal(appended.category, 'chat');
+  assert.equal(appended.text, 'Reviewed the diff.');
+  assert.deepEqual(appended.author, {
+    identity: `cid-room-${ROOM_ID}`, display_name: 'Reviewer', role: 'Reviewer',
+  });
+  assert.equal(appended.author_alias, undefined);
+  assert.deepEqual(appended.recipient_identities, ['cid-alice']);
+  assert(typeof appended.seq === 'number' && appended.seq > 0);
+  assert.equal(typeof appended.record_id, 'string');
+  assert.deepEqual(intentsFor(await f.store.read(ROOM_ID), appended.message_id), ['cid-alice']);
+
+  // room.show lists the registry, so no dedicated list method is needed.
+  assert.deepEqual((await f.service.showRoom(ROOM_ID)).rest_roles, ['Reviewer']);
+});
+
+test('an unregistered REST role is refused by name and appends nothing', async () => {
+  const f = evolutionFixture();
+  await seatedRoom(f);
+  const before = await f.store.read(ROOM_ID);
+
+  await assert.rejects(
+    f.service.postAsRole(ROOM_ID, { role: 'Reviewer', text: 'Not allowed.' }),
+    /Reviewer/,
+  );
+  assert.deepEqual(await f.store.read(ROOM_ID), before);
+
+  // exact byte equality, as role_briefings and seat roles already compare
+  await f.service.addRestRole(ROOM_ID, { role: 'Reviewer' });
+  await assert.rejects(f.service.postAsRole(ROOM_ID, { role: 'reviewer', text: 'Case differs.' }), /reviewer/);
+
+  // strict params: no caller-supplied authorship field of any spelling
+  for (const forged of [
+    { role: 'Reviewer', text: 'x', identity: 'cid-forged' },
+    { role: 'Reviewer', text: 'x', display_name: 'Alice' },
+    { role: 'Reviewer', text: 'x', author: { identity: 'cid-forged' } },
+  ]) {
+    await assert.rejects(f.service.postAsRole(ROOM_ID, forged), /unrecognized|invalid/i);
+  }
+  assert.equal(chatOf(await f.store.read(ROOM_ID)).length, 0);
+});
+
+test('REST role registration reserves "room" and is idempotent in both directions', async () => {
+  const f = evolutionFixture();
+  await seatedRoom(f);
+
+  // "room" is the room's own voice; author.role === 'room' is load-bearing in the console.
+  await assert.rejects(f.service.addRestRole(ROOM_ID, { role: 'room' }), /reserved/i);
+  assert.deepEqual((await f.service.showRoom(ROOM_ID)).rest_roles, []);
+
+  const first = await f.service.addRestRole(ROOM_ID, { role: 'Reviewer' });
+  const again = await f.service.addRestRole(ROOM_ID, { role: 'Reviewer' });
+  assert.deepEqual(again.rest_roles, ['Reviewer']);
+  assert.deepEqual(again, first);
+
+  const removed = await f.service.removeRestRole(ROOM_ID, { role: 'Reviewer' });
+  assert.deepEqual(removed.rest_roles, []);
+  assert.deepEqual(await f.service.removeRestRole(ROOM_ID, { role: 'Reviewer' }), removed);
+  // removing a name that was never registered is equally a no-op
+  assert.deepEqual((await f.service.removeRestRole(ROOM_ID, { role: 'Absent' })).rest_roles, []);
+
+  // closed rooms refuse both sides of the lifecycle
+  f.store.rooms.get(ROOM_ID).state = 'closed';
+  f.store.rooms.get(ROOM_ID).closed_at = '2026-08-02T11:00:00.000Z';
+  await assert.rejects(f.service.addRestRole(ROOM_ID, { role: 'Reviewer' }), /closing|closed/i);
+  await assert.rejects(f.service.removeRestRole(ROOM_ID, { role: 'Reviewer' }), /closing|closed/i);
+});
+
+test('a role held by an active seat may also be REST-addressable, and the two authors differ', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  await admit(f, invite, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
+
+  // registration does not consult seats: a role is a label, not a channel
+  await f.service.addRestRole(ROOM_ID, { role: 'builder' });
+  const posted = await f.service.postAsRole(ROOM_ID, { role: 'builder', text: 'From the script.' });
+  await f.service.postMessage(ROOM_ID, { text: 'From the room.' });
+
+  const chat = chatOf(await f.store.read(ROOM_ID));
+  const roleAuthored = chat.find((record) => record.record_id === posted.record_id);
+  const roomAuthored = chat.at(-1);
+  assert.equal(roleAuthored.author.role, 'builder');
+  assert.equal(roomAuthored.author.role, 'room');
+  assert.equal(roleAuthored.author.identity, roomAuthored.author.identity);
+  assert.notEqual(roleAuthored.author.display_name, roomAuthored.author.display_name);
+  // both reach every active seat, exactly as postMessage does
+  assert.deepEqual([...roleAuthored.recipient_identities].sort(), ['cid-alice', 'cid-bob']);
+});
+
+test('removing a REST role leaves its posted messages byte-identical and refuses later posts', async () => {
+  const f = evolutionFixture();
+  await seatedRoom(f);
+  await f.service.addRestRole(ROOM_ID, { role: 'Reviewer' });
+  await f.service.postAsRole(ROOM_ID, { role: 'Reviewer', text: 'Reviewed once.' });
+  const before = JSON.stringify(await f.store.read(ROOM_ID));
+
+  const removed = await f.service.removeRestRole(ROOM_ID, { role: 'Reviewer' });
+  assert.deepEqual(removed.rest_roles, []);
+  // no tombstone: there is no secret whose exposure window an auditor would reconstruct
+  assert.equal(JSON.stringify(await f.store.read(ROOM_ID)), before);
+  await assert.rejects(f.service.postAsRole(ROOM_ID, { role: 'Reviewer', text: 'Again.' }), /Reviewer/);
+  assert.equal(JSON.stringify(await f.store.read(ROOM_ID)), before);
+});
+
+test('room.say is refused unless the room is active, and accepts a room with no seats', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  // provisioning: registration is allowed, posting is not
+  await f.service.addRestRole(ROOM_ID, { role: 'Reviewer' });
+  await assert.rejects(f.service.postAsRole(ROOM_ID, { role: 'Reviewer', text: 'Too early.' }), /not active/i);
+
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  await f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' });
+
+  // an active room between participants: accepted, archived, relayed to nobody (§4.3)
+  const orphan = await f.service.postAsRole(ROOM_ID, { role: 'Reviewer', text: 'Nobody hears this.' });
+  assert.deepEqual(orphan.recipient_identities, []);
+  assert.deepEqual(intentsFor(await f.store.read(ROOM_ID), orphan.message_id), []);
+
+  for (const state of ['closing', 'closed']) {
+    f.store.rooms.get(ROOM_ID).state = state;
+    if (state === 'closed') f.store.rooms.get(ROOM_ID).closed_at = '2026-08-02T11:00:00.000Z';
+    await assert.rejects(f.service.postAsRole(ROOM_ID, { role: 'Reviewer', text: 'Too late.' }), /not active/i);
+  }
+});

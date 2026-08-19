@@ -19,7 +19,7 @@ The same loopback listener serves an OpenAPI 3.1 description of the room managem
 
 Both are read-only GET routes with no authentication, exactly like the console itself, and they are available whenever `rest.enabled` is true. They ship inside the daemon and load no remote assets, so they work on an offline host. Do not expose either route to another host.
 
-Every room operation is carried by the single route `POST /rpc` with the envelope `{ "version": 1, "id": ..., "method": ..., "params": ... }`; the document describes the seventeen methods the REST listener serves, discriminated on `method`. Operations that carry an invite secret are not part of it — they are reachable only over `management.sock`.
+Every room operation is carried by the single route `POST /rpc` with the envelope `{ "version": 1, "id": ..., "method": ..., "params": ... }`; the document describes the twenty methods the REST listener serves, discriminated on `method`. Operations that carry an invite secret are not part of it — they are reachable only over `management.sock`.
 
 ## Room setup
 

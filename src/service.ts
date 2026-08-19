@@ -12,7 +12,9 @@ import {
   LowerCrockfordUlidSchema,
   MAX_EXTERNAL_INVITE_BYTES,
   MAX_HISTORY_PAGE_BYTES,
+  PostAsRoleInputSchema,
   PostMessageInputSchema,
+  RestRoleInputSchema,
   RoleBriefingDeleteInputSchema,
   RoleBriefingSetInputSchema,
   RoleSchema,
@@ -223,6 +225,7 @@ export class RoomService {
         identity_cid: '',
         mission: { goal: settings.goal, briefing: settings.briefing, briefing_version: 1 },
         role_briefings: {},
+        rest_roles: [],
         anonymous: settings.anonymous ?? false,
         quiet_membership: settings.quiet_membership ?? false,
         membership_epoch: 0,
@@ -1060,38 +1063,127 @@ export class RoomService {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     return this.lock(id, async () => {
       const room = await this.store.load(id);
-      if (room.state !== 'active') {
-        throw new RoomServiceError(`cannot post a room message while room "${id}" is not active`);
+      return this.appendChatUnlocked(id, room, {
+        identity: room.identity_cid,
+        display_name: room.identity_name,
+        role: ROOM_ROLE,
+      }, request.text);
+    });
+  }
+
+  /**
+   * Register a role a REST caller may author under (spec §3.2). Idempotent, like
+   * revokeInvite. Registration does not consult seats: a role is a label, not a
+   * channel, so a role may be held by a seat and be REST-addressable at once.
+   */
+  async addRestRole(roomId: string, input: unknown): Promise<Room> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = RestRoleInputSchema.parse(input);
+    // TRAP: "room" is the room's own voice and the console classifies a message
+    // as the room voice on exactly `author.role === 'room'`. Registering it would
+    // let a caller author records indistinguishable from operator posts.
+    if (request.role === ROOM_ROLE) {
+      throw new RoomServiceError(`role "${ROOM_ROLE}" is reserved for the room's own voice`);
+    }
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'register a REST role for');
+      if (room.rest_roles.includes(request.role)) return room;
+      return this.store.save(RoomSchema.parse({
+        ...room,
+        rest_roles: [...room.rest_roles, request.role],
+      }));
+    });
+  }
+
+  /**
+   * Unregister a REST-addressable role. Messages it already authored are left
+   * exactly as posted and no tombstone is kept: there is no secret whose
+   * exposure window an auditor would need to reconstruct (spec §3.2).
+   */
+  async removeRestRole(roomId: string, input: unknown): Promise<Room> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = RestRoleInputSchema.parse(input);
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'remove a REST role from');
+      if (!room.rest_roles.includes(request.role)) return room;
+      return this.store.save(RoomSchema.parse({
+        ...room,
+        rest_roles: room.rest_roles.filter((role) => role !== request.role),
+      }));
+    });
+  }
+
+  /**
+   * Author a message under a registered REST role (spec §4). Room-side
+   * authorship: the room packet signs the bytes, so `identity` is the room's CID
+   * and the role name doubles as `display_name` — using the room's own name there
+   * would render as the room impersonating a foreign role.
+   */
+  async postAsRole(roomId: string, input: unknown): Promise<MessageRecord> {
+    // Same discipline as postMessage: the caller-controlled object is parsed in
+    // full first, so `role` is the only authorship field a caller can supply.
+    const request = PostAsRoleInputSchema.parse(input);
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      // Room state outranks the role: a closed room refuses the post for being
+      // closed, not for the name it was addressed to.
+      this.assertPostable(id, room);
+      // Read from the metadata loaded inside the lock, never a cache: a role
+      // removed a moment earlier is already absent, so there is no revocation lag.
+      if (!room.rest_roles.includes(request.role)) {
+        throw new RoomServiceError(`role "${request.role}" is not registered for REST authorship in room "${id}"`);
       }
-      const appended = await this.store.append(id, {
+      // No author_alias, in anonymous rooms as in named ones: the alias
+      // invariants govern seats, and there is no seat here to substitute.
+      return this.appendChatUnlocked(id, room, {
+        identity: room.identity_cid,
+        display_name: request.role,
+        role: request.role,
+      }, request.text);
+    });
+  }
+
+  /**
+   * The one operator-side chat append: archive the message, then journal one
+   * relay intent per active seat and resume the pump. Shared by postMessage and
+   * postAsRole so the two authorship paths cannot drift apart — only the author
+   * block differs between them. Caller holds the room lock and supplies the room
+   * it loaded inside that lock.
+   */
+  private async appendChatUnlocked(
+    id: string,
+    room: Room,
+    author: { identity: string; display_name: string; role: string },
+    text: string,
+  ): Promise<MessageRecord> {
+    this.assertPostable(id, room);
+    const appended = await this.store.append(id, {
+      version: 1,
+      kind: 'message',
+      room_id: id,
+      at: this.now(),
+      message_id: LowerCrockfordUlidSchema.parse(this.nextMessageId()),
+      author,
+      category: 'chat',
+      text,
+      recipient_identities: uniqueIdentities(activeSeats(room).map((seat) => seat.identity)),
+    });
+    if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong room message kind');
+    for (const recipientIdentity of appended.recipient_identities) {
+      await this.store.append(id, {
         version: 1,
-        kind: 'message',
+        kind: 'relay_intent',
         room_id: id,
         at: this.now(),
-        message_id: LowerCrockfordUlidSchema.parse(this.nextMessageId()),
-        author: {
-          identity: room.identity_cid,
-          display_name: room.identity_name,
-          role: ROOM_ROLE,
-        },
-        category: 'chat',
-        text: request.text,
-        recipient_identities: uniqueIdentities(activeSeats(room).map((seat) => seat.identity)),
+        message_id: appended.message_id,
+        recipient_identity: recipientIdentity,
       });
-      if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong room message kind');
-      for (const recipientIdentity of appended.recipient_identities) {
-        await this.store.append(id, {
-          version: 1,
-          kind: 'relay_intent',
-          room_id: id,
-          at: this.now(),
-          message_id: appended.message_id,
-          recipient_identity: recipientIdentity,
-        });
-      }
-      await this.intake.resumePending(id);
-      return appended;
-    });
+    }
+    await this.intake.resumePending(id);
+    return appended;
   }
 
   private async reconcileUnlocked(room: Room, packet: RoomPacket): Promise<Room> {
@@ -1498,6 +1590,12 @@ export class RoomService {
     const packet = this.packets.get(roomId);
     if (!packet) throw new RoomServiceError(`room packet "${roomId}" is not hosted`);
     return packet;
+  }
+
+  private assertPostable(id: string, room: Room): void {
+    if (room.state !== 'active') {
+      throw new RoomServiceError(`cannot post a room message while room "${id}" is not active`);
+    }
   }
 
   private assertMutable(room: Room, action: string): void {

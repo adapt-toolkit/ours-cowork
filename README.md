@@ -15,6 +15,8 @@ The localhost HTTP console has no authentication. Keep it bound to `127.0.0.1`; 
 
 Start or install the shared daemon with `@ours.network/cli` 1.0.1 before starting cowork. Cowork never embeds, starts, stops, or silently substitutes an ours daemon. It uses the SDK-standard shared selection (the default `~/.ours` daemon, `OURS_CONFIG`, or a coherent `OURS_PORT` plus `OURS_STATE_DIR` selection) and fails clearly when that daemon is unavailable or mismatched.
 
+The shared daemon retains application payload history outside its protocol packets: each identity has a `history.sqlite3` database and immutable content-addressed file blobs. Cowork authorizes unread metadata by authenticated CID, reads the corresponding persistent history or blob, durably archives the room item and its complete fan-out, and only then advances that exact SDK unread item. There is no packet-inbox fallback, defer queue, host outbox, or cross-store transaction.
+
 The package keeps its room metadata and archives in its own state directory. Only identity names are used to select cowork rooms from the daemon-global identity list; this bookkeeping is not a provenance or authorization boundary. Operator room commands use one JSONL request over `management.sock`. Use `--json` for automation; its stdout is a single JSON value and diagnostics are included in that value.
 
 Ordinary ours-mcp identities can join only as remote participants over the ours protocol.

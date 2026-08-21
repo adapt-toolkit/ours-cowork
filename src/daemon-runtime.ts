@@ -189,8 +189,8 @@ export class CoworkDaemon {
       this.store = this.options.store ?? new CoworkStore(config.stateDir);
 
       // The closure deliberately queues notifications until every recovery
-      // phase is complete. Restored packets may receive traffic as soon as
-      // they are exposed, but packet inbox state itself remains durable.
+      // phase is complete. Restored identities may receive traffic as soon as
+      // they are exposed, but unread external history remains durable.
       let serviceRef: DaemonService | undefined = this.options.service;
       this.registry = this.options.registry ?? new PacketRegistry(
         this.host as unknown as OursRuntimeClientFactory,

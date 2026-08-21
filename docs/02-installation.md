@@ -15,6 +15,8 @@ ours daemon start
 ours daemon status --json
 ```
 
+The external-history daemon is a breaking storage epoch, not an in-place migration. Before upgrading an older daemon, stop applications, take any manual backup you need, remove the old daemon state yourself, and start with clean state; then recreate identities and re-invite contacts as required. The installer and cowork never delete old state automatically.
+
 Open the local console with:
 
 ```sh

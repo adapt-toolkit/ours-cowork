@@ -127,11 +127,11 @@ class FakePacket {
 
   listInvites() { return structuredClone(this.invites); }
   listContacts() { return structuredClone(this.contacts); }
-  peekInbox() { return []; }
-  peekFileInbox() { return []; }
-  consumeFileInbox() { return Promise.resolve({ consumed: [], deferred: [] }); }
+  listUnreadMessages() { return Promise.resolve([]); }
+  listUnreadFiles() { return Promise.resolve([]); }
+  acknowledgeFile() { return Promise.resolve(); }
   sendFile() { throw new Error('not used'); }
-  async consumeInbox() { return { consumed: [], deferred: [] }; }
+  async acknowledgeMessage() {}
   async send() { return { status: 'queued', wire_id: 'wire' }; }
   async removeContact(contact) {
     this.removeContactCalls = [...(this.removeContactCalls ?? []), contact];

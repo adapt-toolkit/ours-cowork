@@ -108,11 +108,11 @@ class FakePacket {
   mintInvite() { throw new Error('not used'); }
   revokeInvite() { throw new Error('not used'); }
   listInvites() { return []; }
-  peekInbox() { return []; }
-  peekFileInbox() { return []; }
-  consumeFileInbox() { return Promise.resolve({ consumed: [], deferred: [] }); }
+  listUnreadMessages() { return Promise.resolve([]); }
+  listUnreadFiles() { return Promise.resolve([]); }
+  acknowledgeFile() { return Promise.resolve(); }
   sendFile() { throw new Error('not used'); }
-  consumeInbox() { throw new Error('not used'); }
+  acknowledgeMessage() { throw new Error('not used'); }
   send() { throw new Error('not used'); }
   sign() { throw new Error('not used'); }
 }

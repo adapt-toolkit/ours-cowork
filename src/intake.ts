@@ -35,6 +35,8 @@ interface NotificationState {
   work: Promise<void>;
 }
 
+const INTAKE_BATCH_SIZE = 32;
+
 /**
  * Produce the byte-stable JSON representation sent by room identities.
  * Arrays retain their order; keys of every object nested inside them are
@@ -117,7 +119,7 @@ export class IntakePump {
     return state.work;
   }
 
-  /** Process the current readonly inbox snapshot, then service durable intents. */
+  /** Process bounded unread history batches, then service durable intents. */
   async pump(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     await this.lock(id, () => this.processAndRelayUnlocked(id, this.packet(id)));
@@ -175,10 +177,13 @@ export class IntakePump {
   }
 
   private async processAndRelayUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
-    const snapshot = packet.peekInbox();
-    for (const item of snapshot) await this.processInboxItem(roomId, packet, item);
-    const fileSnapshot = packet.peekFileInbox();
-    for (const item of fileSnapshot) await this.processFileInboxItem(roomId, packet, item);
+    for (;;) {
+      const messages = await packet.listUnreadMessages(INTAKE_BATCH_SIZE);
+      const files = await packet.listUnreadFiles(INTAKE_BATCH_SIZE);
+      if (messages.length === 0 && files.length === 0) break;
+      for (const item of messages) await this.processInboxItem(roomId, packet, item);
+      for (const item of files) await this.processFileInboxItem(roomId, packet, item);
+    }
     await this.completeSnapshotIntents(roomId);
     await this.relayPendingUnlocked(roomId, packet);
   }
@@ -194,7 +199,7 @@ export class IntakePump {
     // defensive drain handles an older archived item so one poison unread item cannot
     // make every daemon restart fail at resumePending.
     if (!parsedName.success || !parsedMime.success) {
-      await packet.consumeFileInbox([item.file_id]);
+      await packet.acknowledgeFile(item);
       return;
     }
     if (item.data.length > MAX_FILE_BYTES) {
@@ -206,7 +211,7 @@ export class IntakePump {
     );
     if (room.state !== 'active' || !seat) {
       if (room.state === 'active') await this.bounceRemovedSender(roomId, room, packet, item);
-      await packet.consumeFileInbox([item.file_id]);
+      await packet.acknowledgeFile(item);
       return;
     }
     const records = await this.store.read(roomId);
@@ -242,10 +247,15 @@ export class IntakePump {
     }
 
     await this.completeFileIntents(roomId, file);
-    await packet.consumeFileInbox([item.file_id]);
+    await packet.acknowledgeFile(item);
   }
 
-  private async processInboxItem(roomId: string, packet: RoomPacket, item: InboxItem): Promise<void> {
+  private async processInboxItem(
+    roomId: string,
+    packet: RoomPacket,
+    item: InboxItem,
+    acknowledge = true,
+  ): Promise<void> {
     const room = await this.store.load(roomId);
     const seat = room.seats.find(
       (candidate) => candidate.identity === item.sender_id && candidate.state === 'active',
@@ -255,7 +265,7 @@ export class IntakePump {
       // Refused entries are deliberately drained without creating an archive
       // message, intent, wire send, or result.
       if (room.state === 'active') await this.bounceRemovedSender(roomId, room, packet, item);
-      await packet.consumeInbox([item.msg_id]);
+      if (acknowledge) await this.acknowledgeMessage(roomId, packet, item);
       return;
     }
 
@@ -295,11 +305,20 @@ export class IntakePump {
 
     await this.completeMessageIntents(roomId, message);
 
-    // This is the irreversible packet effect. Every preceding append resolves
+    // This is the irreversible SDK read mark. Every preceding append resolves
     // only after its file fsync, so both the message and the complete fan-out
-    // exist durably first. HostedRoomPacket leaves IDs outside this snapshot
-    // unread through the SDK's selective consume/defer contract.
-    await packet.consumeInbox([item.msg_id]);
+    // exist durably first. If an older row became unread after the snapshot,
+    // the SDK returns that row first; archive it through this same path before
+    // retrying the expected row. The promoted row is already read and must not
+    // be acknowledged a second time.
+    if (acknowledge) await this.acknowledgeMessage(roomId, packet, item);
+  }
+
+  private acknowledgeMessage(roomId: string, packet: RoomPacket, expected: InboxItem): Promise<void> {
+    return packet.acknowledgeMessage(
+      expected,
+      (unexpected) => this.processInboxItem(roomId, packet, unexpected, false),
+    );
   }
 
   /**

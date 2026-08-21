@@ -74,6 +74,9 @@ class FakePacket {
   sendFileCalls = [];
   consumeCalls = [];
   consumeFileCalls = [];
+  acknowledgeCalls = [];
+  listCalls = [];
+  acknowledgeOrder = [];
   nextSend = { status: 'queued', wire_id: 'wire-out' };
   beforeConsume;
   afterConsume;
@@ -82,31 +85,43 @@ class FakePacket {
   afterConsumeFile;
   beforeSendFile;
 
-  peekInbox() { return structuredClone(this.inbox); }
-  peekFileInbox() { return structuredClone(this.fileInbox); }
-
-  async consumeInbox(expectedIds) {
-    if (this.beforeConsume) await this.beforeConsume(expectedIds);
-    this.consumeCalls.push([...expectedIds]);
-    const expected = new Set(expectedIds);
-    const consumed = this.inbox.filter((item) => expected.has(item.msg_id)).map((item) => item.msg_id);
-    // This is the observable contract of HostedRoomPacket: messages arriving
-    // after peek are drained and immediately deferred, so remain unread.
-    const deferred = this.inbox.filter((item) => !expected.has(item.msg_id)).map((item) => item.msg_id);
-    this.inbox = this.inbox.filter((item) => !expected.has(item.msg_id));
-    if (this.afterConsume) await this.afterConsume({ consumed, deferred });
-    return { consumed, deferred };
+  async listUnreadMessages(limit) {
+    this.listCalls.push(['messages', limit]);
+    return structuredClone(this.inbox.slice(0, limit));
+  }
+  async listUnreadFiles(limit) {
+    this.listCalls.push(['files', limit]);
+    return structuredClone(this.fileInbox.slice(0, limit));
   }
 
-  async consumeFileInbox(expectedIds) {
-    if (this.beforeConsumeFile) await this.beforeConsumeFile(expectedIds);
-    this.consumeFileCalls.push([...expectedIds]);
-    const expected = new Set(expectedIds);
-    const consumed = this.fileInbox.filter((item) => expected.has(item.file_id)).map((item) => item.file_id);
-    const deferred = this.fileInbox.filter((item) => !expected.has(item.file_id)).map((item) => item.file_id);
-    this.fileInbox = this.fileInbox.filter((item) => !expected.has(item.file_id));
-    if (this.afterConsumeFile) await this.afterConsumeFile({ consumed, deferred });
-    return { consumed, deferred };
+  async acknowledgeMessage(expected, onUnexpected) {
+    this.acknowledgeCalls.push(expected.msg_id);
+    if (this.beforeConsume) await this.beforeConsume([expected.msg_id]);
+    for (;;) {
+      const item = this.inbox.shift();
+      if (!item) {
+        if (this.afterConsume) await this.afterConsume({ consumed: [], deferred: [] });
+        return;
+      }
+      this.consumeCalls.push([item.msg_id]);
+      this.acknowledgeOrder.push(`message:${item.msg_id}`);
+      if (item.msg_id === expected.msg_id && item.wire_id === expected.wire_id) {
+        if (this.afterConsume) await this.afterConsume({ consumed: [item.msg_id], deferred: [] });
+        return;
+      }
+      await onUnexpected(structuredClone(item));
+    }
+  }
+
+  async acknowledgeFile(expected) {
+    if (this.beforeConsumeFile) await this.beforeConsumeFile([expected.file_id]);
+    const index = this.fileInbox.findIndex(
+      (item) => item.file_id === expected.file_id && item.wire_id === expected.wire_id,
+    );
+    const consumed = index < 0 ? [] : [this.fileInbox.splice(index, 1)[0].file_id];
+    this.consumeFileCalls.push([expected.file_id]);
+    this.acknowledgeOrder.push(`file:${expected.file_id}`);
+    if (this.afterConsumeFile) await this.afterConsumeFile({ consumed, deferred: [] });
   }
 
   async send(recipient, body) {
@@ -572,24 +587,57 @@ test('non-seat and non-active messages are consumed but never archived or relaye
   }
 });
 
-test('an arrival between peek and consume is deferred to the next pass', async () => {
+test('an older row promoted after listing takes the full intake path before the expected acknowledgement retries', async () => {
   const f = fixture();
-  f.store.rooms.set(ROOM_ID, room({ seats: room().seats.slice(0, 2) }));
-  f.packet.inbox.push(incoming());
+  f.packet.inbox.push(incoming({
+    msg_id: 8, sender_id: 'cid-bob', wire_id: 'wire-in-8', text: 'Expected snapshot row',
+  }));
   let injected = false;
   f.packet.beforeConsume = () => {
     if (!injected) {
       injected = true;
-      f.packet.inbox.push(incoming({ msg_id: 8, sender_id: 'cid-bob', wire_id: 'wire-in-8', text: 'Raced arrival' }));
+      f.packet.inbox.unshift(incoming({ msg_id: 7, wire_id: 'wire-in-7', text: 'Older introduction row' }));
     }
   };
   await f.pump.pump(ROOM_ID);
-  assert.deepEqual(f.packet.consumeCalls, [[7]], 'the snapshot does not absorb the later arrival');
-  assert.deepEqual(f.packet.inbox.map((item) => item.msg_id), [8]);
+  const records = await f.store.read(ROOM_ID);
+  assert.deepEqual(byKind(records, 'message').map((message) => message.source_msg_id), [8, 7]);
+  assert.deepEqual(f.packet.consumeCalls, [[7], [8]], 'each SDK read result is handled exactly once');
+  assert.deepEqual(f.packet.acknowledgeCalls, [8], 'the already-read promoted row is never acknowledged again');
+  assert.equal(byKind(records, 'relay_intent').length, 4);
+  assert.equal(byKind(records, 'relay_result').length, 4);
+  assert.deepEqual(f.packet.inbox, []);
+});
+
+test('an empty acknowledgement response treats the durably archived expected row as already read', async () => {
+  const f = fixture();
+  f.store.rooms.set(ROOM_ID, room({ seats: room().seats.slice(0, 2) }));
+  f.packet.inbox.push(incoming());
+  f.packet.beforeConsume = () => { f.packet.inbox = []; };
 
   await f.pump.pump(ROOM_ID);
-  assert.deepEqual(f.packet.consumeCalls, [[7], [8]]);
-  assert.equal(byKind(await f.store.read(ROOM_ID), 'message').length, 2);
+
+  const records = await f.store.read(ROOM_ID);
+  assert.deepEqual(f.packet.acknowledgeCalls, [7]);
+  assert.deepEqual(f.packet.consumeCalls, []);
+  assert.equal(byKind(records, 'message').length, 1);
+  assert.equal(byKind(records, 'relay_intent').length, 1);
+  assert.equal(byKind(records, 'relay_result').length, 1);
+});
+
+test('intake bounds each history query and services files between message backlog batches', async () => {
+  const f = fixture({ room: { state: 'provisioning', activated_at: undefined } });
+  for (let msgId = 1; msgId <= 40; msgId += 1) {
+    f.packet.inbox.push(incoming({ msg_id: msgId, wire_id: `wire-backlog-${msgId}` }));
+  }
+  f.packet.fileInbox.push(incomingFile({ file_id: 41, wire_id: 'wire-backlog-file' }));
+
+  await f.pump.pump(ROOM_ID);
+
+  assert(f.packet.listCalls.every(([, limit]) => limit === 32));
+  assert.equal(f.packet.acknowledgeOrder.indexOf('file:41'), 32);
+  assert.equal(f.packet.acknowledgeOrder.at(-1), 'message:40');
+  assert.deepEqual(await f.store.read(ROOM_ID), []);
 });
 
 test('concurrent notify and pump calls serialize one archive message, intent, send, and result', async () => {

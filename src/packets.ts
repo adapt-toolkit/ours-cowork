@@ -11,6 +11,8 @@ import type { OursRuntimeClientFactory } from './ours-runtime.ts';
 export type InviteMode = 'one_time' | 'public';
 export type RelayStatus = 'queued' | 'send_failed';
 type IncomingFileMeta = Awaited<ReturnType<OursClient['listIncomingFiles']>>[number];
+type HistoryMessage = NonNullable<Awaited<ReturnType<OursClient['getHistoryItem']>>>;
+type ReceivedFile = Awaited<ReturnType<OursClient['getFiles']>>['files'][number];
 type SendOutcome = Awaited<ReturnType<OursClient['sendMessage']>>;
 type FileSendOutcome = Awaited<ReturnType<OursClient['sendFile']>>;
 
@@ -54,10 +56,10 @@ export interface RoomPacket {
   revokeInvite(inviteId: string): Promise<{ revoked: boolean }>;
   listInvites(): Array<{ invite_id: string; mode: InviteMode }>;
   listContacts(): Array<{ name: string; container_id: string }>;
-  peekInbox(): InboxItem[];
-  consumeInbox(expectedIds: number[]): Promise<{ consumed: number[]; deferred: number[] }>;
-  peekFileInbox(): FileInboxItem[];
-  consumeFileInbox(expectedIds: number[]): Promise<{ consumed: number[]; deferred: number[] }>;
+  listUnreadMessages(limit: number): Promise<InboxItem[]>;
+  acknowledgeMessage(expected: InboxItem, onUnexpected: (item: InboxItem) => Promise<void>): Promise<void>;
+  listUnreadFiles(limit: number): Promise<FileInboxItem[]>;
+  acknowledgeFile(expected: FileInboxItem): Promise<void>;
   send(contactCid: string, body: string, replyTo?: ReplyReference): Promise<{ status: RelayStatus; wire_id?: string }>;
   sendFile(contactCid: string, filename: string, mime: string, data: Buffer, replyTo?: ReplyReference): Promise<{ status: RelayStatus; wire_id?: string }>;
   removeContact(contactCid: string): Promise<{
@@ -232,8 +234,6 @@ export class SdkRoomPacket implements RoomPacket {
   private readonly client: OursClient;
   private contacts: Array<{ name: string; container_id: string }> = [];
   private invites: Array<{ invite_id: string; mode: InviteMode }> = [];
-  private inbox: InboxItem[] = [];
-  private fileInbox: FileInboxItem[] = [];
   private refreshWork?: Promise<void>;
 
   constructor(name: string, cid: string, client: OursClient) {
@@ -254,34 +254,6 @@ export class SdkRoomPacket implements RoomPacket {
       invite.mode === 'one_time' || invite.mode === 'public'
         ? [{ invite_id: invite.invite_id, mode: invite.mode }]
         : []);
-    this.inbox = (await this.client.listIncomingMessages())
-      .filter((message) => message.status === 'unread')
-      .map((message) => ({
-        msg_id: message.msg_id,
-        sender_id: message.sender_id,
-        sender_name: message.sender_name,
-        text: message.text,
-        date: normalizeDate(message.date),
-        wire_id: message.wire_id,
-        reply_to: cloneReply(message.reply_to),
-      }));
-    await this.refreshFiles();
-  }
-
-  private async refreshFiles(): Promise<void> {
-    const unread = (await this.client.listIncomingFiles()).filter((file) => file.status === 'unread');
-    if (unread.length === 0) {
-      this.fileInbox = [];
-      return;
-    }
-    const ids = unread.map((file) => file.file_id);
-    const wires = unread.map((file) => file.wire_id);
-    try {
-      await this.client.getFiles({ wire_ids: wires });
-      this.fileInbox = await Promise.all(unread.map(async (file) => fileItem(file, await this.client.fetchFile(file.wire_id))));
-    } finally {
-      await this.client.deferFiles({ file_ids: ids }).catch(() => {});
-    }
   }
 
   async mintInvite(mode: InviteMode): Promise<{ blob: string; invite_id: string; reusable: boolean }> {
@@ -310,26 +282,54 @@ export class SdkRoomPacket implements RoomPacket {
 
   listInvites(): Array<{ invite_id: string; mode: InviteMode }> { return this.invites.map((invite) => ({ ...invite })); }
   listContacts(): Array<{ name: string; container_id: string }> { return this.contacts.map((contact) => ({ ...contact })); }
-  peekInbox(): InboxItem[] { return this.inbox.map((item) => ({ ...item })); }
-  peekFileInbox(): FileInboxItem[] { return this.fileInbox.map((item) => ({ ...item, data: Buffer.from(item.data) })); }
 
-  async consumeInbox(expectedIds: number[]): Promise<{ consumed: number[]; deferred: number[] }> {
-    if (expectedIds.length === 0) return { consumed: [], deferred: [] };
-    const pulled = await this.client.getMessages();
-    const expected = new Set(expectedIds);
-    const consumed = pulled.messages.filter((message) => expected.has(message.msg_id)).map((message) => message.msg_id);
-    const deferred = pulled.messages.filter((message) => !expected.has(message.msg_id)).map((message) => message.msg_id);
-    if (deferred.length) await this.client.deferMessages({ msg_ids: deferred });
-    await this.refresh();
-    return { consumed, deferred };
+  async listUnreadMessages(limit: number): Promise<InboxItem[]> {
+    validateBatchLimit(limit);
+    const metadata = (await this.client.listIncomingMessages())
+      .filter((message) => message.status === 'unread')
+      .sort((left, right) => left.seq - right.seq)
+      .slice(0, limit);
+    return Promise.all(metadata.map(async (listed) => {
+      const history = await this.client.getHistoryItem({ wire_id: listed.wire_id });
+      if (history === null) throw new Error(`SDK history is missing unread message ${listed.wire_id}`);
+      assertListedMessage(listed, history);
+      return messageItem(history);
+    }));
   }
 
-  async consumeFileInbox(expectedIds: number[]): Promise<{ consumed: number[]; deferred: number[] }> {
-    const expected = new Set(expectedIds);
-    const selected = this.fileInbox.filter((file) => expected.has(file.file_id));
-    if (selected.length) await this.client.getFiles({ wire_ids: selected.map((file) => file.wire_id) });
-    this.fileInbox = this.fileInbox.filter((file) => !expected.has(file.file_id));
-    return { consumed: selected.map((file) => file.file_id), deferred: [] };
+  async acknowledgeMessage(
+    expected: InboxItem,
+    onUnexpected: (item: InboxItem) => Promise<void>,
+  ): Promise<void> {
+    for (;;) {
+      const pulled = await this.client.getMessages({ limit: 1 });
+      if (pulled.messages.length > 1) throw new Error('SDK returned more than one message for limit 1');
+      const [history] = pulled.messages;
+      if (history === undefined) return;
+      const item = messageItem(history, 'read');
+      if (sameMessageSource(item, expected)) {
+        assertSameMessage(item, expected);
+        return;
+      }
+      await onUnexpected(item);
+    }
+  }
+
+  async listUnreadFiles(limit: number): Promise<FileInboxItem[]> {
+    validateBatchLimit(limit);
+    const unread = (await this.client.listIncomingFiles())
+      .filter((file) => file.status === 'unread')
+      .sort((left, right) => left.seq - right.seq)
+      .slice(0, limit);
+    return Promise.all(unread.map(async (file) => fileItem(file, await this.client.fetchFile(file.wire_id))));
+  }
+
+  async acknowledgeFile(expected: FileInboxItem): Promise<void> {
+    const pulled = await this.client.getFiles({ wire_ids: [expected.wire_id] });
+    if (pulled.files.length !== 1) {
+      throw new Error(`SDK did not acknowledge selected file ${expected.wire_id}`);
+    }
+    assertReceivedFile(expected, pulled.files[0]!);
   }
 
   async send(contactCid: string, body: string, replyTo?: ReplyReference): Promise<{ status: RelayStatus; wire_id?: string }> {
@@ -375,12 +375,14 @@ export class SdkRoomPacket implements RoomPacket {
 }
 
 function sendResult(result: SendOutcome | FileSendOutcome): { status: RelayStatus; wire_id?: string } {
-  if (result.kind === 'refused' || result.kind === 'migrating') return { status: 'send_failed' };
-  if (result.kind === 'introduced') return { status: 'queued' };
+  if (result.kind === 'refused' || result.kind === 'migrating') {
+    return { status: 'send_failed' };
+  }
   return { status: 'queued', wire_id: result.wireId };
 }
 
 async function fileItem(file: IncomingFileMeta, bytes: Uint8Array): Promise<FileInboxItem> {
+  assertIncomingFile(file, bytes);
   return {
     file_id: file.file_id,
     sender_id: file.from.id,
@@ -392,6 +394,123 @@ async function fileItem(file: IncomingFileMeta, bytes: Uint8Array): Promise<File
     wire_id: file.wire_id,
     reply_to: cloneReply(file.reply_to),
   };
+}
+
+function messageItem(history: HistoryMessage, expectedState: 'unread' | 'read' = 'unread'): InboxItem {
+  if (history.direction !== 'in'
+    || history.inbox_state !== expectedState
+    || history.status !== expectedState
+    || history.text !== history.body) {
+    throw new Error(`SDK returned an invalid ${expectedState} message history row ${history.wire_id}`);
+  }
+  validateSequence(history.seq, 'message');
+  validateNumericId(history.msg_id, 'message');
+  validateHistoryWireId(history.wire_id, 'message');
+  validateReply(history.reply_to, 'message');
+  return {
+    msg_id: history.msg_id,
+    sender_id: history.from.id,
+    sender_name: history.from.name,
+    text: history.text,
+    date: normalizeDate(history.date),
+    wire_id: history.wire_id,
+    reply_to: cloneReply(history.reply_to),
+  };
+}
+
+function assertListedMessage(
+  listed: Awaited<ReturnType<OursClient['listIncomingMessages']>>[number],
+  history: HistoryMessage,
+): void {
+  if (listed.seq !== history.seq
+    || listed.msg_id !== history.msg_id
+    || listed.wire_id !== history.wire_id
+    || listed.from.id !== history.from.id
+    || listed.from.name !== history.from.name
+    || normalizeDate(listed.date) !== normalizeDate(history.date)
+    || listed.encryption !== history.encryption
+    || !sameReply(listed.reply_to, history.reply_to)) {
+    throw new Error(`SDK unread metadata does not match message history ${listed.wire_id}`);
+  }
+}
+
+function assertIncomingFile(file: IncomingFileMeta, bytes: Uint8Array): void {
+  if (file.direction !== 'in' || file.inbox_state !== 'unread' || file.status !== 'unread') {
+    throw new Error(`SDK returned an invalid unread file history row ${file.wire_id}`);
+  }
+  validateSequence(file.seq, 'file');
+  validateNumericId(file.file_id, 'file');
+  validateSelectableFileWireId(file.wire_id);
+  validateReply(file.reply_to, 'file');
+  if (file.byte_length !== bytes.byteLength
+    || file.size !== bytes.byteLength
+    || createHash('sha256').update(bytes).digest('hex') !== file.sha256) {
+    throw new Error(`SDK blob does not match unread file metadata ${file.wire_id}`);
+  }
+}
+
+function assertReceivedFile(expected: FileInboxItem, received: ReceivedFile): void {
+  if (received.status !== 'processed'
+    || received.file_id !== expected.file_id
+    || received.wire_id !== expected.wire_id
+    || received.from.id !== expected.sender_id
+    || received.from.name !== expected.sender_name
+    || received.filename !== expected.filename
+    || received.mime !== expected.mime
+    || received.size !== expected.data.byteLength
+    || received.sha256 !== createHash('sha256').update(expected.data).digest('hex')
+    || normalizeDate(received.date) !== expected.date) {
+    throw new Error(`SDK selected file response does not match ${expected.wire_id}`);
+  }
+}
+
+function sameMessageSource(left: InboxItem, right: InboxItem): boolean {
+  return left.msg_id === right.msg_id && left.wire_id === right.wire_id;
+}
+
+function assertSameMessage(observed: InboxItem, expected: InboxItem): void {
+  if (observed.sender_id !== expected.sender_id
+    || observed.sender_name !== expected.sender_name
+    || observed.text !== expected.text
+    || observed.date !== expected.date
+    || !sameReply(observed.reply_to, expected.reply_to)) {
+    throw new Error(`SDK acknowledged message does not match ${expected.wire_id}`);
+  }
+}
+
+function sameReply(left: ReplyReference | null, right: ReplyReference | null): boolean {
+  if (left === null || right === null) return left === right;
+  return left.wire_id === right.wire_id && left.sentence === right.sentence;
+}
+
+function validateBatchLimit(limit: number): void {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 32) {
+    throw new RangeError('SDK intake batch limit must be an integer from 1 through 32');
+  }
+}
+
+function validateSequence(value: number, kind: string): void {
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`SDK returned an invalid ${kind} history sequence`);
+}
+
+function validateNumericId(value: number, kind: string): void {
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`SDK returned an invalid ${kind} inbox id`);
+}
+
+function validateHistoryWireId(value: string, kind: string): void {
+  if (value.length < 1 || value.length > 256) throw new Error(`SDK returned an invalid ${kind} wire id`);
+}
+
+function validateSelectableFileWireId(value: string): void {
+  if (!/^[0-9a-f]{64}$/i.test(value)) throw new Error('SDK returned an invalid selectable file wire id');
+}
+
+function validateReply(value: ReplyReference | null, kind: string): void {
+  if (value === null) return;
+  validateHistoryWireId(value.wire_id, `${kind} reply`);
+  if (value.sentence !== undefined && (!Number.isSafeInteger(value.sentence) || value.sentence < 1)) {
+    throw new Error(`SDK returned an invalid ${kind} reply sentence`);
+  }
 }
 
 function cloneReply(reply: ReplyReference | null): ReplyReference | null {

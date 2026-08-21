@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -163,7 +163,8 @@ if (process.argv.includes('--e2e-driver')) {
     }
 
     async function messages(peer) {
-      return peer.client.listIncomingMessages();
+      const history = await peer.client.listHistory({ limit: 200 });
+      return history.items.filter((message) => message.direction === 'in');
     }
 
     async function joinInvite(peer, invite) {
@@ -196,6 +197,7 @@ if (process.argv.includes('--e2e-driver')) {
     }
 
     t.after(async () => {
+      let coworkLogs = '';
       if (coworkEnv) {
         try { await runCli(['stop'], 20_000); }
         catch (error) { cleanupErrors.push(new Error(`stop cowork daemon: ${error.message}`)); }
@@ -217,6 +219,8 @@ if (process.argv.includes('--e2e-driver')) {
           ]);
         } catch (error) { cleanupErrors.push(error); }
       }
+      const coworkLogPath = join(stateDir, 'cowork', 'daemon.log');
+      if (existsSync(coworkLogPath)) coworkLogs = readFileSync(coworkLogPath, 'utf8').slice(-8_000);
       try { rmSync(stateDir, { recursive: true, force: true }); }
       catch (error) { cleanupErrors.push(error); }
       process.stdout.write(completed && cleanupErrors.length === 0
@@ -225,6 +229,7 @@ if (process.argv.includes('--e2e-driver')) {
           driver: driverFailure?.stack ?? 'driver incomplete',
           cleanup: cleanupErrors.map((error) => error.stack ?? error.message),
           broker: brokerErrors.join('').slice(-4_000),
+          cowork: coworkLogs,
         })}\n`);
       if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, 'E2E cleanup failed');
     });
@@ -314,6 +319,10 @@ if (process.argv.includes('--e2e-driver')) {
       }), 'Bob SDK briefing');
 
       await send(alice, roomCid, 'participant relay from Alice');
+      await waitFor(async () => {
+        const history = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
+        return history.some((record) => record.kind === 'message' && record.text === 'participant relay from Alice');
+      }, 'participant message in cowork archive');
       await waitFor(async () => roomEnvelopes(await messages(bob)).some((message) =>
         message.text === 'participant relay from Alice'
           && message.author.identity === alice.cid), 'participant SDK message relay');

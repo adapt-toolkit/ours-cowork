@@ -1,31 +1,19 @@
 import { randomBytes } from 'node:crypto';
-import * as fs from 'node:fs';
-import { join, resolve } from 'node:path';
 
-import type { OursClient, ResolvedDaemonConfig } from '@ours.network/sdk';
+import type { AttachOursClientOptions, OursClient } from '@ours.network/sdk';
 
-import { daemonMode, type CoworkConfig } from './config.ts';
+import type { CoworkConfig } from './config.ts';
 
 const WATCH_RETRY_MIN_MS = 500;
 const WATCH_RETRY_MAX_MS = 30_000;
-
-interface SdkDaemonHandle {
-  readonly port: number;
-  close(): Promise<void>;
-}
+const STATE_RESYNC_INTERVAL_MS = 2_000;
 
 export interface OursRuntimeClientFactory {
-  createClient(leaseToken?: string): OursClient;
+  createClient(leaseToken?: string): Promise<OursClient>;
+  /** Return only daemon identities whose names are in cowork's durable room set. */
+  listIdentityNames(localNames: ReadonlySet<string>): Promise<Set<string>>;
   onIdentityNotify(listener: (identityName: string) => void): () => void;
-  /**
-   * Follow one hosted room identity's notifications, returning an unsubscribe.
-   *
-   * Only a host that cannot see the runtime's in-process notification callback
-   * implements this. The embedded host omits it because `startDaemon` already
-   * reports every identity, and `PacketRegistry` calls it optionally so both
-   * hosts keep the same registration order.
-   */
-  trackIdentity?(identityName: string): () => void;
+  trackIdentity(identityName: string): () => void;
 }
 
 /** The full contract `CoworkDaemon` owns: a client factory with a lifecycle. */
@@ -35,164 +23,58 @@ export interface OursRuntimeHost extends OursRuntimeClientFactory {
   shutdown(): Promise<{ requiresProcessExit: boolean }>;
 }
 
-/** Pick the host the effective configuration asks for. Embedded is the default. */
-export function createOursHost(
-  config: CoworkConfig,
-  log: (...parts: unknown[]) => void = () => {},
-): OursRuntimeHost {
-  return daemonMode(config) === 'external'
-    ? new ExternalOursHost(config, log)
-    : new EmbeddedOursHost(config, log);
-}
+type AttachClient = (options?: AttachOursClientOptions) => Promise<OursClient>;
 
-/** One process-owned standard ours SDK daemon, isolated below cowork state. */
-export class EmbeddedOursHost implements OursRuntimeHost {
-  private readonly config: CoworkConfig;
-  private readonly log: (...parts: unknown[]) => void;
-  private readonly listeners = new Set<(identityName: string) => void>();
-  private handle?: SdkDaemonHandle;
-  private Client?: typeof OursClient;
-  private apiToken?: string;
-  private closed = false;
-
-  constructor(config: CoworkConfig, log: (...parts: unknown[]) => void = () => {}) {
-    this.config = config;
-    this.log = log;
-  }
-
-  async boot(): Promise<void> {
-    if (this.handle) return;
-    if (this.closed) throw new Error('embedded ours SDK runtime cannot restart in the same process');
-    const runtimeDir = configureOwnedSdkEnvironment(this.config);
-    let handle: SdkDaemonHandle | undefined;
-    try {
-      const [{ OursClient }, { startDaemon }] = await Promise.all([
-        import('@ours.network/sdk'),
-        import('@ours.network/sdk/daemon'),
-      ]);
-      handle = await startDaemon({
-        version: '@ours.network/cowork@vNext',
-        handleSignals: false,
-        onIdentityNotify: (identityName) => {
-          for (const listener of this.listeners) {
-            try { listener(identityName); } catch (error) {
-              this.log(`cowork SDK notification listener failed for ${identityName}:`, error);
-            }
-          }
-        },
-      });
-      const tokenPath = join(runtimeDir, 'daemon-token');
-      const apiToken = fs.readFileSync(tokenPath, 'utf8').trim();
-      if (!apiToken) throw new Error('embedded ours SDK runtime created an empty owner token');
-      this.Client = OursClient;
-      this.apiToken = apiToken;
-      this.handle = handle;
-    } catch (error) {
-      await handle?.close();
-      throw new Error('failed to start the embedded ours SDK runtime', { cause: error });
-    }
-  }
-
-  createClient(leaseToken = `cowork-${randomBytes(16).toString('hex')}`): OursClient {
-    if (!this.handle || !this.Client || !this.apiToken) {
-      throw new Error('embedded ours SDK runtime is not booted');
-    }
-    return new this.Client({
-      url: `http://127.0.0.1:${this.handle.port}`,
-      leaseToken,
-      apiToken: this.apiToken,
-    });
-  }
-
-  onIdentityNotify(listener: (identityName: string) => void): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
-  }
-
-  close(): void {
-    // CoworkDaemon uses shutdown() when available. This method only satisfies
-    // its structural host contract without hiding asynchronous ownership.
-  }
-
-  async shutdown(): Promise<{ requiresProcessExit: boolean }> {
-    if (this.closed) return { requiresProcessExit: true };
-    this.closed = true;
-    const handle = this.handle;
-    this.handle = undefined;
-    this.Client = undefined;
-    this.apiToken = undefined;
-    this.listeners.clear();
-    await handle?.close();
-    // SDK 1.3.1 closes its HTTP/session surface but the pinned native broker
-    // wrapper can retain reconnect work. Cowork already isolates SDK ownership
-    // in its private worker, so the worker remains the deterministic final
-    // resource boundary after the public close completes.
-    return { requiresProcessExit: true };
-  }
-}
+const attachSharedClient: AttachClient = async (options) => {
+  const { attachOursClient } = await import('@ours.network/sdk');
+  return attachOursClient(options);
+};
 
 /**
- * A client of an ALREADY-RUNNING ours daemon. This host starts no runtime: it
- * only ever imports the SDK's client entry, never `@ours.network/sdk/daemon`,
- * and it never touches the process-global `OURS_*` inputs the embedded host
- * owns. If the selected daemon cannot be identified, boot fails — there is no
- * path from here back to an embedded runtime.
+ * Cowork is always a client of the one shared ours daemon. The cowork config is
+ * intentionally not a daemon selection surface: SDK 2 resolves the ordinary
+ * ours configuration/environment and proves endpoint/state-root coherence.
  */
-export class ExternalOursHost implements OursRuntimeHost {
-  private readonly endpoint: string;
-  private readonly daemonStateDir: string;
+export function createOursHost(
+  _config: CoworkConfig,
+  log: (...parts: unknown[]) => void = () => {},
+): OursRuntimeHost {
+  return new SharedOursHost(log);
+}
+
+export class SharedOursHost implements OursRuntimeHost {
   private readonly log: (...parts: unknown[]) => void;
+  private readonly attach: AttachClient;
   private readonly listeners = new Set<(identityName: string) => void>();
   private readonly watchers = new Map<string, IdentityWatcher>();
   private readonly watchLeaseToken = `cowork-watch-${randomBytes(16).toString('hex')}`;
-  private Client?: typeof OursClient;
-  private resolved?: ResolvedDaemonConfig;
   private watchClient?: OursClient;
+  private resyncTimer?: ReturnType<typeof setInterval>;
   private closed = false;
 
-  constructor(config: CoworkConfig, log: (...parts: unknown[]) => void = () => {}) {
-    const daemon = config.daemon;
-    if (daemon?.mode !== 'external' || daemon.endpoint === undefined || daemon.stateDir === undefined) {
-      throw new Error('external ours daemon mode requires both daemon.endpoint and daemon.stateDir');
-    }
-    this.endpoint = daemon.endpoint;
-    this.daemonStateDir = daemon.stateDir;
+  constructor(
+    log: (...parts: unknown[]) => void = () => {},
+    attach: AttachClient = attachSharedClient,
+  ) {
     this.log = log;
+    this.attach = attach;
   }
 
   async boot(): Promise<void> {
-    if (this.resolved) return;
-    if (this.closed) throw new Error('external ours daemon host cannot restart in the same process');
-    const { OursClient, resolveDaemonConfig, assertDaemonStateDir } = await import('@ours.network/sdk');
-    let resolved: ResolvedDaemonConfig;
-    try {
-      resolved = resolveDaemonConfig({ endpoint: this.endpoint, expectStateDir: this.daemonStateDir });
-    } catch (error) {
-      throw new Error(`cowork cannot select the external ours daemon at ${this.endpoint}`, { cause: error });
-    }
-    // Proves the endpoint is an ours daemon owning the expected state directory
-    // BEFORE its API token is sent anywhere. An unreachable, mismatched, or
-    // foreign endpoint fails here, and cowork stops.
-    try {
-      await assertDaemonStateDir(resolved);
-    } catch (error) {
-      throw new Error(
-        `the external ours daemon at ${this.endpoint} is unavailable or does not own ${this.daemonStateDir}`,
-        { cause: error },
-      );
-    }
-    this.Client = OursClient;
-    this.resolved = resolved;
-    this.watchClient = this.createClient(this.watchLeaseToken);
+    if (this.watchClient) return;
+    if (this.closed) throw new Error('shared ours daemon host cannot restart in the same process');
+    this.watchClient = await this.attach({ leaseToken: this.watchLeaseToken });
   }
 
-  createClient(leaseToken = `cowork-${randomBytes(16).toString('hex')}`): OursClient {
-    if (!this.Client || !this.resolved) throw new Error('external ours daemon host is not booted');
-    return new this.Client({
-      url: this.resolved.baseUrl.value,
-      leaseToken,
-      ...(this.resolved.token === undefined ? {} : { apiToken: this.resolved.token.value }),
-    });
+  async createClient(leaseToken = `cowork-${randomBytes(16).toString('hex')}`): Promise<OursClient> {
+    if (!this.watchClient) throw new Error('shared ours daemon host is not booted');
+    return this.attach({ leaseToken });
+  }
+
+  async listIdentityNames(localNames: ReadonlySet<string>): Promise<Set<string>> {
+    if (!this.watchClient) throw new Error('shared ours daemon host is not booted');
+    const rows = await this.watchClient.identities();
+    return new Set(rows.flatMap((row) => localNames.has(row.name) ? [row.name] : []));
   }
 
   onIdentityNotify(listener: (identityName: string) => void): () => void {
@@ -201,36 +83,39 @@ export class ExternalOursHost implements OursRuntimeHost {
   }
 
   trackIdentity(identityName: string): () => void {
-    if (!this.watchClient) throw new Error('external ours daemon host is not booted');
+    if (!this.watchClient) throw new Error('shared ours daemon host is not booted');
     const existing = this.watchers.get(identityName);
     if (existing) return () => this.untrack(identityName, existing);
     const controller = new AbortController();
     const watcher: IdentityWatcher = { controller, work: Promise.resolve() };
     watcher.work = this.follow(identityName, controller.signal);
     this.watchers.set(identityName, watcher);
+    // SDK 2's structured notification log covers inbox work but not every
+    // contact-state transition (notably contact_accepted). Reconcile once now
+    // and periodically while the long poll supplies the low-latency path.
+    this.announce(identityName);
+    this.ensureStateResync();
     return () => this.untrack(identityName, watcher);
   }
 
   close(): void {
-    // CoworkDaemon prefers shutdown(); this only satisfies the host contract
-    // without pretending the asynchronous watcher teardown already happened.
+    // CoworkDaemon calls shutdown(); this method only satisfies the structural
+    // lifecycle contract without hiding asynchronous watcher teardown.
   }
 
   async shutdown(): Promise<{ requiresProcessExit: boolean }> {
     if (this.closed) return { requiresProcessExit: false };
     this.closed = true;
     this.listeners.clear();
+    this.stopStateResync();
     const watchers = [...this.watchers.values()];
     this.watchers.clear();
     for (const watcher of watchers) watcher.controller.abort();
     await Promise.allSettled(watchers.map((watcher) => watcher.work));
     const client = this.watchClient;
     this.watchClient = undefined;
-    this.Client = undefined;
-    this.resolved = undefined;
-    if (client) await client.releaseLease().catch(() => {});
-    // Nothing native is owned here: the daemon is a separate process that keeps
-    // running, so this worker can exit on its own terms.
+    if (client) await client.releaseLease();
+    // The shared daemon remains owned by its operator/CLI and keeps running.
     return { requiresProcessExit: false };
   }
 
@@ -238,24 +123,30 @@ export class ExternalOursHost implements OursRuntimeHost {
     if (this.watchers.get(identityName) !== watcher) return;
     this.watchers.delete(identityName);
     watcher.controller.abort();
+    if (this.watchers.size === 0) this.stopStateResync();
+  }
+
+  private ensureStateResync(): void {
+    if (this.resyncTimer) return;
+    this.resyncTimer = setInterval(() => {
+      for (const identityName of this.watchers.keys()) this.announce(identityName);
+    }, STATE_RESYNC_INTERVAL_MS);
+    this.resyncTimer.unref();
+  }
+
+  private stopStateResync(): void {
+    if (!this.resyncTimer) return;
+    clearInterval(this.resyncTimer);
+    this.resyncTimer = undefined;
   }
 
   /**
    * Long-poll one identity forever, reconnecting with bounded backoff.
    *
-   * A watch primes at the daemon's tip, so a reconnected watch never replays
-   * what arrived while it was down. Losing those arrivals would be silent, so
-   * every reconnect announces the identity once. The consumer's reaction to an
-   * announcement is a full state refresh, which is exactly the recovery this
-   * needs; it is idempotent and self-coalescing, so the extra announcement can
-   * only cost one refresh.
-   *
-   * ORDER IS LOAD-BEARING. The resync is issued only AFTER the replacement
-   * watch's request is already in flight, because that request is what fixes
-   * the new tip. Announcing first would read the inbox at T0 and fix the tip at
-   * T1 > T0, and anything arriving in between would be in neither — the very
-   * gap this exists to close. This way every arrival lands in the refresh, on
-   * the stream, or (harmlessly) in both.
+   * A replacement stream primes at the daemon tip, so each reconnection also
+   * requests a full state resync. The periodic resync above covers the small
+   * request-prime race and daemon transitions that are not in the structured
+   * notification log; reconciliation is idempotent and self-coalescing.
    */
   private async follow(identityName: string, signal: AbortSignal): Promise<void> {
     let backoffMs = WATCH_RETRY_MIN_MS;
@@ -265,7 +156,6 @@ export class ExternalOursHost implements OursRuntimeHost {
       if (!client) return;
       try {
         const stream = client.watchNotifications(identityName, { signal });
-        // Starts the long poll; the tip is fixed by the daemon handling it.
         let step = stream.next();
         if (resyncPending) {
           resyncPending = false;
@@ -276,12 +166,14 @@ export class ExternalOursHost implements OursRuntimeHost {
           this.announce(identityName);
           step = stream.next();
         }
+        if (!signal.aborted) {
+          resyncPending = true;
+          this.log(`[${identityName}] shared ours daemon notification watch ended; reconnecting`);
+        }
       } catch (error) {
         if (signal.aborted) return;
-        // One resync per reconnection, not per failure: the backoff below is
-        // what bounds how often a daemon that stays down is retried at all.
         resyncPending = true;
-        this.log(`[${identityName}] external ours daemon notification watch failed:`, error);
+        this.log(`[${identityName}] shared ours daemon notification watch failed:`, error);
       }
       if (signal.aborted) return;
       await sleep(backoffMs, signal);
@@ -313,25 +205,4 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
       resolveSleep();
     }
   });
-}
-
-export function sdkRuntimeStateDir(config: Pick<CoworkConfig, 'stateDir'>): string {
-  return resolve(config.stateDir, 'ours-sdk');
-}
-
-/** Configure every process-global SDK input before its first value import. */
-export function configureOwnedSdkEnvironment(config: CoworkConfig): string {
-  const stateDir = sdkRuntimeStateDir(config);
-  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  fs.chmodSync(stateDir, 0o700);
-  process.env.OURS_CONFIG = join(stateDir, 'config.json');
-  process.env.OURS_STATE_DIR = stateDir;
-  process.env.OURS_BROKER_URL = config.brokerUrl;
-  process.env.OURS_PORT = '0';
-  process.env.OURS_API_VISIBILITY = 'owner';
-  process.env.OURS_TRANSPORT = 'http';
-  process.env.OURS_AUTOSTART = 'false';
-  process.env.OURS_GC_INTERVAL_MS = '3600000';
-  delete process.env.OURS_API_TOKEN;
-  return stateDir;
 }

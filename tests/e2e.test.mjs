@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -11,9 +11,19 @@ import { fileURLToPath } from 'node:url';
 const THIS_FILE = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(THIS_FILE), '..');
 const CLI = join(ROOT, 'dist', 'cli.js');
+const OURS_CLI = join(ROOT, 'node_modules', '@ours.network', 'cli', 'dist', 'cli.js');
 const SUCCESS = 'COWORK_E2E_DRIVER_SUCCESS';
 const FAILURE = 'COWORK_E2E_DRIVER_FAILURE';
 const sleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
+
+function sharedDaemonEnvironment(configPath) {
+  const env = { ...process.env };
+  for (const key of [
+    'OURS_CONFIG', 'OURS_PORT', 'OURS_STATE_DIR', 'OURS_API_TOKEN',
+    'OURS_BROKER_URL', 'OURS_API_VISIBILITY', 'OURS_GC_INTERVAL_MS',
+  ]) delete env[key];
+  return { ...env, OURS_CONFIG: configPath };
+}
 
 async function unusedPort() {
   const server = createServer();
@@ -60,13 +70,14 @@ function roomEnvelopes(messages) {
 if (process.argv.includes('--e2e-driver')) {
   test('standard SDK cowork mission-room driver', async (t) => {
     const stateDir = mkdtempSync(join(tmpdir(), 'ours-cowork-e2e-'));
-    const peerStateDir = join(stateDir, 'peer-sdk');
+    const oursStateDir = join(stateDir, 'shared-ours');
     const cleanupErrors = [];
     const brokerErrors = [];
     let broker;
     let brokerExit;
-    let peerHost;
+    let oursEnv;
     let coworkEnv;
+    const peerClients = [];
     let completed = false;
     let driverFailure;
     const stage = (name) => process.stdout.write(`COWORK_E2E_STAGE ${name}\n`);
@@ -108,6 +119,45 @@ if (process.argv.includes('--e2e-driver')) {
       return body.result;
     }
 
+    async function runOurs(args, timeoutMs = 35_000) {
+      const child = spawn(process.execPath, [
+        OURS_CLI,
+        ...args,
+        '--config', oursEnv.OURS_CONFIG,
+        '--json',
+      ], {
+        cwd: ROOT,
+        env: oursEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
+      child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
+      let timer;
+      const result = await Promise.race([
+        new Promise((resolveExit) => {
+          child.once('error', (error) => resolveExit({ error }));
+          child.once('exit', (code, signal) => resolveExit({ code, signal }));
+        }),
+        new Promise((resolveTimeout) => { timer = setTimeout(() => resolveTimeout({ timeout: true }), timeoutMs); }),
+      ]);
+      clearTimeout(timer);
+      if (result.timeout) {
+        child.kill('SIGKILL');
+        await new Promise((resolveExit) => child.once('exit', resolveExit));
+        throw new Error(`ours CLI timed out: ${args.join(' ')}`);
+      }
+      if (result.error) throw result.error;
+      if (result.code !== 0) {
+        throw new Error(`ours CLI failed (${args.join(' ')}): exit=${result.code} ${stdout}\n${stderr}`);
+      }
+      let body;
+      try { body = JSON.parse(stdout); }
+      catch { throw new Error(`ours CLI returned invalid JSON (${args.join(' ')}): ${stdout}\n${stderr}`); }
+      return body;
+    }
+
     async function contacts(peer) {
       return (await peer.client.listContacts()).contacts;
     }
@@ -131,11 +181,10 @@ if (process.argv.includes('--e2e-driver')) {
       });
     }
 
-    async function createPeer(OursClient, name, token) {
-      const client = new OursClient({
-        url: `http://127.0.0.1:${peerHost.port}`,
+    async function createPeer(attachOursClient, name) {
+      const client = await attachOursClient({
+        env: oursEnv,
         leaseToken: `cowork-e2e-${name.toLowerCase()}`,
-        apiToken: token,
       });
       const created = await client.createIdentity({
         name,
@@ -151,8 +200,14 @@ if (process.argv.includes('--e2e-driver')) {
         try { await runCli(['stop'], 20_000); }
         catch (error) { cleanupErrors.push(new Error(`stop cowork daemon: ${error.message}`)); }
       }
-      try { await peerHost?.close(); }
-      catch (error) { cleanupErrors.push(new Error(`stop peer SDK: ${error.message}`)); }
+      for (const client of peerClients) {
+        try { await client.releaseLease(); }
+        catch (error) { cleanupErrors.push(new Error(`release peer lease: ${error.message}`)); }
+      }
+      if (oursEnv) {
+        try { await runOurs(['daemon', 'stop'], 20_000); }
+        catch (error) { cleanupErrors.push(new Error(`stop shared ours daemon: ${error.message}`)); }
+      }
       if (broker) {
         broker.kill('SIGKILL');
         try {
@@ -176,15 +231,8 @@ if (process.argv.includes('--e2e-driver')) {
 
     try {
       assert(existsSync(CLI), 'build the daemon and CLI before running E2E');
+      assert(existsSync(OURS_CLI), 'install @ours.network/cli 1.0.1 before running E2E');
       const port = await unusedPort();
-      const configPath = join(stateDir, 'config.json');
-      writeFileSync(configPath, JSON.stringify({
-        version: 1,
-        brokerUrl: `ws://127.0.0.1:${port}`,
-        stateDir,
-        rest: { enabled: false, port: 3052 },
-      }), { mode: 0o600 });
-      coworkEnv = { ...process.env, OURS_COWORK_CONFIG: configPath };
 
       broker = spawn(process.execPath, [join(ROOT, 'node_modules/.bin/adapt-broker'), '--host', '127.0.0.1', '--port', String(port), '--test_mode'], {
         cwd: ROOT,
@@ -198,27 +246,33 @@ if (process.argv.includes('--e2e-driver')) {
       await waitForPort(port);
       stage('broker-ready');
 
-      process.env.OURS_CONFIG = join(peerStateDir, 'config.json');
-      process.env.OURS_STATE_DIR = peerStateDir;
-      process.env.OURS_BROKER_URL = `ws://127.0.0.1:${port}`;
-      process.env.OURS_PORT = '0';
-      process.env.OURS_API_VISIBILITY = 'owner';
-      process.env.OURS_TRANSPORT = 'http';
-      process.env.OURS_AUTOSTART = 'false';
-      process.env.OURS_GC_INTERVAL_MS = '3600000';
-      delete process.env.OURS_API_TOKEN;
-      const [{ OursClient }, { startDaemon }] = await Promise.all([
-        import('@ours.network/sdk'),
-        import('@ours.network/sdk/daemon'),
-      ]);
-      peerHost = await startDaemon({ version: '@ours.network/cowork-e2e', handleSignals: false });
-      const token = readFileSync(join(peerStateDir, 'daemon-token'), 'utf8').trim();
+      const oursPort = await unusedPort();
+      const oursConfigPath = join(stateDir, 'ours-config.json');
+      writeFileSync(oursConfigPath, JSON.stringify({
+        brokerUrl: `ws://127.0.0.1:${port}`,
+        port: oursPort,
+        stateDir: oursStateDir,
+        apiVisibility: 'owner',
+      }), { mode: 0o600 });
+      oursEnv = sharedDaemonEnvironment(oursConfigPath);
+      await runOurs(['daemon', 'start']);
+      await waitForPort(oursPort);
+      const { attachOursClient } = await import('@ours.network/sdk');
       const [alice, bob, charlie] = await Promise.all([
-        createPeer(OursClient, 'Alice', token),
-        createPeer(OursClient, 'Bob', token),
-        createPeer(OursClient, 'Charlie', token),
+        createPeer(attachOursClient, 'Alice'),
+        createPeer(attachOursClient, 'Bob'),
+        createPeer(attachOursClient, 'Charlie'),
       ]);
+      peerClients.push(alice.client, bob.client, charlie.client);
       stage('participants-ready');
+
+      const configPath = join(stateDir, 'cowork-config.json');
+      writeFileSync(configPath, JSON.stringify({
+        version: 1,
+        stateDir: join(stateDir, 'cowork'),
+        rest: { enabled: false, port: 3052 },
+      }), { mode: 0o600 });
+      coworkEnv = { ...oursEnv, OURS_COWORK_CONFIG: configPath };
 
       await runCli(['start']);
       await waitFor(async () => (await runCli(['status'])).running === true, 'authenticated daemon status');
@@ -297,25 +351,20 @@ if (process.argv.includes('--e2e-driver')) {
       assert.equal(room.identity_cid, roomCid);
       assert.equal(room.identity_name, created.identity_name);
       const oldInvite = room.invites.find((invite) => invite.invite_id === invitation.invite.invite_id);
-      assert.equal(oldInvite.state, 'replacement_required');
-      const [replacement] = await runCli(['room', 'recover', roomId]);
-      await joinInvite(charlie, replacement.blob);
+      assert.equal(oldInvite.state, 'live');
+      await joinInvite(charlie, invitation.blob);
       await waitFor(async () => (await contacts(charlie)).some((contact) => contact.container_id === roomCid),
-        'Charlie recovered invite redemption');
-      assert.equal((await runCli(['room', 'participants', roomId])).some((seat) => seat.identity === charlie.cid), false);
-      await runCli([
-        'room', 'recover', roomId, '--confirm', invitation.invite.invite_id, replacement.invite.invite_id,
-      ]);
+        'Charlie live invite redemption after cowork restart');
       await waitFor(async () => (await runCli(['room', 'participants', roomId]))
-        .some((seat) => seat.identity === charlie.cid), 'confirmed recovered invite admission');
-      stage('restart-and-recovery');
+        .some((seat) => seat.identity === charlie.cid), 'shared-daemon invite admission after cowork restart');
+      stage('restart-and-live-invite');
 
       const closed = await runCli(['room', 'close', roomId]);
       assert.equal(closed.state, 'closed');
       await waitFor(() => Promise.all([contacts(alice), contacts(bob), contacts(charlie)]).then((rows) =>
         rows.every((contactsList) => !contactsList.some((contact) => contact.container_id === roomCid))),
       'bilateral SDK contact removal');
-      const roomDir = join(stateDir, 'rooms', roomId);
+      const roomDir = join(stateDir, 'cowork', 'rooms', roomId);
       assert.equal(existsSync(join(roomDir, 'room.json')), true);
       assert.equal(existsSync(join(roomDir, 'archive.jsonl')), true);
       const deleted = await runCli(['room', 'delete', roomId, '--yes']);

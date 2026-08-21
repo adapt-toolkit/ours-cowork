@@ -28,7 +28,6 @@ test('an explicitly disabled REST configuration remains disabled', (t) => {
   const path = join(dir, 'config.json');
   writeFileSync(path, JSON.stringify({
     version: 1,
-    brokerUrl: 'ws://127.0.0.1:3000',
     stateDir: join(dir, 'state'),
     rest: { enabled: false, port: 3052 },
   }), { mode: 0o600 });

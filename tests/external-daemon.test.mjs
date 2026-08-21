@@ -1,23 +1,19 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import test from 'node:test';
 
-import { CoworkConfigSchema, daemonMode, defaultConfig, loadConfig } from '../src/config.ts';
-import { createOursHost, EmbeddedOursHost, ExternalOursHost } from '../src/ours-runtime.ts';
-import { PacketRegistry } from '../src/packets.ts';
+import { defaultConfig, loadConfig } from '../src/config.ts';
+import { createOursHost, SharedOursHost } from '../src/ours-runtime.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const IDENTITY = `ours-cowork-${ROOM_ID}`;
 const CID = 'AB'.repeat(32);
-// Every OURS_* input the SDK's own resolver reads. A cowork worker inherits the
-// operator's shell, so these tests pin them instead of trusting the runner.
 const SDK_ENVIRONMENT = [
   'OURS_CONFIG', 'OURS_STATE_DIR', 'OURS_PORT', 'OURS_API_TOKEN', 'OURS_INSTANCE',
-  'OURS_BROKER_URL', 'OURS_API_VISIBILITY', 'OURS_TRANSPORT', 'OURS_AUTOSTART',
+  'OURS_BROKER_URL', 'OURS_API_VISIBILITY',
 ];
 
 function pinSdkEnvironment(t) {
@@ -31,22 +27,20 @@ function pinSdkEnvironment(t) {
   });
 }
 
-/**
- * A stand-in for an already-running ours daemon: only the routes SDK 1.5.2's
- * client actually uses, with the same token header and the same long-poll
- * notification contract.
- */
 async function startFakeDaemon(t, options = {}) {
-  const stateDir = options.stateDir ?? mkdtempSync(join(tmpdir(), 'cowork-fake-daemon-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'cowork-shared-daemon-'));
   const reportedStateDir = options.reportedStateDir ?? stateDir;
-  const token = options.token ?? 'fake-daemon-token';
-  if (options.writeToken !== false) {
-    writeFileSync(join(stateDir, 'daemon-token'), `${token}\n`, { mode: 0o600 });
-  }
+  const token = 'shared-daemon-token';
+  writeFileSync(join(stateDir, 'daemon-token'), `${token}\n`, { mode: 0o600 });
   const requests = [];
   const polls = [];
   const waiting = new Set();
   const events = [];
+  const identityRows = options.identityRows ?? [
+    { name: IDENTITY },
+    { name: 'Human@laptop' },
+    { name: 'another-app' },
+  ];
 
   function flush() {
     for (const held of [...waiting]) {
@@ -70,26 +64,19 @@ async function startFakeDaemon(t, options = {}) {
       return false;
     };
     if (request.method === 'GET' && url.pathname === '/state-dir') {
-      send(200, { stateDir: reportedStateDir, version: '1.5.2', compat: 1 });
-      return;
-    }
-    if (request.method === 'GET' && (url.pathname === '/version' || url.pathname === '/info')) {
-      send(200, {
-        name: 'ours', version: '1.5.2', compat: 1, protocol: 1,
-        pid: process.pid, stateDir: reportedStateDir,
-      });
+      send(200, { stateDir: reportedStateDir, version: '2.0.1', compat: 1 });
       return;
     }
     if (request.method === 'GET' && url.pathname === '/identities') {
       if (!authorized()) return;
-      send(200, { identities: [{ name: IDENTITY }] });
+      send(200, { identities: identityRows });
       return;
     }
     const notifications = /^\/identities\/([^/]+)\/notifications$/.exec(url.pathname);
     if (request.method === 'GET' && notifications) {
       if (!authorized()) return;
-      polls.push(url.searchParams.get('since'));
       const raw = url.searchParams.get('since');
+      polls.push(raw);
       const since = raw === null || raw === 'tip' ? events.length : Number(raw);
       const held = { since, send: (body) => send(200, body), response };
       waiting.add(held);
@@ -115,7 +102,7 @@ async function startFakeDaemon(t, options = {}) {
     for (const held of [...waiting]) held.send({ cursor: events.length, events: [] });
     waiting.clear();
     await new Promise((closed) => server.close(closed));
-    if (options.stateDir === undefined) rmSync(stateDir, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
   });
   return {
     port,
@@ -123,11 +110,7 @@ async function startFakeDaemon(t, options = {}) {
     stateDir,
     requests,
     polls,
-    endpoint: `http://127.0.0.1:${port}`,
-    /** Append without answering any held poll: an arrival nobody is watching. */
-    append(event) { events.push(event); },
     emit(event) { events.push(event); flush(); },
-    /** Break every held long poll the way a restarted daemon would. */
     dropWatchers() {
       for (const held of [...waiting]) {
         waiting.delete(held);
@@ -135,423 +118,117 @@ async function startFakeDaemon(t, options = {}) {
       }
     },
     get watching() { return waiting.size; },
-    get eventCount() { return events.length; },
   };
 }
 
-function externalConfig(stateDir, endpoint, daemonStateDir) {
-  return {
+function selectDaemon(daemon) {
+  process.env.OURS_PORT = String(daemon.port);
+  process.env.OURS_STATE_DIR = daemon.stateDir;
+}
+
+test('cowork configuration is app-local and removed daemon/broker keys fail with migration guidance', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-config-migration-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const cleanPath = join(dir, 'clean.json');
+  writeFileSync(cleanPath, JSON.stringify({
     version: 1,
-    brokerUrl: 'ws://127.0.0.1:1',
-    stateDir,
-    rest: { enabled: false, port: 3052 },
-    daemon: { mode: 'external', endpoint, stateDir: daemonStateDir },
-  };
-}
-
-test('an unconfigured deployment keeps the exact embedded effective config', (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'cowork-daemon-default-'));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const path = join(dir, 'config.json');
-  writeFileSync(path, JSON.stringify({
-    version: 1, brokerUrl: 'ws://file', stateDir: join(dir, 'state'), rest: { enabled: true, port: 3052 },
+    stateDir: join(dir, 'cowork'),
+    rest: { enabled: true, port: 3052 },
   }), { mode: 0o600 });
-
-  const config = loadConfig({ OURS_COWORK_CONFIG: path });
-
-  assert.deepEqual(config, {
-    version: 1, brokerUrl: 'ws://file', stateDir: join(dir, 'state'), rest: { enabled: true, port: 3052 },
+  assert.deepEqual(loadConfig({ OURS_COWORK_CONFIG: cleanPath }), {
+    version: 1,
+    stateDir: join(dir, 'cowork'),
+    rest: { enabled: true, port: 3052 },
   });
-  assert.equal('daemon' in config, false);
-  assert.equal(daemonMode(config), 'embedded');
+
+  for (const removed of [
+    { brokerUrl: 'wss://broker1.ours.network' },
+    { daemon: { mode: 'embedded' } },
+  ]) {
+    const path = join(dir, `removed-${Object.keys(removed)[0]}.json`);
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      stateDir: join(dir, 'cowork'),
+      rest: { enabled: true, port: 3052 },
+      ...removed,
+    }), { mode: 0o600 });
+    assert.throws(
+      () => loadConfig({ OURS_COWORK_CONFIG: path }),
+      /removed.*shared ours daemon.*@ours\.network\/cli/i,
+    );
+  }
+  for (const name of [
+    'OURS_COWORK_BROKER_URL',
+    'OURS_COWORK_DAEMON_MODE',
+    'OURS_COWORK_DAEMON_ENDPOINT',
+    'OURS_COWORK_DAEMON_STATE_DIR',
+  ]) {
+    assert.throws(
+      () => loadConfig({ [name]: 'obsolete' }),
+      new RegExp(`${name}.*removed.*OURS_CONFIG`, 'i'),
+    );
+  }
+  assert.equal('brokerUrl' in defaultConfig('/home/demo'), false);
   assert.equal('daemon' in defaultConfig('/home/demo'), false);
-  assert.equal(daemonMode(defaultConfig('/home/demo')), 'embedded');
 });
 
-test('the external selection needs both fields, normalizes them, and rejects unusable endpoints', () => {
-  const parsed = CoworkConfigSchema.parse({
-    ...defaultConfig('/home/demo'),
-    daemon: { mode: 'external', endpoint: 'http://127.0.0.1:3050/', stateDir: '/home/demo/.ours/../.ours' },
-  });
-  assert.deepEqual(parsed.daemon, {
-    mode: 'external', endpoint: 'http://127.0.0.1:3050', stateDir: '/home/demo/.ours',
-  });
-  // The common daemon's own default address resolves without any network I/O.
-  assert.equal(daemonMode(parsed), 'external');
-
-  const dedicated = CoworkConfigSchema.parse({
-    ...defaultConfig('/home/demo'),
-    daemon: { mode: 'external', endpoint: 'http://127.0.0.1:3071', stateDir: '/srv/rooms/.ours' },
-  });
-  assert.deepEqual(dedicated.daemon, {
-    mode: 'external', endpoint: 'http://127.0.0.1:3071', stateDir: '/srv/rooms/.ours',
-  });
-
-  for (const daemon of [
-    { mode: 'external' },
-    { mode: 'external', endpoint: 'http://127.0.0.1:3050' },
-    { mode: 'external', stateDir: '/home/demo/.ours' },
-    { mode: 'embedded', endpoint: 'http://127.0.0.1:3050' },
-    { mode: 'embedded', stateDir: '/home/demo/.ours' },
-    { mode: 'elsewhere', endpoint: 'http://127.0.0.1:3050', stateDir: '/home/demo/.ours' },
-    { mode: 'external', endpoint: 'ws://127.0.0.1:3050', stateDir: '/home/demo/.ours' },
-    { mode: 'external', endpoint: 'http://127.0.0.1:3050/rooms', stateDir: '/home/demo/.ours' },
-    { mode: 'external', endpoint: 'http://127.0.0.1:3050?a=1', stateDir: '/home/demo/.ours' },
-    { mode: 'external', endpoint: 'http://user:pass@127.0.0.1:3050', stateDir: '/home/demo/.ours' },
-    { mode: 'external', endpoint: 'http://127.0.0.1:3050', stateDir: '/home/demo/.ours', extra: true },
-  ]) {
-    assert.throws(
-      () => CoworkConfigSchema.parse({ ...defaultConfig('/home/demo'), daemon }),
-      JSON.stringify(daemon),
-    );
-  }
-  assert.equal(CoworkConfigSchema.parse({ ...defaultConfig('/home/demo'), daemon: { mode: 'embedded' } }).daemon.mode, 'embedded');
+test('the host factory has exactly one shared-daemon mode', () => {
+  assert(createOursHost(defaultConfig('/home/demo')) instanceof SharedOursHost);
 });
 
-test('a daemon API token is never offered over plaintext to another host', () => {
-  const accept = (endpoint) => CoworkConfigSchema.parse({
-    ...defaultConfig('/home/demo'),
-    daemon: { mode: 'external', endpoint, stateDir: '/home/demo/.ours' },
-  }).daemon.endpoint;
-
-  // Loopback stays ergonomic: the request never leaves the host.
-  assert.equal(accept('http://127.0.0.1:3050'), 'http://127.0.0.1:3050');
-  assert.equal(accept('http://127.5.6.7:3071'), 'http://127.5.6.7:3071');
-  assert.equal(accept('http://localhost:3050'), 'http://localhost:3050');
-  assert.equal(accept('http://LOCALHOST:3050'), 'http://localhost:3050');
-  assert.equal(accept('http://[::1]:3050'), 'http://[::1]:3050');
-  // TLS is accepted anywhere.
-  assert.equal(accept('https://rooms.example.test'), 'https://rooms.example.test');
-  assert.equal(accept('https://10.0.0.4:3071'), 'https://10.0.0.4:3071');
-
-  for (const endpoint of [
-    'http://10.0.0.4:3050',
-    'http://192.168.1.10:3050',
-    'http://rooms.example.test',
-    'http://rooms.example.test:3050',
-    'http://128.0.0.1:3050',
-    'http://[2001:db8::1]:3050',
-  ]) {
-    assert.throws(
-      () => accept(endpoint),
-      (error) => /https:\/\/ unless the daemon is on this host/.test(String(error)),
-      endpoint,
-    );
-  }
-});
-
-test('daemon environment overrides select, merge, and fail closed', (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'cowork-daemon-env-'));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const path = join(dir, 'config.json');
-  const base = { version: 1, brokerUrl: 'ws://file', stateDir: join(dir, 'state'), rest: { enabled: true, port: 3052 } };
-  writeFileSync(path, JSON.stringify(base), { mode: 0o600 });
-
-  assert.deepEqual(loadConfig({
-    OURS_COWORK_CONFIG: path,
-    OURS_COWORK_DAEMON_ENDPOINT: 'http://127.0.0.1:3071/',
-    OURS_COWORK_DAEMON_STATE_DIR: join(dir, 'dedicated'),
-  }).daemon, { mode: 'external', endpoint: 'http://127.0.0.1:3071', stateDir: join(dir, 'dedicated') });
-
-  writeFileSync(path, JSON.stringify({
-    ...base,
-    daemon: { mode: 'external', endpoint: 'http://127.0.0.1:3050', stateDir: join(dir, 'common') },
-  }), { mode: 0o600 });
-  assert.deepEqual(loadConfig({
-    OURS_COWORK_CONFIG: path, OURS_COWORK_DAEMON_ENDPOINT: 'http://127.0.0.1:3071',
-  }).daemon, { mode: 'external', endpoint: 'http://127.0.0.1:3071', stateDir: join(dir, 'common') });
-  assert.deepEqual(loadConfig({ OURS_COWORK_CONFIG: path, OURS_COWORK_DAEMON_MODE: 'embedded' }).daemon, { mode: 'embedded' });
-
-  assert.throws(
-    () => loadConfig({ OURS_COWORK_CONFIG: path, OURS_COWORK_DAEMON_MODE: 'sidecar' }),
-    /OURS_COWORK_DAEMON_MODE/,
-  );
-  assert.throws(
-    () => loadConfig({
-      OURS_COWORK_CONFIG: path,
-      OURS_COWORK_DAEMON_MODE: 'embedded',
-      OURS_COWORK_DAEMON_ENDPOINT: 'http://127.0.0.1:3071',
-    }),
-    /require daemon mode "external"/,
-  );
-  writeFileSync(path, JSON.stringify(base), { mode: 0o600 });
-  assert.throws(
-    () => loadConfig({ OURS_COWORK_CONFIG: path, OURS_COWORK_DAEMON_ENDPOINT: 'http://127.0.0.1:3071' }),
-    (error) => /invalid effective cowork config/.test(error.message)
-      && /daemon\.stateDir is required/.test(String(error.cause)),
-  );
-});
-
-test('the host factory follows the configured mode and refuses an incomplete external selection', (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'cowork-host-factory-'));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const embedded = { ...defaultConfig('/home/demo'), stateDir: dir };
-
-  assert(createOursHost(embedded) instanceof EmbeddedOursHost);
-  assert(createOursHost({ ...embedded, daemon: { mode: 'embedded' } }) instanceof EmbeddedOursHost);
-  assert(createOursHost(externalConfig(dir, 'http://127.0.0.1:3071', join(dir, 'ours'))) instanceof ExternalOursHost);
-  assert.throws(
-    () => new ExternalOursHost({ ...embedded, daemon: { mode: 'external', endpoint: 'http://127.0.0.1:3071' } }),
-    /daemon\.endpoint and daemon\.stateDir/,
-  );
-});
-
-test('external boot proves the daemon, then reaches it with that daemon own token', async (t) => {
+test('shared boot proves the state root before credentials and filters global identities locally', async (t) => {
   pinSdkEnvironment(t);
-  const coworkStateDir = mkdtempSync(join(tmpdir(), 'cowork-external-boot-'));
-  t.after(() => rmSync(coworkStateDir, { recursive: true, force: true }));
   const daemon = await startFakeDaemon(t);
-  const host = new ExternalOursHost(
-    CoworkConfigSchema.parse(externalConfig(coworkStateDir, daemon.endpoint, daemon.stateDir)),
-  );
+  selectDaemon(daemon);
+  const host = new SharedOursHost();
 
   await host.boot();
-  const identities = await host.createClient('external-boot-contract').identities();
-
-  assert.deepEqual(identities, [{ name: IDENTITY }]);
+  assert.deepEqual(
+    await host.listIdentityNames(new Set([IDENTITY, 'not-present'])),
+    new Set([IDENTITY]),
+  );
   assert.deepEqual(daemon.requests[0], { method: 'GET', path: '/state-dir', token: null });
   assert(daemon.requests.some((entry) => entry.path === '/identities' && entry.token === daemon.token));
   assert.deepEqual(await host.shutdown(), { requiresProcessExit: false });
 });
 
-test('a dedicated daemon on its own port and state directory is addressed independently', async (t) => {
+test('a mismatched shared daemon fails before cowork offers its credential', async (t) => {
   pinSdkEnvironment(t);
-  const coworkStateDir = mkdtempSync(join(tmpdir(), 'cowork-external-dedicated-'));
-  t.after(() => rmSync(coworkStateDir, { recursive: true, force: true }));
-  const common = await startFakeDaemon(t, { token: 'common-daemon-token' });
-  const dedicated = await startFakeDaemon(t, { token: 'dedicated-daemon-token' });
-  assert.notEqual(common.port, dedicated.port);
-  assert.notEqual(common.stateDir, dedicated.stateDir);
+  const daemon = await startFakeDaemon(t, { reportedStateDir: join(tmpdir(), 'wrong-ours-state') });
+  selectDaemon(daemon);
+  const host = new SharedOursHost();
 
-  for (const target of [common, dedicated]) {
-    const host = new ExternalOursHost(
-      CoworkConfigSchema.parse(externalConfig(coworkStateDir, target.endpoint, target.stateDir)),
-    );
-    await host.boot();
-    assert.deepEqual(await host.createClient('dedicated-contract').identities(), [{ name: IDENTITY }]);
-    await host.shutdown();
-  }
-
-  // Each selection read only its own daemon's token file.
-  assert.deepEqual(
-    [...new Set(common.requests.map((entry) => entry.token).filter(Boolean))], [common.token],
-  );
-  assert.deepEqual(
-    [...new Set(dedicated.requests.map((entry) => entry.token).filter(Boolean))], [dedicated.token],
-  );
+  await assert.rejects(host.boot(), /owns state directory|selection expects/);
+  assert.deepEqual(daemon.requests.map((entry) => entry.token), [null]);
+  await assert.rejects(host.createClient(), /not booted/);
 });
 
-test('an unavailable or mismatched daemon fails boot without offering a credential', async (t) => {
+test('shared notification watch forwards events and releases without stopping the daemon', async (t) => {
   pinSdkEnvironment(t);
-  const coworkStateDir = mkdtempSync(join(tmpdir(), 'cowork-external-refuse-'));
-  t.after(() => rmSync(coworkStateDir, { recursive: true, force: true }));
-
-  const impostor = await startFakeDaemon(t, { reportedStateDir: join(tmpdir(), 'someone-elses-ours') });
-  const mismatched = new ExternalOursHost(
-    CoworkConfigSchema.parse(externalConfig(coworkStateDir, impostor.endpoint, impostor.stateDir)),
-  );
-  await assert.rejects(mismatched.boot(), (error) =>
-    /is unavailable or does not own/.test(error.message) && /INCOHERENT_SELECTION/.test(String(error.cause?.code)));
-  assert.deepEqual(impostor.requests.map((entry) => entry.token), [null]);
-  assert.throws(() => mismatched.createClient(), /not booted/);
-
-  const offline = await startFakeDaemon(t, { token: 'unused-token' });
-  const closedEndpoint = offline.endpoint;
-  const closedStateDir = offline.stateDir;
-  await new Promise((closed) => { const probe = createServer(); probe.close(closed); });
-  const unavailable = new ExternalOursHost(
-    CoworkConfigSchema.parse(externalConfig(coworkStateDir, 'http://127.0.0.1:1', closedStateDir)),
-  );
-  await assert.rejects(unavailable.boot(), (error) =>
-    error.message.includes('http://127.0.0.1:1') && /unavailable or does not own/.test(error.message));
-  assert.notEqual(closedEndpoint, 'http://127.0.0.1:1');
-});
-
-test('a tracked identity long-polls the external daemon and stops when it is untracked', async (t) => {
-  pinSdkEnvironment(t);
-  const coworkStateDir = mkdtempSync(join(tmpdir(), 'cowork-external-watch-'));
-  t.after(() => rmSync(coworkStateDir, { recursive: true, force: true }));
   const daemon = await startFakeDaemon(t);
-  const host = new ExternalOursHost(
-    CoworkConfigSchema.parse(externalConfig(coworkStateDir, daemon.endpoint, daemon.stateDir)),
-  );
+  selectDaemon(daemon);
+  const host = new SharedOursHost();
   await host.boot();
-  t.after(() => host.shutdown());
-
   const seen = [];
   host.onIdentityNotify((name) => seen.push(name));
   const untrack = host.trackIdentity(IDENTITY);
-  await waitFor(() => daemon.watching === 1, 'the notification long poll to be held open');
+  await waitFor(() => daemon.watching === 1, 'notification watch');
+  await waitFor(() => seen.length >= 1, 'initial state resync');
+  const afterInitial = seen.length;
+  await waitFor(() => seen.length > afterInitial, 'periodic state resync for unlogged contact transitions');
+  const beforeEvent = seen.length;
 
-  daemon.emit({ event: 'message_received', sender_id: CID, sender_name: 'Peer', from: 'Peer', msg_id: '1', wire_id: 'w1', date: '2026-08-16T00:00:00Z' });
-  await waitFor(() => seen.length === 1, 'the identity notification to reach the listener');
-  assert.deepEqual(seen, [IDENTITY]);
-
-  untrack();
-  await waitFor(() => daemon.watching === 0, 'the notification long poll to be released');
-  daemon.emit({ event: 'message_received', sender_id: CID, sender_name: 'Peer', from: 'Peer', msg_id: '2', wire_id: 'w2', date: '2026-08-16T00:00:01Z' });
-  await new Promise((tick) => setTimeout(tick, 200));
-  assert.deepEqual(seen, [IDENTITY]);
-});
-
-test('an arrival during a dropped watch is recovered, once, on reconnect', async (t) => {
-  pinSdkEnvironment(t);
-  const coworkStateDir = mkdtempSync(join(tmpdir(), 'cowork-external-resync-'));
-  t.after(() => rmSync(coworkStateDir, { recursive: true, force: true }));
-  const daemon = await startFakeDaemon(t);
-  const host = new ExternalOursHost(
-    CoworkConfigSchema.parse(externalConfig(coworkStateDir, daemon.endpoint, daemon.stateDir)),
-  );
-  await host.boot();
-  t.after(() => host.shutdown());
-
-  const seen = [];
-  host.onIdentityNotify((name) => seen.push(name));
-  host.trackIdentity(IDENTITY);
-  await waitFor(() => daemon.watching === 1, 'the first long poll to be held open');
-  assert.deepEqual(seen, []);
-
-  // The daemon goes away mid-poll and an arrival lands while nothing watches.
-  daemon.dropWatchers();
-  daemon.append({
-    event: 'message_received', sender_id: CID, sender_name: 'Peer', from: 'Peer',
-    msg_id: '1', wire_id: 'lost-in-the-gap', date: '2026-08-16T00:00:00Z',
-  });
-
-  // The replacement watch primes at the tip, so it can NEVER deliver that
-  // event. Anything the listener sees here is the reconnect resync.
-  await waitFor(() => seen.length >= 1, 'the reconnect resync to reach the listener');
-  assert.deepEqual(seen, [IDENTITY]);
-  await waitFor(() => daemon.watching === 1, 'the replacement long poll to be held open');
-  assert.deepEqual(daemon.polls, ['tip', 'tip']);
-
-  // Exactly one recovery, not a loop: a healthy reconnected watch stays quiet.
-  await new Promise((tick) => setTimeout(tick, 1_500));
-  assert.deepEqual(seen, [IDENTITY]);
-  assert.equal(daemon.polls.length, 2);
-
-  // And the replacement watch still delivers live traffic.
   daemon.emit({
     event: 'message_received', sender_id: CID, sender_name: 'Peer', from: 'Peer',
-    msg_id: '2', wire_id: 'after-recovery', date: '2026-08-16T00:00:02Z',
+    msg_id: '1', wire_id: 'wire-1', date: '2026-08-21T00:00:00Z',
   });
-  await waitFor(() => seen.length === 2, 'live traffic after the reconnect');
-  assert.deepEqual(seen, [IDENTITY, IDENTITY]);
-  assert.equal(daemon.eventCount, 2);
-});
+  await waitFor(() => seen.length > beforeEvent, 'notification callback');
+  assert(seen.every((name) => name === IDENTITY));
 
-test('the packet registry tracks every hosted identity and releases each watch', async (t) => {
-  const stateDir = mkdtempSync(join(tmpdir(), 'cowork-external-registry-'));
-  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
-  const tracked = [];
-  const untracked = [];
-  const client = {
-    removeFailure: undefined,
-    async chooseIdentity() {
-      if (client.chooseFailure) throw client.chooseFailure;
-      return { name: IDENTITY, cid: CID, switchedFrom: null };
-    },
-    async createIdentity() { return { info: { cid: CID } }; },
-    async listContacts() { return { contacts: [] }; },
-    async listInvites() { return []; },
-    async listIncomingMessages() { return []; },
-    async listIncomingFiles() { return []; },
-    async removeIdentity() { if (client.removeFailure) throw client.removeFailure; },
-    async releaseLease() { return { released: [IDENTITY] }; },
-  };
-  const host = {
-    createClient() { return client; },
-    onIdentityNotify() { return () => {}; },
-    trackIdentity(name) {
-      tracked.push(name);
-      return () => untracked.push(name);
-    },
-  };
-  const registry = new PacketRegistry(host, stateDir);
-
-  // create() provisions a brand new identity and must track it too.
-  client.chooseFailure = Object.assign(new Error('missing'), { code: 'NO_SUCH_IDENTITY' });
-  await registry.create(ROOM_ID, IDENTITY, 'room bio');
-  client.chooseFailure = undefined;
-  assert.deepEqual(tracked, [IDENTITY]);
-  assert.deepEqual(untracked, []);
-  await registry.destroy(ROOM_ID);
-  assert.deepEqual(untracked, [IDENTITY]);
-
-  await registry.restore(ROOM_ID, CID, IDENTITY);
-  assert.deepEqual(tracked, [IDENTITY, IDENTITY]);
-  await registry.unhostAll();
-  assert.deepEqual(untracked, [IDENTITY, IDENTITY]);
-
-  // A destroy that fails must still release the watch, or it polls an identity
-  // this registry has stopped answering for.
-  await registry.restore(ROOM_ID, CID, IDENTITY);
-  client.removeFailure = new Error('daemon refused removeIdentity');
-  await assert.rejects(registry.destroy(ROOM_ID), /failed to remove standard SDK identity/);
-  assert.deepEqual(tracked, [IDENTITY, IDENTITY, IDENTITY]);
-  assert.deepEqual(untracked, [IDENTITY, IDENTITY, IDENTITY]);
-});
-
-test('an external host starts no runtime: no listener, no owned state, no SDK environment', async (t) => {
-  pinSdkEnvironment(t);
-  const coworkStateDir = mkdtempSync(join(tmpdir(), 'cowork-external-inert-'));
-  t.after(() => rmSync(coworkStateDir, { recursive: true, force: true }));
-  const daemon = await startFakeDaemon(t);
-  const moduleUrl = new URL('../src/ours-runtime.ts', import.meta.url).href;
-  const script = `
-    const { createOursHost, sdkRuntimeStateDir } = await import(${JSON.stringify(moduleUrl)});
-    const { existsSync } = await import('node:fs');
-    const config = {
-      version: 1,
-      brokerUrl: 'ws://127.0.0.1:1',
-      stateDir: ${JSON.stringify(coworkStateDir)},
-      rest: { enabled: false, port: 3052 },
-      daemon: {
-        mode: 'external',
-        endpoint: ${JSON.stringify(daemon.endpoint)},
-        stateDir: ${JSON.stringify(daemon.stateDir)},
-      },
-    };
-    const host = createOursHost(config);
-    await host.boot();
-    const identities = await host.createClient('inert-contract').identities();
-    const listeners = process.getActiveResourcesInfo().filter((name) => /SERVER/i.test(name));
-    const environment = ${JSON.stringify(SDK_ENVIRONMENT)}.filter((name) => process.env[name] !== undefined);
-    const owned = existsSync(sdkRuntimeStateDir(config));
-    const stopped = await host.shutdown();
-    console.log('COWORK_EXTERNAL_RESULT ' + JSON.stringify({ identities, listeners, environment, owned, stopped }));
-    process.exit(0);
-  `;
-  const environment = { ...process.env };
-  for (const name of SDK_ENVIRONMENT) delete environment[name];
-  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: environment,
-  });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
-  child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
-  let timer;
-  const exited = await Promise.race([
-    new Promise((done) => child.once('exit', (code, signal) => done({ code, signal }))),
-    new Promise((done) => { timer = setTimeout(() => done('timeout'), 20_000); }),
-  ]);
-  clearTimeout(timer);
-  if (exited === 'timeout') child.kill('SIGKILL');
-  assert.notEqual(exited, 'timeout', stderr);
-  assert.deepEqual(exited, { code: 0, signal: null }, stderr);
-  const marker = stdout.split('\n').find((line) => line.startsWith('COWORK_EXTERNAL_RESULT '));
-  assert(marker, `${stdout}\n${stderr}`);
-  const result = JSON.parse(marker.slice('COWORK_EXTERNAL_RESULT '.length));
-
-  assert.deepEqual(result.identities, [{ name: IDENTITY }]);
-  // The embedded host would have bound a port and written every one of these.
-  assert.deepEqual(result.listeners, []);
-  assert.deepEqual(result.environment, []);
-  assert.equal(result.owned, false);
-  assert.deepEqual(result.stopped, { requiresProcessExit: false });
-  assert.equal(resolve(coworkStateDir), coworkStateDir);
+  untrack();
+  await waitFor(() => daemon.watching === 0, 'watch release');
+  assert.deepEqual(await host.shutdown(), { requiresProcessExit: false });
+  assert(daemon.requests.some((entry) => entry.path === '/api/v1/releaseLease'));
 });
 
 async function waitFor(check, description, timeoutMs = 10_000) {

@@ -3,18 +3,16 @@ import * as fs from 'node:fs';
 import { join } from 'node:path';
 import { brotliCompressSync, brotliDecompressSync, constants as zlibConstants } from 'node:zlib';
 
-import type {
-  IncomingFileMeta,
-  OursClient,
-  SendOutcome,
-  FileSendOutcome,
-} from '@ours.network/sdk';
+import type { OursClient } from '@ours.network/sdk';
 
 import { FileMimeSchema, FileNameSchema, MAX_EXTERNAL_INVITE_BYTES, MAX_FILE_BYTES } from './contracts.ts';
 import type { OursRuntimeClientFactory } from './ours-runtime.ts';
 
 export type InviteMode = 'one_time' | 'public';
 export type RelayStatus = 'queued' | 'send_failed';
+type IncomingFileMeta = Awaited<ReturnType<OursClient['listIncomingFiles']>>[number];
+type SendOutcome = Awaited<ReturnType<OursClient['sendMessage']>>;
+type FileSendOutcome = Awaited<ReturnType<OursClient['sendFile']>>;
 
 export interface ReplyReference {
   wire_id: string;
@@ -85,7 +83,7 @@ export class LegacyCoworkStateError extends Error {
   }
 }
 
-/** Standard-SDK identities owned by the one embedded runtime. */
+/** Standard-SDK room identities selected from the shared daemon by local name. */
 export class PacketRegistry {
   private readonly packets = new Map<string, SdkRoomPacket>();
   private readonly trackers = new Map<string, () => void>();
@@ -121,13 +119,14 @@ export class PacketRegistry {
     this.assertStandardIdentity(roomId, identityName);
     this.assertNoLegacyState(roomId);
     if (this.packets.has(roomId)) throw new Error(`room identity "${roomId}" is already hosted`);
-    const client = this.host.createClient();
+    const localNames = new Set([identityName]);
+    const available = await this.host.listIdentityNames(localNames);
+    const client = await this.host.createClient();
     try {
       let cid: string;
-      try {
+      if (available.has(identityName)) {
         cid = (await client.chooseIdentity({ name: identityName, force: false })).cid;
-      } catch (error) {
-        if (!hasOursCode(error, 'NO_SUCH_IDENTITY')) throw error;
+      } else {
         const created = await client.createIdentity({
           name: identityName,
           bio,
@@ -152,7 +151,11 @@ export class PacketRegistry {
     this.assertStandardIdentity(roomId, identityName);
     this.assertNoLegacyState(roomId);
     if (this.packets.has(roomId)) throw new Error(`room identity "${roomId}" is already hosted`);
-    const client = this.host.createClient();
+    const available = await this.host.listIdentityNames(new Set([identityName]));
+    if (!available.has(identityName)) {
+      throw new Error(`shared ours daemon does not contain the established room identity "${identityName}"`);
+    }
+    const client = await this.host.createClient();
     try {
       const bound = await client.chooseIdentity({ name: identityName, force: false });
       if (expectedCid !== undefined && bound.cid !== expectedCid) {
@@ -197,13 +200,9 @@ export class PacketRegistry {
     if (errors.length) throw new AggregateError(errors, 'failed to release room SDK leases');
   }
 
-  /**
-   * Hosts that watch the runtime from outside need to be told which identities
-   * exist; an embedded host omits `trackIdentity` and keeps its own callback.
-   */
+  /** Begin the shared daemon notification watch for one locally known name. */
   private track(roomId: string, identityName: string): void {
-    const dispose = this.host.trackIdentity?.(identityName);
-    if (dispose) this.trackers.set(roomId, dispose);
+    this.trackers.set(roomId, this.host.trackIdentity(identityName));
   }
 
   private untrack(roomId: string): void {
@@ -406,10 +405,6 @@ function normalizeDate(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.valueOf())) throw new Error(`SDK returned an invalid message timestamp: ${value}`);
   return date.toISOString();
-}
-
-function hasOursCode(error: unknown, code: string): boolean {
-  return error instanceof Error && 'code' in error && (error as Error & { code?: unknown }).code === code;
 }
 
 function validateRoomId(roomId: string): void {

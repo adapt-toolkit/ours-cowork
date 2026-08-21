@@ -1,5 +1,5 @@
 # Prerequisites
 
-ours-cowork requires Node.js 20 or newer and access to an ours/ADAPT broker over WebSocket. The daemon is a standalone process with its own package, configuration, state directory, embedded standard-SDK host, and operator socket.
+ours-cowork requires Node.js 20 or newer and one already-running shared ours daemon. Install the operator lifecycle with `npm install --global @ours.network/cli@1.0.1`, then use `ours daemon start` or `ours daemon install-service --yes`. The shared daemon owns broker connectivity and global identity state; cowork attaches through `@ours.network/sdk` 2.0.1 and never starts a runtime of its own.
 
-The account running it must be able to create a private `0700` state directory. The Unix management socket is local and owner-only. systemd user services are supported on Linux and launchd agents on macOS.
+The account running both processes must be able to create private `0700` state directories. Cowork's Unix management socket is local and owner-only. systemd user services are supported on Linux and launchd agents on macOS.

@@ -6,7 +6,7 @@ Open the production console with:
 ours-cowork web
 ```
 
-The command safely starts the daemon only when it is absent, waits for `GET /` readiness, then opens `http://127.0.0.1:3052/`. `ours-cowork --json web` performs the same readiness checks but returns `{ "url": "http://127.0.0.1:3052/", "opened": false }` inside the standard JSON result without opening a browser.
+The command safely starts the cowork daemon only when it is absent, waits for `GET /` readiness, then opens `http://127.0.0.1:3052/`. The shared ours daemon must already be running; this command never starts it. `ours-cowork --json web` performs the same readiness checks but returns `{ "url": "http://127.0.0.1:3052/", "opened": false }` inside the standard JSON result without opening a browser.
 
 The console and HTTP room RPC have no authentication. They bind only to `127.0.0.1`; both the `127.0.0.1` and `localhost` browser URLs are accepted. Do not use port forwarding, a reverse proxy, or another mechanism to expose this listener to other hosts.
 

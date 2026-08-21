@@ -246,7 +246,9 @@ test('built distribution remains standalone and delegates packet ownership to th
   assert.match(readFileSync(join(ROOT, 'dist', 'cli.js'), 'utf8'), /--name/);
   assert.match(readFileSync(join(ROOT, 'dist', 'web', 'assets', 'app.js'), 'utf8'), /room_name/);
   assert.equal(existsSync(join(ROOT, 'dist', 'mufl_code')), false);
-  assert.match(readFileSync(join(ROOT, 'dist', 'daemon.js'), 'utf8'), /@ours\.network\/sdk\/daemon/);
+  const daemon = readFileSync(join(ROOT, 'dist', 'daemon.js'), 'utf8');
+  assert.match(daemon, /attachOursClient/);
+  assert.doesNotMatch(daemon, /@ours\.network\/sdk\/daemon|startDaemon|OURS_UNIT_DIR/);
 });
 
 test('npm dry-run pack list is the exact standalone release artifact', () => {

@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +9,7 @@ import {
   PacketRegistry,
   SdkRoomPacket,
 } from '../src/packets.ts';
+import { SharedOursHost } from '../src/ours-runtime.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const IDENTITY = `ours-cowork-${ROOM_ID}`;
@@ -208,21 +208,24 @@ test('packet registry creates, restores, releases, and removes standard SDK iden
   let notify;
   let unsubscribed = false;
   const clients = [];
+  let available = new Set();
   const host = {
-    createClient() { const client = blankClient(); clients.push(client); return client; },
+    async createClient() { const client = blankClient(); clients.push(client); return client; },
+    async listIdentityNames(localNames) {
+      return new Set([...available].filter((name) => localNames.has(name)));
+    },
     onIdentityNotify(listener) { notify = listener; return () => { unsubscribed = true; }; },
+    trackIdentity() { return () => {}; },
   };
   const events = [];
   const registry = new PacketRegistry(host, stateDir, { onNotify: (...parts) => events.push(parts) });
   const creating = clients.length;
   assert.equal(creating, 0);
   const createClient = blankClient();
-  createClient.chooseFailure = Object.assign(new Error('missing'), { code: 'NO_SUCH_IDENTITY' });
-  host.createClient = () => { clients.push(createClient); return createClient; };
+  host.createClient = async () => { clients.push(createClient); return createClient; };
   const packet = await registry.create(ROOM_ID, IDENTITY, 'room bio');
   assert.equal(packet.cid, CID);
-  assert.deepEqual(createClient.calls.slice(0, 2), [
-    ['chooseIdentity', { name: IDENTITY, force: false }],
+  assert.deepEqual(createClient.calls.slice(0, 1), [
     ['createIdentity', { name: IDENTITY, bio: 'room bio', exposeLocal: false, localAutoAccept: true }],
   ]);
   notify(IDENTITY);
@@ -233,7 +236,8 @@ test('packet registry creates, restores, releases, and removes standard SDK iden
   assert(createClient.calls.some((call) => call[0] === 'releaseLease'));
 
   const restoring = blankClient();
-  host.createClient = () => restoring;
+  available = new Set([IDENTITY]);
+  host.createClient = async () => restoring;
   await registry.restore(ROOM_ID, CID, IDENTITY);
   await registry.unhostAll();
   assert(restoring.calls.some((call) => call[0] === 'releaseLease'));
@@ -245,7 +249,9 @@ test('packet registry refuses pre-1.0 actor state with recreate and re-invite gu
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
   const host = {
     createClient() { assert.fail('legacy state must fail before an SDK lease is created'); },
+    listIdentityNames() { assert.fail('legacy state must fail before daemon identity discovery'); },
     onIdentityNotify() { return () => {}; },
+    trackIdentity() { return () => {}; },
   };
   const registry = new PacketRegistry(host, stateDir);
   await assert.rejects(
@@ -262,50 +268,58 @@ test('packet registry refuses pre-1.0 actor state with recreate and re-invite gu
   );
 });
 
-test('embedded host boots the standard SDK with private owned state and closes its public surface', async (t) => {
-  const stateDir = mkdtempSync(join(tmpdir(), 'cowork-sdk-boot-'));
+test('established room restore fails clearly when its locally recorded name is absent globally', async (t) => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'cowork-sdk-missing-established-'));
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
-  const moduleUrl = new URL('../src/ours-runtime.ts', import.meta.url).href;
-  const script = `
-    const { EmbeddedOursHost, sdkRuntimeStateDir } = await import(${JSON.stringify(moduleUrl)});
-    const config = {
-      version: 1,
-      brokerUrl: 'ws://127.0.0.1:1',
-      stateDir: ${JSON.stringify(stateDir)},
-      rest: { enabled: false, port: 3052 },
-    };
-    const before = { sigint: process.listenerCount('SIGINT'), sigterm: process.listenerCount('SIGTERM') };
-    const host = new EmbeddedOursHost(config);
-    await host.boot();
-    const info = await host.createClient('boot-contract').version();
-    const stopped = await host.shutdown();
-    const after = { sigint: process.listenerCount('SIGINT'), sigterm: process.listenerCount('SIGTERM') };
-    console.log('COWORK_SDK_RESULT ' + JSON.stringify({ info, stopped, before, after, owned: sdkRuntimeStateDir(config) }));
-    process.exit(0);
-  `;
-  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.setEncoding('utf8');
-  child.stderr.setEncoding('utf8');
-  child.stdout.on('data', (chunk) => { stdout += chunk; });
-  child.stderr.on('data', (chunk) => { stderr += chunk; });
-  let timeout;
-  const exited = await Promise.race([
-    new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal }))),
-    new Promise((resolve) => { timeout = setTimeout(() => resolve('timeout'), 15_000); }),
+  const host = {
+    async listIdentityNames(localNames) {
+      assert.deepEqual(localNames, new Set([IDENTITY]));
+      return new Set();
+    },
+    async createClient() { assert.fail('missing established identity must not be created'); },
+    onIdentityNotify() { return () => {}; },
+    trackIdentity() { return () => {}; },
+  };
+  const registry = new PacketRegistry(host, stateDir);
+  await assert.rejects(
+    registry.restore(ROOM_ID, CID, IDENTITY),
+    /shared ours daemon does not contain the established room identity/,
+  );
+});
+
+test('shared host attaches through SDK 2, filters daemon-global names, and releases only its leases', async () => {
+  const calls = [];
+  const watcher = {
+    async identities() {
+      return [{ name: IDENTITY }, { name: 'unrelated-human' }, { name: 'other-app-room' }];
+    },
+    async releaseLease() { calls.push(['releaseLease', 'watch']); return { released: [] }; },
+    async *watchNotifications() { /* no events */ },
+  };
+  const room = blankClient();
+  const attach = async ({ leaseToken }) => {
+    calls.push(['attach', leaseToken]);
+    return leaseToken === 'room-lease' ? room : watcher;
+  };
+  const host = new SharedOursHost(() => {}, attach);
+
+  await host.boot();
+  assert.deepEqual(
+    await host.listIdentityNames(new Set([IDENTITY, 'local-but-absent'])),
+    new Set([IDENTITY]),
+  );
+  assert.equal(await host.createClient('room-lease'), room);
+  assert.deepEqual(await host.shutdown(), { requiresProcessExit: false });
+  assert.deepEqual(calls, [
+    ['attach', calls[0][1]],
+    ['attach', 'room-lease'],
+    ['releaseLease', 'watch'],
   ]);
-  clearTimeout(timeout);
-  if (exited === 'timeout') child.kill('SIGKILL');
-  assert.notEqual(exited, 'timeout', stderr);
-  assert.deepEqual(exited, { code: 0, signal: null }, stderr);
-  const marker = stdout.split('\n').find((line) => line.startsWith('COWORK_SDK_RESULT '));
-  assert(marker, stdout);
-  const result = JSON.parse(marker.slice('COWORK_SDK_RESULT '.length));
-  assert.equal(result.info.version, '1.5.2');
-  assert.deepEqual(result.stopped, { requiresProcessExit: true });
-  assert.deepEqual(result.after, result.before);
-  assert.equal(result.owned, join(stateDir, 'ours-sdk'));
+});
+
+test('shared host exposes attach failure and never falls back to another runtime', async () => {
+  const unavailable = new Error('shared daemon unavailable');
+  const host = new SharedOursHost(() => {}, async () => { throw unavailable; });
+  await assert.rejects(host.boot(), (error) => error === unavailable);
+  await assert.rejects(host.createClient(), /not booted/);
 });

@@ -1,0 +1,142 @@
+name: Nightly
+
+# Full gate set against the `prerelease` branch -> nightly npm prerelease.
+#
+# This workflow never moves the `latest` dist-tag. It publishes
+# X.Y.Z-nightly.<date>.<sha> under the CANONICAL `nightly` dist-tag, so
+# `npm install @ours.network/cowork` keeps resolving to the release line that
+# .github/workflows/ci.yml owns, and `@nightly` opts into the prerelease line.
+# That tag is the one every other ours service already uses.
+#
+# `next` is retained as a COMPATIBILITY ALIAS of the same version, because it
+# was this package's prerelease tag first and consumers already pinned to it
+# would otherwise freeze on the last version published before the rename.
+#
+# The alias is applied with `npm dist-tag add`, never with a second publish,
+# and it runs on BOTH paths — including the same-commit rerun where
+# nightly-version.sh reports publish=false. That is what repairs a run whose
+# alias write failed: the version output names the already-published version,
+# so a retry points `next` at it without republishing. The step is not allowed
+# to swallow its own failure, so a broken alias fails the run and stays
+# visible instead of silently persisting.
+#
+# Trust boundary: the only triggers are repository-controlled (a schedule, a
+# push to `prerelease`, and manual dispatch). There is deliberately no
+# pull_request or pull_request_target trigger, so the npm credential is never
+# exposed to code that has not already been merged into `prerelease`.
+#
+# Scheduled runs execute the copy of this file on the DEFAULT branch while
+# testing the `prerelease` tip, so the nightly cron only starts firing once
+# this workflow reaches the default branch. Pushes to `prerelease` fire from
+# that branch's own copy immediately.
+#
+# Required repository secrets:
+#   - NPM_TOKEN: npm automation token with publish rights to @ours.network.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  push:
+    branches: [prerelease]
+  workflow_dispatch:
+
+# Least privilege: no job here writes to the repository. The nightly version is
+# applied to the workspace only and is never committed, so no contents: write
+# and no GitHub App token are needed.
+permissions:
+  contents: read
+
+# One nightly at a time regardless of trigger: a schedule (which runs on the
+# default branch ref) and a push to `prerelease` otherwise race for the same
+# version string. Queued runs are not cancelled, so the later one still gets to
+# observe the tip and no-op if the commit is already published.
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Prerelease gates
+    timeout-minutes: 30
+    env:
+      COWORK_CHROME_PATH: /usr/bin/google-chrome
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: prerelease
+      - name: Resolve prerelease tip
+        id: resolve
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run typecheck:web
+      - run: npm run build
+      - run: test -f dist/daemon.js && test -f dist/cli.js && test -f dist/web/index.html && test -f dist/web/assets/app.js && test -f dist/web/assets/app.css && test "$(find dist/web -type f | wc -l)" -eq 3 && test "$(find docs -maxdepth 1 -name '*.md' | wc -l)" -eq 11
+      - run: npm run test:release
+      - run: npm test
+      - run: npm run test:web
+      - run: npm run test:browser
+      - run: for i in 1 2 3; do node --test tests/e2e.test.mjs || exit 1; done
+
+  publish-nightly:
+    needs: test
+    if: github.repository == 'adapt-toolkit/ours-cowork'
+    runs-on: ubuntu-latest
+    name: Publish nightly prerelease
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.test.outputs.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - name: Compute nightly version
+        id: version
+        run: bash .github/workflows/scripts/nightly-version.sh
+      - if: steps.version.outputs.publish == 'true'
+        run: npm run build
+      - name: Verify nightly artifact
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          test "$(node -p "require('./package.json').version")" = "${{ steps.version.outputs.version }}"
+          npm pack --dry-run --json > /tmp/ours-cowork-nightly-pack.json
+          node - <<'NODE'
+          const pack = require('/tmp/ours-cowork-nightly-pack.json')[0];
+          const files = new Set(pack.files.map((entry) => entry.path));
+          for (const path of [
+            'dist/cli.js', 'dist/daemon.js', 'dist/web/index.html',
+            'LICENSE', 'README.md',
+          ]) {
+            if (!files.has(path)) throw new Error(`@ours.network/cowork nightly is missing ${path}`);
+          }
+          NODE
+      - name: Publish @ours.network/cowork nightly
+        if: steps.version.outputs.publish == 'true'
+        run: npm publish --access public --tag nightly
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Deliberately NOT gated on publish, and deliberately without `|| true`:
+      # this is the step that repairs a previous run whose alias write failed,
+      # on the same-commit path where nothing is published at all.
+      - name: Alias the compatibility next dist-tag
+        run: npm dist-tag add @ours.network/cowork@${{ steps.version.outputs.version }} next
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Summary
+        run: |
+          if [ "${{ steps.version.outputs.publish }}" = 'true' ]; then
+            echo "Published @ours.network/cowork@${{ steps.version.outputs.version }} to the canonical nightly dist-tag and aliased the compatibility next dist-tag to the same version" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Prerelease tip ${{ needs.test.outputs.sha }} already has @ours.network/cowork@${{ steps.version.outputs.version }} on the canonical nightly dist-tag; gates passed, nothing published, and the compatibility next dist-tag was reconciled to that existing version" >> "$GITHUB_STEP_SUMMARY"
+          fi

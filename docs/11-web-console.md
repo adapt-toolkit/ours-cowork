@@ -6,7 +6,7 @@ Open the production console with:
 ours-cowork web
 ```
 
-The command safely starts the daemon only when it is absent, waits for `GET /` readiness, then opens `http://127.0.0.1:3052/`. `ours-cowork --json web` performs the same readiness checks but returns `{ "url": "http://127.0.0.1:3052/", "opened": false }` inside the standard JSON result without opening a browser.
+The command safely starts the cowork daemon only when it is absent, waits for `GET /` readiness, then opens `http://127.0.0.1:3052/`. The shared ours daemon must already be running; this command never starts it. `ours-cowork --json web` performs the same readiness checks but returns `{ "url": "http://127.0.0.1:3052/", "opened": false }` inside the standard JSON result without opening a browser.
 
 The console and HTTP room RPC have no authentication. They bind only to `127.0.0.1`; both the `127.0.0.1` and `localhost` browser URLs are accepted. Do not use port forwarding, a reverse proxy, or another mechanism to expose this listener to other hosts.
 
@@ -19,13 +19,13 @@ The same loopback listener serves an OpenAPI 3.1 description of the room managem
 
 Both are read-only GET routes with no authentication, exactly like the console itself, and they are available whenever `rest.enabled` is true. They ship inside the daemon and load no remote assets, so they work on an offline host. Do not expose either route to another host.
 
-Every room operation is carried by the single route `POST /rpc` with the envelope `{ "version": 1, "id": ..., "method": ..., "params": ... }`; the document describes the twenty methods the REST listener serves, discriminated on `method`. Operations that carry an invite secret are not part of it — they are reachable only over `management.sock`.
+Every room operation is carried by the single route `POST /rpc` with the envelope `{ "version": 1, "id": ..., "method": ..., "params": ... }`; the document describes the twenty methods the REST listener serves, discriminated on `method`. Accepting an external invite secret (`room.accept`) is not part of it — that operation is reachable only over `management.sock`.
 
 ## Room setup
 
 1. Choose Create room and enter the friendly Name, Goal, and Briefing. The name is shown in the room list, workspace header, and room details.
 2. Submit once. The new room is selected and its Invite panel opens.
-3. Add one invitation requirement at a time. Choose one-time or public mode and set the minimum acceptances for a public invite.
+3. Add one invitation requirement at a time. Choose one-time or public mode and set the minimum acceptances for a public invite. Revoke or consume it before creating another; the standard-SDK room keeps only one live invite so contact admission remains unambiguous.
 4. Copy every invite from its blocking receipt before choosing Done. The secret is shown once and is not retained in browser storage, the URL, logs, or durable room metadata.
 
 The room activates after its durable invitation requirements are satisfied. Participants shows admitted identities and their invite roles.

@@ -143,6 +143,8 @@ describe('room DTO guards', () => {
     expect(isRoomDto({ ...daemonRoom, rest_roles: undefined })).toBe(false);
     expect(isRoomDto({ ...daemonRoom, rest_roles: 'Reviewer' })).toBe(false);
     expect(isRoomDto({ ...daemonRoom, rest_roles: [''] })).toBe(false);
+    expect(isRoomDto({ ...daemonRoom, rest_roles: ['room'] })).toBe(false);
+    expect(isRoomDto({ ...daemonRoom, rest_roles: ['Reviewer', 'Reviewer'] })).toBe(false);
 
     const externalPending = RoomSchema.parse({
       ...daemonRoom,

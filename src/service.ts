@@ -5,38 +5,37 @@ import { z } from 'zod';
 import {
   AcceptExternalInviteInputSchema,
   ContainerIdSchema,
+  configuredRoomIdentityName,
   CreateRoomInputSchema,
   DEFAULT_ROLE,
   defaultRoomName,
   InviteModeSchema,
+  isPersistedRoomIdentityName,
   LowerCrockfordUlidSchema,
   MAX_EXTERNAL_INVITE_BYTES,
   MAX_HISTORY_PAGE_BYTES,
   PostAsRoleInputSchema,
   PostMessageInputSchema,
   RestRoleInputSchema,
+  ROOM_ROLE,
   RoleBriefingDeleteInputSchema,
   RoleBriefingSetInputSchema,
   RoleSchema,
   RoomInviteSchema,
   RoomSchema,
   UpdateRoomInputSchema,
-  legacyRoomIdentityName,
-  roomIdentityName,
   type CommunicationRecord,
   type InviteMode,
   type RelayStatus,
   type Room,
+  type RoomIdentityNameMode,
   type RoomInvite,
   type Seat,
 } from './contracts.ts';
-import { unpackInvite } from './adapt.ts';
-import type { RoomPacket } from './packets.ts';
+import { unpackInvite, type RoomPacket } from './packets.ts';
 import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
 import { IntakePump } from './intake.ts';
 import { generateUlid } from './ulid.ts';
-
-const ROOM_ROLE = 'room';
 
 function byteBoundedHistoryPage<T>(records: T[]): T[] {
   const page: T[] = [];
@@ -77,7 +76,7 @@ const HistoryOptionsSchema = z.object({
 }).strict();
 
 /**
- * The participant-facing history projection (§4.4 item 7): message records
+ * The participant-facing history projection: message records
  * only, authors redacted to alias form in anonymous rooms, and no routing
  * identities, so no other participant's cid or contact name ever leaves the
  * operator boundary through this view.
@@ -122,7 +121,7 @@ type MembershipIntentRecord = Extract<CommunicationRecord, { kind: 'membership_i
 export interface RoomPacketRegistry {
   get(roomId: string): RoomPacket | undefined;
   create(roomId: string, identityName?: string, bio?: string): Promise<RoomPacket>;
-  restore?(roomId: string, expectedCid?: string, identityName?: string, bio?: string): Promise<RoomPacket>;
+  restore?(roomId: string, expectedCid: string, identityName?: string, bio?: string): Promise<RoomPacket>;
   destroy(roomId: string): Promise<string[]>;
 }
 
@@ -131,6 +130,7 @@ export interface RoomServiceOptions {
   roomId?: () => string;
   messageId?: () => string;
   provisioningCheckpoint?: (stage: 'metadata') => void;
+  identityNameMode?: RoomIdentityNameMode;
 }
 
 export interface InviteReceipt {
@@ -192,6 +192,7 @@ export class RoomService {
   private readonly nextMessageId: () => string;
   private readonly intake: IntakePump;
   private readonly provisioningCheckpoint: NonNullable<RoomServiceOptions['provisioningCheckpoint']>;
+  private readonly identityNameMode: RoomIdentityNameMode;
 
   constructor(store: Store, packets: RoomPacketRegistry, options: RoomServiceOptions = {}) {
     this.store = store;
@@ -200,6 +201,7 @@ export class RoomService {
     this.nextRoomId = options.roomId ?? generateUlid;
     this.nextMessageId = options.messageId ?? generateUlid;
     this.provisioningCheckpoint = options.provisioningCheckpoint ?? (() => {});
+    this.identityNameMode = options.identityNameMode ?? 'stable_id';
     this.intake = new IntakePump(store, packets, {
       now: this.nowValue,
       messageId: this.nextMessageId,
@@ -212,7 +214,7 @@ export class RoomService {
     const settings = CreateRoomInputSchema.parse(input);
     const roomId = LowerCrockfordUlidSchema.parse(this.nextRoomId());
     const roomName = settings.name ?? defaultRoomName(roomId);
-    const identityName = roomIdentityName(roomName);
+    const identityName = configuredRoomIdentityName(roomId, roomName, this.identityNameMode);
     return this.lock(roomId, async () => {
       const provisional = RoomSchema.parse({
         version: 2,
@@ -274,31 +276,21 @@ export class RoomService {
         );
       }
     } else if (packetPending) {
-      if (this.packets.restore) {
-        try {
-          packet = await this.packets.restore(
-            id,
-            undefined,
-            room.identity_name,
-            `ours-cowork mission room ${id}`,
-          );
-        } catch { /* no live packet was durably established; provision below */ }
-      }
-      if (!packet) {
-        try {
-          packet = await this.packets.create(id, room.identity_name, `ours-cowork mission room ${id}`);
-        } catch (createFailure) {
-          throw new RoomServiceError(`failed to recover room packet "${id}"`, {
-            cause: createFailure,
-          });
-        }
+      try {
+        packet = await this.packets.create(id, room.identity_name, `ours-cowork mission room ${id}`);
+      } catch (createFailure) {
+        throw new RoomServiceError(
+          `failed to recover unproven packet-pending room identity "${room.identity_name}"; ` +
+          'cowork will not adopt an existing identity without a durably recorded CID',
+          { cause: createFailure },
+        );
       }
     } else {
       if (!this.packets.restore) {
         throw new RoomServiceError(`room packet "${id}" with established CID must be restored, not created`);
       }
       try {
-        packet = await this.packets.restore(id, room.identity_cid);
+        packet = await this.packets.restore(id, room.identity_cid, room.identity_name);
       } catch (error) {
         throw new RoomServiceError(
           `failed to restore established room packet "${id}": ${error instanceof Error ? error.message : String(error)}`,
@@ -348,7 +340,7 @@ export class RoomService {
     return updated;
   }
 
-  /** Author or edit one role's briefing; an edit bumps its version and re-delivers to seats of that role only (spec §3.3). */
+  /** Author or edit one role's briefing; an edit bumps its version and re-delivers to seats of that role only. */
   async setRoleBriefing(roomId: string, input: unknown): Promise<Room> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const request = RoleBriefingSetInputSchema.parse(input);
@@ -401,6 +393,11 @@ export class RoomService {
     return this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'create an invite for');
+      if (room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
+        throw new RoomServiceError(
+          'standard SDK rooms permit one live invitation at a time so every accepted contact has unambiguous room admission metadata',
+        );
+      }
       return this.mintInviteUnlocked(room, {
         mode: request.mode,
         role: request.role ?? DEFAULT_ROLE,
@@ -497,6 +494,11 @@ export class RoomService {
     room: Room,
     request: { mode: InviteMode; role: string; min_accepts: number; replaces_seat?: string },
   ): Promise<InviteReceipt> {
+    if (room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
+      throw new RoomServiceError(
+        'standard SDK rooms permit one live invitation at a time; revoke or consume the current invitation first',
+      );
+    }
     const packet = this.packet(room.room_id);
     const minted = await packet.mintInvite(request.mode);
     const invite = RoomInviteSchema.parse({
@@ -527,7 +529,7 @@ export class RoomService {
   }
 
   /**
-   * Operator-only removal (spec §5.2): archive-before-act membership intent,
+   * Operator-only removal: archive-before-act membership intent,
    * seat state flip + epoch bump, core 0.13 bilateral sever with an honest
    * receipt, and an alias-form announcement unless the room or call is quiet.
    */
@@ -546,8 +548,8 @@ export class RoomService {
   }
 
   /**
-   * Removal plus a same-role invite stamped with the seat lineage (spec §5.3).
-   * Owner override OC-2/OC-6: in an anonymous room the flow is unconditionally
+   * Removal plus a same-role invite stamped with the seat lineage.
+   * In an anonymous room the flow is unconditionally
    * silent — the successor inherits the alias and other members see nothing.
    */
   async replaceParticipant(roomId: string, input: unknown): Promise<ReplacementReceipt> {
@@ -644,7 +646,7 @@ export class RoomService {
       recipient_identity: seat.identity,
       role: seat.role,
       // The participant-visible label: the alias in anonymous rooms, the
-      // contact display name otherwise (INV-R3 holds either way).
+      // contact display name otherwise; the anonymous relay stays pseudonymous either way.
       alias: seat.alias ?? seat.display_name,
       epoch: room.membership_epoch + 1,
       notify,
@@ -659,7 +661,7 @@ export class RoomService {
   /**
    * Idempotent completion of a durable removal intent: each step re-checks the
    * archive/state it would produce, so a crash anywhere re-drives cleanly
-   * (INV-R5; the 0.13 sever is replay-safe by design).
+   * The 0.13 sever is replay-safe by design.
    */
   private async completeRemovalUnlocked(
     room: Room,
@@ -904,7 +906,7 @@ export class RoomService {
       }
       const coreInvite = this.packet(id).listInvites().find((invite) => invite.invite_id === replacementId);
       if (!coreInvite || coreInvite.mode !== replacement.mode) {
-        throw new RoomServiceError('recovered invite is no longer present in packet state');
+        throw new RoomServiceError('recovered invite is no longer present in SDK identity state');
       }
       const confirmed: RoomInvite = {
         invite_id: replacement.invite_id,
@@ -1072,7 +1074,7 @@ export class RoomService {
   }
 
   /**
-   * Register a role a REST caller may author under (spec §3.2). Idempotent, like
+   * Register a role a REST caller may author under. Idempotent, like
    * revokeInvite. Registration does not consult seats: a role is a label, not a
    * channel, so a role may be held by a seat and be REST-addressable at once.
    */
@@ -1099,7 +1101,7 @@ export class RoomService {
   /**
    * Unregister a REST-addressable role. Messages it already authored are left
    * exactly as posted and no tombstone is kept: there is no secret whose
-   * exposure window an auditor would need to reconstruct (spec §3.2).
+   * exposure window an auditor would need to reconstruct.
    */
   async removeRestRole(roomId: string, input: unknown): Promise<Room> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
@@ -1116,8 +1118,8 @@ export class RoomService {
   }
 
   /**
-   * Author a message under a registered REST role (spec §4). Room-side
-   * authorship: the room packet signs the bytes, so `identity` is the room's CID
+   * Author a message under a registered REST role. Room-side
+   * authorship: the shared-daemon room identity signs the bytes, so `identity` is the room's CID
    * and the role name doubles as `display_name` — using the room's own name there
    * would render as the room impersonating a foreign role.
    */
@@ -1192,14 +1194,13 @@ export class RoomService {
     for (const contact of packet.listContacts()) {
       if (!contactsByCid.has(contact.container_id)) contactsByCid.set(contact.container_id, contact.name);
     }
-    const origins = packet.listContactOrigins();
     const inviteById = new Map(room.invites.map((invite) => [invite.invite_id, invite]));
     const existingCids = new Set(room.seats
       .filter((seat) => seat.state === 'active' || seat.state === 'pending')
       .map((seat) => seat.identity));
-    // Automatic forward admission of a removed cid requires an invite minted
-    // after its latest removal (§5.3). Explicit operator reverse admission is
-    // separately authorized by a new exact invite_redeemed provenance below.
+    // The public standard SDK intentionally does not expose custom actor
+    // contact-origin records. Cowork 1.0 therefore keeps at most one live room
+    // invite and assigns newly accepted contacts to that unambiguous descriptor.
     const lastRemovedAt = new Map<string, string>();
     for (const seat of room.seats) {
       if (seat.state !== 'removed' || seat.removed_at === undefined) continue;
@@ -1213,55 +1214,28 @@ export class RoomService {
     for (const [seatIndex, seat] of room.seats.entries()) {
       if (seat.state !== 'pending') continue;
       const displayName = contactsByCid.get(seat.identity);
-      const origin = origins[seat.identity];
-      if (displayName === undefined || origin === undefined) continue;
-      const completedExternalRedemption = origin.via === 'invite_redeemed'
-        && origin.invite_id === seat.invite_id;
-      const fallbackInvite = (origin.via === 'invite_one_time' || origin.via === 'invite_public')
-        ? inviteById.get(origin.invite_id)
-        : undefined;
-      const confirmedFallback = fallbackInvite !== undefined
-        && fallbackInvite.state !== 'receipt_pending'
-        && (fallbackInvite.recovery_of === undefined || fallbackInvite.recovery_confirmed === true);
-      if (!completedExternalRedemption && !confirmedFallback) continue;
-      const removedAt = lastRemovedAt.get(seat.identity);
-      if (fallbackInvite !== undefined && removedAt !== undefined && fallbackInvite.created_at <= removedAt) continue;
-      const predecessor = fallbackInvite?.replaces_seat === undefined
-        ? undefined
-        : room.seats.find((candidate) =>
-          candidate.participant_id === fallbackInvite.replaces_seat && candidate.state === 'removed');
-      if (fallbackInvite?.replaces_seat !== undefined && predecessor === undefined) continue;
+      if (displayName === undefined) continue;
       const { alias: _alias, replaces_seat: _replacesSeat, ...base } = seat;
       const activated: Seat = {
         ...base,
         state: 'active',
         display_name: displayName,
-        accepted_at: origin.at,
-        role: fallbackInvite?.role ?? seat.role,
-        invite_id: fallbackInvite?.invite_id ?? seat.invite_id,
-        ...(fallbackInvite === undefined
-          ? (_replacesSeat === undefined ? {} : { replaces_seat: _replacesSeat })
-          : (predecessor === undefined ? {} : { replaces_seat: predecessor.participant_id })),
-        ...(room.anonymous
-          ? { alias: fallbackInvite === undefined
-              ? _alias!
-              : predecessor?.alias
-                ?? (fallbackInvite.role === seat.role ? _alias! : mintAlias(seatsWithActivations, fallbackInvite.role)) }
-          : {}),
+        accepted_at: this.now(),
+        ...(_replacesSeat === undefined ? {} : { replaces_seat: _replacesSeat }),
+        ...(room.anonymous ? { alias: _alias! } : {}),
       };
       activatedPending.push(activated);
       seatsWithActivations[seatIndex] = activated;
     }
     const newSeats: Seat[] = [];
 
+    const eligibleInvites = room.invites.filter((invite) => invite.state === 'live'
+      && (invite.recovery_of === undefined || invite.recovery_confirmed === true));
+    const admissionInvite = eligibleInvites.length === 1 ? eligibleInvites[0] : undefined;
     for (const [cid, displayName] of contactsByCid) {
       if (existingCids.has(cid)) continue;
-      const origin = origins[cid];
-      if (!origin || (origin.via !== 'invite_one_time' && origin.via !== 'invite_public')) continue;
-      const invite = inviteById.get(origin.invite_id);
-      if (!invite
-        || invite.state === 'receipt_pending'
-        || (invite.recovery_of !== undefined && invite.recovery_confirmed !== true)) continue;
+      const invite = admissionInvite;
+      if (!invite) continue;
       const removedAt = lastRemovedAt.get(cid);
       if (removedAt !== undefined && invite.created_at <= removedAt) continue;
       const seated = [...seatsWithActivations, ...newSeats];
@@ -1274,11 +1248,11 @@ export class RoomService {
         display_name: displayName,
         role: invite.role,
         invite_id: invite.invite_id,
-        accepted_at: origin.at,
+        accepted_at: this.now(),
         participant_id: LowerCrockfordUlidSchema.parse(generateUlid()),
         state: 'active',
         ...(predecessor === undefined ? {} : { replaces_seat: predecessor.participant_id }),
-        // OC-6 (owner override): a replacement into a role inherits the
+        // A replacement into a role inherits the
         // predecessor's alias — the alias binds to the seat/role lineage.
         ...(room.anonymous
           ? { alias: predecessor?.alias ?? mintAlias(seated, invite.role) }
@@ -1323,7 +1297,7 @@ export class RoomService {
       invites,
       membership_epoch: room.membership_epoch + activatedPending.length + newSeats.length,
     });
-    // Re-drive any removal whose intent has no terminal result (INV-R5).
+    // Re-drive any removal whose intent has no terminal result.
     const journal = await this.store.read(next.room_id);
     const completedIntents = new Set(journal
       .filter((record) => record.kind === 'membership_result')
@@ -1351,6 +1325,10 @@ export class RoomService {
     const roomId = room.room_id;
     const packet = this.packets.get(roomId);
     if (packet) {
+      // A preceding remove may have committed in the daemon even when its
+      // caller observed a transport failure. Reconcile before interpreting a
+      // result-less intent, so retries never rely on an in-process cache.
+      await packet.refreshContacts();
       let records = await this.store.read(roomId);
       let contacts = currentContactIdentities(packet);
       const completed = new Set(records
@@ -1471,8 +1449,8 @@ export class RoomService {
   }
 
   /**
-   * Deliver the common briefing followed by the seat's role briefing (spec
-   * §3.3): exactly once per (seat, briefing kind, version) via the message +
+   * Deliver the common briefing followed by the seat's role briefing:
+   * exactly once per (seat, briefing kind, version) via the message +
    * relay-intent ledger. Returns the timestamp of the common briefing message
    * that admitted the earliest of the given recipients (activation time).
    */
@@ -1608,8 +1586,7 @@ export class RoomService {
     return room.identity_cid === ''
       && room.state === 'provisioning'
       && room.status === 'packet_pending'
-      && (room.identity_name === legacyRoomIdentityName(room.room_id)
-        || room.identity_name === roomIdentityName(room.room_name));
+      && isPersistedRoomIdentityName(room.room_id, room.identity_name);
   }
 
   private now(): string {

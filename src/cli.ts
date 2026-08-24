@@ -611,7 +611,7 @@ async function waitForOwnedDaemon(config: CoworkConfig, timeoutMs: number): Prom
   return null;
 }
 
-async function startDaemon(config: CoworkConfig): Promise<{ started: boolean; alreadyRunning: boolean }> {
+async function startCoworkDaemon(config: CoworkConfig): Promise<{ started: boolean; alreadyRunning: boolean }> {
   const socketPath = join(config.stateDir, 'management.sock');
   const existing = await probeDaemon(config);
   if (existing.kind === 'running') return { started: false, alreadyRunning: true };
@@ -727,7 +727,7 @@ export async function openWebConsole(
   config: CoworkConfig,
   json: boolean,
   dependencies: WebCommandDependencies = {
-    ensureDaemon: startDaemon,
+    ensureDaemon: startCoworkDaemon,
     waitForHttpReady: waitForHttpReadiness,
     openBrowser,
   },
@@ -794,9 +794,14 @@ async function stopDaemon(config: CoworkConfig): Promise<{ stopped: boolean }> {
 
 function serviceEnvironment(config: CoworkConfig): Record<string, string> {
   return {
-    OURS_COWORK_BROKER_URL: config.brokerUrl,
     OURS_COWORK_STATE_DIR: config.stateDir,
     ...(config.rest.enabled ? { OURS_COWORK_REST_PORT: String(config.rest.port) } : {}),
+    // Preserve only the SDK's non-secret shared-daemon selection. The API token
+    // stays in the daemon's state directory/config and never enters a service
+    // definition owned by cowork.
+    ...(process.env.OURS_CONFIG === undefined ? {} : { OURS_CONFIG: process.env.OURS_CONFIG }),
+    ...(process.env.OURS_PORT === undefined ? {} : { OURS_PORT: process.env.OURS_PORT }),
+    ...(process.env.OURS_STATE_DIR === undefined ? {} : { OURS_STATE_DIR: process.env.OURS_STATE_DIR }),
   };
 }
 
@@ -854,17 +859,24 @@ function installSystemd(config: CoworkConfig): string {
   const environment = Object.entries(serviceEnvironment(config))
     .map(([key, value]) => `Environment=${systemdValueQuote(`${key}=${value}`)}`)
     .join('\n');
+  // systemd's default start rate limit (5 starts per 10s) turns a dependency
+  // that is merely not ready yet into a permanently failed unit that no longer
+  // retries. Cowork can legitimately fail to start for a while — the broker or,
+  // the shared ours daemon may come up after this cowork service attempt
+  // unit — so the rate limit is disabled and the retry interval carries the
+  // bound instead. Restart stays on-failure, so a clean stop is still final.
   const unit = `[Unit]
 Description=ours-cowork standalone mission-room daemon
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=${systemdExecutableQuote(SELF)} serve
 ${environment}
 Restart=on-failure
-RestartSec=2
+RestartSec=5
 
 [Install]
 WantedBy=default.target
@@ -1036,7 +1048,7 @@ async function execute(args: string[], output: Output): Promise<void> {
       return;
     }
     case 'start': {
-      const result = await startDaemon(config);
+      const result = await startCoworkDaemon(config);
       output.success(result, result.alreadyRunning
         ? 'ours-cowork is already running'
         : 'ours-cowork started');
@@ -1049,7 +1061,7 @@ async function execute(args: string[], output: Output): Promise<void> {
     }
     case 'restart': {
       await stopDaemon(config);
-      const result = await startDaemon(config);
+      const result = await startCoworkDaemon(config);
       output.success(result, 'ours-cowork restarted');
       return;
     }

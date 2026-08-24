@@ -59,21 +59,23 @@ test('config is exact, env overrides are strict, and malformed input fails close
   try {
     const path = join(dir, 'config.json');
     writeFileSync(path, JSON.stringify({
-      version: 1, brokerUrl: 'ws://file', stateDir: join(dir, 'state'), rest: { enabled: false, port: 3010 },
+      version: 1, stateDir: join(dir, 'state'), rest: { enabled: false, port: 3010 },
     }), { mode: 0o600 });
     const config = loadConfig({
       OURS_COWORK_CONFIG: path,
-      OURS_COWORK_BROKER_URL: 'ws://env',
       OURS_COWORK_STATE_DIR: join(dir, 'override'),
       OURS_COWORK_REST_PORT: '4010',
     });
     assert.deepEqual(config, {
-      version: 1, brokerUrl: 'ws://env', stateDir: join(dir, 'override'), rest: { enabled: true, port: 4010 },
+      version: 1,
+      stateDir: join(dir, 'override'),
+      roomIdentity: { nameMode: 'stable_id' },
+      rest: { enabled: true, port: 4010 },
     });
-    writeFileSync(path, JSON.stringify({ version: 1, brokerUrl: 'ws://file', stateDir: dir, rest: { enabled: false, port: 3010 }, extra: true }));
+    writeFileSync(path, JSON.stringify({ version: 1, stateDir: dir, rest: { enabled: false, port: 3010 }, extra: true }));
     assert.throws(() => loadConfig({ OURS_COWORK_CONFIG: path }), /config/i);
     writeFileSync(path, JSON.stringify({
-      version: 1, brokerUrl: 'ws://file', stateDir: join(dir, 'state'), rest: { enabled: false, port: 3010 },
+      version: 1, stateDir: join(dir, 'state'), rest: { enabled: false, port: 3010 },
     }));
     assert.throws(() => loadConfig({ OURS_COWORK_CONFIG: path, OURS_COWORK_REST_PORT: '3x' }), /REST_PORT/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -191,7 +193,6 @@ test('supervisor strips inherited preload and execution modes from its worker', 
         ...(mode === 'node-options' ? { NODE_OPTIONS: `--require=${preload}` } : {}),
         COWORK_PRELOAD_MARKER: marker,
         OURS_COWORK_STATE_DIR: join(dir, `${mode}-state`),
-        OURS_COWORK_BROKER_URL: 'ws://127.0.0.1:1',
       },
       stdio: ['ignore', 'ignore', 'pipe'],
     });
@@ -316,7 +317,6 @@ test('authorized worker shutdown before and during capability handshake never cr
         OURS_COWORK_DAEMON_WORKER: '1',
         OURS_COWORK_SUPERVISOR_PID: String(process.pid),
         OURS_COWORK_STATE_DIR: dir,
-        OURS_COWORK_BROKER_URL: 'ws://127.0.0.1:1',
       },
       stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
     });
@@ -354,7 +354,6 @@ test('ambient worker environment or mismatched live IPC fails before runtime sta
         OURS_COWORK_DAEMON_WORKER: '1',
         OURS_COWORK_SUPERVISOR_PID: scenario === 'no-ipc' ? String(process.pid) : String(process.pid === 1 ? 2 : 1),
         OURS_COWORK_STATE_DIR: dir,
-        OURS_COWORK_BROKER_URL: 'ws://127.0.0.1:1',
       },
       stdio: scenario === 'no-ipc' ? ['ignore', 'ignore', 'pipe'] : ['ignore', 'ignore', 'pipe', 'ipc'],
     });
@@ -382,7 +381,7 @@ test('runtime state creates no token and rejects insecure modes and symlinks', (
   const dir = mkdtempSync(join(tmpdir(), 'cowork-perms-'));
   try {
     const stateDir = join(dir, 'state');
-    const config = { version: 1, brokerUrl: 'ws://broker', stateDir, rest: { enabled: true, port: 3010 } };
+    const config = { version: 1, stateDir, rest: { enabled: true, port: 3010 } };
     const runtime = ensureRuntimeState(config);
     assert.equal('token' in runtime, false);
     assert.equal('tokenPath' in runtime, false);
@@ -406,11 +405,11 @@ test('state setup rejects a hostile writable ancestor and config validates the o
     realFs.mkdirSync(hostile, { mode: 0o777 });
     chmodSync(hostile, 0o777);
     assert.throws(() => ensureRuntimeState({
-      version: 1, brokerUrl: 'ws://broker', stateDir: join(hostile, 'state'), rest: { enabled: false, port: 3010 },
+      version: 1, stateDir: join(hostile, 'state'), rest: { enabled: false, port: 3010 },
     }), /unsafe writable ancestor/i);
 
     const configPath = join(dir, 'config.json');
-    const config = { version: 1, brokerUrl: 'ws://broker', stateDir: join(dir, 'state'), rest: { enabled: false, port: 3010 } };
+    const config = { version: 1, stateDir: join(dir, 'state'), rest: { enabled: false, port: 3010 } };
     writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
     const replacement = join(dir, 'replacement.json');
     writeFileSync(replacement, JSON.stringify(config), { mode: 0o644 });
@@ -454,7 +453,7 @@ test('safe foreign ancestors are allowed, but foreign-owned sticky writable ance
       },
     });
     const config = {
-      version: 1, brokerUrl: 'ws://broker', stateDir: join(foreign, 'state'),
+      version: 1, stateDir: join(foreign, 'state'),
       rest: { enabled: false, port: 3010 },
     };
     ensureRuntimeState(config, { fs: fsWithAncestor(0o755) });
@@ -539,7 +538,7 @@ test('daemon boot uses phased recovery order and shutdown drains before unhostin
     { room_id: '01jz6y7n8p9q0r1s2t3v4w5x6z', state: 'closing' },
     { room_id: '01jz6y7n8p9q0r1s2t3v4w5x70', state: 'closed' },
   ];
-  const config = { version: 1, brokerUrl: 'ws://broker', stateDir: dir, rest: { enabled: false, port: 3010 } };
+  const config = { version: 1, stateDir: dir, rest: { enabled: false, port: 3010 } };
   const transports = {
     async start() { events.push('transports.start'); },
     async stop() { events.push('transports.stop'); },
@@ -573,11 +572,53 @@ test('daemon boot uses phased recovery order and shutdown drains before unhostin
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('daemon restart retries packet-pending creation only after a verified orphan is removed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-daemon-orphan-retry-'));
+  const room = { room_id: '01jz6y7n8p9q0r1s2t3v4w5x6y', state: 'provisioning' };
+  const events = [];
+  let orphanPresent = true;
+  let recoveryCalls = 0;
+  const makeDaemon = () => {
+    const service = new FakeService(events, [room]);
+    service.recoverPacket = async (id) => {
+      recoveryCalls += 1;
+      events.push(`restore:${id}`);
+      if (orphanPresent) throw new Error('unproven identity collision; refusing adoption');
+    };
+    return new CoworkDaemon({
+      config: { version: 1, stateDir: dir, rest: { enabled: false, port: 3010 } },
+      prepare: () => ({ socketPath: join(dir, 'management.sock') }),
+      lock: () => ({ release: () => events.push('lock.release') }),
+      host: new FakeHost(events),
+      store: { async list() { return [room]; } },
+      registry: new FakeRegistry(events),
+      service,
+      transports: {
+        async start() { events.push('transports.start'); },
+        async stop() { events.push('transports.stop'); },
+      },
+      writePid: () => events.push('pid.write'),
+      removePid: () => events.push('pid.remove'),
+    });
+  };
+
+  try {
+    await assert.rejects(makeDaemon().boot(), /unproven identity collision/i);
+    assert.equal(events.includes('transports.start'), false, 'failed boot must expose no transport');
+    orphanPresent = false; // operator verified and removed the exact orphan
+    const restarted = makeDaemon();
+    await restarted.boot();
+    assert.equal(recoveryCalls, 2);
+    assert.equal(events.filter((event) => event === 'transports.start').length, 1);
+    await restarted.shutdown();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('partial boot failure rolls back transports, PID, packets, host, and lock', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-rollback-'));
   const events = [];
   const daemon = new CoworkDaemon({
-    config: { version: 1, brokerUrl: 'ws://broker', stateDir: dir, rest: { enabled: false, port: 3010 } },
+    config: { version: 1, stateDir: dir, rest: { enabled: false, port: 3010 } },
     prepare: () => ({ socketPath: join(dir, 'management.sock') }),
     lock: () => ({ release: () => events.push('lock.release') }),
     host: new FakeHost(events),
@@ -599,7 +640,7 @@ test('runtime shutdown is idempotent and does not own process signal listeners',
   const dir = mkdtempSync(join(tmpdir(), 'cowork-runtime-shutdown-'));
   const events = [];
   const daemon = new CoworkDaemon({
-    config: { version: 1, brokerUrl: 'ws://broker', stateDir: dir, rest: { enabled: false, port: 3010 } },
+    config: { version: 1, stateDir: dir, rest: { enabled: false, port: 3010 } },
     prepare: () => ({ socketPath: join(dir, 'management.sock') }),
     lock: () => ({ release: () => events.push('lock.release') }),
     host: new FakeHost(events),
@@ -621,7 +662,7 @@ test('runtime shutdown preserves requiresProcessExit on aggregated cleanup failu
   const stopFailure = Object.assign(new Error('wrapper stop failed'), { requiresProcessExit: true });
   const events = [];
   const daemon = new CoworkDaemon({
-    config: { version: 1, brokerUrl: 'ws://broker', stateDir: dir, rest: { enabled: false, port: 3010 } },
+    config: { version: 1, stateDir: dir, rest: { enabled: false, port: 3010 } },
     prepare: () => ({ socketPath: join(dir, 'management.sock') }),
     lock: () => ({ release() { events.push('lock.release'); } }),
     host: { async boot() {}, async shutdown() { throw stopFailure; }, close() {} },
@@ -645,7 +686,7 @@ test('shutdown during delayed wrapper boot cancels every later boot phase before
     close() { assert.fail('legacy close must not be used when shutdown exists'); },
   };
   const daemon = new CoworkDaemon({
-    config: { version: 1, brokerUrl: 'ws://broker', stateDir: dir, rest: { enabled: false, port: 3010 } },
+    config: { version: 1, stateDir: dir, rest: { enabled: false, port: 3010 } },
     prepare: () => ({ socketPath: join(dir, 'management.sock') }),
     lock: () => ({ release: () => events.push('lock.release') }), host,
     store: { async list() { events.push('rooms.list'); return []; } },
@@ -683,7 +724,7 @@ test('rejected host boot and transport start still invoke their idempotent clean
       async stop() { events.push('transport.stop'); },
     };
     const daemon = new CoworkDaemon({
-      config: { version: 1, brokerUrl: 'ws://broker', stateDir: dir, rest: { enabled: false, port: 3010 } },
+      config: { version: 1, stateDir: dir, rest: { enabled: false, port: 3010 } },
       prepare: () => ({ socketPath: join(dir, 'management.sock') }), lock: () => ({ release() { events.push('lock.release'); } }),
       host, store: { async list() { return failAt === 'transport' ? [room] : []; } }, registry: new FakeRegistry(events),
       service: new FakeService(events, []), transports,
@@ -702,7 +743,7 @@ test('boot failure preserves the primary error and aggregates cleanup failures w
   const cleanup = new Error('host cleanup failure');
   const events = [];
   const daemon = new CoworkDaemon({
-    config: { version: 1, brokerUrl: 'ws://broker', stateDir: dir, rest: { enabled: false, port: 3010 } },
+    config: { version: 1, stateDir: dir, rest: { enabled: false, port: 3010 } },
     prepare: () => ({ socketPath: join(dir, 'management.sock') }),
     lock: () => ({ release() { events.push('lock.release'); } }),
     host: { async boot() { throw primary; }, async shutdown() { throw cleanup; }, close() {} },
@@ -722,94 +763,34 @@ test('boot failure preserves the primary error and aggregates cleanup failures w
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('real executable owns SIGINT/SIGTERM after SDK boot and exits without runtime endpoints', async (t) => {
-  for (const shutdownSignal of ['SIGINT', 'SIGTERM']) {
-    const dir = mkdtempSync(join(tmpdir(), `cowork-real-${shutdownSignal.toLowerCase()}-`));
-    const configPath = join(dir, 'config.json');
-    writeFileSync(configPath, JSON.stringify({
-      version: 1,
-      brokerUrl: 'ws://127.0.0.1:1',
-      stateDir: dir,
-      rest: { enabled: false, port: 3052 },
-    }), { mode: 0o600 });
-    const child = spawn(process.execPath, [DAEMON_EXECUTABLE], {
-      env: {
-        ...process.env,
-        OURS_COWORK_CONFIG: configPath,
-      },
-      stdio: ['ignore', 'ignore', 'pipe'],
-    });
-    let stderr = '';
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk) => { stderr += chunk; });
-    t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); rmSync(dir, { recursive: true, force: true }); });
-    const pidPath = join(dir, 'daemon.pid');
-    const socketPath = join(dir, 'management.sock');
-    const deadline = Date.now() + 10_000;
-    while ((!existsSync(pidPath) || !existsSync(socketPath)) && Date.now() < deadline) {
-      if (child.exitCode !== null) assert.fail(`daemon exited during boot (${child.exitCode}): ${stderr}`);
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    assert(existsSync(pidPath), `daemon did not write PID: ${stderr}`);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.equal(child.exitCode, null, `daemon exited before ${shutdownSignal}: ${stderr}`);
-    const exitWork = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
-    child.kill(shutdownSignal);
-    const exited = await Promise.race([
-      exitWork,
-      new Promise((resolve) => setTimeout(() => resolve('timeout'), 3_000)),
-    ]);
-    assert.notEqual(exited, 'timeout', `daemon retained SDK reconnect resources after ${shutdownSignal}: ${stderr}`);
-    assert.deepEqual(exited, { code: 0, signal: null }, stderr);
-    assert.equal(existsSync(socketPath), false);
-    assert.equal(existsSync(pidPath), false);
-  }
-});
-
-test('real SDK-free supervisor handles signals from pre-lock through ready', async (t) => {
-  const daemonUrl = DAEMON_EXECUTABLE_URL;
-  const stages = ['pre-lock', 'post-lock', 'during-host-init', 'post-host', 'pre-pid', 'ready'];
-  for (const [index, stage] of stages.entries()) {
-    const signal = index % 2 === 0 ? 'SIGINT' : 'SIGTERM';
-    const dir = mkdtempSync(join(tmpdir(), `cowork-stage-${stage}-`));
-    const configPath = join(dir, 'config.json');
-    writeFileSync(configPath, JSON.stringify({
-      version: 1,
-      brokerUrl: 'ws://127.0.0.1:1',
-      stateDir: dir,
-      rest: { enabled: false, port: 3052 },
-    }), { mode: 0o600 });
-    const program = [
-      `import { runSupervisor } from ${JSON.stringify(daemonUrl)};`,
-      `const target = ${JSON.stringify(stage)};`,
-      `const signal = ${JSON.stringify(signal)};`,
-      'const code = await runSupervisor({ onStage(current) {',
-      '  if (current === target) process.kill(process.pid, signal);',
-      '} });',
-      'process.exitCode = code;',
-    ].join('\n');
-    const child = spawn(process.execPath, ['--input-type=module', '--eval', program], {
-      env: {
-        ...process.env,
-        OURS_COWORK_CONFIG: configPath,
-      },
-      stdio: ['ignore', 'ignore', 'pipe'],
-    });
-    let stderr = '';
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk) => { stderr += chunk; });
-    t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); rmSync(dir, { recursive: true, force: true }); });
-    const exited = await Promise.race([
-      new Promise((resolve) => child.once('exit', (code, exitSignal) => resolve({ code, signal: exitSignal }))),
-      new Promise((resolve) => {
-        const timer = setTimeout(() => resolve('timeout'), 10_000);
-        timer.unref();
-      }),
-    ]);
-    assert.notEqual(exited, 'timeout', `${stage} did not converge: ${stderr}`);
-    assert.deepEqual(exited, { code: 0, signal: null }, `${stage}: ${stderr}`);
-    assert.equal(existsSync(join(dir, 'daemon.lock')), false, `${stage} retained daemon.lock`);
-    assert.equal(existsSync(join(dir, 'daemon.pid')), false, `${stage} retained daemon.pid`);
-    assert.equal(existsSync(join(dir, 'management.sock')), false, `${stage} retained management.sock`);
-  }
+test('real executable fails closed when the shared daemon is absent and creates no embedded state', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-real-shared-absent-'));
+  const coworkState = join(dir, 'cowork');
+  const configPath = join(dir, 'config.json');
+  writeFileSync(configPath, JSON.stringify({
+    version: 1,
+    stateDir: coworkState,
+    rest: { enabled: false, port: 3052 },
+  }), { mode: 0o600 });
+  const child = spawn(process.execPath, [DAEMON_EXECUTABLE], {
+    env: {
+      ...process.env,
+      OURS_COWORK_CONFIG: configPath,
+      OURS_PORT: '1',
+      OURS_STATE_DIR: join(dir, 'shared-ours'),
+    },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
+  t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); rmSync(dir, { recursive: true, force: true }); });
+  const exited = await Promise.race([
+    new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal }))),
+    new Promise((resolve) => setTimeout(() => resolve('timeout'), 10_000)),
+  ]);
+  assert.notEqual(exited, 'timeout', stderr);
+  assert.deepEqual(exited, { code: 1, signal: null });
+  assert.equal(existsSync(join(coworkState, 'ours-sdk')), false);
+  assert.equal(existsSync(join(coworkState, 'daemon.pid')), false);
+  assert.equal(existsSync(join(coworkState, 'management.sock')), false);
 });

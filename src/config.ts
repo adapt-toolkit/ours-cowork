@@ -4,17 +4,18 @@ import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 
 import { z } from 'zod';
 
+import { RoomIdentityNameModeSchema } from './contracts.ts';
+
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
 const NO_FOLLOW = nodeFs.constants.O_NOFOLLOW ?? 0;
 
 export const CoworkConfigSchema = z.object({
   version: z.literal(1),
-  brokerUrl: z.string().url().refine((value) => {
-    const protocol = new URL(value).protocol;
-    return protocol === 'ws:' || protocol === 'wss:';
-  }, 'brokerUrl must use ws:// or wss://'),
   stateDir: z.string().min(1),
+  roomIdentity: z.object({
+    nameMode: RoomIdentityNameModeSchema,
+  }).strict().default({ nameMode: 'stable_id' }),
   rest: z.object({
     enabled: z.boolean(),
     port: z.number().int().min(1).max(65_535),
@@ -34,6 +35,9 @@ export interface ConfigEnvironment {
   OURS_COWORK_BROKER_URL?: string;
   OURS_COWORK_STATE_DIR?: string;
   OURS_COWORK_REST_PORT?: string;
+  OURS_COWORK_DAEMON_MODE?: string;
+  OURS_COWORK_DAEMON_ENDPOINT?: string;
+  OURS_COWORK_DAEMON_STATE_DIR?: string;
 }
 
 export interface ConfigIo {
@@ -51,17 +55,18 @@ export class CoworkConfigError extends Error {
 export function defaultConfig(home = homedir()): CoworkConfig {
   return {
     version: 1,
-    brokerUrl: 'wss://broker1.ours.network',
     stateDir: resolve(home, '.ours-cowork'),
+    roomIdentity: { nameMode: 'stable_id' },
     rest: { enabled: true, port: 3052 },
   };
 }
 
-/** Load one strict config document, then apply the four documented overrides. */
+/** Load one strict cowork-only config document, then apply its two overrides. */
 export function loadConfig(
   env: ConfigEnvironment = process.env,
   io: ConfigIo = {},
 ): CoworkConfig {
+  rejectRemovedEnvironment(env);
   const fs = io.fs ?? nodeFs;
   const defaults = defaultConfig(io.home);
   const configPath = resolve(env.OURS_COWORK_CONFIG ?? join(io.home ?? homedir(), '.ours-cowork', 'config.json'));
@@ -75,6 +80,7 @@ export function loadConfig(
     } catch (error) {
       throw new CoworkConfigError(`malformed cowork config at ${configPath}`, { cause: error });
     }
+    rejectRemovedConfig(parsed, configPath);
     try {
       file = CoworkConfigSchema.parse(parsed);
     } catch (error) {
@@ -90,8 +96,8 @@ export function loadConfig(
   try {
     return CoworkConfigSchema.parse({
       version: 1,
-      brokerUrl: env.OURS_COWORK_BROKER_URL ?? file.brokerUrl,
       stateDir: resolve(env.OURS_COWORK_STATE_DIR ?? file.stateDir),
+      roomIdentity: file.roomIdentity,
       rest: {
         enabled: restPort === undefined ? file.rest.enabled : true,
         port: restPort ?? file.rest.port,
@@ -100,6 +106,30 @@ export function loadConfig(
   } catch (error) {
     throw new CoworkConfigError('invalid effective cowork config', { cause: error });
   }
+}
+
+function rejectRemovedEnvironment(env: ConfigEnvironment): void {
+  const removed = [
+    'OURS_COWORK_BROKER_URL',
+    'OURS_COWORK_DAEMON_MODE',
+    'OURS_COWORK_DAEMON_ENDPOINT',
+    'OURS_COWORK_DAEMON_STATE_DIR',
+  ].filter((name) => env[name as keyof ConfigEnvironment] !== undefined);
+  if (removed.length === 0) return;
+  throw new CoworkConfigError(
+    `${removed.join(', ')} ${removed.length === 1 ? 'was' : 'were'} removed: ours-cowork now attaches only to the shared ours daemon. ` +
+    'Configure that daemon with @ours.network/cli and select it through the standard OURS_CONFIG, OURS_PORT, and OURS_STATE_DIR inputs.',
+  );
+}
+
+function rejectRemovedConfig(value: unknown, path: string): void {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return;
+  const removed = ['brokerUrl', 'daemon'].filter((key) => Object.hasOwn(value, key));
+  if (removed.length === 0) return;
+  throw new CoworkConfigError(
+    `cowork config at ${path} contains removed ${removed.join(' and ')} ${removed.length === 1 ? 'key' : 'keys'}: ` +
+    'ours-cowork now attaches only to the shared ours daemon. Remove those keys and configure the daemon with @ours.network/cli.',
+  );
 }
 
 /** Establish and verify every host-owned runtime path before a wrapper starts. */

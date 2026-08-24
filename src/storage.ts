@@ -396,7 +396,7 @@ export class CoworkStore {
   }
 
   /**
-   * Lazy additive v1 → v2 migration (spec §7): preserve the exact pre-migration
+   * Lazy additive v1 → v2 migration: preserve the exact pre-migration
    * bytes once as room.json.v1.bak, then atomically persist the v2 metadata.
    *
    * THE BACKUP IS WRITTEN TEMP → FSYNC → RENAME, not opened in place, and the

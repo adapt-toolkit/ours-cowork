@@ -26,18 +26,15 @@ jobs:
       COWORK_CHROME_PATH: /usr/bin/google-chrome
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
       - run: npm ci
-      - run: scripts/compile-mufl.sh
       - run: npm run typecheck
       - run: npm run typecheck:web
       - run: npm run build
-      - run: test -f dist/daemon.js && test -f dist/cli.js && test -f dist/web/index.html && test -f dist/web/assets/app.js && test -f dist/web/assets/app.css && test "$(find dist/web -type f | wc -l)" -eq 3 && test "$(find dist/mufl_code -name '*.muflo' | wc -l)" -eq 1 && test "$(find docs -maxdepth 1 -name '*.md' | wc -l)" -eq 11
+      - run: test -f dist/daemon.js && test -f dist/cli.js && test -f dist/web/index.html && test -f dist/web/assets/app.js && test -f dist/web/assets/app.css && test "$(find dist/web -type f | wc -l)" -eq 3 && test "$(find docs -maxdepth 1 -name '*.md' | wc -l)" -eq 11
       - run: npm run test:release
       - run: npm test
       - run: npm run test:web
@@ -85,14 +82,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version-bump.outputs.new-sha }}
-          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
           registry-url: https://registry.npmjs.org
       - run: npm ci
-      - run: scripts/compile-mufl.sh
       - run: npm run build
       - name: Verify npm artifact
         run: |
@@ -106,9 +101,6 @@ jobs:
             'LICENSE', 'README.md',
           ]) {
             if (!files.has(path)) throw new Error(`@ours.network/cowork package is missing ${path}`);
-          }
-          if (![...files].some((path) => path.startsWith('dist/mufl_code/') && path.endsWith('.muflo'))) {
-            throw new Error('@ours.network/cowork package is missing its compiled MUFL packet');
           }
           NODE
       - name: Publish @ours.network/cowork

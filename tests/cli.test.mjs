@@ -5,7 +5,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import test from 'node:test';
+import test, { after } from 'node:test';
 
 import {
   NATIVE_RPC_TIMEOUT_MS,
@@ -19,6 +19,14 @@ import {
 const ROOT = resolve(new URL('..', import.meta.url).pathname);
 const CLI = join(ROOT, 'dist', 'cli.js');
 const TOKEN_PATTERN = /\b[0-9a-f]{64}\b/;
+const CLEAN_CONFIG_DIR = await mkdtemp(join(tmpdir(), 'ours-cowork-cli-tests-'));
+const CLEAN_COWORK_CONFIG = join(CLEAN_CONFIG_DIR, 'config.json');
+await writeFile(CLEAN_COWORK_CONFIG, JSON.stringify({
+  version: 1,
+  stateDir: join(CLEAN_CONFIG_DIR, 'state'),
+  rest: { enabled: false, port: 3052 },
+}), { mode: 0o600 });
+after(() => rm(CLEAN_CONFIG_DIR, { recursive: true, force: true }));
 
 async function runCli(args, options = {}) {
   const cli = options.cli ?? CLI;
@@ -29,9 +37,16 @@ async function runCli(args, options = {}) {
       process.argv = [process.execPath, ${JSON.stringify(cli)}, ...${JSON.stringify(args)}];
       await import(${JSON.stringify(new URL(`file://${cli}`).href)});
     `];
+  const env = { ...process.env };
+  for (const key of ['OURS_CONFIG', 'OURS_PORT', 'OURS_STATE_DIR']) delete env[key];
+  env.OURS_COWORK_CONFIG = CLEAN_COWORK_CONFIG;
+  for (const [key, value] of Object.entries(options.env ?? {})) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
   const child = spawn(process.execPath, nodeArgs, {
     cwd: ROOT,
-    env: { ...process.env, ...options.env },
+    env,
     stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
   });
   if (options.input !== undefined) child.stdin.end(options.input);
@@ -129,7 +144,6 @@ test('web uses the safe daemon start path, waits on GET readiness, and opens onc
     const calls = [];
     const config = {
       version: 1,
-      brokerUrl: 'wss://broker.example.invalid',
       stateDir: '/tmp/cowork-web-test',
       rest: { enabled: true, port: 4312 },
     };
@@ -150,7 +164,6 @@ test('web uses the safe daemon start path, waits on GET readiness, and opens onc
 test('web disabled, readiness timeout, and JSON mode preserve exact side-effect boundaries', async () => {
   const disabled = {
     version: 1,
-    brokerUrl: 'wss://broker.example.invalid',
     stateDir: '/tmp/cowork-web-test',
     rest: { enabled: false, port: 3052 },
   };
@@ -238,7 +251,6 @@ test('web CLI exits 1 with the exact disabled message', async () => {
   const configPath = join(stateDir, 'config.json');
   await writeFile(configPath, JSON.stringify({
     version: 1,
-    brokerUrl: 'ws://127.0.0.1:1',
     stateDir,
     rest: { enabled: false, port: 3052 },
   }), { mode: 0o600 });
@@ -269,7 +281,7 @@ test('room commands send exactly one JSONL request over management.sock', async 
     { args: ['room', 'delete', 'room1', '--yes'], method: 'room.delete', params: { room_id: 'room1', confirm: true } },
     { args: ['room', 'recover', 'room1'], method: 'room.recover', params: { room_id: 'room1' } },
     { args: ['room', 'recover', 'room1', '--confirm', 'old1', 'new1'], method: 'room.recover.confirm', params: { room_id: 'room1', recovery_of: 'old1', invite_id: 'new1' } },
-    // Rooms evolution Phase A5 verbs
+    // Room membership and briefing verbs
     { args: ['room', 'create', '--goal', 'Ship', '--briefing', 'B', '--anonymous', '--quiet-membership'], method: 'room.create', params: { goal: 'Ship', briefing: 'B', anonymous: true, quiet_membership: true } },
     { args: ['room', 'settings', 'room1', '--quiet-membership', 'false'], method: 'room.settings', params: { room_id: 'room1', quiet_membership: false } },
     { args: ['room', 'invite', 'room1'], method: 'room.invite', params: { room_id: 'room1', mode: 'one_time', min_accepts: 1 } },
@@ -631,15 +643,42 @@ test('replacement of the authenticated control session proves the original sessi
 test('real daemon start, status, and stop use the management control session', { timeout: 30_000 }, async (t) => {
   const stateDir = await mkdtemp(join(tmpdir(), 'cowork-cli-real-control-'));
   await chmod(stateDir, 0o700);
+  const sharedStateDir = join(stateDir, 'shared-ours');
+  await mkdir(sharedStateDir, { mode: 0o700 });
+  const token = 'ab'.repeat(32);
+  await writeFile(join(sharedStateDir, 'daemon-token'), `${token}\n`, { mode: 0o600 });
+  const shared = createHttpServer((request, response) => {
+    const send = (status, body) => {
+      response.writeHead(status, { 'content-type': 'application/json' });
+      response.end(JSON.stringify(body));
+    };
+    if (request.method === 'GET' && request.url === '/state-dir') {
+      send(200, { stateDir: sharedStateDir, version: '2.0.1', compat: 1 });
+      return;
+    }
+    if (request.method === 'POST' && request.url === '/api/v1/releaseLease'
+      && request.headers['x-ours-api-token'] === token) {
+      send(200, { released: [] });
+      return;
+    }
+    send(404, { error: 'not found' });
+  });
+  await new Promise((ready, reject) => {
+    shared.once('error', reject);
+    shared.listen(0, '127.0.0.1', ready);
+  });
+  const address = shared.address();
+  assert(address && typeof address === 'object');
   const configPath = join(stateDir, 'config.json');
   await writeFile(configPath, JSON.stringify({
     version: 1,
-    brokerUrl: 'ws://127.0.0.1:1',
     stateDir,
     rest: { enabled: false, port: 3052 },
   }), { mode: 0o600 });
   const env = {
     OURS_COWORK_CONFIG: configPath,
+    OURS_PORT: String(address.port),
+    OURS_STATE_DIR: sharedStateDir,
   };
   t.after(async () => {
     const pidPath = join(stateDir, 'daemon.pid');
@@ -647,6 +686,7 @@ test('real daemon start, status, and stop use the management control session', {
       const pid = Number((await readFile(pidPath, 'utf8')).trim());
       if (Number.isSafeInteger(pid)) process.kill(pid, 'SIGKILL');
     } catch { /* daemon stopped or never started */ }
+    await new Promise((closed) => shared.close(closed));
     await rm(stateDir, { recursive: true, force: true });
   });
   const started = await runCli(['start', '--json'], { env });
@@ -698,7 +738,7 @@ test('offline docs cover operations and exact limitations without exposing a man
   assert.match(result.stdout, /duplicate/i);
   assert.match(result.stdout, /does not observe delivery/i);
   assert.match(result.stdout, /stopped/i);
-  assert.match(result.stdout, /complete state directory/i);
+  assert.match(result.stdout, /complete cowork state directory/i);
   assert.match(result.stdout, /uninstall.*retain/i);
   assert.match(result.stdout, /closed.*--yes/i);
 
@@ -746,11 +786,70 @@ test('generated service definitions execute the cowork CLI directly and uninstal
     const externalDaemonPattern = new RegExp(`${['ours', 'mcp'].join('-')}|(?:^|[ /])\\.ours(?:[ /]|$)`, 'im');
     assert.doesNotMatch(unit, externalDaemonPattern);
     assert.doesNotMatch(unit, /management-token|Bearer/i);
+    // systemd's default start rate limit would turn "the thing I need is not up
+    // yet" into a permanently failed unit that stops retrying entirely.
+    assert.match(unit, /^\[Unit\][\s\S]*^StartLimitIntervalSec=0$/m);
+    assert.match(unit, /^Restart=on-failure$/m);
+    assert.match(unit, /^RestartSec=5$/m);
+    assert(unit.indexOf('StartLimitIntervalSec=0') < unit.indexOf('[Service]'),
+      'StartLimitIntervalSec belongs to the [Unit] section');
 
     await writeFile(join(stateDir, 'keep-me'), 'retained');
     const uninstalled = await runCli(['uninstall-service'], { env });
     assert.equal(uninstalled.code, 0, uninstalled.stderr);
     assert.equal(await readFile(join(stateDir, 'keep-me'), 'utf8'), 'retained');
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('a service definition carries the standard shared-daemon selection and never a credential', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'cowork-service-shared-'));
+  const stateDir = join(home, 'state');
+  const daemonStateDir = join(home, 'shared-ours');
+  const binDir = join(home, 'bin');
+  await mkdir(stateDir, { mode: 0o700 });
+  await mkdir(daemonStateDir, { mode: 0o700 });
+  await mkdir(binDir, { mode: 0o700 });
+  for (const name of ['systemctl', 'loginctl']) {
+    const path = join(binDir, name);
+    await writeFile(path, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+    await chmod(path, 0o700);
+  }
+  // A real daemon token beside the selected state directory must stay there.
+  await writeFile(join(daemonStateDir, 'daemon-token'), `${'a1'.repeat(32)}\n`, { mode: 0o600 });
+  const env = {
+    HOME: home,
+    PATH: `${binDir}:${process.env.PATH}`,
+    OURS_COWORK_STATE_DIR: stateDir,
+    OURS_PORT: '3071',
+    OURS_STATE_DIR: daemonStateDir,
+  };
+  try {
+    const installed = await runCli(['install-service'], { env });
+    assert.equal(installed.code, 0, installed.stderr);
+    const unit = await readFile(join(home, '.config', 'systemd', 'user', 'ours-cowork.service'), 'utf8');
+    assert.match(unit, /^Environment="OURS_PORT=3071"$/m);
+    assert.match(unit, new RegExp(`^Environment="OURS_STATE_DIR=${daemonStateDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"$`, 'm'));
+    assert.doesNotMatch(unit, TOKEN_PATTERN);
+    assert.doesNotMatch(unit, /management-token|Bearer|api[_-]?token/i);
+    // The shared daemon may well come up after this unit; retrying forever at
+    // a bounded interval is the difference between eventual success and a unit
+    // that gave up during boot and never tried again.
+    assert.match(unit, /^StartLimitIntervalSec=0$/m);
+    assert.match(unit, /^RestartSec=5$/m);
+    // The default emits no explicit shared-daemon selection at all.
+    const standard = await runCli(['install-service'], {
+      env: {
+        ...env,
+        OURS_PORT: undefined,
+        OURS_STATE_DIR: undefined,
+        OURS_CONFIG: undefined,
+      },
+    });
+    assert.equal(standard.code, 0, standard.stderr);
+    const plain = await readFile(join(home, '.config', 'systemd', 'user', 'ours-cowork.service'), 'utf8');
+    assert.doesNotMatch(plain, /Environment="OURS_(?:CONFIG|PORT|STATE_DIR)=/);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

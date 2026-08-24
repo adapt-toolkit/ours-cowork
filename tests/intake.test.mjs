@@ -72,49 +72,56 @@ class FakePacket {
   fileInbox = [];
   sendCalls = [];
   sendFileCalls = [];
-  signCalls = [];
   consumeCalls = [];
   consumeFileCalls = [];
+  acknowledgeCalls = [];
+  listCalls = [];
+  acknowledgeOrder = [];
   nextSend = { status: 'queued', wire_id: 'wire-out' };
   beforeConsume;
   afterConsume;
-  beforeSign;
   beforeSend;
   beforeConsumeFile;
   afterConsumeFile;
   beforeSendFile;
 
-  peekInbox() { return structuredClone(this.inbox); }
-  peekFileInbox() { return structuredClone(this.fileInbox); }
-
-  async consumeInbox(expectedIds) {
-    if (this.beforeConsume) await this.beforeConsume(expectedIds);
-    this.consumeCalls.push([...expectedIds]);
-    const expected = new Set(expectedIds);
-    const consumed = this.inbox.filter((item) => expected.has(item.msg_id)).map((item) => item.msg_id);
-    // This is the observable contract of HostedRoomPacket: messages arriving
-    // after peek are drained and immediately deferred, so remain unread.
-    const deferred = this.inbox.filter((item) => !expected.has(item.msg_id)).map((item) => item.msg_id);
-    this.inbox = this.inbox.filter((item) => !expected.has(item.msg_id));
-    if (this.afterConsume) await this.afterConsume({ consumed, deferred });
-    return { consumed, deferred };
+  async listUnreadMessages(limit) {
+    this.listCalls.push(['messages', limit]);
+    return structuredClone(this.inbox.slice(0, limit));
+  }
+  async listUnreadFiles(limit) {
+    this.listCalls.push(['files', limit]);
+    return structuredClone(this.fileInbox.slice(0, limit));
   }
 
-  async consumeFileInbox(expectedIds) {
-    if (this.beforeConsumeFile) await this.beforeConsumeFile(expectedIds);
-    this.consumeFileCalls.push([...expectedIds]);
-    const expected = new Set(expectedIds);
-    const consumed = this.fileInbox.filter((item) => expected.has(item.file_id)).map((item) => item.file_id);
-    const deferred = this.fileInbox.filter((item) => !expected.has(item.file_id)).map((item) => item.file_id);
-    this.fileInbox = this.fileInbox.filter((item) => !expected.has(item.file_id));
-    if (this.afterConsumeFile) await this.afterConsumeFile({ consumed, deferred });
-    return { consumed, deferred };
+  async acknowledgeMessage(expected, onUnexpected) {
+    this.acknowledgeCalls.push(expected.msg_id);
+    if (this.beforeConsume) await this.beforeConsume([expected.msg_id]);
+    for (;;) {
+      const item = this.inbox.shift();
+      if (!item) {
+        if (this.afterConsume) await this.afterConsume({ consumed: [], deferred: [] });
+        return;
+      }
+      this.consumeCalls.push([item.msg_id]);
+      this.acknowledgeOrder.push(`message:${item.msg_id}`);
+      if (item.msg_id === expected.msg_id && item.wire_id === expected.wire_id) {
+        if (this.afterConsume) await this.afterConsume({ consumed: [item.msg_id], deferred: [] });
+        return;
+      }
+      await onUnexpected(structuredClone(item));
+    }
   }
 
-  async sign(body) {
-    this.signCalls.push(body);
-    if (this.beforeSign) await this.beforeSign(body);
-    return 'stable-signature';
+  async acknowledgeFile(expected) {
+    if (this.beforeConsumeFile) await this.beforeConsumeFile([expected.file_id]);
+    const index = this.fileInbox.findIndex(
+      (item) => item.file_id === expected.file_id && item.wire_id === expected.wire_id,
+    );
+    const consumed = index < 0 ? [] : [this.fileInbox.splice(index, 1)[0].file_id];
+    this.consumeFileCalls.push([expected.file_id]);
+    this.acknowledgeOrder.push(`file:${expected.file_id}`);
+    if (this.afterConsumeFile) await this.afterConsumeFile({ consumed, deferred: [] });
   }
 
   async send(recipient, body) {
@@ -133,7 +140,6 @@ class FakePacket {
   revokeInvite() { throw new Error('not used'); }
   listInvites() { return []; }
   listContacts() { return []; }
-  listContactOrigins() { return {}; }
   removeContact() { throw new Error('not used'); }
 }
 
@@ -177,6 +183,7 @@ function incoming(overrides = {}) {
     text: 'Participant update',
     date: '2026-08-02T10:12:00.000Z',
     wire_id: 'wire-in-7',
+    reply_to: null,
     ...overrides,
   };
 }
@@ -191,6 +198,7 @@ function incomingFile(overrides = {}) {
     data: Buffer.from([0, 1, 2, 255]),
     date: '2026-08-02T10:12:30.000Z',
     wire_id: 'wire-file-in-9',
+    reply_to: null,
     ...overrides,
   };
 }
@@ -217,6 +225,20 @@ function fixture(options = {}) {
 function byKind(records, kind) { return records.filter((record) => record.kind === kind); }
 
 // ---- Durable file broadcast -------------------------------------------------
+
+test('intake preserves standard SDK reply references on archived messages and files', async () => {
+  const f = fixture();
+  f.packet.inbox.push(incoming({ reply_to: { wire_id: 'wire-parent-message', sentence: 2 } }));
+  f.packet.fileInbox.push(incomingFile({ reply_to: { wire_id: 'wire-parent-file' } }));
+
+  await f.pump.pump(ROOM_ID);
+
+  const records = await f.store.read(ROOM_ID);
+  assert.deepEqual(byKind(records, 'message')[0].source_reply_to, {
+    wire_id: 'wire-parent-message', sentence: 2,
+  });
+  assert.deepEqual(byKind(records, 'file')[0].source_reply_to, { wire_id: 'wire-parent-file' });
+});
 
 test('restart intake drains legacy invalid file metadata without archiving it or blocking later files', async () => {
   const f = fixture();
@@ -358,10 +380,10 @@ test('anonymous file metadata uses only the alias author and never leaks real se
   const [file] = byKind(await f.store.read(ROOM_ID), 'file');
   assert.equal(file.author.identity, 'cid-alice');
   assert.equal(file.author_alias.alias, 'builder #1');
-  for (const call of [...f.packet.sendCalls.map((send) => send.body), ...f.packet.signCalls]) {
+  for (const call of f.packet.sendCalls.map((send) => send.body)) {
     const bytes = Buffer.from(call, 'utf8');
     for (const leak of ['cid-alice', 'Alice', 'cid-bob', 'cid-cara', 'Untrusted current name']) {
-      assert.equal(bytes.includes(leak), false, `${leak} leaked into signed file metadata`);
+      assert.equal(bytes.includes(leak), false, `${leak} leaked into file metadata`);
     }
   }
   assert.deepEqual(JSON.parse(f.packet.sendCalls[0].body).author, {
@@ -397,8 +419,8 @@ test('canonical JSON recursively sorts keys and participant fan-out excludes its
     { status: 'queued', wire_id: 'wire-out' },
   ]);
 
-  const unsigned = JSON.parse(f.packet.signCalls[0]);
-  assert.deepEqual(unsigned, {
+  const envelope = JSON.parse(f.packet.sendCalls[0].body);
+  assert.deepEqual(envelope, {
     at: incoming().date,
     author: message.author,
     kind: 'room_msg',
@@ -407,10 +429,10 @@ test('canonical JSON recursively sorts keys and participant fan-out excludes its
     text: incoming().text,
     version: 1,
   });
-  assert.equal('signature' in unsigned, false);
-  assert.equal('recipient_identities' in unsigned, false);
+  assert.equal('signature' in envelope, false);
+  assert.equal('recipient_identities' in envelope, false);
   assert.deepEqual(Object.keys(JSON.parse(f.packet.sendCalls[0].body)).sort(),
-    ['at', 'author', 'kind', 'message_id', 'room_id', 'signature', 'text', 'version']);
+    ['at', 'author', 'kind', 'message_id', 'room_id', 'text', 'version']);
 });
 
 test('crash before message append leaves the input unread and creates no archive records', async () => {
@@ -515,7 +537,7 @@ test('crash after transport acceptance and before result fsync resends one stabl
   f.store.beforeAppend = undefined;
   await f.pump.resumePending(ROOM_ID);
   assert.equal(f.packet.sendCalls.length, 2, 'the result-less durable intent is deliberately retried');
-  assert.equal(f.packet.sendCalls[0].body, f.packet.sendCalls[1].body, 'retry keeps exact signed envelope stable');
+  assert.equal(f.packet.sendCalls[0].body, f.packet.sendCalls[1].body, 'retry keeps the canonical envelope byte-stable');
   assert.equal(JSON.parse(f.packet.sendCalls[0].body).message_id, MESSAGE_IDS[0]);
   const results = byKind(await f.store.read(ROOM_ID), 'relay_result');
   assert.equal(results.length, 1, 'one eventual terminal result belongs to the durable intent');
@@ -526,21 +548,10 @@ test('crash after transport acceptance and before result fsync resends one stabl
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 1);
 });
 
-test('sign and thrown send failures leave intents result-less and create no ghost results', async () => {
+test('thrown send failures leave intents result-less and create no ghost results', async () => {
   const f = fixture();
   f.store.rooms.set(ROOM_ID, room({ seats: room().seats.slice(0, 2) }));
   f.packet.inbox.push(incoming());
-  let failSign = true;
-  f.packet.beforeSign = () => {
-    if (failSign) {
-      failSign = false;
-      throw new Error('sign unavailable');
-    }
-  };
-  await assert.rejects(f.pump.pump(ROOM_ID), /sign unavailable/);
-  assert.equal(f.packet.sendCalls.length, 0);
-  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 0);
-
   let failSend = true;
   f.packet.beforeSend = () => {
     if (failSend) {
@@ -548,7 +559,7 @@ test('sign and thrown send failures leave intents result-less and create no ghos
       throw new Error('send outcome unknown');
     }
   };
-  await assert.rejects(f.pump.resumePending(ROOM_ID), /send outcome unknown/);
+  await assert.rejects(f.pump.pump(ROOM_ID), /send outcome unknown/);
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 0);
 
   await f.pump.resumePending(ROOM_ID);
@@ -566,36 +577,68 @@ test('an observed transport refusal appends a terminal send_failed result withou
   assert.equal('wire_id' in result, false);
 });
 
-test('non-seat and non-active messages are consumed but never archived, signed, or relayed', async () => {
+test('non-seat and non-active messages are consumed but never archived or relayed', async () => {
   for (const roomOverride of [{}, { state: 'provisioning', activated_at: undefined }]) {
     const f = fixture({ room: roomOverride });
     f.packet.inbox.push(incoming(roomOverride.state ? {} : { sender_id: 'cid-outsider' }));
     await f.pump.pump(ROOM_ID);
     assert.equal(f.packet.inbox.length, 0);
     assert.deepEqual(await f.store.read(ROOM_ID), []);
-    assert.equal(f.packet.signCalls.length, 0);
     assert.equal(f.packet.sendCalls.length, 0);
   }
 });
 
-test('an arrival between peek and consume is deferred to the next pass', async () => {
+test('an older row promoted after listing takes the full intake path before the expected acknowledgement retries', async () => {
   const f = fixture();
-  f.store.rooms.set(ROOM_ID, room({ seats: room().seats.slice(0, 2) }));
-  f.packet.inbox.push(incoming());
+  f.packet.inbox.push(incoming({
+    msg_id: 8, sender_id: 'cid-bob', wire_id: 'wire-in-8', text: 'Expected snapshot row',
+  }));
   let injected = false;
   f.packet.beforeConsume = () => {
     if (!injected) {
       injected = true;
-      f.packet.inbox.push(incoming({ msg_id: 8, sender_id: 'cid-bob', wire_id: 'wire-in-8', text: 'Raced arrival' }));
+      f.packet.inbox.unshift(incoming({ msg_id: 7, wire_id: 'wire-in-7', text: 'Older introduction row' }));
     }
   };
   await f.pump.pump(ROOM_ID);
-  assert.deepEqual(f.packet.consumeCalls, [[7]], 'the snapshot does not absorb the later arrival');
-  assert.deepEqual(f.packet.inbox.map((item) => item.msg_id), [8]);
+  const records = await f.store.read(ROOM_ID);
+  assert.deepEqual(byKind(records, 'message').map((message) => message.source_msg_id), [8, 7]);
+  assert.deepEqual(f.packet.consumeCalls, [[7], [8]], 'each SDK read result is handled exactly once');
+  assert.deepEqual(f.packet.acknowledgeCalls, [8], 'the already-read promoted row is never acknowledged again');
+  assert.equal(byKind(records, 'relay_intent').length, 4);
+  assert.equal(byKind(records, 'relay_result').length, 4);
+  assert.deepEqual(f.packet.inbox, []);
+});
+
+test('an empty acknowledgement response treats the durably archived expected row as already read', async () => {
+  const f = fixture();
+  f.store.rooms.set(ROOM_ID, room({ seats: room().seats.slice(0, 2) }));
+  f.packet.inbox.push(incoming());
+  f.packet.beforeConsume = () => { f.packet.inbox = []; };
 
   await f.pump.pump(ROOM_ID);
-  assert.deepEqual(f.packet.consumeCalls, [[7], [8]]);
-  assert.equal(byKind(await f.store.read(ROOM_ID), 'message').length, 2);
+
+  const records = await f.store.read(ROOM_ID);
+  assert.deepEqual(f.packet.acknowledgeCalls, [7]);
+  assert.deepEqual(f.packet.consumeCalls, []);
+  assert.equal(byKind(records, 'message').length, 1);
+  assert.equal(byKind(records, 'relay_intent').length, 1);
+  assert.equal(byKind(records, 'relay_result').length, 1);
+});
+
+test('intake bounds each history query and services files between message backlog batches', async () => {
+  const f = fixture({ room: { state: 'provisioning', activated_at: undefined } });
+  for (let msgId = 1; msgId <= 40; msgId += 1) {
+    f.packet.inbox.push(incoming({ msg_id: msgId, wire_id: `wire-backlog-${msgId}` }));
+  }
+  f.packet.fileInbox.push(incomingFile({ file_id: 41, wire_id: 'wire-backlog-file' }));
+
+  await f.pump.pump(ROOM_ID);
+
+  assert(f.packet.listCalls.every(([, limit]) => limit === 32));
+  assert.equal(f.packet.acknowledgeOrder.indexOf('file:41'), 32);
+  assert.equal(f.packet.acknowledgeOrder.at(-1), 'message:40');
+  assert.deepEqual(await f.store.read(ROOM_ID), []);
 });
 
 test('concurrent notify and pump calls serialize one archive message, intent, send, and result', async () => {
@@ -615,7 +658,7 @@ test('concurrent notify and pump calls serialize one archive message, intent, se
   assert.equal(byKind(records, 'relay_result').length, 1);
 });
 
-test('resumePending reconciles Task 5 briefing intents into signed room_briefing envelopes', async () => {
+test('resumePending reconciles briefing intents into canonical room_briefing envelopes', async () => {
   const briefingId = MESSAGE_IDS[2];
   const f = fixture({
     records: [
@@ -632,9 +675,9 @@ test('resumePending reconciles Task 5 briefing intents into signed room_briefing
     ],
   });
   await f.pump.resumePending(ROOM_ID);
-  const unsigned = JSON.parse(f.packet.signCalls[0]);
-  assert.equal(unsigned.kind, 'room_briefing');
-  assert.equal(unsigned.message_id, briefingId);
+  const envelope = JSON.parse(f.packet.sendCalls[0].body);
+  assert.equal(envelope.kind, 'room_briefing');
+  assert.equal(envelope.message_id, briefingId);
   assert.equal(f.packet.sendCalls[0].recipient, 'cid-alice');
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 1);
 });
@@ -784,7 +827,7 @@ test('notify chains a dirty replacement after a failed worker and still reports 
   assert.equal(calls, 2, 'dirty shutdown work must be handed to a replacement worker');
 });
 
-// ---- Rooms evolution Phase A3 (spec §4.2, §4.4, §8.3) — anonymity ----
+// ---- Anonymous-room intake and relay privacy -------------------------------
 
 function anonymousRoom(overrides = {}) {
   const base = room();
@@ -800,7 +843,7 @@ function anonymousRoom(overrides = {}) {
   };
 }
 
-test('anonymous rooms relay alias authors with zero real identity bytes in signed bodies (release-blocking pin)', async () => {
+test('anonymous rooms relay alias authors with zero real identity bytes in bodies (release-blocking pin)', async () => {
   const f = fixture({ room: anonymousRoom() });
   f.packet.inbox.push(incoming());
 
@@ -817,16 +860,16 @@ test('anonymous rooms relay alias authors with zero real identity bytes in signe
 
   const records = await f.store.read(ROOM_ID);
   const [message] = byKind(records, 'message');
-  // the archive keeps BOTH the real seat identity and the alias (INV-R4)
+  // The archive keeps both the real seat identity and the alias.
   assert.deepEqual(message.author, { identity: 'cid-alice', display_name: 'Alice', role: 'builder' });
   assert.deepEqual(message.author_alias, {
     participant_id: '01jz6y7n8p9q0r1s2t3v4w5xa1',
     alias: 'builder #1',
   });
 
-  // the relayed signed body carries only the room-scoped pseudonym
+  // the relayed body carries only the room-scoped pseudonym
   assert.equal(f.packet.sendCalls.length, 2);
-  for (const call of [...f.packet.sendCalls.map((send) => send.body), ...f.packet.signCalls]) {
+  for (const call of f.packet.sendCalls.map((send) => send.body)) {
     const bytes = Buffer.from(call, 'utf8');
     assert.equal(bytes.includes('cid-alice'), false, 'no author cid bytes in a relayed body');
     assert.equal(bytes.includes('Alice'), false, 'no author display-name bytes in a relayed body');
@@ -840,7 +883,7 @@ test('anonymous rooms relay alias authors with zero real identity bytes in signe
     role: 'builder',
   });
 
-  // default-level logs never pair an alias with a cid (§4.4 item 6)
+  // Default-level logs never pair an alias with a CID.
   for (const line of consoleLines) {
     assert.equal(line.includes('cid-alice') && line.includes('builder #1'), false, line);
   }
@@ -872,7 +915,7 @@ test('room-voice messages in anonymous rooms carry the room author and no seat i
 test('role-authored messages in anonymous rooms inherit the room-voice exemption from aliasing', async () => {
   // A REST role is room-side authorship, so it takes the same unaliased path the
   // room's own voice already takes here. The alias invariants constrain SEATS;
-  // there is no seat to substitute, so INV-R3/INV-R4 have nothing to apply to.
+  // There is no seat to substitute, so seat-alias rules do not apply.
   const f = fixture({ room: anonymousRoom({ rest_roles: ['Bot'] }) });
   await f.service.postAsRole(ROOM_ID, { role: 'Bot', text: 'Scripted update.' });
   assert.equal(f.packet.sendCalls.length, 3);
@@ -883,7 +926,7 @@ test('role-authored messages in anonymous rooms inherit the room-voice exemption
     // No `via` marker and no other new field: author.identity + author.role already
     // discriminate, so the relayed key set stays exactly what it pins above.
     assert.deepEqual(Object.keys(body).sort(),
-      ['at', 'author', 'kind', 'message_id', 'room_id', 'signature', 'text', 'version']);
+      ['at', 'author', 'kind', 'message_id', 'room_id', 'text', 'version']);
     for (const leak of ['cid-alice', 'cid-bob', 'cid-cara', 'Alice', 'Bob', 'Cara', 'builder #1']) {
       assert.equal(Buffer.from(call.body, 'utf8').includes(leak), false, `${leak} leaked into a role body`);
     }
@@ -930,7 +973,7 @@ test('history views: participant redacts to alias form and drops identities; ope
   assert.equal('recipient_identities' in plainView[0], false);
 });
 
-// ---- Rooms evolution Phase A4 (spec §5.2, §8.4) — removed members at intake ----
+// ---- Removed members at intake ---------------------------------------------
 
 function roomWithRemovedAlice(overrides = {}) {
   const base = room();
@@ -946,7 +989,7 @@ function roomWithRemovedAlice(overrides = {}) {
   };
 }
 
-test('a removed member gets exactly one content-free signed bounce and no archive residue', async () => {
+test('a removed member gets exactly one content-free bounce and no archive residue', async () => {
   const f = fixture({ room: roomWithRemovedAlice() });
   f.packet.inbox.push(incoming());
   await f.pump.pump(ROOM_ID);
@@ -961,7 +1004,7 @@ test('a removed member gets exactly one content-free signed bounce and no archiv
   const bounce = JSON.parse(f.packet.sendCalls[0].body);
   assert.equal(bounce.kind, 'room_not_member');
   assert.equal(bounce.room_id, ROOM_ID);
-  assert.deepEqual(Object.keys(bounce).sort(), ['kind', 'room_id', 'signature', 'version']);
+  assert.deepEqual(Object.keys(bounce).sort(), ['kind', 'room_id', 'version']);
   for (const leak of ['cid-bob', 'cid-cara', 'Bob', 'Cara', 'builder #1', 'Alice']) {
     assert.equal(Buffer.from(f.packet.sendCalls[0].body, 'utf8').includes(leak), false, `${leak} leaked into the bounce`);
   }
@@ -1004,9 +1047,9 @@ test('relay intents addressed to a removed seat resolve as skipped_removed and a
   assert.deepEqual(f.packet.sendCalls.map((call) => call.recipient), ['cid-bob']);
 });
 
-// ---- The outbound funnel (§8.3 pin coverage) --------------------------------
+// ---- The outbound privacy-test funnel --------------------------------------
 
-test('there is exactly ONE packet.send call site in src/, and it is the signing funnel', async () => {
+test('there is exactly ONE packet.send call site in src/, and it is the canonical envelope funnel', async () => {
   // WHAT THIS GUARDS, and why a count is the right shape for it.
   //
   // The byte-level privacy pins assert that no real cid, contact display name or
@@ -1026,7 +1069,7 @@ test('there is exactly ONE packet.send call site in src/, and it is the signing 
   // about behaviour that does not exist yet.
   //
   // If you are here because you added an outbound path: route it through
-  // `sendSignedBody` rather than raising the number. That is the whole point —
+  // `sendRoomBody` rather than raising the number. That is the whole point —
   // the funnel is what the pins already read, so going through it means your new
   // path is covered on the day you write it.
   const { readdirSync, readFileSync } = await import('node:fs');
@@ -1065,7 +1108,7 @@ test('there is exactly ONE packet.send call site in src/, and it is the signing 
       // `packet.send(` and `this.packet(...).send(` — the room-packet wire call.
       // `this.send(` / `this.child.send(` in src/daemon.ts are node IPC to the
       // supervised child process, not the ours wire, and are deliberately out of
-      // scope: they carry no signed body and no participant identity.
+      // scope: they carry no room body and no participant identity.
       if (/\bpacket\.send\s*\(/.test(line)) sites.push(`${file.slice(SRC.length + 1)}:${index + 1}`);
     });
   }
@@ -1073,25 +1116,23 @@ test('there is exactly ONE packet.send call site in src/, and it is the signing 
   assert.equal(
     sites.length,
     1,
-    'every signed body must leave through sendSignedBody.\n'
+    'every room body must leave through sendRoomBody.\n'
     + `  found: ${JSON.stringify(sites)}\n`
-    + '  If you added an outbound path, route it through sendSignedBody instead of\n'
+    + '  If you added an outbound path, route it through sendRoomBody instead of\n'
     + '  adding a site here — that is what puts it inside the anonymity pins.',
   );
   assert.match(sites[0], /^intake\.ts:\d+$/, `the one packet.send site moved outside intake.ts: ${sites[0]}`);
 
   // And the one site must actually BE the funnel, not merely the first match:
-  // a rename that moved the call out of sendSignedBody while keeping the count
+  // a rename that moved the call out of sendRoomBody while keeping the count
   // at one would satisfy the assertion above and defeat its purpose.
   const intake = readFileSync(join(SRC, 'intake.ts'), 'utf8');
-  const funnel = intake.slice(intake.indexOf('export async function sendSignedBody'));
+  const funnel = intake.slice(intake.indexOf('export async function sendRoomBody'));
   const funnelBody = funnel.slice(0, funnel.indexOf('\n}\n') + 3);
   assert.ok(
     /\bpacket\.send\s*\(/.test(funnelBody),
-    'the single packet.send call site must live inside sendSignedBody',
+    'the single packet.send call site must live inside sendRoomBody',
   );
-  assert.ok(
-    /packet\.sign\s*\(/.test(funnelBody),
-    'and sendSignedBody must be what signs it — an unsigned funnel is not the contract',
-  );
+  assert.doesNotMatch(funnelBody, /packet\.sign\s*\(/);
+  assert.match(funnelBody, /canonicalJson\s*\(/);
 });

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { basename, extname, join, relative, resolve, sep } from 'node:path';
 import test from 'node:test';
 
@@ -206,14 +206,13 @@ test('web release gate detects standalone, remote URL, persistence, and source-m
     webReleaseViolations(normalized(path), readFileSync(path, 'utf8'))), []);
 });
 
-test('recursive owned-source discovery covers configs/scripts/tests/fixtures/MUFL and excludes only pinned third-party source', () => {
+test('recursive owned-source discovery covers configs, scripts, tests, and fixtures while excluding dependency trees', () => {
   const sourceFiles = discoverOwnedSource();
   const targets = sourceFiles.map(normalized);
   for (const expected of [
-    '.github/workflows/ci.yml', '.gitmodules', 'build.mjs', 'package.json', 'package-lock.json',
-    'scripts/compile-mufl.sh', 'src/daemon.ts', 'tests/e2e.test.mjs', 'mufl_code/actor.mu', 'mufl_code/config.mufl',
-    'mufl_code/protocol_container.mm', 'tests/fixtures/permissive-actor.mu',
-    'tests/fixtures/97473F4B9BC707583A5D699722D6DB11BF29E80222E3DDA016F09EB1208A2163.muflo', 'tsconfig.json',
+    '.github/workflows/ci.yml', 'build.mjs', 'package.json', 'package-lock.json',
+    'src/daemon.ts', 'src/ours-runtime.ts', 'tests/e2e.test.mjs',
+    'tests/sdk-runtime.test.mjs', 'tsconfig.json',
   ]) assert(targets.includes(expected), `source discovery omitted ${expected}`);
   assert(targets.every((path) => !path.startsWith('mufl_code/core/')));
   assert.deepEqual(sourceFiles.flatMap((path) => {
@@ -235,7 +234,7 @@ test('README and every operator document preserve the exact wording boundary', (
   assert.doesNotMatch(documentationFiles.map((path) => readFileSync(path, 'utf8')).join('\n'), /management-token/i);
 });
 
-test('built distribution remains standalone and contains one compiled packet', () => {
+test('built distribution remains standalone and delegates packet ownership to the public SDK', () => {
   const distFiles = filesBelow(join(ROOT, 'dist'), new Set(['.js', '.json']));
   assert.deepEqual(distFiles.flatMap((path) => boundaryViolations(normalized(path), readFileSync(path, 'utf8'))), []);
   assert.doesNotMatch(distFiles.map((path) => readFileSync(path, 'utf8')).join('\n'), /management-token/i);
@@ -246,8 +245,10 @@ test('built distribution remains standalone and contains one compiled packet', (
   assert.match(readFileSync(join(ROOT, 'dist', 'cli.js'), 'utf8'), /room_name/);
   assert.match(readFileSync(join(ROOT, 'dist', 'cli.js'), 'utf8'), /--name/);
   assert.match(readFileSync(join(ROOT, 'dist', 'web', 'assets', 'app.js'), 'utf8'), /room_name/);
-  const packets = filesBelow(join(ROOT, 'dist', 'mufl_code'), new Set(['.muflo']));
-  assert.equal(packets.length, 1);
+  assert.equal(existsSync(join(ROOT, 'dist', 'mufl_code')), false);
+  const daemon = readFileSync(join(ROOT, 'dist', 'daemon.js'), 'utf8');
+  assert.match(daemon, /attachOursClient/);
+  assert.doesNotMatch(daemon, /@ours\.network\/sdk\/daemon|startDaemon|OURS_UNIT_DIR/);
 });
 
 test('npm dry-run pack list is the exact standalone release artifact', () => {
@@ -256,13 +257,12 @@ test('npm dry-run pack list is the exact standalone release artifact', () => {
   assert.equal(packs.length, 1);
   const paths = packs[0].files.map((file) => file.path).sort();
   assert.equal(paths.some((path) => path.startsWith('docs/superpowers/')), false);
-  const packetPaths = paths.filter((path) => /^dist\/mufl_code\/[0-9A-F]{64}\.muflo$/.test(path));
-  assert.equal(packetPaths.length, 1);
+  assert.equal(paths.some((path) => path.startsWith('dist/mufl_code/')), false);
   for (const required of WEB_RELEASE_ARTIFACTS) assert(paths.includes(required), `package omitted ${required}`);
-  assert.equal(paths.filter((path) => path.endsWith('.muflo')).length, 1);
+  assert.equal(paths.filter((path) => path.endsWith('.muflo')).length, 0);
   const expected = [
     'LICENSE', 'README.md', 'dist/cli.js', 'dist/daemon.js', 'package.json',
-    ...WEB_RELEASE_ARTIFACTS, ...DOC_NAMES, packetPaths[0],
+    ...WEB_RELEASE_ARTIFACTS, ...DOC_NAMES,
   ].sort();
   assert.deepEqual(paths, expected);
   assert.equal(paths.some((path) => /(?:^|\/)(?:src|tests)(?:\/|$)|secret|token|identity\.key|state_data\.bin/i.test(path)), false);
@@ -295,6 +295,57 @@ test('CI repeats E2E and invokes the asserted release gate', () => {
   assert.match(workflow, /node-version:\s*20/);
 });
 
+test('nightly runs the release gates and publishes a prerelease without release or repository authority', () => {
+  // Comment lines are stripped first: the header documents the triggers and
+  // permissions this gate forbids, and only the directives may be asserted on.
+  const workflow = readFileSync(join(ROOT, '.github', 'workflows', 'nightly.yml'), 'utf8')
+    .split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
+  const publishJobAt = workflow.indexOf('\n  publish-nightly:');
+  assert(publishJobAt > 0, 'nightly workflow has no publish job');
+  const gateJob = workflow.slice(0, publishJobAt);
+
+  // The npm credential must never be reachable from a trigger that can carry
+  // unmerged code, and must never run alongside the gates that execute it.
+  assert.doesNotMatch(workflow, /pull_request/);
+  assert.doesNotMatch(gateJob, /\bsecrets\./);
+  // Publishing and aliasing each need the credential, and both must live in
+  // the publish job — which is the property the old single-use count stood in
+  // for, asserted directly instead of by arithmetic.
+  const credentialUses = [...workflow.matchAll(/secrets\.NPM_TOKEN/g)].map((match) => match.index);
+  assert.equal(credentialUses.length, 2);
+  assert(credentialUses.every((at) => at > publishJobAt), 'the npm credential escaped the publish job');
+  assert.doesNotMatch(workflow, /secrets\.VERSION_BUMP_APP_(?:ID|PRIVATE_KEY)/);
+  assert.match(workflow, /^permissions:\n  contents: read$/m);
+  assert.doesNotMatch(workflow, /contents:\s*write|id-token:\s*write|packages:\s*write/);
+  assert.match(workflow, /if: github\.repository == 'adapt-toolkit\/ours-cowork'/);
+
+  // A nightly is a side channel: it may not move the dist-tag that
+  // .github/workflows/ci.yml publishes releases to. `nightly` is canonical and
+  // `next` is a compatibility alias applied with dist-tag, never a second
+  // publish — tests/dist-tags.test.mjs owns that contract in full.
+  const publishes = workflow.match(/npm publish[^\n]*/g);
+  assert.deepEqual(publishes, ['npm publish --access public --tag nightly']);
+  assert.deepEqual(workflow.match(/npm dist-tag[^\n]*/g), [
+    'npm dist-tag add @ours.network/cowork@${{ steps.version.outputs.version }} next',
+  ]);
+  assert.match(workflow, /bash \.github\/workflows\/scripts\/nightly-version\.sh/);
+  assert(existsSync(join(ROOT, '.github', 'workflows', 'scripts', 'nightly-version.sh')));
+
+  // The gate job is the CI gate set, run against the prerelease tip that the
+  // publish job then reuses verbatim.
+  assert.match(gateJob, /ref: prerelease/);
+  assert.match(workflow, /ref: \$\{\{ needs\.test\.outputs\.sha \}\}/);
+  assert.match(gateJob, /COWORK_CHROME_PATH:\s*\/usr\/bin\/google-chrome/);
+  assert.match(gateJob, /for i in 1 2 3; do node --test tests\/e2e\.test\.mjs \|\| exit 1; done/);
+  for (const command of [
+    'npm run typecheck', 'npm run typecheck:web', 'npm run build',
+    'npm run test:release', 'npm test', 'npm run test:web', 'npm run test:browser',
+  ]) {
+    assert(gateJob.includes(command), `${command} missing from the nightly gate job`);
+  }
+  assert.match(workflow, /node-version:\s*20/);
+});
+
 test('main runner rejects loaderless Node and undeclared direct loaders while covering every native suite', () => {
   assert.match(mainTestRunnerViolations(
     'node --test --test-concurrency=1 tests/*.test.mjs',
@@ -308,11 +359,11 @@ test('main runner rejects loaderless Node and undeclared direct loaders while co
   const suites = readdirSync(join(ROOT, 'tests'))
     .filter((name) => name.endsWith('.test.mjs'))
     .sort();
-  assert(suites.length >= 16, `main runner discovered only ${suites.length} native suites`);
+  assert(suites.length >= 15, `main runner discovered only ${suites.length} native suites`);
   for (const representative of [
-    'actor-protocol.test.mjs',
     'browser-smoke.test.mjs',
     'intake.test.mjs',
+    'sdk-runtime.test.mjs',
     'static-gates.test.mjs',
     'web-server.test.mjs',
   ]) {

@@ -1,22 +1,29 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { brotliDecompressSync } from 'node:zlib';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(THIS_FILE), '..');
 const CLI = join(ROOT, 'dist', 'cli.js');
-const UNIT_DIR = join(ROOT, 'mufl_code');
+const OURS_CLI = join(ROOT, 'node_modules', '@ours.network', 'cli', 'dist', 'cli.js');
 const SUCCESS = 'COWORK_E2E_DRIVER_SUCCESS';
 const FAILURE = 'COWORK_E2E_DRIVER_FAILURE';
-const NATIVE_CLI_TIMEOUT_MS = 125_000;
 const sleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
+
+function sharedDaemonEnvironment(configPath) {
+  const env = { ...process.env };
+  for (const key of [
+    'OURS_CONFIG', 'OURS_PORT', 'OURS_STATE_DIR', 'OURS_API_TOKEN',
+    'OURS_BROKER_URL', 'OURS_API_VISIBILITY', 'OURS_GC_INTERVAL_MS',
+  ]) delete env[key];
+  return { ...env, OURS_CONFIG: configPath };
+}
 
 async function unusedPort() {
   const server = createServer();
@@ -30,7 +37,7 @@ async function unusedPort() {
   return address.port;
 }
 
-async function waitFor(check, description, timeoutMs = 20_000) {
+async function waitFor(check, description, timeoutMs = 25_000) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
   while (Date.now() < deadline) {
@@ -53,70 +60,33 @@ async function waitForPort(port) {
   }), `broker port ${port}`);
 }
 
-function renderMessages(value) {
-  const messages = [];
-  for (let index = 0; ; index += 1) {
-    const message = value.Reduce(index);
-    if (message.IsNil()) break;
-    messages.push({
-      msg_id: Number(message.Reduce('msg_id').Visualize()),
-      sender_id: message.Reduce('sender_id').Visualize(),
-      sender_name: message.Reduce('sender_name').Visualize(),
-      text: message.Reduce('text').Visualize(),
-      status: message.Reduce('status').Visualize(),
-    });
-  }
-  return messages;
-}
-
-function renderFiles(value) {
-  const files = [];
-  for (let index = 0; ; index += 1) {
-    const file = value.Reduce(index);
-    if (file.IsNil()) break;
-    files.push({
-      file_id: Number(file.Reduce('file_id').Visualize()),
-      sender_id: file.Reduce('sender_id').Visualize(),
-      sender_name: file.Reduce('sender_name').Visualize(),
-      filename: file.Reduce('filename').Visualize(),
-      mime: file.Reduce('mime').Visualize(),
-      data: Buffer.from(file.Reduce('data').GetBinary()),
-      status: file.Reduce('status').Visualize(),
-    });
-  }
-  return files;
-}
-
-function roomEnvelopes(peer) {
-  return peer.inbox().flatMap((message) => {
-    try { return [{ ...JSON.parse(message.text), sender_id: message.sender_id }]; }
+function roomEnvelopes(messages) {
+  return messages.flatMap((message) => {
+    try { return [{ ...JSON.parse(message.text), source: message }]; }
     catch { return []; }
   });
 }
 
 if (process.argv.includes('--e2e-driver')) {
-  test('standalone cowork mission-room driver', async (t) => {
+  test('standard SDK cowork mission-room driver', async (t) => {
     const stateDir = mkdtempSync(join(tmpdir(), 'ours-cowork-e2e-'));
-    const packets = [];
+    const oursStateDir = join(stateDir, 'shared-ours');
     const cleanupErrors = [];
     const brokerErrors = [];
     let broker;
     let brokerExit;
-    let wrapper;
-    let env;
+    let oursEnv;
+    let coworkEnv;
+    let observer;
+    const peerClients = [];
     let completed = false;
     let driverFailure;
     const stage = (name) => process.stdout.write(`COWORK_E2E_STAGE ${name}\n`);
 
-    const nativeCommands = new Set(['create', 'invite', 'revoke', 'message', 'close', 'recover']);
-    const cliTimeout = (args) => args[0] === 'room' && nativeCommands.has(args[1])
-      ? NATIVE_CLI_TIMEOUT_MS
-      : 35_000;
-
-    async function runCli(args, timeoutMs = cliTimeout(args), expectedError) {
+    async function runCli(args, timeoutMs = 35_000, expectedError) {
       const child = spawn(process.execPath, [CLI, '--json', ...args], {
         cwd: ROOT,
-        env,
+        env: coworkEnv,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let stdout = '';
@@ -129,9 +99,7 @@ if (process.argv.includes('--e2e-driver')) {
           child.once('error', (error) => resolveExit({ error }));
           child.once('exit', (code, signal) => resolveExit({ code, signal }));
         }),
-        new Promise((resolveTimeout) => {
-          timer = setTimeout(() => resolveTimeout({ timeout: true }), timeoutMs);
-        }),
+        new Promise((resolveTimeout) => { timer = setTimeout(() => resolveTimeout({ timeout: true }), timeoutMs); }),
       ]);
       clearTimeout(timer);
       if (result.timeout) {
@@ -152,85 +120,98 @@ if (process.argv.includes('--e2e-driver')) {
       return body.result;
     }
 
-    function readonly(peer, name) {
-      return peer.pw.packet.ExecuteTransaction(peer.objectToValue({ name, targ: undefined }));
-    }
-
-    function mutate(peer, name, targ) {
-      return new Promise((resolveResult, rejectResult) => {
-        const timer = setTimeout(() => rejectResult(new Error(`${peer.name}.${name} timed out`)), 25_000);
-        peer.pending.push({ resolve: resolveResult, reject: rejectResult, timer });
-        peer.pw.add_client_message(peer.objectToValue({ name, targ }));
+    async function runOurs(args, timeoutMs = 35_000) {
+      const child = spawn(process.execPath, [
+        OURS_CLI,
+        ...args,
+        '--config', oursEnv.OURS_CONFIG,
+        '--json',
+      ], {
+        cwd: ROOT,
+        env: oursEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
       });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
+      child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
+      let timer;
+      const result = await Promise.race([
+        new Promise((resolveExit) => {
+          child.once('error', (error) => resolveExit({ error }));
+          child.once('exit', (code, signal) => resolveExit({ code, signal }));
+        }),
+        new Promise((resolveTimeout) => { timer = setTimeout(() => resolveTimeout({ timeout: true }), timeoutMs); }),
+      ]);
+      clearTimeout(timer);
+      if (result.timeout) {
+        child.kill('SIGKILL');
+        await new Promise((resolveExit) => child.once('exit', resolveExit));
+        throw new Error(`ours CLI timed out: ${args.join(' ')}`);
+      }
+      if (result.error) throw result.error;
+      if (result.code !== 0) {
+        throw new Error(`ours CLI failed (${args.join(' ')}): exit=${result.code} ${stdout}\n${stderr}`);
+      }
+      let body;
+      try { body = JSON.parse(stdout); }
+      catch { throw new Error(`ours CLI returned invalid JSON (${args.join(' ')}): ${stdout}\n${stderr}`); }
+      return body;
     }
 
-    async function createPeer(name, seed, unit, PacketWrapperConfigurator, objectToValue) {
-      const config = new PacketWrapperConfigurator();
-      config.process_arguments(['--unit_hash', unit.hash, '--seed_phrase', seed, '--unit_dir_path', unit.dir]);
-      const peer = { name, cid: '', pw: undefined, pending: [], rejects: [], objectToValue };
-      await new Promise((resolveCreated, rejectCreated) => {
-        const timer = setTimeout(() => rejectCreated(new Error(`${name} creation timed out`)), 30_000);
-        wrapper.packet_manager.create_packet(config, (pw) => {
-          clearTimeout(timer);
-          peer.pw = pw;
-          peer.cid = pw.packet.GetContainerID().Visualize();
-          pw.on_return_data = (data) => {
-            const kind = data.Reduce('kind').Visualize();
-            if (kind === 'save_state' || kind === 'notify_agent') return;
-            const pending = peer.pending.shift();
-            if (!pending) return;
-            clearTimeout(pending.timer);
-            pending.resolve(data.Reduce('payload'));
-          };
-          pw.on_transaction_failure = (message) => {
-            const pending = peer.pending.shift();
-            if (pending) {
-              clearTimeout(pending.timer);
-              pending.reject(new Error(String(message)));
-            } else peer.rejects.push(String(message));
-          };
-          resolveCreated();
-        }, unit.bytes);
-      });
-      peer.inbox = () => renderMessages(readonly(peer, '::actor::list_incoming_messages'));
-      peer.fileInbox = () => renderFiles(readonly(peer, '::actor::list_incoming_files'));
-      peer.contacts = () => readonly(peer, '::a2a_messaging::list_contacts').Visualize();
-      packets.push(peer);
-      await mutate(peer, '::a2a_messaging::set_my_name', { name });
-      return peer;
+    async function contacts(peer) {
+      return (await peer.client.listContacts()).contacts;
     }
 
-    async function joinInvite(peer, encoded) {
-      const raw = brotliDecompressSync(Buffer.from(encoded, 'base64url'));
-      const invite = peer.pw.packet.NewBinaryFromBuffer(raw);
-      await mutate(peer, '::a2a_messaging::add_contact', { invite });
+    async function messages(peer) {
+      const history = await peer.client.listHistory({ limit: 200 });
+      return history.items.filter((message) => message.direction === 'in');
     }
 
-    async function send(peer, roomCid, text) {
-      await mutate(peer, '::a2a_messaging::send_message', { contact: roomCid, text });
+    async function joinInvite(peer, invite) {
+      return peer.client.addContact({ invite });
     }
 
-    async function sendFile(peer, roomCid, filename, mime, data) {
-      await mutate(peer, '::a2a_messaging::send_file', {
+    async function send(peer, roomCid, text, reply) {
+      return peer.client.sendMessage({
         contact: roomCid,
-        filename,
-        mime,
-        data: peer.pw.packet.NewBinaryFromBuffer(Buffer.from(data)),
+        text,
+        ...(reply === undefined ? {} : {
+          reply_to_wire_id: reply.wire_id,
+          ...(reply.sentence === undefined ? {} : { reply_to_sentence: reply.sentence }),
+        }),
       });
     }
 
-    async function getFiles(peer) {
-      return renderFiles((await mutate(peer, '::actor::get_files', {})).Reduce('files'));
+    async function createPeer(attachOursClient, name) {
+      const client = await attachOursClient({
+        env: oursEnv,
+        leaseToken: `cowork-e2e-${name.toLowerCase()}`,
+      });
+      const created = await client.createIdentity({
+        name,
+        bio: `cowork E2E participant ${name}`,
+        exposeLocal: false,
+        localAutoAccept: true,
+      });
+      return { name, cid: created.info.cid, client };
     }
 
     t.after(async () => {
-      for (const packet of packets) {
-        try { wrapper?.remove_packet(packet.cid); }
-        catch (error) { cleanupErrors.push(new Error(`remove ${packet.name}: ${error.message}`)); }
-      }
-      if (env) {
+      let coworkLogs = '';
+      if (coworkEnv) {
         try { await runCli(['stop'], 20_000); }
-        catch (error) { cleanupErrors.push(new Error(`stop daemon: ${error.message}`)); }
+        catch (error) { cleanupErrors.push(new Error(`stop cowork daemon: ${error.message}`)); }
+      }
+      for (const client of peerClients) {
+        try { await client.releaseLease(); }
+        catch (error) { cleanupErrors.push(new Error(`release peer lease: ${error.message}`)); }
+      }
+      try { await observer?.releaseLease(); }
+      catch (error) { cleanupErrors.push(new Error(`release observer lease: ${error.message}`)); }
+      if (oursEnv) {
+        try { await runOurs(['daemon', 'stop'], 20_000); }
+        catch (error) { cleanupErrors.push(new Error(`stop shared ours daemon: ${error.message}`)); }
       }
       if (broker) {
         broker.kill('SIGKILL');
@@ -241,6 +222,8 @@ if (process.argv.includes('--e2e-driver')) {
           ]);
         } catch (error) { cleanupErrors.push(error); }
       }
+      const coworkLogPath = join(stateDir, 'cowork', 'daemon.log');
+      if (existsSync(coworkLogPath)) coworkLogs = readFileSync(coworkLogPath, 'utf8').slice(-8_000);
       try { rmSync(stateDir, { recursive: true, force: true }); }
       catch (error) { cleanupErrors.push(error); }
       process.stdout.write(completed && cleanupErrors.length === 0
@@ -249,26 +232,15 @@ if (process.argv.includes('--e2e-driver')) {
           driver: driverFailure?.stack ?? 'driver incomplete',
           cleanup: cleanupErrors.map((error) => error.stack ?? error.message),
           broker: brokerErrors.join('').slice(-4_000),
+          cowork: coworkLogs,
         })}\n`);
       if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, 'E2E cleanup failed');
     });
 
     try {
       assert(existsSync(CLI), 'build the daemon and CLI before running E2E');
-      const unitFile = readdirSync(UNIT_DIR).find((name) => name.endsWith('.muflo'));
-      assert(unitFile, 'compile the cowork packet before running E2E');
+      assert(existsSync(OURS_CLI), 'install @ours.network/cli 2.0.1 before running E2E');
       const port = await unusedPort();
-      const configPath = join(stateDir, 'config.json');
-      writeFileSync(configPath, JSON.stringify({
-        version: 1,
-        brokerUrl: `ws://127.0.0.1:${port}`,
-        stateDir,
-        rest: { enabled: false, port: 3052 },
-      }), { mode: 0o600 });
-      env = {
-        ...process.env,
-        OURS_COWORK_CONFIG: configPath,
-      };
 
       broker = spawn(process.execPath, [join(ROOT, 'node_modules/.bin/adapt-broker'), '--host', '127.0.0.1', '--port', String(port), '--test_mode'], {
         cwd: ROOT,
@@ -282,294 +254,139 @@ if (process.argv.includes('--e2e-driver')) {
       await waitForPort(port);
       stage('broker-ready');
 
-      const [{ adapt_wrapper }, { PacketWrapperConfigurator }, { object_to_adapt_value }] = await Promise.all([
-        import('@adapt-toolkit/sdk/executables'),
-        import('@adapt-toolkit/sdk/wrappers'),
-        import('@adapt-toolkit/sdk/wrapper'),
-      ]);
-      wrapper = await adapt_wrapper.start([
-        '--broker_address', `ws://127.0.0.1:${port}`,
-        '--test_mode',
-        '--logger_config', '--level', 'WARNING', '--stdout', 'stderr', '--logger_config_end',
-      ]);
-      wrapper.start();
-      const unit = {
-        dir: UNIT_DIR,
-        hash: unitFile.slice(0, -'.muflo'.length),
-        bytes: new Uint8Array(readFileSync(join(UNIT_DIR, unitFile))),
-      };
+      const oursPort = await unusedPort();
+      const oursConfigPath = join(stateDir, 'ours-config.json');
+      writeFileSync(oursConfigPath, JSON.stringify({
+        brokerUrl: `ws://127.0.0.1:${port}`,
+        port: oursPort,
+        stateDir: oursStateDir,
+        apiVisibility: 'owner',
+      }), { mode: 0o600 });
+      oursEnv = sharedDaemonEnvironment(oursConfigPath);
+      await runOurs(['daemon', 'start']);
+      await waitForPort(oursPort);
+      const { attachOursClient } = await import('@ours.network/sdk');
+      observer = await attachOursClient({ env: oursEnv, leaseToken: 'cowork-e2e-observer' });
       const [alice, bob, charlie] = await Promise.all([
-        createPeer('Alice', `e2e-alice-${Date.now()}`, unit, PacketWrapperConfigurator, object_to_adapt_value),
-        createPeer('Bob', `e2e-bob-${Date.now()}`, unit, PacketWrapperConfigurator, object_to_adapt_value),
-        createPeer('Charlie', `e2e-charlie-${Date.now()}`, unit, PacketWrapperConfigurator, object_to_adapt_value),
+        createPeer(attachOursClient, 'Alice'),
+        createPeer(attachOursClient, 'Bob'),
+        createPeer(attachOursClient, 'Charlie'),
       ]);
+      peerClients.push(alice.client, bob.client, charlie.client);
       stage('participants-ready');
+
+      const configPath = join(stateDir, 'cowork-config.json');
+      writeFileSync(configPath, JSON.stringify({
+        version: 1,
+        stateDir: join(stateDir, 'cowork'),
+        rest: { enabled: false, port: 3052 },
+      }), { mode: 0o600 });
+      coworkEnv = { ...oursEnv, OURS_COWORK_CONFIG: configPath };
 
       await runCli(['start']);
       await waitFor(async () => (await runCli(['status'])).running === true, 'authenticated daemon status');
       stage('daemon-ready');
 
-      // Prove invite behavior with effects, not receipt metadata. Separate room
-      // CIDs ensure a refused one-time attempt cannot leave a peer handshake
-      // that interferes with the independent public-reuse proof.
-      const oneTimeProof = await runCli(['room', 'create', '--goal', 'Prove one-time semantics', '--briefing', 'One-time proof briefing']);
-      const proofOneTime = await runCli(['room', 'invite', oneTimeProof.room_id, '--mode', 'one_time', '--role', 'single', '--min-accepts', '1']);
-      await joinInvite(alice, proofOneTime.blob);
-      await waitFor(() => alice.contacts().includes(oneTimeProof.identity_cid), 'first one-time redemption');
-      await joinInvite(bob, proofOneTime.blob);
-
-      const publicProof = await runCli(['room', 'create', '--goal', 'Prove public semantics', '--briefing', 'Public proof briefing']);
-      const proofPublic = await runCli(['room', 'invite', publicProof.room_id, '--mode', 'public', '--role', 'shared', '--min-accepts', '2']);
-      await Promise.all([joinInvite(bob, proofPublic.blob), joinInvite(charlie, proofPublic.blob)]);
-      await waitFor(() => bob.contacts().includes(publicProof.identity_cid)
-        && charlie.contacts().includes(publicProof.identity_cid), 'two public invite redemptions');
-      await waitFor(async () => (await runCli(['room', 'show', publicProof.room_id])).state === 'active',
-        'public acceptance notification activation');
-      await waitFor(() => !bob.contacts().includes(oneTimeProof.identity_cid), 'second one-time redemption refusal');
-      await runCli(['restart']);
-      const oneTimeRoom = await runCli(['room', 'show', oneTimeProof.room_id]);
-      const publicRoom = await runCli(['room', 'show', publicProof.room_id]);
-      assert.equal(oneTimeRoom.state, 'active');
-      assert.equal(publicRoom.state, 'active');
-      assert.deepEqual(oneTimeRoom.seats.map((seat) => [seat.identity, seat.role, seat.invite_id]), [
-        [alice.cid, 'single', proofOneTime.invite.invite_id],
+      const created = await runCli([
+        'room', 'create', '--name', '  Cafe\u0301 launch 🤖  ',
+        '--goal', 'Ship the release', '--briefing', 'Keep evidence and blockers explicit',
       ]);
-      assert.deepEqual(
-        publicRoom.seats.map((seat) => [seat.identity, seat.role, seat.invite_id]).sort(([left], [right]) => left.localeCompare(right)),
-        [
-          [bob.cid, 'shared', proofPublic.invite.invite_id],
-          [charlie.cid, 'shared', proofPublic.invite.invite_id],
-        ].sort(([left], [right]) => left.localeCompare(right)),
-      );
-      assert.deepEqual(
-        oneTimeRoom.invites.find((invite) => invite.invite_id === proofOneTime.invite.invite_id).accepted_cids,
-        [alice.cid],
-        'the second one-time redemption is refused and never admitted',
-      );
-      assert.equal(bob.contacts().includes(oneTimeProof.identity_cid), false);
-      assert.deepEqual(
-        new Set(publicRoom.invites.find((invite) => invite.invite_id === proofPublic.invite.invite_id).accepted_cids),
-        new Set([bob.cid, charlie.cid]),
-        'one public blob admits two distinct exact origins',
-      );
-      await runCli(['room', 'close', oneTimeProof.room_id]);
-      await runCli(['room', 'close', publicProof.room_id]);
-      await runCli(['room', 'delete', oneTimeProof.room_id, '--yes']);
-      await runCli(['room', 'delete', publicProof.room_id, '--yes']);
-      stage('invite-redemption-semantics');
-
-      const created = await runCli(['room', 'create', '--name', '  Cafe\u0301 launch 🤖  ', '--goal', 'Ship the release', '--briefing', 'Keep evidence and blockers explicit']);
       const roomId = created.room_id;
       const roomCid = created.identity_cid;
-      stage('room-created');
       assert.match(roomId, /^[0-7][0-9a-hjkmnp-tv-z]{25}$/);
       assert.equal(created.room_name, 'Café launch 🤖');
-      assert.equal(created.identity_name, 'ours-cowork-room:Café launch 🤖');
-      assert.equal((await runCli(['room', 'list'])).find((candidate) => candidate.room_id === roomId).room_name, 'Café launch 🤖');
-      const renamed = await runCli(['room', 'settings', roomId, '--name', 'Delivery bridge']);
-      assert.equal(renamed.room_name, 'Delivery bridge');
-      assert.equal(renamed.room_id, roomId);
-      assert.equal(renamed.identity_name, created.identity_name);
-      assert.equal(renamed.identity_cid, roomCid);
+      assert.equal(created.identity_name, `ours-cowork-${roomId}`);
+      stage('room-created');
 
-      const oneTime = await runCli(['room', 'invite', roomId, '--mode', 'one_time', '--role', 'lead', '--min-accepts', '1']);
-      const publicInvite = await runCli(['room', 'invite', roomId, '--mode', 'public', '--role', 'reviewer', '--min-accepts', '1']);
-      assert.equal(oneTime.invite.mode, 'one_time');
-      assert.equal(oneTime.reusable, false);
-      assert.equal(publicInvite.invite.mode, 'public');
-      assert.equal(publicInvite.reusable, true);
-
-      await joinInvite(alice, oneTime.blob);
-      await waitFor(() => alice.contacts().includes(roomCid), 'Alice one-time contact');
+      const invitation = await runCli([
+        'room', 'invite', roomId, '--mode', 'public', '--role', 'reviewer', '--min-accepts', '2',
+      ]);
+      await Promise.all([joinInvite(alice, invitation.blob), joinInvite(bob, invitation.blob)]);
+      await waitFor(() => Promise.all([contacts(alice), contacts(bob)]).then(([a, b]) =>
+        a.some((contact) => contact.container_id === roomCid)
+          && b.some((contact) => contact.container_id === roomCid)), 'SDK invite redemptions');
       let room = await waitFor(async () => {
         const candidate = await runCli(['room', 'show', roomId]);
-        return candidate.seats.some((seat) => seat.identity === alice.cid) ? candidate : undefined;
-      }, 'Alice acceptance notification admission');
-      assert.equal(room.state, 'provisioning', 'public min_accepts keeps the room provisioning');
-      assert.deepEqual(room.seats.map(({ identity, role, invite_id }) => ({ identity, role, invite_id })), [{
-        identity: alice.cid, role: 'lead', invite_id: oneTime.invite.invite_id,
-      }]);
-      stage('one-time-admitted');
-
-      await joinInvite(bob, publicInvite.blob);
-      await waitFor(() => bob.contacts().includes(roomCid), 'Bob public contact');
-      await send(bob, roomCid, 'immediate message after acceptance');
-      room = await waitFor(async () => {
-        const candidate = await runCli(['room', 'show', roomId]);
         return candidate.state === 'active' ? candidate : undefined;
-      }, 'room activation at exact minimum');
-      assert.equal(room.invites.find((invite) => invite.invite_id === publicInvite.invite.invite_id).min_accepts, 1);
-      assert.deepEqual(room.seats.map((seat) => [seat.identity, seat.role, seat.invite_id]), [
-        [alice.cid, 'lead', oneTime.invite.invite_id],
-        [bob.cid, 'reviewer', publicInvite.invite.invite_id],
-      ]);
-      await waitFor(() => roomEnvelopes(alice).some((message) => message.kind === 'room_briefing' && message.text === created.mission.briefing), 'Alice initial briefing');
-      await waitFor(() => roomEnvelopes(bob).some((message) => message.kind === 'room_briefing' && message.text === created.mission.briefing), 'Bob initial briefing');
-      await waitFor(() => roomEnvelopes(alice).some((message) => message.text === 'immediate message after acceptance'
-        && message.author.identity === bob.cid), 'immediate accepted participant message relay');
-      stage('activated-and-briefed');
+      }, 'room activation');
+      assert.deepEqual(new Set(room.seats.map((seat) => seat.identity)), new Set([alice.cid, bob.cid]));
+      assert(room.seats.every((seat) => seat.role === 'reviewer'));
+      stage('activated');
+
+      const aliceBriefing = await waitFor(async () => (await messages(alice)).find((message) => {
+        try { return JSON.parse(message.text).kind === 'room_briefing'; }
+        catch { return false; }
+      }), 'Alice SDK briefing');
+      await waitFor(async () => (await messages(bob)).some((message) => {
+        try { return JSON.parse(message.text).kind === 'room_briefing'; }
+        catch { return false; }
+      }), 'Bob SDK briefing');
 
       await send(alice, roomCid, 'participant relay from Alice');
-      await waitFor(() => roomEnvelopes(bob).some((message) => message.text === 'participant relay from Alice'
-        && message.author.identity === alice.cid && message.author.role === 'lead'), 'participant relay with exact attribution');
-      assert.equal(roomEnvelopes(alice).some((message) => message.text === 'participant relay from Alice'), false);
-      stage('participant-relayed');
-
-      const aliceBytes = Buffer.from([0, 1, 2, 255, 0, 7]);
-      await sendFile(alice, roomCid, 'alice-evidence.bin', 'application/octet-stream', aliceBytes);
-      await waitFor(
-        () => bob.fileInbox().some((file) => file.filename === 'alice-evidence.bin'),
-        'Alice file relayed through room to Bob inbox',
-      );
-      let received = await getFiles(bob);
-      assert.equal(received.length, 1);
-      assert.equal(received[0].sender_id, roomCid);
-      assert.equal(received[0].mime, 'application/octet-stream');
-      assert.deepEqual(received[0].data, aliceBytes);
-      assert.equal(received[0].status, 'processed');
-      await waitFor(() => roomEnvelopes(bob).some((message) => message.kind === 'room_file'
-        && message.filename === 'alice-evidence.bin'
-        && message.author.identity === alice.cid), 'Alice signed file metadata at Bob');
-
-      const bobBytes = Buffer.from('Bob evidence with NUL\0and UTF-8 ✓');
-      await sendFile(bob, roomCid, 'bob-evidence.txt', 'text/plain; charset=utf-8', bobBytes);
-      await waitFor(
-        () => alice.fileInbox().some((file) => file.filename === 'bob-evidence.txt'),
-        'Bob file relayed through room to Alice inbox',
-      );
-      received = await getFiles(alice);
-      assert.equal(received.length, 1);
-      assert.equal(received[0].sender_id, roomCid);
-      assert.equal(received[0].mime, 'text/plain; charset=utf-8');
-      assert.deepEqual(received[0].data, bobBytes);
-      assert.equal(received[0].status, 'processed');
-      await waitFor(() => roomEnvelopes(alice).some((message) => message.kind === 'room_file'
-        && message.filename === 'bob-evidence.txt'
-        && message.author.identity === bob.cid), 'Bob signed file metadata at Alice');
-      const archivedFiles = await waitFor(async () => {
+      await waitFor(async () => {
         const history = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
-        const files = history.filter((record) => record.kind === 'file');
-        return files.length === 2 ? files : undefined;
-      }, 'canonical file rows archived by the real daemon');
-      assert.deepEqual(archivedFiles.map((record) => ({
-        author: record.author,
-        filename: record.filename,
-        mime: record.mime,
-        size: record.size,
-        sha256: record.sha256,
-        data_base64: record.data_base64,
-        recipient_identities: record.recipient_identities,
-      })), [
-        {
-          author: { identity: alice.cid, display_name: 'Alice', role: 'lead' },
-          filename: 'alice-evidence.bin',
-          mime: 'application/octet-stream',
-          size: aliceBytes.length,
-          sha256: createHash('sha256').update(aliceBytes).digest('hex'),
-          data_base64: aliceBytes.toString('base64'),
-          recipient_identities: [bob.cid],
-        },
-        {
-          author: { identity: bob.cid, display_name: 'Bob', role: 'reviewer' },
-          filename: 'bob-evidence.txt',
-          mime: 'text/plain; charset=utf-8',
-          size: bobBytes.length,
-          sha256: createHash('sha256').update(bobBytes).digest('hex'),
-          data_base64: bobBytes.toString('base64'),
-          recipient_identities: [alice.cid],
-        },
-      ]);
-      assert(archivedFiles.every((record) => Number.isSafeInteger(record.seq)
-        && record.record_id === `${roomId}:${record.seq}`
-        && Number.isSafeInteger(record.source_file_id)));
-      const archivedFileSnapshot = structuredClone(archivedFiles);
-      stage('files-relayed-both-directions');
+        return history.some((record) => record.kind === 'message' && record.text === 'participant relay from Alice');
+      }, 'participant message in cowork archive');
+      await waitFor(async () => roomEnvelopes(await messages(bob)).some((message) =>
+        message.text === 'participant relay from Alice'
+          && message.author.identity === alice.cid), 'participant SDK message relay');
 
-      const operatorRecord = await runCli(['room', 'message', roomId, '--text', 'operator voice']);
-      assert.equal(operatorRecord.author.identity, roomCid);
-      assert.equal(operatorRecord.author.role, 'room');
-      await waitFor(() => [alice, bob].every((peer) => roomEnvelopes(peer).some((message) =>
-        message.text === 'operator voice' && message.author.identity === roomCid)), 'operator voice fan-out');
-      stage('operator-relayed');
+      await send(alice, roomCid, 'reply through the room', { wire_id: aliceBriefing.wire_id, sentence: 1 });
+      const replyRecord = await waitFor(async () => {
+        const history = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
+        return history.find((record) => record.kind === 'message' && record.text === 'reply through the room');
+      }, 'archived SDK reply reference');
+      assert.deepEqual(replyRecord.source_reply_to, { wire_id: aliceBriefing.wire_id, sentence: 1 });
+      stage('messages-and-replies');
 
-      const firstPage = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '2']);
-      assert.equal(firstPage.length, 2);
-      assert(firstPage.every((record) => Number.isSafeInteger(record.seq)));
-      const secondPage = await runCli(['room', 'history', roomId, '--after', String(firstPage.at(-1).seq), '--limit', '2']);
-      assert(secondPage.length > 0);
-      assert(secondPage.every((record) => record.seq > firstPage.at(-1).seq));
-      stage('history-paged');
+      const bytes = Buffer.from([0, 1, 2, 255, 0, 7]);
+      await alice.client.sendFile({
+        contact: roomCid,
+        data_base64: bytes.toString('base64'),
+        filename: 'alice-evidence.bin',
+        mime: 'application/octet-stream',
+        reply_to_wire_id: aliceBriefing.wire_id,
+      });
+      const fileMeta = await waitFor(async () => (await bob.client.listIncomingFiles())
+        .find((file) => file.filename === 'alice-evidence.bin'), 'SDK file relay');
+      await bob.client.getFiles({ wire_ids: [fileMeta.wire_id] });
+      assert.deepEqual(Buffer.from(await bob.client.fetchFile(fileMeta.wire_id)), bytes);
+      const archivedFile = await waitFor(async () => {
+        const history = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
+        return history.find((record) => record.kind === 'file' && record.filename === 'alice-evidence.bin');
+      }, 'archived SDK file');
+      assert.equal(archivedFile.sha256, createHash('sha256').update(bytes).digest('hex'));
+      assert.deepEqual(archivedFile.source_reply_to, { wire_id: aliceBriefing.wire_id });
+      stage('files');
 
-      await runCli(['restart']);
+      await runCli(['restart'], 45_000);
       room = await runCli(['room', 'show', roomId]);
-      assert.equal(room.identity_cid, roomCid, 'room CID is stable across daemon restart');
-      assert.equal(room.identity_name, created.identity_name, 'announced identity name is stable across daemon restart');
-      assert.deepEqual(
-        (await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']))
-          .filter((record) => record.kind === 'file'),
-        archivedFileSnapshot,
-        'authoritative file rows and bytes survive daemon restart unchanged',
-      );
-      const oldPublic = room.invites.find((invite) => invite.invite_id === publicInvite.invite.invite_id);
-      assert.equal(oldPublic.state, 'replacement_required');
-      const replacements = await runCli(['room', 'recover', roomId]);
-      assert.equal(replacements.length, 1);
-      const replacement = replacements[0];
-      assert.equal(replacement.recovery_of, publicInvite.invite.invite_id);
-      assert.notEqual(replacement.invite.invite_id, publicInvite.invite.invite_id);
-      assert.equal(replacement.invite.state, 'receipt_pending');
-      stage('restarted-and-replaced');
-
-      await joinInvite(charlie, replacement.blob);
-      await waitFor(() => charlie.contacts().includes(roomCid), 'Charlie replacement contact');
-      assert.equal((await runCli(['room', 'participants', roomId])).some((seat) => seat.identity === charlie.cid), false);
-      await send(charlie, roomCid, 'refused non-seat message');
-      await runCli(['room', 'message', roomId, '--text', 'non-seat processing barrier']);
-      const afterRefusal = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
-      assert.equal(afterRefusal.some((record) => record.kind === 'message' && record.text === 'refused non-seat message'), false);
-      assert.equal([alice, bob].some((peer) => roomEnvelopes(peer).some((message) => message.text === 'refused non-seat message')), false);
-      stage('non-seat-refused');
-
-      await runCli(['room', 'recover', roomId, '--confirm', publicInvite.invite.invite_id, replacement.invite.invite_id]);
-      const seats = await runCli(['room', 'participants', roomId]);
-      const charlieSeat = seats.find((seat) => seat.identity === charlie.cid);
-      assert.deepEqual(
-        { role: charlieSeat.role, invite_id: charlieSeat.invite_id },
-        { role: 'reviewer', invite_id: replacement.invite.invite_id },
-      );
-      await waitFor(() => roomEnvelopes(charlie).some((message) => message.kind === 'room_briefing'
-        && message.text === created.mission.briefing), 'late participant briefing');
-      const historyAfterLateJoin = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
-      const briefingMessages = historyAfterLateJoin.filter((record) => record.kind === 'message' && record.category === 'briefing');
-      assert.deepEqual(briefingMessages.map((record) => record.recipient_identities), [[alice.cid, bob.cid], [charlie.cid]]);
-      stage('late-seat-briefed');
-
-      await send(charlie, roomCid, 'late participant relay');
-      await waitFor(() => [alice, bob].every((peer) => roomEnvelopes(peer).some((message) =>
-        message.text === 'late participant relay' && message.author.identity === charlie.cid)), 'late participant relay');
-      stage('late-seat-relayed');
+      assert.equal(room.identity_cid, roomCid);
+      assert.equal(room.identity_name, created.identity_name);
+      const oldInvite = room.invites.find((invite) => invite.invite_id === invitation.invite.invite_id);
+      assert.equal(oldInvite.state, 'live');
+      await joinInvite(charlie, invitation.blob);
+      await waitFor(async () => (await contacts(charlie)).some((contact) => contact.container_id === roomCid),
+        'Charlie live invite redemption after cowork restart');
+      await waitFor(async () => (await runCli(['room', 'participants', roomId]))
+        .some((seat) => seat.identity === charlie.cid), 'shared-daemon invite admission after cowork restart');
+      stage('restart-and-live-invite');
 
       const closed = await runCli(['room', 'close', roomId]);
       assert.equal(closed.state, 'closed');
-      await waitFor(() => [alice, bob, charlie].every((peer) => !peer.contacts().includes(roomCid)), 'bilateral contact removal');
-      const roomDir = join(stateDir, 'rooms', roomId);
-      assert.equal(existsSync(join(roomDir, 'live')), false, 'closed room has empty live residue');
-      assert.equal(existsSync(join(roomDir, 'room.json')), true, 'closed metadata is retained');
-      assert.equal(existsSync(join(roomDir, 'archive.jsonl')), true, 'closed archive is retained');
-      assert(readFileSync(join(roomDir, 'archive.jsonl'), 'utf8').trim().length > 0);
-      const closedHistory = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
-      assert(closedHistory.length > 0);
-      assert.deepEqual(
-        closedHistory.filter((record) => record.kind === 'file'),
-        archivedFileSnapshot,
-        'closed-room history retains the exact authoritative file rows',
-      );
-      stage('closed-and-retained');
-
+      await waitFor(async () => !(await observer.identities())
+        .some((identity) => identity.name === created.identity_name),
+      'room identity deletion from the shared daemon');
+      await waitFor(() => Promise.all([contacts(alice), contacts(bob), contacts(charlie)]).then((rows) =>
+        rows.every((contactsList) => !contactsList.some((contact) => contact.container_id === roomCid))),
+      'bilateral SDK contact removal');
+      const roomDir = join(stateDir, 'cowork', 'rooms', roomId);
+      assert.equal(existsSync(join(roomDir, 'room.json')), true);
+      assert.equal(existsSync(join(roomDir, 'archive.jsonl')), true);
       const deleted = await runCli(['room', 'delete', roomId, '--yes']);
       assert.deepEqual(deleted, { version: 1, room_id: roomId, deleted: true, scope: 'this_host' });
-      assert.equal(existsSync(roomDir), false, 'confirmed delete removes retained host state');
-      stage('deleted');
+      assert.equal(existsSync(roomDir), false);
+      stage('closed-and-deleted');
       completed = true;
     } catch (error) {
       driverFailure = error;
@@ -577,7 +394,7 @@ if (process.argv.includes('--e2e-driver')) {
     }
   });
 } else {
-  test('standalone daemon completes the real three-participant mission-room flow', async (t) => {
+  test('standalone daemon completes the real standard-SDK three-participant flow', async (t) => {
     const child = spawn(process.execPath, [THIS_FILE, '--e2e-driver'], {
       cwd: ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -623,11 +440,7 @@ if (process.argv.includes('--e2e-driver')) {
     child.stdout.on('data', inspect);
     child.stderr.on('data', inspect);
     armWatchdog();
-    const outcome = await Promise.race([
-      terminal,
-      exited.then(() => 'exit'),
-      timeout,
-    ]);
+    const outcome = await Promise.race([terminal, exited.then(() => 'exit'), timeout]);
     clearTimeout(watchdog);
     const result = await killAndReap();
     assert.equal(outcome, 'success', `E2E driver ${outcome}; exit=${result.error?.message ?? result.signal ?? result.code}\n${output.slice(-16_000)}`);

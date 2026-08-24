@@ -633,7 +633,7 @@ test('delete resumes every expected partial stage and removes explicitly authori
   });
 });
 
-// ---- Rooms evolution Phase A (spec §7) — lazy v1 → v2 migration ----
+// ---- Lazy room metadata v1 → v2 migration ----------------------------------
 
 function roomV1(overrides = {}) {
   return {

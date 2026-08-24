@@ -6,7 +6,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { HostedRoomPacket, PacketPersistenceError, PacketRegistry } from '../src/packets.ts';
 import { RoomService } from '../src/service.ts';
 import { CoworkStore } from '../src/storage.ts';
 
@@ -94,8 +93,15 @@ class FakePacket {
   ]);
   beforeRemove;
   afterRemove;
+  beforeRefresh;
+  refreshCalls = 0;
 
   listContacts() { return structuredClone(this.contacts); }
+
+  async refreshContacts() {
+    this.refreshCalls++;
+    if (this.beforeRefresh) await this.beforeRefresh();
+  }
 
   async removeContact(identity) {
     this.removeCalls.push(identity);
@@ -109,12 +115,11 @@ class FakePacket {
   mintInvite() { throw new Error('not used'); }
   revokeInvite() { throw new Error('not used'); }
   listInvites() { return []; }
-  listContactOrigins() { return {}; }
-  peekInbox() { return []; }
-  peekFileInbox() { return []; }
-  consumeFileInbox() { return Promise.resolve({ consumed: [], deferred: [] }); }
+  listUnreadMessages() { return Promise.resolve([]); }
+  listUnreadFiles() { return Promise.resolve([]); }
+  acknowledgeFile() { return Promise.resolve(); }
   sendFile() { throw new Error('not used'); }
-  consumeInbox() { throw new Error('not used'); }
+  acknowledgeMessage() { throw new Error('not used'); }
   send() { throw new Error('not used'); }
   sign() { throw new Error('not used'); }
 }
@@ -183,75 +188,6 @@ function fixture(roomOverrides = {}) {
 }
 
 function byKind(records, kind) { return records.filter((record) => record.kind === kind); }
-
-test('hosted contact removal propagates every unknown mutation failure', async () => {
-  for (const failure of [
-    new Error('transaction outcome unknown'),
-    new Error('packet closed concurrently'),
-    new PacketPersistenceError('disk full'),
-  ]) {
-    const native = {
-      name: 'fake-room', cid: 'cid-fake', pw: {},
-      mutatingTx: async () => { throw failure; },
-    };
-    const hosted = new HostedRoomPacket(native, () => {}, () => {});
-    await assert.rejects(hosted.removeContact('cid-peer'), (error) => error === failure);
-  }
-});
-
-function fakeAdaptBoolean(value) {
-  if (value === undefined) {
-    return { IsNil: () => true, GetBoolean: () => { throw new Error('nil'); }, Visualize: () => 'NIL' };
-  }
-  if (typeof value === 'boolean') {
-    return { IsNil: () => false, GetBoolean: () => value, Visualize: () => String(value) };
-  }
-  return {
-    IsNil: () => false,
-    GetBoolean: () => { throw new Error('not a boolean'); },
-    Visualize: () => String(value),
-  };
-}
-
-function hostedRemovalResult({ notified, retained }) {
-  const native = {
-    name: 'fake-room', cid: 'cid-fake', pw: {},
-    mutatingTx: async () => ({
-      Reduce(key) {
-        if (key === 'notified') return fakeAdaptBoolean(notified);
-        if (key === 'key_material_retained') return fakeAdaptBoolean(retained);
-        return fakeAdaptBoolean(undefined);
-      },
-    }),
-  };
-  return new HostedRoomPacket(native, () => {}, () => {}).removeContact('cid-peer');
-}
-
-test('hosted contact removal truthfully decodes notice and retained-key results', async () => {
-  assert.deepEqual(await hostedRemovalResult({ notified: true, retained: true }), {
-    status: 'queued', notified: true, key_material_retained: true,
-  });
-  assert.deepEqual(await hostedRemovalResult({ notified: false, retained: true }), {
-    status: 'send_failed', notified: false, key_material_retained: true,
-  });
-
-  for (const retained of [false, undefined, 'malformed']) {
-    await assert.rejects(
-      hostedRemovalResult({ notified: true, retained }),
-      /key_material_retained|retained key material|boolean/i,
-    );
-    const f = fixture();
-    f.packet.removeContact = () => hostedRemovalResult({ notified: true, retained });
-    await assert.rejects(
-      f.service.closeRoom(ROOM_ID),
-      /key_material_retained|retained key material|boolean/i,
-    );
-    const records = await f.store.read(ROOM_ID);
-    assert.equal(byKind(records, 'close_notice_intent').length, 1);
-    assert.equal(byKind(records, 'close_notice_result').length, 0,
-      'invalid retained-key output must leave its close intent result-less');
-  }
-});
 
 function fsyncFaultStore(t) {
   const stateDir = mkdtempSync(join(tmpdir(), 'ours-cowork-close-fsync-'));
@@ -396,6 +332,27 @@ test('close uses current unique contacts, records actual outcomes, purges live l
   assert.deepEqual(await f.store.read(ROOM_ID), snapshot);
   assert.deepEqual(f.registry.destroyCalls, [ROOM_ID]);
   assert.deepEqual(f.packet.removeCalls, ['cid-alice', 'cid-outsider']);
+});
+
+test('close refreshes contacts before effects and a refresh failure is a clean retry boundary', async () => {
+  const f = fixture();
+  f.packet.beforeRefresh = () => { throw new Error('contact refresh unavailable'); };
+  await assert.rejects(f.service.closeRoom(ROOM_ID), /contact refresh unavailable/);
+  assert.equal((await f.store.load(ROOM_ID)).state, 'closing');
+  assert.equal(f.packet.removeCalls.length, 0);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'close_notice_intent').length, 0);
+  assert.equal(f.registry.destroyCalls.length, 0);
+
+  f.packet.beforeRefresh = undefined;
+  await assertConverged(f);
+  assert.equal(f.packet.refreshCalls, 2);
+});
+
+test('close does not depend on unrelated invite listing', async () => {
+  const f = fixture();
+  f.packet.listInvites = () => { throw new Error('invite listing unavailable'); };
+  await assertConverged(f);
+  assert.equal(f.packet.refreshCalls, 1);
 });
 
 test('every named close crash boundary resumes without success fabrication', async (t) => {
@@ -596,42 +553,4 @@ test('delete requires exact confirmation and a closed room, then returns only a 
   assert.deepEqual(Object.keys(receipt).sort(), ['deleted', 'room_id', 'scope', 'version']);
   assert.equal(JSON.stringify(receipt).match(/backup|remote|secure|erase/gi), null);
   assert.deepEqual(f.store.deleteCalls, [ROOM_ID]);
-});
-
-test('PacketRegistry destroy is idempotent, retries purge, and never follows a live symlink', async (t) => {
-  const stateDir = mkdtempSync(join(tmpdir(), 'ours-cowork-close-registry-'));
-  const outside = mkdtempSync(join(tmpdir(), 'ours-cowork-close-outside-'));
-  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
-  t.after(() => rmSync(outside, { recursive: true, force: true }));
-  fs.writeFileSync(join(outside, 'keep'), 'untouched');
-  const roomDir = join(stateDir, 'rooms', ROOM_ID);
-  fs.mkdirSync(roomDir, { recursive: true, mode: 0o700 });
-  const live = join(roomDir, 'live');
-  fs.symlinkSync(outside, live);
-  const removed = [];
-  const host = { removePacket: (cid) => removed.push(cid) };
-  const registry = new PacketRegistry(host, stateDir);
-  registry.packets.set(ROOM_ID, { name: 'room', cid: 'cid-room' });
-
-  assert.deepEqual(await registry.destroy(ROOM_ID), []);
-  assert.deepEqual(removed, ['cid-room']);
-  assert.equal(fs.lstatSync(outside).isDirectory(), true);
-  assert.equal(fs.readFileSync(join(outside, 'keep'), 'utf8'), 'untouched');
-  assert.equal(fs.existsSync(live), false);
-  assert.deepEqual(await registry.destroy(ROOM_ID), []);
-  assert.deepEqual(removed, ['cid-room']);
-});
-
-test('normal packet close retains the fixed uncertain provisioning residue', async (t) => {
-  const stateDir = mkdtempSync(join(tmpdir(), 'ours-cowork-close-residue-'));
-  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
-  const roomDir = join(stateDir, 'rooms', ROOM_ID);
-  fs.mkdirSync(join(roomDir, 'live'), { recursive: true, mode: 0o700 });
-  fs.mkdirSync(join(roomDir, 'provisioning-residue'), { mode: 0o700 });
-  fs.writeFileSync(join(roomDir, 'provisioning-residue', 'unknown'), 'retain');
-  const registry = new PacketRegistry({ removePacket() {} }, stateDir);
-  registry.packets.set(ROOM_ID, { name: 'room', cid: 'cid-room' });
-  assert.deepEqual(await registry.destroy(ROOM_ID), []);
-  assert.equal(fs.existsSync(join(roomDir, 'live')), false);
-  assert.equal(fs.readFileSync(join(roomDir, 'provisioning-residue', 'unknown'), 'utf8'), 'retain');
 });

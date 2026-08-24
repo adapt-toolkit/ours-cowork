@@ -589,7 +589,9 @@ function isRoleBriefingMap(value: unknown): value is Record<string, RoleBriefing
 }
 
 function isRestRoleList(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((role) => isUtf8Bounded(role, MAX_ROLE_BYTES) && role.length > 0);
+  return Array.isArray(value)
+    && value.every((role) => isUtf8Bounded(role, MAX_ROLE_BYTES) && role.length > 0 && role !== 'room')
+    && new Set(value).size === value.length;
 }
 
 function isRoomInvite(value: unknown): value is RoomInviteDto {

@@ -9,6 +9,9 @@ import {
   CreateRoomInputSchema,
   FileMimeSchema,
   FileNameSchema,
+  friendlyRoomIdentityName,
+  isPersistedRoomIdentityName,
+  isStandardRoomIdentityName,
   LowerCrockfordUlidSchema,
   MessageTextSchema,
   MAX_FILE_BYTES,
@@ -24,6 +27,7 @@ import {
   legacyRoomIdentityName,
   migrateRoomV1,
   roomIdentityName,
+  roomIdentitySlug,
 } from '../src/contracts.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
@@ -136,10 +140,35 @@ test('room names trim, NFC-normalize, count Unicode code points, and reject cont
   assert.deepEqual(UpdateRoomInputSchema.parse({ name: '  Renamed  ' }), { name: 'Renamed' });
 });
 
-test('room identity names use the normalized friendly contract while preserving an explicit legacy helper', () => {
-  assert.equal(roomIdentityName('  Cafe\u0301 launch  '), 'ours-cowork-room:Café launch');
+test('room identity names use a globally unique ASCII SDK-safe contract', () => {
+  assert.equal(roomIdentityName(ROOM_ID), `ours-cowork-${ROOM_ID}`);
+  assert.equal(roomIdentitySlug('  Cafe\u0301 launch  '), 'cafe-launch');
+  assert.equal(roomIdentitySlug('研发 🚀'), 'room');
+  assert.equal(roomIdentitySlug('../Path...tokens///'), 'path-tokens');
+  assert.equal(roomIdentitySlug('a'.repeat(64)), 'a'.repeat(25));
+  assert.equal(roomIdentitySlug(`${'a'.repeat(24)}-tail`), 'a'.repeat(24));
+  assert.equal(
+    friendlyRoomIdentityName(ROOM_ID, '  Cafe\u0301 launch  '),
+    `ours-cowork-cafe-launch-${ROOM_ID}`,
+  );
+  const maximum = friendlyRoomIdentityName(ROOM_ID, 'a'.repeat(64));
+  assert.equal(maximum.length, 64);
+  assert.match(maximum, /^[A-Za-z0-9 _.@-]{1,64}$/);
+  for (const name of [
+    roomIdentityName(ROOM_ID),
+    friendlyRoomIdentityName(ROOM_ID, 'Release room'),
+    legacyRoomIdentityName(ROOM_ID),
+  ]) assert.equal(isPersistedRoomIdentityName(ROOM_ID, name), true, name);
+  assert.equal(isStandardRoomIdentityName(ROOM_ID, legacyRoomIdentityName(ROOM_ID)), false);
+  assert.equal(isStandardRoomIdentityName(ROOM_ID, friendlyRoomIdentityName(ROOM_ID, 'Release room')), true);
+  for (const invalid of [
+    `ours-cowork--${ROOM_ID}`,
+    `ours-cowork-${'a'.repeat(26)}-${ROOM_ID}`,
+    `ours-cowork-bad_slug-${ROOM_ID}`,
+    `ours-cowork-release-${ROOM_ID.slice(0, -1)}0`,
+  ]) assert.equal(isPersistedRoomIdentityName(ROOM_ID, invalid), false, invalid);
   assert.equal(legacyRoomIdentityName(ROOM_ID), `cowork-room-${ROOM_ID}`);
-  assert.throws(() => roomIdentityName('   '));
+  assert.throws(() => roomIdentityName(ROOM_ID.toUpperCase()));
   assert.throws(() => legacyRoomIdentityName(ROOM_ID.toUpperCase()));
 });
 
@@ -168,6 +197,8 @@ test('each additive v2 default is injected independently of the others', () => {
 
   // an explicit value is never overwritten by the default
   assert.deepEqual(RoomSchema.parse(room({ rest_roles: ['Reviewer'] })).rest_roles, ['Reviewer']);
+  assert.throws(() => RoomSchema.parse(room({ rest_roles: ['room'] })), /reserved/i);
+  assert.throws(() => RoomSchema.parse(room({ rest_roles: ['Reviewer', 'Reviewer'] })), /unique/i);
   assert.throws(() => RoomSchema.parse(room({ rest_roles: ['x'.repeat(257)] })));
   assert.throws(() => RoomSchema.parse(room({ rest_roles: 'Reviewer' })));
 });
@@ -260,7 +291,11 @@ test('only the exact packet-pending room sentinel may have an empty identity CID
   assert.equal(RoomSchema.parse(pending).identity_cid, '');
   assert.equal(RoomSchema.parse({
     ...pending,
-    identity_name: roomIdentityName(pending.room_name),
+    identity_name: roomIdentityName(pending.room_id),
+  }).identity_cid, '');
+  assert.equal(RoomSchema.parse({
+    ...pending,
+    identity_name: friendlyRoomIdentityName(pending.room_id, pending.room_name),
   }).identity_cid, '');
   assert.throws(() => RoomSchema.parse({ ...pending, status: undefined }));
   assert.throws(() => RoomSchema.parse({ ...pending, state: 'active', activated_at: AT }));
@@ -325,6 +360,7 @@ test('communication records form a strict discriminated version-1 union', () => 
     recipient_identities: ['cid-bob'],
     source_msg_id: 7,
     source_wire_id: 'wire-7',
+    source_reply_to: { wire_id: 'wire-parent', sentence: 2 },
   };
   assert.deepEqual(CommunicationRecordSchema.parse(message), message);
 
@@ -345,6 +381,7 @@ test('communication records form a strict discriminated version-1 union', () => 
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, category: 'system' }));
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, recipient_identities: ['cid-bob', 'cid-bob'] }));
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, recipient_identities: ['', 'cid-bob'] }));
+  assert.throws(() => CommunicationRecordSchema.parse({ ...message, source_reply_to: { wire_id: 'wire-parent', sentence: 0 } }));
   const { recipient_identities: _recipients, ...missingRecipients } = message;
   assert.throws(() => CommunicationRecordSchema.parse(missingRecipients));
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, extra: true }));
@@ -373,6 +410,7 @@ test('file archive records bind canonical bytes, size, digest, and one relay sub
     recipient_identities: ['cid-bob'],
     source_file_id: 7,
     source_wire_id: 'wire-file-7',
+    source_reply_to: { wire_id: 'wire-parent-file' },
   };
   assert.equal(CommunicationRecordSchema.parse(file).kind, 'file');
   assert.throws(() => CommunicationRecordSchema.parse({ ...file, size: bytes.length + 1 }), /size/i);
@@ -389,7 +427,7 @@ test('file archive records bind canonical bytes, size, digest, and one relay sub
   assert.throws(() => CommunicationRecordSchema.parse(missing), /exactly one/i);
 });
 
-// ---- Rooms evolution Phase A (spec §3.1, §4.1, §5.1, §7) — contracts v2 ----
+// ---- Room metadata, anonymity, and membership contracts v2 -----------------
 
 const PID_1 = '01jz6y7n8p9q0r1s2t3v4w5x70';
 const PID_2 = '01jz6y7n8p9q0r1s2t3v4w5x71';
@@ -498,7 +536,7 @@ test('room schema v2 rejects v1 payloads and invalid membership/anonymity combos
       seatV2({ identity: 'cid-bob', display_name: 'Bob', participant_id: PID_2, role: 'writer', replaces_seat: PID_1 }),
     ],
   })));
-  // OC-6 (owner override): anonymous replacement inherits the predecessor alias
+  // An anonymous replacement inherits the predecessor alias.
   assert.throws(() => RoomSchema.parse(roomV2({
     anonymous: true,
     membership_epoch: 2,

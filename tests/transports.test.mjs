@@ -127,7 +127,7 @@ test('external invite acceptance has strict params and is excluded from the ordi
   })).error.code, 'invalid_params');
 });
 
-test('phase-A verbs are reachable over authenticated RPC with strict params (spec §8.5)', async () => {
+test('room membership and briefing verbs are reachable over authenticated RPC with strict params', async () => {
   const calls = [];
   const service = new Proxy({}, {
     get: (_target, method) => async (...args) => { calls.push([method, ...args]); return { ok: true }; },

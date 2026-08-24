@@ -83,7 +83,7 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
   {
     method: 'room.create',
     summary: 'Create a room',
-    description: 'Provisions a room, its durable metadata, and its room packet. The room stays '
+    description: 'Provisions durable room metadata and a standard identity on the shared daemon. The room stays '
       + 'in the provisioning state until its invitation requirements are satisfied.',
     params: params({
       name: roomNameProperty,

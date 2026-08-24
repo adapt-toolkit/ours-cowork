@@ -16,6 +16,8 @@ const MAX_FILE_NAME_BYTES = 255;
 const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;
 export const MAX_ROOM_NAME_CHARACTERS = 64;
+export const MAX_ROOM_IDENTITY_NAME_CHARACTERS = 64;
+export const MAX_FRIENDLY_IDENTITY_SLUG_CHARACTERS = 25;
 
 function utf8Bounded(label: string, maximumBytes: number): z.ZodType<string> {
   return z.string()
@@ -74,18 +76,78 @@ export const RoomNameSchema = z.string()
     }
   });
 
-/** Authenticated announced-name contract for rooms created by current builds. */
-export const ROOM_IDENTITY_PREFIX = 'ours-cowork-room:';
+/** Supported creation-time behavior for the room's immutable SDK identity name. */
+export const RoomIdentityNameModeSchema = z.enum(['stable_id', 'friendly']);
+export type RoomIdentityNameMode = z.infer<typeof RoomIdentityNameModeSchema>;
 
-export function roomIdentityName(roomName: string): string {
-  return `${ROOM_IDENTITY_PREFIX}${RoomNameSchema.parse(roomName)}`;
+/** ASCII, globally unique SDK identity name for rooms created by vNext. */
+export const ROOM_IDENTITY_PREFIX = 'ours-cowork-';
+const SDK_IDENTITY_NAME_PATTERN = /^[A-Za-z0-9 _.@-]{1,64}$/;
+const FRIENDLY_SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+export function roomIdentityName(roomId: string): string {
+  return `${ROOM_IDENTITY_PREFIX}${LowerCrockfordUlidSchema.parse(roomId)}`;
+}
+
+export function roomIdentitySlug(roomName: string): string {
+  const normalized = RoomNameSchema.parse(roomName)
+    .normalize('NFKD')
+    .replace(/\p{M}+/gu, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  const bounded = normalized
+    .slice(0, MAX_FRIENDLY_IDENTITY_SLUG_CHARACTERS)
+    .replace(/-+$/g, '');
+  return bounded || 'room';
+}
+
+export function friendlyRoomIdentityName(roomId: string, roomName: string): string {
+  const id = LowerCrockfordUlidSchema.parse(roomId);
+  const name = `${ROOM_IDENTITY_PREFIX}${roomIdentitySlug(roomName)}-${id}`;
+  if (name.length > MAX_ROOM_IDENTITY_NAME_CHARACTERS || !SDK_IDENTITY_NAME_PATTERN.test(name)) {
+    throw new TypeError('generated room identity name violates the shared ours daemon contract');
+  }
+  return name;
+}
+
+export function configuredRoomIdentityName(
+  roomId: string,
+  roomName: string,
+  mode: RoomIdentityNameMode,
+): string {
+  return mode === 'friendly'
+    ? friendlyRoomIdentityName(roomId, roomName)
+    : roomIdentityName(roomId);
 }
 
 /** Existing rooms retain this room-id-based identity name without migration. */
 export function legacyRoomIdentityName(roomId: string): string {
   return `cowork-room-${LowerCrockfordUlidSchema.parse(roomId)}`;
 }
+
+/** Accept exact durable names without recomputing a slug from mutable room_name. */
+export function isPersistedRoomIdentityName(roomId: string, identityName: string): boolean {
+  const id = LowerCrockfordUlidSchema.safeParse(roomId);
+  if (!id.success) return false;
+  if (identityName === roomIdentityName(id.data) || identityName === legacyRoomIdentityName(id.data)) return true;
+  const suffix = `-${id.data}`;
+  if (!identityName.startsWith(ROOM_IDENTITY_PREFIX) || !identityName.endsWith(suffix)) return false;
+  const slug = identityName.slice(ROOM_IDENTITY_PREFIX.length, -suffix.length);
+  return slug.length >= 1
+    && slug.length <= MAX_FRIENDLY_IDENTITY_SLUG_CHARACTERS
+    && FRIENDLY_SLUG_PATTERN.test(slug)
+    && identityName.length <= MAX_ROOM_IDENTITY_NAME_CHARACTERS
+    && SDK_IDENTITY_NAME_PATTERN.test(identityName);
+}
+
+/** Standard SDK formats are restorable; the exact legacy format remains loadable but refused later. */
+export function isStandardRoomIdentityName(roomId: string, identityName: string): boolean {
+  return isPersistedRoomIdentityName(roomId, identityName)
+    && identityName !== legacyRoomIdentityName(roomId);
+}
 export const RoleSchema = utf8Bounded('role', MAX_ROLE_BYTES);
+export const ROOM_ROLE = 'room';
 export const MissionTextSchema = utf8Bounded('mission text', MAX_TEXT_BYTES);
 export const MessageTextSchema = utf8Bounded('message text', MAX_TEXT_BYTES);
 export const FileNameSchema = utf8Bounded('file name', MAX_FILE_NAME_BYTES)
@@ -101,7 +163,7 @@ export const RoomStateSchema = z.enum(['provisioning', 'active', 'closing', 'clo
 export const SeatStateSchema = z.enum(['pending', 'active', 'removed']);
 export const InviteModeSchema = z.enum(['one_time', 'public']);
 
-/** Built-in role assigned when an invite omits one (owner amendment to spec OC table). */
+/** Built-in role assigned when an invite omits one. */
 export const DEFAULT_ROLE = 'Participant';
 export const InviteStateSchema = z.enum([
   'live',
@@ -288,13 +350,9 @@ interface RoomLineageView {
 }
 
 function refineRoomLineage(room: RoomLineageView, context: z.RefinementCtx): void {
-  const pendingIdentityName = legacyRoomIdentityName(room.room_id);
-  const currentPendingIdentityName = room.room_name === undefined
-    ? undefined
-    : roomIdentityName(room.room_name);
   const exactPacketPending = room.state === 'provisioning'
     && room.status === 'packet_pending'
-    && (room.identity_name === pendingIdentityName || room.identity_name === currentPendingIdentityName)
+    && isPersistedRoomIdentityName(room.room_id, room.identity_name)
     && room.invites.length === 0
     && room.seats.length === 0
     && room.activated_at === undefined
@@ -383,12 +441,32 @@ const CurrentRoomSchema = z.object({
   mission: MissionSchema,
   role_briefings: z.record(RoleSchema, RoleBriefingSchema),
   /**
-   * Roles a REST caller may author under (spec §3.1). A plain array of names:
+   * Roles a REST caller may author under. A plain array of names:
    * the role name IS the identifier, so there is nothing per-role to store.
-   * Not a seat, not a membership — no invariant here constrains it, because a
-   * role is a label and several speakers may share one.
+   * Not a seat, not a membership: seat and membership invariants do not apply.
+   * The registry itself is an exact-name set, and reserves `room` for the
+   * room's own voice.
    */
-  rest_roles: z.array(RoleSchema),
+  rest_roles: z.array(RoleSchema).superRefine((roles, context) => {
+    const seen = new Set<string>();
+    for (const [index, role] of roles.entries()) {
+      if (role === ROOM_ROLE) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index],
+          message: `role "${ROOM_ROLE}" is reserved for the room's own voice`,
+        });
+      }
+      if (seen.has(role)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index],
+          message: 'REST role names must be unique within the room',
+        });
+      }
+      seen.add(role);
+    }
+  }),
   anonymous: z.boolean(),
   quiet_membership: z.boolean(),
   membership_epoch: z.number().int().nonnegative().safe(),
@@ -468,7 +546,7 @@ const CurrentRoomSchema = z.object({
       });
     }
     if (room.anonymous && seat.alias !== predecessor.alias) {
-      // Owner choice OC-6: the alias binds to the seat/role lineage.
+      // The alias binds to the seat/role lineage.
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['seats', index, 'alias'],
@@ -505,7 +583,7 @@ export const RoomSchema = z.preprocess((value) => {
   return { ...value, ...patch };
 }, CurrentRoomSchema);
 
-/** Additive v1 → v2 mapping (spec §7). Existing rooms keep their exact behavior. */
+/** Additive v1 → v2 mapping. Existing rooms keep their exact behavior. */
 export function migrateRoomV1(
   room: z.infer<typeof RoomV1Schema>,
   mintParticipantId: () => string,
@@ -559,7 +637,7 @@ export const PostMessageInputSchema = z.object({
 }).strict();
 
 /**
- * Caller-controlled role-authored message fields (spec §4). `role` is the only
+ * Caller-controlled role-authored message fields. `role` is the only
  * authorship input a caller may supply; `identity` and `display_name` stay
  * host-owned. Strict for the same reason PostMessageInputSchema is: the caller's
  * object is parsed in full before any host-owned field is consulted, so every
@@ -570,7 +648,7 @@ export const PostAsRoleInputSchema = z.object({
   text: MessageTextSchema,
 }).strict();
 
-/** Register or unregister one REST-addressable role (spec §3.2). */
+/** Register or unregister one REST-addressable role. */
 export const RestRoleInputSchema = z.object({
   role: RoleSchema,
 }).strict();
@@ -616,12 +694,17 @@ export const MembershipNoticeSchema = z.object({
 }).strict();
 
 /**
- * Archived alongside the real author snapshot in anonymous rooms (INV-R4):
+ * Archived alongside the real author snapshot in anonymous rooms:
  * the operator keeps both, the relay uses only this room-scoped pseudonym.
  */
 export const AuthorAliasSchema = z.object({
   participant_id: LowerCrockfordUlidSchema,
   alias: NonEmptyStringSchema,
+}).strict();
+
+export const ReplyReferenceSchema = z.object({
+  wire_id: NonEmptyStringSchema,
+  sentence: PositiveSafeIntegerSchema.optional(),
 }).strict();
 
 const MessageShape = {
@@ -649,6 +732,7 @@ const MessageShape = {
   }),
   source_msg_id: z.number().int().nonnegative().safe().optional(),
   source_wire_id: NonEmptyStringSchema.optional(),
+  source_reply_to: ReplyReferenceSchema.optional(),
 } as const;
 
 const RelayIntentShape = {
@@ -658,7 +742,7 @@ const RelayIntentShape = {
   recipient_identity: NonEmptyStringSchema,
 } as const;
 
-/** A relay intent may terminate without a send when its seat was removed (§5.3). */
+/** A relay intent may terminate without a send when its seat was removed. */
 export const RelayResultStatusSchema = z.enum(['queued', 'send_failed', 'skipped_removed']);
 
 const RelayResultShape = {
@@ -697,6 +781,7 @@ const FileShape = {
   }),
   source_file_id: z.number().int().nonnegative().safe(),
   source_wire_id: NonEmptyStringSchema.optional(),
+  source_reply_to: ReplyReferenceSchema.optional(),
 } as const;
 
 const MembershipIntentShape = {

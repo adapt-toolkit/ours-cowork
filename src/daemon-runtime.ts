@@ -5,7 +5,6 @@ import * as nodeFs from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { AdaptHost } from './adapt.ts';
 import {
   ensureRuntimeState,
   loadConfig,
@@ -13,6 +12,7 @@ import {
   type RuntimeState,
 } from './config.ts';
 export { loadConfig } from './config.ts';
+import { createOursHost, type OursRuntimeClientFactory } from './ours-runtime.ts';
 import { PacketRegistry } from './packets.ts';
 import { RoomService } from './service.ts';
 import { CoworkStore } from './storage.ts';
@@ -185,15 +185,15 @@ export class CoworkDaemon {
     this.options.onStage?.('post-lock');
     this.checkpoint();
     try {
-      this.host = this.options.host ?? new AdaptHost(config.brokerUrl, this.options.log);
+      this.host = this.options.host ?? createOursHost(config, this.options.log);
       this.store = this.options.store ?? new CoworkStore(config.stateDir);
 
       // The closure deliberately queues notifications until every recovery
-      // phase is complete. Restored packets may receive traffic as soon as
-      // they are exposed, but packet inbox state itself remains durable.
+      // phase is complete. Restored identities may receive traffic as soon as
+      // they are exposed, but unread external history remains durable.
       let serviceRef: DaemonService | undefined = this.options.service;
       this.registry = this.options.registry ?? new PacketRegistry(
-        this.host as AdaptHost,
+        this.host as unknown as OursRuntimeClientFactory,
         config.stateDir,
         {
           log: this.options.log,
@@ -207,6 +207,7 @@ export class CoworkDaemon {
       this.service = this.options.service ?? new RoomService(
         this.store as CoworkStore,
         this.registry as PacketRegistry,
+        { identityNameMode: config.roomIdentity?.nameMode ?? 'stable_id' },
       );
       serviceRef = this.service;
 
@@ -235,7 +236,7 @@ export class CoworkDaemon {
         await this.service.closeRoom(room.room_id);
         this.checkpoint();
       }
-      // Task 6 resumePending itself performs inbox snapshot -> complete all
+      // resumePending itself performs inbox snapshot -> complete all
       // intents -> atomic consume -> pending sends, in that exact order.
       for (const room of recoverable.filter((candidate) => candidate.state !== 'closing')) {
         await this.service.resumePending(room.room_id);

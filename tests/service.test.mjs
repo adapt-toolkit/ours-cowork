@@ -4,7 +4,7 @@ import test from 'node:test';
 
 import { RoomService } from '../src/service.ts';
 import { MAX_HISTORY_PAGE_BYTES } from '../src/contracts.ts';
-import { packInvite } from '../src/adapt.ts';
+import { packInvite } from '../src/packets.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const MESSAGE_IDS = [
@@ -91,7 +91,6 @@ class FakePacket {
   revokeFailures = new Map();
   invites = [];
   contacts = [];
-  origins = {};
   nextInvite = 1;
   addCalls = [];
   addResult = {
@@ -128,17 +127,15 @@ class FakePacket {
 
   listInvites() { return structuredClone(this.invites); }
   listContacts() { return structuredClone(this.contacts); }
-  listContactOrigins() { return structuredClone(this.origins); }
-  peekInbox() { return []; }
-  peekFileInbox() { return []; }
-  consumeFileInbox() { return Promise.resolve({ consumed: [], deferred: [] }); }
+  listUnreadMessages() { return Promise.resolve([]); }
+  listUnreadFiles() { return Promise.resolve([]); }
+  acknowledgeFile() { return Promise.resolve(); }
   sendFile() { throw new Error('not used'); }
-  async consumeInbox() { return { consumed: [], deferred: [] }; }
+  async acknowledgeMessage() {}
   async send() { return { status: 'queued', wire_id: 'wire' }; }
   async removeContact(contact) {
     this.removeContactCalls = [...(this.removeContactCalls ?? []), contact];
     this.contacts = this.contacts.filter((candidate) => candidate.container_id !== contact);
-    delete this.origins[contact];
     return { status: 'queued', notified: true, key_material_retained: true };
   }
   async sign() { return 'signature'; }
@@ -150,7 +147,7 @@ class FakeRegistry {
   restoreCalls = [];
   failCreate;
   restoreResult;
-  restoreFailure = new Error('live packet state is missing');
+  restoreFailure = new Error('live SDK identity state is missing');
 
   get(roomId) { return this.packets.get(roomId); }
 
@@ -162,7 +159,7 @@ class FakeRegistry {
       throw failure;
     }
     assert.equal(this.packets.has(roomId), false, 'must never provision a duplicate packet');
-    const packet = new FakePacket(`cowork-room-${roomId}`, `cid-room-${roomId}`);
+    const packet = new FakePacket(identityName, `cid-room-${roomId}`);
     this.packets.set(roomId, packet);
     return packet;
   }
@@ -177,7 +174,7 @@ class FakeRegistry {
   }
 }
 
-function fixture() {
+function fixture(options = {}) {
   const store = new MemoryStore();
   const registry = new FakeRegistry();
   let timeIndex = 0;
@@ -186,6 +183,7 @@ function fixture() {
     roomId: () => ROOM_ID,
     messageId: () => MESSAGE_IDS[messageIndex++],
     now: () => TIMES[timeIndex++],
+    ...options,
   });
   return { store, registry, service };
 }
@@ -194,7 +192,7 @@ async function create(f) {
   return f.service.createRoom({ goal: 'Ship the room', briefing: 'Read the mission.' });
 }
 
-test('create validates caller input first and provisions exactly one named room packet', async () => {
+test('create validates caller input first and provisions exactly one SDK room identity', async () => {
   const f = fixture();
   await assert.rejects(
     f.service.createRoom({ goal: 'Ship', briefing: 'Brief', identity_cid: 'forged' }),
@@ -209,10 +207,10 @@ test('create validates caller input first and provisions exactly one named room 
   const room = await create(f);
   assert.deepEqual(f.registry.createCalls, [{
     roomId: ROOM_ID,
-    identityName: 'ours-cowork-room:Room 01jz6y7n',
+    identityName: `ours-cowork-${ROOM_ID}`,
     bio: `ours-cowork mission room ${ROOM_ID}`,
   }]);
-  assert.equal(room.identity_name, 'ours-cowork-room:Room 01jz6y7n');
+  assert.equal(room.identity_name, `ours-cowork-${ROOM_ID}`);
   assert.equal(room.room_name, 'Room 01jz6y7n');
   assert.equal(room.identity_cid, `cid-room-${ROOM_ID}`);
   assert.equal(room.state, 'provisioning');
@@ -242,7 +240,7 @@ test('external acceptance persists a zero-authority pending seat and returns onl
   assert.deepEqual(packet.addCalls, [secret]);
 });
 
-test('external expected-CID mismatch writes no seat and only exact completed redemption provenance activates', async () => {
+test('external expected-CID mismatch writes no seat and the exact pending CID activates on SDK contact completion', async () => {
   const f = fixture();
   await create(f);
   await f.service.setRoleBriefing(ROOM_ID, { role: 'reviewer', text: 'Review exactly.' });
@@ -265,14 +263,6 @@ test('external expected-CID mismatch writes no seat and only exact completed red
 
   packet.contacts.push({ name: 'Renamed after authentication', container_id: 'AB'.repeat(32) });
   room = await f.service.reconcileRoom(ROOM_ID);
-  assert.equal(room.seats[0].state, 'pending', 'a known CID without redemption provenance is not enough');
-
-  packet.origins['AB'.repeat(32)] = { via: 'invite_redeemed', invite_id: 'another-external-invite', at: TIMES[3] };
-  room = await f.service.recoverRoom(ROOM_ID);
-  assert.equal(room.seats[0].state, 'pending', 'a different redemption by the exact CID is not enough');
-
-  packet.origins['AB'.repeat(32)] = { via: 'invite_redeemed', invite_id: pending.invite_id, at: TIMES[3] };
-  room = await f.service.recoverRoom(ROOM_ID);
   assert.equal(room.seats.length, 1);
   assert.equal(room.seats[0].participant_id, originalParticipant);
   assert.equal(room.seats[0].state, 'active');
@@ -285,14 +275,11 @@ test('external expected-CID mismatch writes no seat and only exact completed red
   assert(briefings.every((record) => record.recipient_identities[0] === 'AB'.repeat(32)));
 });
 
-test('external acceptance refuses an already-known CID because its immutable origin cannot prove this redemption', async () => {
+test('external acceptance refuses an already-known CID because a second SDK redemption is ambiguous', async () => {
   const f = fixture();
   await create(f);
   const packet = f.registry.get(ROOM_ID);
   packet.contacts = [{ name: 'Existing contact', container_id: 'AB'.repeat(32) }];
-  packet.origins['AB'.repeat(32)] = {
-    via: 'invite_redeemed', invite_id: 'older-external-invite', at: TIMES[0],
-  };
   const secret = packInvite(Buffer.from('new but ambiguous redemption'));
   await assert.rejects(
     f.service.acceptExternalInvite(ROOM_ID, { role: 'reviewer', invite: secret }),
@@ -300,72 +287,6 @@ test('external acceptance refuses an already-known CID because its immutable ori
   );
   assert.equal((await f.store.load(ROOM_ID)).seats.length, 0);
   assert.deepEqual(packet.addCalls, [secret]);
-});
-
-test('a room-invite fallback activates the same pending seat with room role provenance and invite credit', async () => {
-  const f = fixture();
-  await create(f);
-  const fallback = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
-  const packet = f.registry.get(ROOM_ID);
-  const pending = await f.service.acceptExternalInvite(ROOM_ID, {
-    role: 'reviewer', invite: packInvite(Buffer.from('external reviewer invite')),
-  });
-  packet.contacts = [{ name: 'Fallback entrant', container_id: 'AB'.repeat(32) }];
-  packet.origins['AB'.repeat(32)] = {
-    via: 'invite_public', invite_id: fallback.invite.invite_id, at: TIMES[3],
-  };
-  packet.invites = [];
-
-  const room = await f.service.reconcileRoom(ROOM_ID);
-  assert.equal(room.seats.length, 1);
-  assert.equal(room.seats[0].participant_id, pending.participant_id);
-  assert.equal(room.seats[0].state, 'active');
-  assert.equal(room.seats[0].role, 'builder');
-  assert.equal(room.seats[0].invite_id, fallback.invite.invite_id);
-  assert.match(room.seats[0].invite_sha256, /^[0-9a-f]{64}$/);
-  assert.deepEqual(room.invites[0].accepted_cids, ['AB'.repeat(32)]);
-  assert.equal(room.invites[0].state, 'replacement_required');
-  assert.equal(room.state, 'active');
-});
-
-test('same-role fallback activations mint distinct anonymous aliases in one recoverable reconciliation batch', async () => {
-  const f = fixture();
-  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.', anonymous: true });
-  const fallback = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 2 });
-  const packet = f.registry.get(ROOM_ID);
-  packet.addResult = {
-    invite_id: 'external-a', container_id: 'AB'.repeat(32), inviter_name: 'Alice', pending_name: '',
-  };
-  const alice = await f.service.acceptExternalInvite(ROOM_ID, {
-    role: 'reviewer', invite: packInvite(Buffer.from('external alice')),
-  });
-  packet.addResult = {
-    invite_id: 'external-b', container_id: 'CD'.repeat(32), inviter_name: 'Bob', pending_name: '',
-  };
-  const bob = await f.service.acceptExternalInvite(ROOM_ID, {
-    role: 'reviewer', invite: packInvite(Buffer.from('external bob')),
-  });
-  packet.contacts = [
-    { name: 'Alice', container_id: alice.identity },
-    { name: 'Bob', container_id: bob.identity },
-  ];
-  packet.origins = {
-    [alice.identity]: { via: 'invite_public', invite_id: fallback.invite.invite_id, at: TIMES[4] },
-    [bob.identity]: { via: 'invite_public', invite_id: fallback.invite.invite_id, at: TIMES[5] },
-  };
-
-  let room = await f.service.reconcileRoom(ROOM_ID);
-  assert.deepEqual(room.seats.map((seat) => seat.alias).sort(), ['builder #1', 'builder #2']);
-  assert.deepEqual(room.seats.map((seat) => seat.role), ['builder', 'builder']);
-  assert.deepEqual(room.invites[0].accepted_cids.sort(), [alice.identity, bob.identity].sort());
-  assert.equal(room.state, 'active');
-  assert.equal(room.membership_epoch, 2);
-
-  room = await f.service.reconcileRoom(ROOM_ID);
-  await f.service.notifyRoom(ROOM_ID, 'contact_added');
-  const recovered = await f.service.showRoom(ROOM_ID);
-  assert.deepEqual(recovered.seats.map((seat) => seat.alias).sort(), ['builder #1', 'builder #2']);
-  assert.equal(recovered.membership_epoch, 2);
 });
 
 test('pending external seats can be cancelled without authority or epoch gain and cannot be replaced', async () => {
@@ -407,9 +328,6 @@ test('late redemption after cancellation can be severed and safely re-accepted b
   })).status, 'cancelled_pending');
 
   packet.contacts = [{ name: 'Late inviter', container_id: cancelled.identity }];
-  packet.origins[cancelled.identity] = {
-    via: 'invite_redeemed', invite_id: cancelled.invite_id, at: TIMES[3],
-  };
   let room = await f.service.reconcileRoom(ROOM_ID);
   assert.equal(room.seats[0].state, 'removed');
   packet.addResult = {
@@ -425,20 +343,16 @@ test('late redemption after cancellation can be severed and safely re-accepted b
   assert.equal(recovery.status, 'queued');
   assert.deepEqual(packet.removeContactCalls, [cancelled.identity]);
   assert.equal(packet.contacts.length, 0);
-  assert.equal(packet.origins[cancelled.identity], undefined);
 
   const readmitted = await f.service.acceptExternalInvite(ROOM_ID, { role: 'reviewer', invite: secondSecret });
   packet.contacts = [{ name: 'Recovered inviter', container_id: readmitted.identity }];
-  packet.origins[readmitted.identity] = {
-    via: 'invite_redeemed', invite_id: readmitted.invite_id, at: TIMES[5],
-  };
   room = await f.service.reconcileRoom(ROOM_ID);
   assert.deepEqual(room.seats.map((seat) => seat.state), ['removed', 'active']);
   assert.equal(room.seats[1].participant_id, readmitted.participant_id);
   assert.equal(room.membership_epoch, 1);
 });
 
-test('create normalizes friendly names, allows duplicates, and freezes the initial announced identity', async () => {
+test('create normalizes duplicate friendly names while assigning globally unique SDK identity names', async () => {
   const store = new MemoryStore();
   const registry = new FakeRegistry();
   const ids = [ROOM_ID, '01jz6y7n8p9q0r1s2t3v4w5x70'];
@@ -447,6 +361,7 @@ test('create normalizes friendly names, allows duplicates, and freezes the initi
     roomId: () => ids.shift(),
     messageId: () => MESSAGE_IDS[0],
     now: () => TIMES[timeIndex++],
+    identityNameMode: 'friendly',
   });
 
   const first = await service.createRoom({ name: '  Cafe\u0301 launch  ', goal: 'One', briefing: 'Brief' });
@@ -454,10 +369,38 @@ test('create normalizes friendly names, allows duplicates, and freezes the initi
   assert.equal(first.room_name, 'Café launch');
   assert.equal(second.room_name, 'Café launch');
   assert.notEqual(first.room_id, second.room_id);
-  assert.equal(first.identity_name, 'ours-cowork-room:Café launch');
-  assert.equal(second.identity_name, 'ours-cowork-room:Café launch');
+  assert.equal(first.identity_name, `ours-cowork-cafe-launch-${first.room_id}`);
+  assert.equal(second.identity_name, `ours-cowork-cafe-launch-${second.room_id}`);
+  assert.notEqual(first.identity_name, second.identity_name);
   assert.notEqual(first.identity_cid, second.identity_cid, 'duplicate labels still have distinct authenticated identities');
   assert.deepEqual((await service.listRooms()).map((room) => room.room_name), ['Café launch', 'Café launch']);
+});
+
+test('configuration changes affect only future rooms and restore each exact persisted name', async () => {
+  for (const [createdMode, restartedMode] of [
+    ['friendly', 'stable_id'],
+    ['stable_id', 'friendly'],
+  ]) {
+    const f = fixture({ identityNameMode: createdMode });
+    const created = await f.service.createRoom({ name: 'Release room', goal: 'Ship', briefing: 'Brief' });
+    f.registry.packets.clear();
+    f.registry.restoreResult = new FakePacket(created.identity_name, created.identity_cid);
+    const restarted = new RoomService(f.store, f.registry, {
+      identityNameMode: restartedMode,
+      messageId: () => MESSAGE_IDS[0],
+      now: () => TIMES[1],
+    });
+
+    const restored = await restarted.recoverPacket(created.room_id);
+    assert.equal(restored.identity_name, created.identity_name);
+    assert.equal(restored.identity_cid, created.identity_cid);
+    assert.deepEqual(f.registry.restoreCalls.at(-1), {
+      roomId: created.room_id,
+      expectedCid: created.identity_cid,
+      identityName: created.identity_name,
+      bio: undefined,
+    });
+  }
 });
 
 test('recoverRoom resumes the durable provisioning boundary with exactly one live packet', async () => {
@@ -500,23 +443,50 @@ test('metadata-boundary crash resumes the already provisioned packet without dup
   assert.equal(f.registry.createCalls.length, 1);
 });
 
-test('recoverRoom restores rather than creates when a packet exists behind the provisioning sentinel', async () => {
+test('packet-pending recovery never restores or adopts an identity without a durable CID', async () => {
   const f = fixture();
   f.registry.failCreate = new Error('crash after metadata reservation');
   await assert.rejects(create(f), /metadata reservation/);
   const restored = new FakePacket(`cowork-room-${ROOM_ID}`, 'cid-restored-from-live');
   f.registry.restoreResult = restored;
+  f.registry.failCreate = new Error('generated name already exists');
   const createCount = f.registry.createCalls.length;
-  const recovered = await f.service.recoverRoom(ROOM_ID);
-  assert.equal(recovered.identity_cid, restored.cid);
+  await assert.rejects(f.service.recoverRoom(ROOM_ID), /unproven.*will not adopt/i);
+  assert.equal(f.registry.createCalls.length, createCount + 1);
+  assert.deepEqual(f.registry.restoreCalls, []);
+  assert.equal((await f.store.load(ROOM_ID)).identity_cid, '');
+});
+
+test('a crash-created orphan remains fail-closed until removal, then boot-style packet recovery creates anew', async () => {
+  const f = fixture();
+  let crashed = false;
+  const interrupted = new RoomService(f.store, f.registry, {
+    roomId: () => ROOM_ID,
+    messageId: () => MESSAGE_IDS[0],
+    now: () => TIMES[0],
+    provisioningCheckpoint() {
+      if (!crashed) {
+        crashed = true;
+        throw new Error('process lost after daemon identity creation');
+      }
+    },
+  });
+  await assert.rejects(
+    interrupted.createRoom({ goal: 'Ship', briefing: 'Brief' }),
+    /process lost/,
+  );
+  f.registry.packets.clear(); // new process cannot prove the prior in-memory create result
+  f.registry.failCreate = new Error('shared daemon already contains unproven room identity');
+  await assert.rejects(f.service.recoverPacket(ROOM_ID), /unproven.*will not adopt/i);
+  assert.deepEqual(f.registry.restoreCalls, []);
+  assert.equal((await f.store.load(ROOM_ID)).identity_cid, '');
+
+  // Simulate the operator verifying and removing the orphan, then restarting
+  // cowork: the boot recoverPacket phase creates rather than adopting it.
+  const recovered = await f.service.recoverPacket(ROOM_ID);
+  assert.equal(recovered.identity_cid, `cid-room-${ROOM_ID}`);
   assert.equal('status' in recovered, false);
-  assert.equal(f.registry.createCalls.length, createCount);
-  assert.deepEqual(f.registry.restoreCalls, [{
-    roomId: ROOM_ID,
-    expectedCid: undefined,
-    identityName: 'ours-cowork-room:Room 01jz6y7n',
-    bio: `ours-cowork mission room ${ROOM_ID}`,
-  }]);
+  assert.deepEqual(f.registry.restoreCalls, []);
 });
 
 test('recoverRoom never creates over an established CID when restore fails', async () => {
@@ -534,13 +504,18 @@ test('recoverRoom never creates over an established CID when restore fails', asy
     f.registry.restoreFailure = new Error(`injected ${state} restore failure`);
     const createCount = f.registry.createCalls.length;
     await assert.rejects(f.service.recoverRoom(ROOM_ID), new RegExp(`${state} restore failure`));
-    assert.deepEqual(f.registry.restoreCalls, [{ roomId: ROOM_ID, expectedCid: established.identity_cid, identityName: undefined, bio: undefined }]);
+    assert.deepEqual(f.registry.restoreCalls, [{
+      roomId: ROOM_ID,
+      expectedCid: established.identity_cid,
+      identityName: established.identity_name,
+      bio: undefined,
+    }]);
     assert.equal(f.registry.createCalls.length, createCount, `${state} must be restore-only`);
     assert.deepEqual(await f.store.load(ROOM_ID), established, `${state} metadata must remain unchanged`);
   }
 });
 
-test('recoverRoom preserves an established legacy identity without rename or reprovisioning', async () => {
+test('recoverRoom surfaces legacy SDK-state refusal without rename or reprovisioning', async () => {
   const f = fixture();
   const created = await create(f);
   const legacy = {
@@ -549,17 +524,16 @@ test('recoverRoom preserves an established legacy identity without rename or rep
   };
   await f.store.save(legacy);
   f.registry.packets.clear();
-  f.registry.restoreResult = new FakePacket(legacy.identity_name, legacy.identity_cid);
+  f.registry.restoreFailure = new Error(
+    `room "${ROOM_ID}" uses the pre-1.0 custom packet format; recreate the room and re-invite its participants`,
+  );
   const createCount = f.registry.createCalls.length;
 
-  const recovered = await f.service.recoverRoom(ROOM_ID);
-
-  assert.equal(recovered.identity_name, legacy.identity_name);
-  assert.equal(recovered.identity_cid, legacy.identity_cid);
+  await assert.rejects(f.service.recoverRoom(ROOM_ID), /pre-1\.0.*recreate.*re-invite/i);
   assert.deepEqual(f.registry.restoreCalls, [{
     roomId: ROOM_ID,
     expectedCid: legacy.identity_cid,
-    identityName: undefined,
+    identityName: legacy.identity_name,
     bio: undefined,
   }]);
   assert.equal(f.registry.createCalls.length, createCount);
@@ -581,7 +555,12 @@ test('recoverRoom rejects a restored CID mismatch without changing established m
     f.registry.restoreResult = new FakePacket(`cowork-room-${ROOM_ID}`, `cid-wrong-${state}`);
     const createCount = f.registry.createCalls.length;
     await assert.rejects(f.service.recoverRoom(ROOM_ID), /CID mismatch/i);
-    assert.deepEqual(f.registry.restoreCalls, [{ roomId: ROOM_ID, expectedCid: established.identity_cid, identityName: undefined, bio: undefined }]);
+    assert.deepEqual(f.registry.restoreCalls, [{
+      roomId: ROOM_ID,
+      expectedCid: established.identity_cid,
+      identityName: established.identity_name,
+      bio: undefined,
+    }]);
     assert.equal(f.registry.createCalls.length, createCount);
     assert.deepEqual(await f.store.load(ROOM_ID), established);
   }
@@ -705,20 +684,16 @@ test('confirm replay requires exact durable lineage and one-time consumption ret
   const f = fixture();
   await create(f);
   const original = await f.service.createInvite(ROOM_ID, { mode: 'one_time', role: 'builder', min_accepts: 1 });
-  const unrelated = await f.service.createInvite(ROOM_ID, { mode: 'one_time', role: 'other', min_accepts: 1 });
   const packet = f.registry.get(ROOM_ID);
-  packet.invites = packet.invites.filter((invite) => invite.invite_id === unrelated.invite.invite_id);
+  packet.invites = [];
   const [receipt] = await f.service.recoverInvites(ROOM_ID);
   await f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, receipt.invite.invite_id);
   await assert.rejects(
-    f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, unrelated.invite.invite_id),
+    f.service.confirmRecoveredInvite(ROOM_ID, original.invite.invite_id, 'not-this-recovery'),
     /lineage|pointer|descriptor/i,
   );
 
   packet.contacts = [{ name: 'Alice', container_id: 'cid-alice' }];
-  packet.origins = {
-    'cid-alice': { via: 'invite_one_time', invite_id: receipt.invite.invite_id, at: TIMES[5] },
-  };
   packet.invites = packet.invites.filter((invite) => invite.invite_id !== receipt.invite.invite_id);
   const reconciled = await f.service.reconcileRoom(ROOM_ID);
   const consumed = reconciled.invites.find((invite) => invite.invite_id === receipt.invite.invite_id);
@@ -741,9 +716,6 @@ test('discarded pending lineage cannot admit or satisfy confirm after rotation/c
   await f.service.recoverInvites(ROOM_ID); // rotates discarded to revoked/unconfirmed
 
   packet.contacts = [{ name: 'Discarded contact', container_id: 'cid-discarded' }];
-  packet.origins = {
-    'cid-discarded': { via: 'invite_public', invite_id: discarded.invite.invite_id, at: TIMES[5] },
-  };
   let room = await f.service.reconcileRoom(ROOM_ID);
   const retired = room.invites.find((invite) => invite.invite_id === discarded.invite.invite_id);
   assert.equal(retired.state, 'revoked');
@@ -761,7 +733,7 @@ test('discarded pending lineage cannot admit or satisfy confirm after rotation/c
   assert.equal(room.invites.find((invite) => invite.invite_id === latestPending.invite_id).recovery_confirmed, false);
 });
 
-test('confirmed then revoked recovery lineage remains historically admissible and replay-valid', async () => {
+test('confirmed then revoked recovery lineage cannot admit future SDK contacts but remains replay-valid', async () => {
   const f = fixture();
   await create(f);
   const original = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'confirmed-role', min_accepts: 1 });
@@ -772,11 +744,8 @@ test('confirmed then revoked recovery lineage remains historically admissible an
   await f.service.revokeInvite(ROOM_ID, receipt.invite.invite_id);
 
   packet.contacts = [{ name: 'Accepted before confirmed revoke', container_id: 'cid-confirmed' }];
-  packet.origins = {
-    'cid-confirmed': { via: 'invite_public', invite_id: receipt.invite.invite_id, at: TIMES[5] },
-  };
   const room = await f.service.reconcileRoom(ROOM_ID);
-  assert.deepEqual(room.seats.map((seat) => [seat.identity, seat.role]), [['cid-confirmed', 'confirmed-role']]);
+  assert.deepEqual(room.seats, []);
   const revoked = room.invites.find((invite) => invite.invite_id === receipt.invite.invite_id);
   assert.equal(revoked.state, 'revoked');
   assert.equal(revoked.recovery_confirmed, true);
@@ -786,30 +755,21 @@ test('confirmed then revoked recovery lineage remains historically admissible an
   );
 });
 
-test('contacts accepted before revocation or replacement are still admitted by exact origin', async () => {
+test('one live SDK invite admits unambiguous contacts and must be revoked before another is minted', async () => {
   const f = fixture();
   await create(f);
-  const revokedInvite = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'revoked-role', min_accepts: 1 });
-  const missingInvite = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'missing-role', min_accepts: 1 });
+  const first = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'first-role', min_accepts: 1 });
+  await assert.rejects(
+    f.service.createInvite(ROOM_ID, { mode: 'public', role: 'second-role', min_accepts: 1 }),
+    /one live invitation/i,
+  );
   const packet = f.registry.get(ROOM_ID);
-  packet.contacts = [
-    { name: 'Before revoke', container_id: 'cid-revoked' },
-    { name: 'Before restore', container_id: 'cid-replacement' },
-  ];
-  packet.origins = {
-    'cid-revoked': { via: 'invite_public', invite_id: revokedInvite.invite.invite_id, at: TIMES[4] },
-    'cid-replacement': { via: 'invite_public', invite_id: missingInvite.invite.invite_id, at: TIMES[5] },
-  };
-  await f.service.revokeInvite(ROOM_ID, revokedInvite.invite.invite_id);
-  packet.invites = packet.invites.filter((invite) => invite.invite_id !== missingInvite.invite.invite_id);
-
+  packet.contacts = [{ name: 'First contact', container_id: 'cid-first' }];
   const room = await f.service.reconcileRoom(ROOM_ID);
-  assert.deepEqual(room.seats.map((seat) => [seat.identity, seat.role]), [
-    ['cid-revoked', 'revoked-role'],
-    ['cid-replacement', 'missing-role'],
-  ]);
-  assert.equal(room.invites.find((invite) => invite.invite_id === revokedInvite.invite.invite_id).state, 'revoked');
-  assert.equal(room.invites.find((invite) => invite.invite_id === missingInvite.invite.invite_id).state, 'replacement_required');
+  assert.deepEqual(room.seats.map((seat) => [seat.identity, seat.role]), [['cid-first', 'first-role']]);
+  await f.service.revokeInvite(ROOM_ID, first.invite.invite_id);
+  const second = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'second-role', min_accepts: 1 });
+  assert.equal(second.invite.role, 'second-role');
 });
 
 test('ambiguous recovery save revokes/records the pending replacement and retry converges', async () => {
@@ -845,9 +805,6 @@ test('receipt-pending IDs never admit seats and survive startup reconciliation a
   const [receipt] = await f.service.recoverInvites(ROOM_ID);
   const revokeCount = packet.revokeCalls.length;
   packet.contacts = [{ name: 'Pending Alice', container_id: 'cid-pending' }];
-  packet.origins = {
-    'cid-pending': { via: 'invite_public', invite_id: receipt.invite.invite_id, at: TIMES[4] },
-  };
 
   const reconciled = await f.service.reconcileRoom(ROOM_ID);
   assert.deepEqual(reconciled.seats, []);
@@ -865,7 +822,7 @@ test('reconciliation revokes a core invite orphaned before its metadata save', a
   assert.equal((await f.store.load(ROOM_ID)).invites.length, 0);
 });
 
-test('admission uses only exact invite origins, never contact names or roles for authorization', async () => {
+test('one live SDK invite assigns every unique new contact its configured room role', async () => {
   const f = fixture();
   await create(f);
   const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'trusted-looking label', min_accepts: 2 });
@@ -877,21 +834,13 @@ test('admission uses only exact invite origins, never contact names or roles for
     { name: 'Alice', container_id: 'cid-alice' },
     { name: 'Alice duplicate', container_id: 'cid-alice' },
   ];
-  packet.origins = {
-    'cid-wrong-via': { via: 'direct', invite_id: invite.invite_id, at: TIMES[2] },
-    'cid-wrong-invite': { via: 'invite_public', invite_id: 'another-room-invite', at: TIMES[2] },
-    'cid-alice': { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[2] },
-  };
   const room = await f.service.reconcileRoom(ROOM_ID);
-  assert.equal(room.seats.length, 1);
-  const { participant_id, ...seat } = room.seats[0];
-  assert.match(participant_id, /^[0-7][0-9a-hjkmnp-tv-z]{25}$/);
-  assert.deepEqual(seat, {
-    identity: 'cid-alice', display_name: 'Alice', role: 'trusted-looking label',
-    invite_id: invite.invite_id, accepted_at: TIMES[2], state: 'active',
-  });
-  assert.deepEqual(room.invites[0].accepted_cids, ['cid-alice']);
-  assert.equal(room.state, 'provisioning', 'two accepts are required');
+  assert.equal(room.seats.length, 4);
+  assert(room.seats.every((seat) => seat.role === 'trusted-looking label' && seat.invite_id === invite.invite_id));
+  assert.deepEqual(room.invites[0].accepted_cids.sort(), [
+    'cid-no-origin', 'cid-wrong-via', 'cid-wrong-invite', 'cid-alice',
+  ].sort());
+  assert.equal(room.state, 'active');
 });
 
 test('live contact acceptance admits and activates before immediate intake without manual recovery', async () => {
@@ -900,9 +849,6 @@ test('live contact acceptance admits and activates before immediate intake witho
   const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'reviewer', min_accepts: 1 });
   const packet = f.registry.get(ROOM_ID);
   packet.contacts = [{ name: 'Alice', container_id: 'cid-alice' }];
-  packet.origins = {
-    'cid-alice': { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[2] },
-  };
 
   await Promise.all([
     f.service.notifyRoom(ROOM_ID, 'contact_accepted'),
@@ -924,15 +870,11 @@ test('activation requires every non-revoked requirement and at least one unique 
   const f = fixture();
   await create(f);
   const required = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 2 });
-  const waived = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'observer', min_accepts: 5 });
-  await f.service.revokeInvite(ROOM_ID, waived.invite.invite_id);
   const packet = f.registry.get(ROOM_ID);
   packet.contacts = [{ name: 'Alice', container_id: 'cid-alice' }];
-  packet.origins = { 'cid-alice': { via: 'invite_public', invite_id: required.invite.invite_id, at: TIMES[4] } };
   assert.equal((await f.service.reconcileRoom(ROOM_ID)).state, 'provisioning');
 
   packet.contacts.push({ name: 'Bob', container_id: 'cid-bob' });
-  packet.origins['cid-bob'] = { via: 'invite_public', invite_id: required.invite.invite_id, at: TIMES[5] };
   const active = await f.service.reconcileRoom(ROOM_ID);
   assert.equal(active.state, 'active');
   assert(active.activated_at);
@@ -949,11 +891,9 @@ test('a seat admitted after activation gets a new durable briefing and duplicate
   const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
   const packet = f.registry.get(ROOM_ID);
   packet.contacts = [{ name: 'Alice', container_id: 'cid-alice' }];
-  packet.origins = { 'cid-alice': { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[3] } };
   await f.service.reconcileRoom(ROOM_ID);
 
   packet.contacts.push({ name: 'Alice again', container_id: 'cid-alice' }, { name: 'Bob', container_id: 'cid-bob' });
-  packet.origins['cid-bob'] = { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[4] };
   const afterLateJoin = await f.service.reconcileRoom(ROOM_ID);
   await f.service.reconcileRoom(ROOM_ID);
   assert.deepEqual(afterLateJoin.seats.map((seat) => seat.identity), ['cid-alice', 'cid-bob']);
@@ -971,7 +911,6 @@ test('activation resumes after crashes between briefing, intents, and metadata w
   const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
   const packet = f.registry.get(ROOM_ID);
   packet.contacts = [{ name: 'Alice', container_id: 'cid-alice' }];
-  packet.origins = { 'cid-alice': { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[3] } };
 
   let failIntent = true;
   f.store.beforeAppend = (draft) => {
@@ -1007,7 +946,6 @@ test('a seat appearing after activation briefing fsync gets a distinct exact-sna
   const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
   const packet = f.registry.get(ROOM_ID);
   packet.contacts = [{ name: 'Alice', container_id: 'cid-alice' }];
-  packet.origins = { 'cid-alice': { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[3] } };
   let fail = true;
   f.store.beforeAppend = (draft) => {
     if (fail && draft.kind === 'relay_intent') {
@@ -1018,7 +956,6 @@ test('a seat appearing after activation briefing fsync gets a distinct exact-sna
   await assert.rejects(f.service.reconcileRoom(ROOM_ID), /exact briefing snapshot/);
 
   packet.contacts.push({ name: 'Bob', container_id: 'cid-bob' });
-  packet.origins['cid-bob'] = { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[4] };
   f.store.beforeAppend = undefined;
   assert.equal((await f.service.reconcileRoom(ROOM_ID)).state, 'active');
   const records = await f.store.read(ROOM_ID);
@@ -1034,12 +971,10 @@ test('concurrent reconciliation and a late-seat save retry produce one seat and 
   const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
   const packet = f.registry.get(ROOM_ID);
   packet.contacts = [{ name: 'Alice', container_id: 'cid-alice' }];
-  packet.origins = { 'cid-alice': { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[3] } };
   await Promise.all([f.service.reconcileRoom(ROOM_ID), f.service.reconcileRoom(ROOM_ID)]);
   assert.equal((await f.service.participants(ROOM_ID)).length, 1);
 
   packet.contacts.push({ name: 'Bob', container_id: 'cid-bob' });
-  packet.origins['cid-bob'] = { via: 'invite_public', invite_id: invite.invite_id, at: TIMES[4] };
   let failLateSeatSave = true;
   f.store.beforeSave = (room) => {
     if (failLateSeatSave && room.seats.some((seat) => seat.identity === 'cid-bob')) {
@@ -1058,11 +993,13 @@ test('concurrent reconciliation and a late-seat save retry produce one seat and 
 });
 
 test('projections update settings and page numeric history without exposing invite blobs', async () => {
-  const f = fixture();
-  await create(f);
+  const f = fixture({ identityNameMode: 'friendly' });
+  const created = await f.service.createRoom({ name: 'Initial room', goal: 'Ship', briefing: 'Brief' });
   await f.service.createInvite(ROOM_ID, { mode: 'one_time', role: 'builder', min_accepts: 1 });
   const updated = await f.service.updateRoom(ROOM_ID, { name: '  Renamed room  ', status: 'working', goal: 'New goal' });
   assert.equal(updated.room_name, 'Renamed room');
+  assert.equal(updated.identity_name, created.identity_name, 'display rename must not churn the SDK identity');
+  assert.equal(updated.identity_cid, created.identity_cid, 'display rename must not change authentication authority');
   assert.equal(updated.status, 'working');
   assert.equal(updated.mission.goal, 'New goal');
   assert.equal((await f.service.listRooms()).length, 1);
@@ -1097,7 +1034,7 @@ test('history returns byte-bounded short pages whose last sequence is a usable c
   assert.deepEqual(await f.service.history(ROOM_ID, { after: second[0].seq, limit: 1 }), []);
 });
 
-// ---- Rooms evolution Phase A2 (spec §3.3, §8.2) — dual briefings ----
+// ---- Common and role briefing delivery -------------------------------------
 
 function evolutionFixture() {
   const store = new MemoryStore();
@@ -1115,7 +1052,6 @@ function evolutionFixture() {
 async function admit(f, invite, cid, name, at = '2026-08-02T10:20:00.000Z') {
   const packet = f.registry.get(ROOM_ID);
   packet.contacts.push({ name, container_id: cid });
-  packet.origins[cid] = { via: 'invite_public', invite_id: invite.invite_id, at };
   return f.service.reconcileRoom(ROOM_ID);
 }
 
@@ -1201,8 +1137,9 @@ test('briefing version bumps re-deliver exactly to the affected seats', async ()
   await f.service.setRoleBriefing(ROOM_ID, { role: 'reviewer', text: 'Reviewer v1.' });
   await f.service.setRoleBriefing(ROOM_ID, { role: 'writer', text: 'Writer v1.' });
   const { invite: reviewerInvite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'reviewer', min_accepts: 1 });
-  const { invite: writerInvite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'writer', min_accepts: 1 });
   await admit(f, reviewerInvite, 'cid-alice', 'Alice');
+  await f.service.revokeInvite(ROOM_ID, reviewerInvite.invite_id);
+  const { invite: writerInvite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'writer', min_accepts: 1 });
   await admit(f, writerInvite, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
 
   // reviewer-only bump touches only alice
@@ -1266,7 +1203,6 @@ test('a crash between role-briefing append and its intent re-drives without dupl
   };
   const packet = f.registry.get(ROOM_ID);
   packet.contacts.push({ name: 'Alice', container_id: 'cid-alice' });
-  packet.origins['cid-alice'] = { via: 'invite_public', invite_id: invite.invite_id, at: '2026-08-02T10:20:00.000Z' };
   await assert.rejects(f.service.reconcileRoom(ROOM_ID), /crash after role briefing/);
 
   f.store.beforeAppend = undefined;
@@ -1281,7 +1217,7 @@ test('a crash between role-briefing append and its intent re-drives without dupl
   assert.deepEqual(intentsFor(records, common[0].message_id), ['cid-alice']);
 });
 
-// ---- Rooms evolution Phase A4 (spec §5.2–§5.3, §8.4) — removal & replacement ----
+// ---- Participant removal and replacement -----------------------------------
 
 function membershipRecords(records) {
   return {
@@ -1367,7 +1303,7 @@ test('quiet_membership and notify:false suppress the announcement but never the 
   assert.equal(notices.length, 0);
 });
 
-test('anonymous replacement is unconditionally silent and the successor inherits the alias (OC-6/OC-2 override)', async () => {
+test('anonymous replacement is unconditionally silent and the successor inherits the alias', async () => {
   const f = evolutionFixture();
   await f.service.createRoom({ goal: 'Ship', briefing: 'Common.', anonymous: true });
   await f.service.setRoleBriefing(ROOM_ID, { role: 'Developer', text: 'Build.' });
@@ -1380,6 +1316,7 @@ test('anonymous replacement is unconditionally silent and the successor inherits
   const recordCountForBobBefore = (await f.store.read(ROOM_ID)).filter((record) =>
     record.kind === 'message' && record.recipient_identities.includes('cid-bob')).length;
 
+  await f.service.revokeInvite(ROOM_ID, invite.invite_id);
   const replacement = await f.service.replaceParticipant(ROOM_ID, { participant: 'cid-alice', mode: 'one_time' });
   assert.equal(replacement.invite.role, 'Developer');
   assert.equal(replacement.invite.replaces_seat, aliceSeat.participant_id);
@@ -1458,15 +1395,14 @@ test('a removed cid re-admits only through an invite minted after its removal', 
   // the pre-removal public invite cannot silently re-admit the removed cid
   const packet = f.registry.get(ROOM_ID);
   packet.contacts.push({ name: 'Alice returns', container_id: 'cid-alice' });
-  packet.origins['cid-alice'] = { via: 'invite_public', invite_id: original.invite_id, at: '2026-08-02T10:50:00.000Z' };
   await f.service.reconcileRoom(ROOM_ID);
   let seats = (await f.service.showRoom(ROOM_ID)).seats.filter((seat) => seat.identity === 'cid-alice');
   assert.equal(seats.length, 1);
   assert.equal(seats[0].state, 'removed');
 
   // a deliberate fresh invite admits it with a fresh seat
+  await f.service.revokeInvite(ROOM_ID, original.invite_id);
   const { invite: fresh } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
-  packet.origins['cid-alice'] = { via: 'invite_public', invite_id: fresh.invite_id, at: '2026-08-02T10:55:00.000Z' };
   await f.service.reconcileRoom(ROOM_ID);
   seats = (await f.service.showRoom(ROOM_ID)).seats.filter((seat) => seat.identity === 'cid-alice');
   assert.equal(seats.length, 2);
@@ -1491,9 +1427,6 @@ test('an operator may explicitly re-admit a removed CID by accepting that peer e
     role: 'reviewer', invite: packInvite(Buffer.from('fresh operator-approved peer invite')),
   });
   packet.contacts = [{ name: 'Alice returns', container_id: cid }];
-  packet.origins[cid] = {
-    via: 'invite_redeemed', invite_id: pending.invite_id, at: '2026-08-02T10:56:00.000Z',
-  };
 
   const room = await f.service.reconcileRoom(ROOM_ID);
   const seats = room.seats.filter((seat) => seat.identity === cid);
@@ -1503,7 +1436,7 @@ test('an operator may explicitly re-admit a removed CID by accepting that peer e
   assert.equal(seats[1].invite_id, 'external-readmission');
 });
 
-// ---- REST role authorship (spec §4, §7) -------------------------------------
+// ---- REST role authorship ---------------------------------------------------
 
 /** An active room with one `builder` seat, ready for role-authored posts. */
 async function seatedRoom(f) {
@@ -1641,7 +1574,7 @@ test('room.say is refused unless the room is active, and accepts a room with no 
   await admit(f, invite, 'cid-alice', 'Alice');
   await f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' });
 
-  // an active room between participants: accepted, archived, relayed to nobody (§4.3)
+  // An active room between participants accepts and archives, but relays to nobody.
   const orphan = await f.service.postAsRole(ROOM_ID, { role: 'Reviewer', text: 'Nobody hears this.' });
   assert.deepEqual(orphan.recipient_identities, []);
   assert.deepEqual(intentsFor(await f.store.read(ROOM_ID), orphan.message_id), []);

@@ -35,8 +35,10 @@ interface NotificationState {
   work: Promise<void>;
 }
 
+const INTAKE_BATCH_SIZE = 32;
+
 /**
- * Produce the byte-stable JSON representation signed by room packets.
+ * Produce the byte-stable JSON representation sent by room identities.
  * Arrays retain their order; keys of every object nested inside them are
  * sorted as well. Envelope values are already schema-controlled JSON values.
  */
@@ -47,12 +49,13 @@ export function canonicalJson(value: unknown): string {
 }
 
 /**
- * THE ONLY PLACE A SIGNED BODY CROSSES THE WIRE.
+ * THE ONLY PLACE A ROOM BODY CROSSES THE WIRE.
  *
- * Every outbound envelope is signed here, canonicalised here, and sent here.
- * That is not tidiness — it is what makes the anonymity pins mean something.
+ * Every outbound envelope is canonicalised and sent here. Standard SDK
+ * identities authenticate the transport; cowork 1.0 no longer reaches into a
+ * custom actor to add a second application-level signature.
  *
- * The byte-level privacy pins (§8.3) assert that no real cid, contact display
+ * The byte-level privacy tests assert that no real cid, contact display
  * name or sender-claimed name appears in any relayed body of an anonymous room.
  * They read the bodies produced by the send sites that existed when they were
  * written. There were two. NOTHING ASSERTED THAT THERE WERE ONLY TWO, so the
@@ -70,13 +73,12 @@ export function canonicalJson(value: unknown): string {
  * folding either in here would make the funnel a policy decision instead of a
  * choke point.
  */
-export async function sendSignedBody(
-  packet: Pick<RoomPacket, 'sign' | 'send'>,
+export async function sendRoomBody(
+  packet: Pick<RoomPacket, 'send'>,
   recipientIdentity: string,
   unsigned: Record<string, unknown>,
 ): Promise<Awaited<ReturnType<RoomPacket['send']>>> {
-  const signature = await packet.sign(canonicalJson(unsigned));
-  return packet.send(recipientIdentity, canonicalJson({ ...unsigned, signature }));
+  return packet.send(recipientIdentity, canonicalJson(unsigned));
 }
 
 /** Archive, consume, and relay participant messages for hosted room packets. */
@@ -103,7 +105,7 @@ export class IntakePump {
    */
   notify(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
-    // The unread item remains in packet state and is resumed on next boot.
+    // The unread item remains in SDK identity state and is resumed on next boot.
     if (!this.acceptingNotifications) return Promise.resolve();
     const existing = this.notifications.get(id);
     if (existing) {
@@ -117,7 +119,7 @@ export class IntakePump {
     return state.work;
   }
 
-  /** Process the current readonly inbox snapshot, then service durable intents. */
+  /** Process bounded unread history batches, then service durable intents. */
   async pump(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     await this.lock(id, () => this.processAndRelayUnlocked(id, this.packet(id)));
@@ -175,10 +177,13 @@ export class IntakePump {
   }
 
   private async processAndRelayUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
-    const snapshot = packet.peekInbox();
-    for (const item of snapshot) await this.processInboxItem(roomId, packet, item);
-    const fileSnapshot = packet.peekFileInbox();
-    for (const item of fileSnapshot) await this.processFileInboxItem(roomId, packet, item);
+    for (;;) {
+      const messages = await packet.listUnreadMessages(INTAKE_BATCH_SIZE);
+      const files = await packet.listUnreadFiles(INTAKE_BATCH_SIZE);
+      if (messages.length === 0 && files.length === 0) break;
+      for (const item of messages) await this.processInboxItem(roomId, packet, item);
+      for (const item of files) await this.processFileInboxItem(roomId, packet, item);
+    }
     await this.completeSnapshotIntents(roomId);
     await this.relayPendingUnlocked(roomId, packet);
   }
@@ -190,11 +195,11 @@ export class IntakePump {
   ): Promise<void> {
     const parsedName = FileNameSchema.safeParse(item.filename);
     const parsedMime = FileMimeSchema.safeParse(item.mime);
-    // New actors reject this metadata before persistence. This defensive drain
-    // handles state exported by an older actor so one poison unread item cannot
+    // The current SDK boundary rejects this metadata before persistence. This
+    // defensive drain handles an older archived item so one poison unread item cannot
     // make every daemon restart fail at resumePending.
     if (!parsedName.success || !parsedMime.success) {
-      await packet.consumeFileInbox([item.file_id]);
+      await packet.acknowledgeFile(item);
       return;
     }
     if (item.data.length > MAX_FILE_BYTES) {
@@ -206,7 +211,7 @@ export class IntakePump {
     );
     if (room.state !== 'active' || !seat) {
       if (room.state === 'active') await this.bounceRemovedSender(roomId, room, packet, item);
-      await packet.consumeFileInbox([item.file_id]);
+      await packet.acknowledgeFile(item);
       return;
     }
     const records = await this.store.read(roomId);
@@ -235,26 +240,32 @@ export class IntakePump {
         recipient_identities: recipientIdentities,
         source_file_id: item.file_id,
         ...(item.wire_id === '' ? {} : { source_wire_id: item.wire_id }),
+        ...(item.reply_to == null ? {} : { source_reply_to: item.reply_to }),
       });
       if (appended.kind !== 'file') throw new Error('storage returned the wrong participant file kind');
       file = appended;
     }
 
     await this.completeFileIntents(roomId, file);
-    await packet.consumeFileInbox([item.file_id]);
+    await packet.acknowledgeFile(item);
   }
 
-  private async processInboxItem(roomId: string, packet: RoomPacket, item: InboxItem): Promise<void> {
+  private async processInboxItem(
+    roomId: string,
+    packet: RoomPacket,
+    item: InboxItem,
+    acknowledge = true,
+  ): Promise<void> {
     const room = await this.store.load(roomId);
     const seat = room.seats.find(
       (candidate) => candidate.identity === item.sender_id && candidate.state === 'active',
     );
     if (room.state !== 'active' || !seat) {
-      // Inbox entries are ordinary packet state, not an authorization source.
+      // Inbox entries are ordinary SDK identity state, not an authorization source.
       // Refused entries are deliberately drained without creating an archive
-      // message, intent, signature, or result.
+      // message, intent, wire send, or result.
       if (room.state === 'active') await this.bounceRemovedSender(roomId, room, packet, item);
-      await packet.consumeInbox([item.msg_id]);
+      if (acknowledge) await this.acknowledgeMessage(roomId, packet, item);
       return;
     }
 
@@ -276,7 +287,7 @@ export class IntakePump {
           display_name: seat.display_name,
           role: seat.role,
         },
-        // In an anonymous room the archive keeps both identities (INV-R4);
+        // In an anonymous room the archive keeps both identities;
         // the relay pump substitutes the alias into every outbound body.
         ...(room.anonymous && seat.alias !== undefined
           ? { author_alias: { participant_id: seat.participant_id, alias: seat.alias } }
@@ -286,6 +297,7 @@ export class IntakePump {
         recipient_identities: recipientIdentities,
         source_msg_id: item.msg_id,
         ...(item.wire_id === '' ? {} : { source_wire_id: item.wire_id }),
+        ...(item.reply_to == null ? {} : { source_reply_to: item.reply_to }),
       });
       if (appended.kind !== 'message') throw new Error('storage returned the wrong participant message kind');
       message = appended;
@@ -293,15 +305,24 @@ export class IntakePump {
 
     await this.completeMessageIntents(roomId, message);
 
-    // This is the irreversible packet effect. Every preceding append resolves
+    // This is the irreversible SDK read mark. Every preceding append resolves
     // only after its file fsync, so both the message and the complete fan-out
-    // exist durably first. HostedRoomPacket leaves IDs outside this snapshot
-    // unread in the same atomic actor transaction.
-    await packet.consumeInbox([item.msg_id]);
+    // exist durably first. If an older row became unread after the snapshot,
+    // the SDK returns that row first; archive it through this same path before
+    // retrying the expected row. The promoted row is already read and must not
+    // be acknowledged a second time.
+    if (acknowledge) await this.acknowledgeMessage(roomId, packet, item);
+  }
+
+  private acknowledgeMessage(roomId: string, packet: RoomPacket, expected: InboxItem): Promise<void> {
+    return packet.acknowledgeMessage(
+      expected,
+      (unexpected) => this.processInboxItem(roomId, packet, unexpected, false),
+    );
   }
 
   /**
-   * One content-free self-assertion per removed seat (spec §5.2, OC-8), so a
+   * One content-free self-assertion per removed seat, so a
    * healthy ex-client stops sending. The durable bounced_at mark precedes the
    * best-effort send: at-most-once, and a hostile peer gets nothing further.
    */
@@ -325,7 +346,7 @@ export class IntakePump {
     await this.store.save(RoomSchema.parse({ ...room, seats }));
     try {
       const unsigned = { version: 1 as const, kind: 'room_not_member' as const, room_id: roomId };
-      await sendSignedBody(packet, item.sender_id, unsigned);
+      await sendRoomBody(packet, item.sender_id, unsigned);
     } catch { /* best effort — the channel is severed or severing */ }
   }
 
@@ -410,7 +431,7 @@ export class IntakePump {
       const recipients = message?.recipient_identities ?? file!.recipient_identities;
       if (!recipients.includes(intent.recipient_identity)) continue;
       if (!activeCids.has(intent.recipient_identity) && removedCids.has(intent.recipient_identity)) {
-        // The seat was removed after fan-out: terminal result, never a send (§5.3).
+        // The seat was removed after fan-out: terminal result, never a send.
         const skipped = await this.store.append(roomId, {
           version: 1,
           kind: 'relay_result',
@@ -433,7 +454,7 @@ export class IntakePump {
           display_name: file.author_alias.alias,
           role: file.author.role,
         };
-        const metadata = await sendSignedBody(packet, intent.recipient_identity, {
+        const metadata = await sendRoomBody(packet, intent.recipient_identity, {
           version: 1 as const,
           kind: 'room_file' as const,
           room_id: roomId,
@@ -488,7 +509,7 @@ export class IntakePump {
         kind: wireKind(message!.category),
         room_id: roomId,
         message_id: message!.message_id,
-        // INV-R3: an anonymous author leaves the archive only in alias form.
+        // An anonymous author leaves the archive only in alias form.
         author: message!.author_alias === undefined ? message!.author : {
           identity: message!.author_alias.participant_id,
           display_name: message!.author_alias.alias,
@@ -503,7 +524,7 @@ export class IntakePump {
       // RoomPacket.send returns only an observed queued/refused outcome. A
       // thrown call remains result-less because its acceptance is unknown and
       // will deliberately be retried on restart with the stable message ID.
-      const outcome = await sendSignedBody(packet, intent.recipient_identity, unsigned);
+      const outcome = await sendRoomBody(packet, intent.recipient_identity, unsigned);
       const appended = await this.store.append(roomId, {
         version: 1,
         kind: 'relay_result',
@@ -526,6 +547,7 @@ export class IntakePump {
     if (!message) return undefined;
     const observedWireId = item.wire_id === '' ? undefined : item.wire_id;
     if (message.source_wire_id !== observedWireId
+      || !sameReply(message.source_reply_to, item.reply_to)
       || message.author.identity !== item.sender_id
       || message.text !== item.text
       || message.at !== item.date) {
@@ -541,6 +563,7 @@ export class IntakePump {
     const observedWireId = item.wire_id === '' ? undefined : item.wire_id;
     const bytes = Buffer.from(item.data);
     if (file.source_wire_id !== observedWireId
+      || !sameReply(file.source_reply_to, item.reply_to)
       || file.author.identity !== item.sender_id
       || file.filename !== item.filename
       || file.mime !== item.mime
@@ -565,6 +588,14 @@ export class IntakePump {
   private now(): string {
     return z.string().datetime({ offset: true }).parse(this.nowValue());
   }
+}
+
+function sameReply(
+  stored: { wire_id: string; sentence?: number } | undefined,
+  observed: { wire_id: string; sentence?: number } | null | undefined,
+): boolean {
+  if (stored === undefined || observed == null) return stored === undefined && observed == null;
+  return stored.wire_id === observed.wire_id && stored.sentence === observed.sentence;
 }
 
 function canonicalValue(value: unknown): unknown {

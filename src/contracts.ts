@@ -187,6 +187,7 @@ export const SeatSchema = z.object({
   display_name: NonEmptyStringSchema,
   role: RoleSchema,
   invite_id: NonEmptyStringSchema,
+  admission_id: NonEmptyStringSchema.optional(),
   accepted_at: Rfc3339Schema.optional(),
   requested_at: Rfc3339Schema.optional(),
   invite_sha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
@@ -256,6 +257,7 @@ export const SeatSchema = z.object({
 
 export const RoomInviteSchema = z.object({
   invite_id: NonEmptyStringSchema,
+  admission_id: NonEmptyStringSchema.optional(),
   mode: InviteModeSchema,
   role: RoleSchema,
   min_accepts: PositiveSafeIntegerSchema,

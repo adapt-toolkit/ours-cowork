@@ -99,7 +99,10 @@ test('the exhaustive service route table marks every route auth:true', () => {
   ]);
   assert(Object.values(routes).every((route) => route.auth === true));
   const privateRoutes = createPrivateServiceRoutes(service);
-  assert.deepEqual(Object.keys(privateRoutes), ['room.accept']);
+  assert.deepEqual(Object.keys(privateRoutes).sort(), [
+    'room.accept', 'room.admission.ensure', 'room.admission.rotate',
+    'room.capabilities', 'room.reconcile',
+  ]);
   assert(Object.values(privateRoutes).every((route) => route.auth === true));
 });
 

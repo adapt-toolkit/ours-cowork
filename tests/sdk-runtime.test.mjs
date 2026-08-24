@@ -25,6 +25,7 @@ const FILE_OUT_WIRE = '66'.repeat(32);
 
 class FakeClient {
   contacts = [];
+  inviteProvenance;
   invites = [];
   messages = [];
   messageHistory = new Map();
@@ -45,7 +46,12 @@ class FakeClient {
     return { info: { cid: CID } };
   }
 
-  async listContacts() { return { contacts: structuredClone(this.contacts) }; }
+  async listContacts() {
+    return {
+      contacts: structuredClone(this.contacts),
+      ...(this.inviteProvenance === undefined ? {} : { inviteProvenance: this.inviteProvenance }),
+    };
+  }
   async listInvites() { return structuredClone(this.invites); }
   async listIncomingMessages() { return structuredClone(this.messages); }
   async listIncomingFiles() { return structuredClone(this.files); }
@@ -197,11 +203,14 @@ test('SDK room packet maps message/file/reply state and uses only typed public o
     kind: 'file',
   }];
   client.bytes.set(FILE_WIRE, bytes);
+  client.inviteProvenance = 'exact_invite_id';
+  client.contacts[0].accepted_via_invite_id = 'invite-1';
 
   const packet = new SdkRoomPacket(IDENTITY, CID, client);
   await packet.refresh();
 
   assert.deepEqual(packet.listContacts(), client.contacts);
+  assert.equal(packet.admissionCapability(), 'exact_invite_provenance');
   assert.deepEqual(packet.listInvites(), [{ invite_id: 'invite-1', mode: 'one_time' }]);
   assert.deepEqual(await packet.listUnreadMessages(32), [{
     msg_id: 7,

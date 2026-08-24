@@ -126,7 +126,18 @@ class FakePacket {
   }
 
   listInvites() { return structuredClone(this.invites); }
-  listContacts() { return structuredClone(this.contacts); }
+  listContacts() {
+    return this.contacts.map((contact) => ({
+      ...structuredClone(contact),
+      ...(this.contactOrigins?.[contact.container_id]?.invite_id === undefined
+        || this.contactOrigins[contact.container_id].via === 'invite_redeemed'
+        ? {}
+        : { accepted_via_invite_id: this.contactOrigins[contact.container_id].invite_id }),
+    }));
+  }
+  admissionCapability() {
+    return this.contactOrigins === undefined ? 'legacy_single_live' : 'exact_invite_provenance';
+  }
   listUnreadMessages() { return Promise.resolve([]); }
   listUnreadFiles() { return Promise.resolve([]); }
   acknowledgeFile() { return Promise.resolve(); }
@@ -770,6 +781,167 @@ test('one live SDK invite admits unambiguous contacts and must be revoked before
   await f.service.revokeInvite(ROOM_ID, first.invite.invite_id);
   const second = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'second-role', min_accepts: 1 });
   assert.equal(second.invite.role, 'second-role');
+});
+
+test('authenticated invite provenance admits concurrent live role invitations exactly', async () => {
+  const f = fixture();
+  await create(f);
+  const packet = f.registry.get(ROOM_ID);
+  packet.contactOrigins = {};
+  const first = await f.service.createInvite(ROOM_ID, { mode: 'one_time', role: 'builder', min_accepts: 1 });
+  const second = await f.service.createInvite(ROOM_ID, { mode: 'one_time', role: 'reviewer', min_accepts: 1 });
+
+  packet.contacts = [
+    { name: 'Reviewer', container_id: 'cid-reviewer' },
+    { name: 'Builder', container_id: 'cid-builder' },
+    { name: 'Unattributed', container_id: 'cid-unattributed' },
+    { name: 'Unknown', container_id: 'cid-unknown' },
+  ];
+  packet.contactOrigins = {
+    'cid-reviewer': { via: 'invite_one_time', invite_id: second.invite.invite_id, at: '2026-08-24T00:00:01.000Z' },
+    'cid-builder': { via: 'invite_one_time', invite_id: first.invite.invite_id, at: '2026-08-24T00:00:02.000Z' },
+    'cid-unattributed': { via: 'invite_redeemed', invite_id: first.invite.invite_id, at: '2026-08-24T00:00:03.000Z' },
+    'cid-unknown': { via: 'invite_one_time', invite_id: 'unknown-invite', at: '2026-08-24T00:00:04.000Z' },
+  };
+
+  const room = await f.service.reconcileRoom(ROOM_ID);
+  assert.deepEqual(room.seats.map((seat) => [seat.identity, seat.role, seat.invite_id]).sort(), [
+    ['cid-builder', 'builder', first.invite.invite_id],
+    ['cid-reviewer', 'reviewer', second.invite.invite_id],
+  ].sort());
+  assert.equal(room.seats.some((seat) => seat.identity === 'cid-unattributed'), false);
+  assert.equal(room.seats.some((seat) => seat.identity === 'cid-unknown'), false);
+});
+
+test('room capabilities explicitly distinguish exact and legacy admission', async () => {
+  const f = fixture();
+  await create(f);
+  assert.deepEqual(await f.service.roomCapabilities(ROOM_ID), { admission_provenance: 'legacy_unattributed' });
+  f.registry.get(ROOM_ID).contactOrigins = {};
+  assert.deepEqual(await f.service.roomCapabilities(ROOM_ID), { admission_provenance: 'exact_invite_id' });
+});
+
+test('durable admission ensure and rotate are idempotent without persisting secret bytes', async () => {
+  const f = fixture();
+  await create(f);
+  const packet = f.registry.get(ROOM_ID);
+  packet.contactOrigins = {};
+  const input = {
+    admission_id: 'fleet:room:builder', mode: 'public', role: 'builder', min_accepts: 2,
+  };
+
+  const issued = await f.service.ensureAdmission(ROOM_ID, input);
+  assert.equal(issued.secret_state, 'issued');
+  assert.equal(issued.invite.admission_id, input.admission_id);
+  assert.match(issued.blob, /^SECRET-BLOB-/);
+  assert.doesNotMatch(JSON.stringify(await f.store.load(ROOM_ID)), /SECRET-BLOB/);
+
+  const ensuredAgain = await f.service.ensureAdmission(ROOM_ID, input);
+  assert.equal(ensuredAgain.secret_state, 'unavailable');
+  assert.equal(ensuredAgain.invite.invite_id, issued.invite.invite_id);
+  assert.equal(ensuredAgain.blob, '');
+  assert.equal(packet.mintCalls.length, 1);
+
+  const rotated = await f.service.rotateAdmission(ROOM_ID, {
+    admission_id: input.admission_id, expected_invite_id: issued.invite.invite_id,
+  });
+  assert.equal(rotated.secret_state, 'issued');
+  assert.notEqual(rotated.invite.invite_id, issued.invite.invite_id);
+  assert.equal(rotated.invite.admission_id, input.admission_id);
+  const rotateReplay = await f.service.rotateAdmission(ROOM_ID, {
+    admission_id: input.admission_id, expected_invite_id: issued.invite.invite_id,
+  });
+  assert.equal(rotateReplay.secret_state, 'unavailable');
+  assert.equal(rotateReplay.invite.invite_id, rotated.invite.invite_id);
+  assert.equal(packet.mintCalls.length, 2);
+});
+
+test('one public invite attributes multiple accepts while replay stays idempotent', async () => {
+  const f = fixture();
+  await create(f);
+  const packet = f.registry.get(ROOM_ID);
+  packet.contactOrigins = {};
+  const { invite } = await f.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'builder', min_accepts: 2,
+  });
+  packet.contacts = [
+    { name: 'First', container_id: 'cid-first' },
+    { name: 'Second', container_id: 'cid-second' },
+  ];
+  packet.contactOrigins = Object.fromEntries(packet.contacts.map(({ container_id }) => [
+    container_id,
+    { via: 'invite_public', invite_id: invite.invite_id, at: '2026-08-24T00:00:00.000Z' },
+  ]));
+
+  const admitted = await f.service.reconcileRoom(ROOM_ID);
+  assert.deepEqual(admitted.seats.map((seat) => seat.identity).sort(), ['cid-first', 'cid-second']);
+  const replayed = await f.service.reconcileRoom(ROOM_ID);
+  assert.equal(replayed.seats.length, 2);
+  assert.deepEqual(replayed.invites[0].accepted_cids.sort(), ['cid-first', 'cid-second']);
+});
+
+test('exact one-time provenance consumes once and a revoke race admits nothing', async () => {
+  const f = fixture();
+  await create(f);
+  const packet = f.registry.get(ROOM_ID);
+  packet.contactOrigins = {};
+  const oneTime = await f.service.createInvite(ROOM_ID, {
+    mode: 'one_time', role: 'builder', min_accepts: 1,
+  });
+  packet.invites = [];
+  packet.contacts = [{ name: 'Builder', container_id: 'cid-builder' }];
+  packet.contactOrigins = {
+    'cid-builder': {
+      via: 'invite_one_time', invite_id: oneTime.invite.invite_id, at: '2026-08-24T00:00:00.000Z',
+    },
+  };
+  let room = await f.service.reconcileRoom(ROOM_ID);
+  assert.equal(room.seats.length, 1);
+  assert.equal(room.invites[0].state, 'consumed');
+
+  const raced = await f.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'reviewer', min_accepts: 1,
+  });
+  await f.service.revokeInvite(ROOM_ID, raced.invite.invite_id);
+  packet.contacts.push({ name: 'Late', container_id: 'cid-late' });
+  packet.contactOrigins['cid-late'] = {
+    via: 'invite_public', invite_id: raced.invite.invite_id, at: '2026-08-24T00:00:01.000Z',
+  };
+  room = await f.service.reconcileRoom(ROOM_ID);
+  assert.equal(room.seats.some((seat) => seat.identity === 'cid-late'), false);
+});
+
+test('exact provenance preserves replacement lineage and rejects legacy missing origins', async () => {
+  const f = fixture();
+  await create(f);
+  const packet = f.registry.get(ROOM_ID);
+  packet.contactOrigins = {};
+  const original = await f.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'builder', min_accepts: 1,
+  });
+  packet.contacts = [{ name: 'Original', container_id: 'cid-member' }];
+  packet.contactOrigins['cid-member'] = {
+    via: 'invite_public', invite_id: original.invite.invite_id, at: '2026-08-24T00:00:00.000Z',
+  };
+  let room = await f.service.reconcileRoom(ROOM_ID);
+  const originalSeat = room.seats[0];
+
+  const replacement = await f.service.replaceParticipant(ROOM_ID, {
+    participant: originalSeat.participant_id, mode: 'one_time',
+  });
+  packet.contacts = [
+    { name: 'Legacy without origin', container_id: 'cid-legacy' },
+    { name: 'Replacement', container_id: 'cid-replacement' },
+  ];
+  packet.contactOrigins = {
+    'cid-replacement': {
+      via: 'invite_one_time', invite_id: replacement.invite.invite_id, at: '2026-08-24T00:00:01.000Z',
+    },
+  };
+  room = await f.service.reconcileRoom(ROOM_ID);
+  const successor = room.seats.find((seat) => seat.identity === 'cid-replacement');
+  assert.equal(successor.replaces_seat, originalSeat.participant_id);
+  assert.equal(room.seats.some((seat) => seat.identity === 'cid-legacy'), false);
 });
 
 test('ambiguous recovery save revokes/records the pending replacement and retry converges', async () => {

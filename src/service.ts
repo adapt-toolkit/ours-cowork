@@ -69,6 +69,18 @@ const CreateInviteInputSchema = z.object({
   }
 });
 
+const EnsureAdmissionInputSchema = z.object({
+  admission_id: z.string().min(1).max(256),
+  mode: InviteModeSchema,
+  role: RoleSchema,
+  min_accepts: z.number().int().positive().safe(),
+}).strict();
+
+const RotateAdmissionInputSchema = z.object({
+  admission_id: z.string().min(1).max(256),
+  expected_invite_id: z.string().min(1),
+}).strict();
+
 const HistoryOptionsSchema = z.object({
   after: z.number().int().nonnegative().safe().optional(),
   limit: z.number().int().positive().safe().optional(),
@@ -387,13 +399,94 @@ export class RoomService {
     });
   }
 
+  async roomCapabilities(roomId: string): Promise<{
+    admission_provenance: 'exact_invite_id' | 'legacy_unattributed';
+  }> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    await this.store.load(id);
+    return {
+      admission_provenance: this.packet(id).admissionCapability?.() === 'exact_invite_provenance'
+        ? 'exact_invite_id'
+        : 'legacy_unattributed',
+    };
+  }
+
+  async ensureAdmission(roomId: string, input: unknown): Promise<InviteReceipt & {
+    admission_id: string;
+    secret_state: 'issued' | 'unavailable';
+  }> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = EnsureAdmissionInputSchema.parse(input);
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      if ((this.packet(id).admissionCapability?.() ?? 'legacy_single_live') !== 'exact_invite_provenance') {
+        throw new RoomServiceError('exact invite provenance is required for durable admissions');
+      }
+      const matches = room.invites.filter((invite) => invite.admission_id === request.admission_id);
+      if (matches.length > 1) throw new RoomServiceError('admission_id resolves to multiple invite descriptors');
+      const existing = matches[0];
+      if (existing) {
+        if (existing.mode !== request.mode || existing.role !== request.role
+          || existing.min_accepts !== request.min_accepts) {
+          throw new RoomServiceError('admission_id already exists with different immutable parameters');
+        }
+        return {
+          room_id: id, invite: existing, blob: '', reusable: existing.mode === 'public',
+          admission_id: request.admission_id, secret_state: 'unavailable',
+        };
+      }
+      const issued = await this.mintInviteUnlocked(room, request);
+      return { ...issued, admission_id: request.admission_id, secret_state: 'issued' };
+    });
+  }
+
+  async rotateAdmission(roomId: string, input: unknown): Promise<InviteReceipt & {
+    admission_id: string;
+    secret_state: 'issued' | 'unavailable';
+  }> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = RotateAdmissionInputSchema.parse(input);
+    return this.lock(id, async () => {
+      let room = await this.store.load(id);
+      if ((this.packet(id).admissionCapability?.() ?? 'legacy_single_live') !== 'exact_invite_provenance') {
+        throw new RoomServiceError('exact invite provenance is required for durable admissions');
+      }
+      const matches = room.invites.filter((invite) => invite.admission_id === request.admission_id);
+      if (matches.length !== 1) throw new RoomServiceError('admission_id must resolve to exactly one invite descriptor');
+      const current = matches[0];
+      if (current.invite_id !== request.expected_invite_id) {
+        return {
+          room_id: id, invite: current, blob: '', reusable: current.mode === 'public',
+          admission_id: request.admission_id, secret_state: 'unavailable',
+        };
+      }
+      if (current.accepted_cids.length > 0) {
+        throw new RoomServiceError('cannot rotate an admission after an authenticated CID was accepted');
+      }
+      if (current.state === 'live') await this.packet(id).revokeInvite(current.invite_id);
+      room = await this.store.save(RoomSchema.parse({
+        ...room,
+        invites: room.invites.filter((invite) => invite.invite_id !== current.invite_id),
+      }));
+      const issued = await this.mintInviteUnlocked(room, {
+        admission_id: request.admission_id,
+        mode: current.mode,
+        role: current.role,
+        min_accepts: current.min_accepts,
+        ...(current.replaces_seat === undefined ? {} : { replaces_seat: current.replaces_seat }),
+      });
+      return { ...issued, admission_id: request.admission_id, secret_state: 'issued' };
+    });
+  }
+
   async createInvite(roomId: string, input: unknown): Promise<InviteReceipt> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const request = CreateInviteInputSchema.parse(input);
     return this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'create an invite for');
-      if (room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
+      if ((this.packet(id).admissionCapability?.() ?? 'legacy_single_live') === 'legacy_single_live'
+        && room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
         throw new RoomServiceError(
           'standard SDK rooms permit one live invitation at a time so every accepted contact has unambiguous room admission metadata',
         );
@@ -492,9 +585,10 @@ export class RoomService {
 
   private async mintInviteUnlocked(
     room: Room,
-    request: { mode: InviteMode; role: string; min_accepts: number; replaces_seat?: string },
+    request: { mode: InviteMode; role: string; min_accepts: number; replaces_seat?: string; admission_id?: string },
   ): Promise<InviteReceipt> {
-    if (room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
+    if ((this.packet(room.room_id).admissionCapability?.() ?? 'legacy_single_live') === 'legacy_single_live'
+      && room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
       throw new RoomServiceError(
         'standard SDK rooms permit one live invitation at a time; revoke or consume the current invitation first',
       );
@@ -503,6 +597,7 @@ export class RoomService {
     const minted = await packet.mintInvite(request.mode);
     const invite = RoomInviteSchema.parse({
       invite_id: minted.invite_id,
+      admission_id: request.admission_id ?? minted.invite_id,
       mode: request.mode,
       role: request.role,
       min_accepts: request.min_accepts,
@@ -1198,9 +1293,9 @@ export class RoomService {
     const existingCids = new Set(room.seats
       .filter((seat) => seat.state === 'active' || seat.state === 'pending')
       .map((seat) => seat.identity));
-    // The public standard SDK intentionally does not expose custom actor
-    // contact-origin records. Cowork 1.0 therefore keeps at most one live room
-    // invite and assigns newly accepted contacts to that unambiguous descriptor.
+    // New SDKs expose core-authenticated invite provenance. Older daemons omit
+    // it; those retain the one-live-invite compatibility path below.
+    const exactInviteProvenance = packet.admissionCapability?.() === 'exact_invite_provenance';
     const lastRemovedAt = new Map<string, string>();
     for (const seat of room.seats) {
       if (seat.state !== 'removed' || seat.removed_at === undefined) continue;
@@ -1231,10 +1326,20 @@ export class RoomService {
 
     const eligibleInvites = room.invites.filter((invite) => invite.state === 'live'
       && (invite.recovery_of === undefined || invite.recovery_confirmed === true));
-    const admissionInvite = eligibleInvites.length === 1 ? eligibleInvites[0] : undefined;
+    const legacyAdmissionInvite = !exactInviteProvenance && eligibleInvites.length === 1
+      ? eligibleInvites[0]
+      : undefined;
     for (const [cid, displayName] of contactsByCid) {
       if (existingCids.has(cid)) continue;
-      const invite = admissionInvite;
+      const contactRows = packet.listContacts().filter((contact) => contact.container_id === cid);
+      const provenanceIds = new Set(contactRows.flatMap((contact) =>
+        contact.accepted_via_invite_id === undefined ? [] : [contact.accepted_via_invite_id]));
+      const exactInviteId = provenanceIds.size === 1 && contactRows.every((contact) =>
+        contact.accepted_via_invite_id !== undefined) ? [...provenanceIds][0] : undefined;
+      const invite = exactInviteProvenance && exactInviteId !== undefined
+        ? inviteById.get(exactInviteId)
+        : legacyAdmissionInvite;
+      if (invite !== undefined && !eligibleInvites.includes(invite)) continue;
       if (!invite) continue;
       const removedAt = lastRemovedAt.get(cid);
       if (removedAt !== undefined && invite.created_at <= removedAt) continue;
@@ -1248,6 +1353,7 @@ export class RoomService {
         display_name: displayName,
         role: invite.role,
         invite_id: invite.invite_id,
+        ...(invite.admission_id === undefined ? {} : { admission_id: invite.admission_id }),
         accepted_at: this.now(),
         participant_id: LowerCrockfordUlidSchema.parse(generateUlid()),
         state: 'active',

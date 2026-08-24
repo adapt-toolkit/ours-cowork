@@ -111,6 +111,10 @@ export interface RoomServiceApi {
   replaceParticipant(roomId: string, input: unknown): Promise<unknown>;
   listRooms(): Promise<unknown>;
   showRoom(roomId: string): Promise<unknown>;
+  reconcileRoom(roomId: string): Promise<unknown>;
+  roomCapabilities(roomId: string): Promise<unknown>;
+  ensureAdmission(roomId: string, input: unknown): Promise<unknown>;
+  rotateAdmission(roomId: string, input: unknown): Promise<unknown>;
   participants(roomId: string): Promise<unknown>;
   history(roomId: string, options: unknown): Promise<unknown>;
   postMessage(roomId: string, input: unknown): Promise<unknown>;
@@ -242,12 +246,29 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
   } satisfies AuthenticatedRouteTable;
 }
 
-/** Secret-bearing mutation routes are deliberately available only to the Unix dispatcher. */
+/** Management-only mutations are deliberately available only to the Unix dispatcher. */
 export function createPrivateServiceRoutes(service: RoomServiceApi): AuthenticatedRouteTable {
   return {
     'room.accept': { auth: true, run: (params) => {
       const { room_id, ...input } = ExternalInviteAcceptParams.parse(params);
       return service.acceptExternalInvite(room_id, input);
+    } },
+    'room.reconcile': { auth: true, run: (params) =>
+      service.reconcileRoom(RoomIdParams.parse(params).room_id) },
+    'room.capabilities': { auth: true, run: (params) =>
+      service.roomCapabilities(RoomIdParams.parse(params).room_id) },
+    'room.admission.ensure': { auth: true, run: (params) => {
+      const { room_id, ...input } = z.object({
+        room_id: z.string(), admission_id: z.unknown(), mode: z.unknown(),
+        role: z.unknown(), min_accepts: z.unknown(),
+      }).strict().parse(params);
+      return service.ensureAdmission(room_id, input);
+    } },
+    'room.admission.rotate': { auth: true, run: (params) => {
+      const { room_id, ...input } = z.object({
+        room_id: z.string(), admission_id: z.unknown(), expected_invite_id: z.unknown(),
+      }).strict().parse(params);
+      return service.rotateAdmission(room_id, input);
     } },
   } satisfies AuthenticatedRouteTable;
 }

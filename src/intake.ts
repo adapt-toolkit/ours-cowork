@@ -55,7 +55,7 @@ export function canonicalJson(value: unknown): string {
  * identities authenticate the transport; cowork 1.0 no longer reaches into a
  * custom actor to add a second application-level signature.
  *
- * The byte-level privacy pins (§8.3) assert that no real cid, contact display
+ * The byte-level privacy tests assert that no real cid, contact display
  * name or sender-claimed name appears in any relayed body of an anonymous room.
  * They read the bodies produced by the send sites that existed when they were
  * written. There were two. NOTHING ASSERTED THAT THERE WERE ONLY TWO, so the
@@ -287,7 +287,7 @@ export class IntakePump {
           display_name: seat.display_name,
           role: seat.role,
         },
-        // In an anonymous room the archive keeps both identities (INV-R4);
+        // In an anonymous room the archive keeps both identities;
         // the relay pump substitutes the alias into every outbound body.
         ...(room.anonymous && seat.alias !== undefined
           ? { author_alias: { participant_id: seat.participant_id, alias: seat.alias } }
@@ -322,7 +322,7 @@ export class IntakePump {
   }
 
   /**
-   * One content-free self-assertion per removed seat (spec §5.2, OC-8), so a
+   * One content-free self-assertion per removed seat, so a
    * healthy ex-client stops sending. The durable bounced_at mark precedes the
    * best-effort send: at-most-once, and a hostile peer gets nothing further.
    */
@@ -431,7 +431,7 @@ export class IntakePump {
       const recipients = message?.recipient_identities ?? file!.recipient_identities;
       if (!recipients.includes(intent.recipient_identity)) continue;
       if (!activeCids.has(intent.recipient_identity) && removedCids.has(intent.recipient_identity)) {
-        // The seat was removed after fan-out: terminal result, never a send (§5.3).
+        // The seat was removed after fan-out: terminal result, never a send.
         const skipped = await this.store.append(roomId, {
           version: 1,
           kind: 'relay_result',
@@ -509,7 +509,7 @@ export class IntakePump {
         kind: wireKind(message!.category),
         room_id: roomId,
         message_id: message!.message_id,
-        // INV-R3: an anonymous author leaves the archive only in alias form.
+        // An anonymous author leaves the archive only in alias form.
         author: message!.author_alias === undefined ? message!.author : {
           identity: message!.author_alias.participant_id,
           display_name: message!.author_alias.alias,

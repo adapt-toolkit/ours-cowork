@@ -8,6 +8,26 @@ ours-cowork room message <room-id> --text "Decision recorded"
 
 The daemon assigns authorship. Author, identity, display-name, and role flags are rejected for this command.
 
+## Authoring as a role
+
+A room can also post under a named role instead of its own voice. Register the role first, then say something as it:
+
+```sh
+ours-cowork room rest-role <room-id> --role Reviewer
+ours-cowork room say <room-id> --role Reviewer --text "Reviewed the release diff"
+ours-cowork room rest-role <room-id> --role Reviewer --remove
+```
+
+The role name is the whole identifier. Nothing is minted, nothing expires, and nothing is presented once: registering the name is the enabling act, and `room.show` lists the registered names in `rest_roles`. Registration and removal are both idempotent, matching is by exact bytes (`Reviewer` and `reviewer` are two roles), and the name `room` is reserved because it is the room's own voice.
+
+This is identification, not authorization. Anyone who can reach the management API can author as any registered role in that room, exactly as they can already post as the room, read all history, and delete the room. If you need per-role access control, put it in front of the API and key it on `params.role`.
+
+The message is signed and sent by the room, so participants see the room's identity with the role as its label, and they see the same role label in anonymous rooms as in named ones. A role may also be held by a participant; a role is a display label, not a channel, so the two are told apart by the identity on the message rather than by the label. A role-authored message can never be replied to as the role: a role has no seat and hears nothing back.
+
+A role briefing set for a REST-addressable role reaches nobody, because briefings are sent to seats and a role has none.
+
+If the room has no active seats, `room say` still succeeds and archives the message, and it is relayed to nobody — the same outcome `room message` already produces for an empty room. A `200` therefore means durable, not received.
+
 An option value that begins with `--` uses the unambiguous inline form, for example `--text=--help` or `--text=--json`. A bare `--` ends option parsing for positional values. Only an exact standalone `--json` before `--` selects global JSON output; text inside `--text=VALUE` is never consumed as a global flag.
 
 Read the ordered archive with numeric paging:

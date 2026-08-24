@@ -18,6 +18,22 @@ test('package stays an independent cowork daemon', async () => {
   const forbiddenPackage = `@ours.network/${'mcp'}`;
   assert.equal(forbiddenPackage in dependencies, false);
 
+  const sdkVersion = dependencies['@ours.network/sdk'];
+  const sdkMajor = sdkVersion.split('.')[0];
+  const cliVersion = pkg.devDependencies['@ours.network/cli'];
+  const publicDocs = {
+    README: await read('README.md'),
+    prerequisites: await read('docs/01-prerequisites.md'),
+    installation: await read('docs/02-installation.md'),
+    configuration: await read('docs/03-configuration.md'),
+  };
+  assert(publicDocs.README.includes(`@ours.network/sdk\` ${sdkMajor}`));
+  assert(publicDocs.README.includes(`@ours.network/cli\` ${cliVersion}`));
+  assert(publicDocs.prerequisites.includes(`@ours.network/sdk\` ${sdkVersion}`));
+  assert.match(publicDocs.prerequisites, new RegExp(`@ours\\.network/cli@${cliVersion.replaceAll('.', '\\.')}`));
+  assert.match(publicDocs.installation, new RegExp(`@ours\\.network/cli@${cliVersion.replaceAll('.', '\\.')}`));
+  assert.match(publicDocs.configuration, new RegExp(`SDK ${sdkMajor}\\b`));
+
   await assert.rejects(access(new URL('../.gitmodules', import.meta.url)));
 
   const build = await read('build.mjs');

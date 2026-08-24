@@ -32,7 +32,7 @@ const attachSharedClient: AttachClient = async (options) => {
 
 /**
  * Cowork is always a client of the one shared ours daemon. The cowork config is
- * intentionally not a daemon selection surface: SDK 2 resolves the ordinary
+ * intentionally not a daemon selection surface: SDK 3 resolves the ordinary
  * ours configuration/environment and proves endpoint/state-root coherence.
  */
 export function createOursHost(
@@ -90,7 +90,7 @@ export class SharedOursHost implements OursRuntimeHost {
     const watcher: IdentityWatcher = { controller, work: Promise.resolve() };
     watcher.work = this.follow(identityName, controller.signal);
     this.watchers.set(identityName, watcher);
-    // SDK 2's structured notification log covers inbox work but not every
+    // SDK 3's structured notification log covers inbox work but not every
     // contact-state transition (notably contact_accepted). Reconcile once now
     // and periodically while the long poll supplies the low-latency path.
     this.announce(identityName);

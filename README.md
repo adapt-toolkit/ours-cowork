@@ -1,6 +1,6 @@
 # ours-cowork
 
-`ours-cowork` provides durable ours mission rooms on the one shared ours daemon. It uses `@ours.network/sdk` 2 directly, keeps one ordinary ours identity per room, stores an ordered local archive, and exposes a private Unix management socket plus a localhost web console with room RPC.
+`ours-cowork` provides durable ours mission rooms on the one shared ours daemon. It uses `@ours.network/sdk` 3 directly, keeps one ordinary ours identity per room, stores an ordered local archive, and exposes a private Unix management socket plus a localhost web console with room RPC.
 
 ```sh
 ours-cowork web
@@ -13,7 +13,9 @@ The friendly `room_name` is presentation metadata. By default, new rooms use the
 
 The localhost HTTP console has no authentication. Keep it bound to `127.0.0.1`; do not proxy, forward, or expose the port to other hosts. Room state is refreshed by periodic polling, not pushed to the browser.
 
-Start or install the shared daemon with `@ours.network/cli` 1.0.1 before starting cowork. Cowork never embeds, starts, stops, or silently substitutes an ours daemon. It uses the SDK-standard shared selection (the default `~/.ours` daemon, `OURS_CONFIG`, or a coherent `OURS_PORT` plus `OURS_STATE_DIR` selection) and fails clearly when that daemon is unavailable or mismatched.
+The same listener describes its own room management REST API: `http://127.0.0.1:3052/openapi.json` is the OpenAPI 3.1 document and `http://127.0.0.1:3052/docs` is the browser UI for it. Both are read-only, load no remote assets, and follow the console's loopback-only exposure rules.
+
+Start or install the shared daemon with `@ours.network/cli` 2.0.1 before starting cowork. Cowork never embeds, starts, stops, or silently substitutes an ours daemon. It uses the SDK-standard shared selection (the default `~/.ours` daemon, `OURS_CONFIG`, or a coherent `OURS_PORT` plus `OURS_STATE_DIR` selection) and fails clearly when that daemon is unavailable or mismatched.
 
 The shared daemon retains application payload history outside its protocol packets: each identity has a `history.sqlite3` database and immutable content-addressed file blobs. Cowork authorizes unread metadata by authenticated CID, reads the corresponding persistent history or blob, durably archives the room item and its complete fan-out, and only then advances that exact SDK unread item. There is no packet-inbox fallback, defer queue, host outbox, or cross-store transaction.
 

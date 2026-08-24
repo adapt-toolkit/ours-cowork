@@ -1234,6 +1234,10 @@ export class RoomService {
     const roomId = room.room_id;
     const packet = this.packets.get(roomId);
     if (packet) {
+      // A preceding remove may have committed in the daemon even when its
+      // caller observed a transport failure. Reconcile before interpreting a
+      // result-less intent, so retries never rely on an in-process cache.
+      await packet.refreshContacts();
       let records = await this.store.read(roomId);
       let contacts = currentContactIdentities(packet);
       const completed = new Set(records

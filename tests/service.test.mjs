@@ -783,11 +783,11 @@ test('concurrent invites admit each authenticated contact into its exact role in
   packet.contacts = [
     {
       name: 'Reviewer', container_id: 'cid-reviewer',
-      invite_origin: { via: 'invite_one_time', invite_id: reviewer.invite.invite_id, at: '2026-08-24T12:00:02Z' },
+      accepted_via_invite_id: reviewer.invite.invite_id,
     },
     {
       name: 'Builder', container_id: 'cid-builder',
-      invite_origin: { via: 'invite_public', invite_id: builder.invite.invite_id, at: '2026-08-24T12:00:01Z' },
+      accepted_via_invite_id: builder.invite.invite_id,
     },
   ];
 
@@ -801,7 +801,7 @@ test('concurrent invites admit each authenticated contact into its exact role in
   assert.equal(room.invites.find((invite) => invite.invite_id === reviewer.invite.invite_id).state, 'consumed');
 });
 
-test('authenticated provenance fails closed for missing, untrusted, unknown, revoked, and pending invite IDs', async () => {
+test('authenticated provenance fails closed for missing, unknown, revoked, and pending invite IDs', async () => {
   const f = fixture();
   await create(f);
   const packet = f.registry.get(ROOM_ID);
@@ -811,10 +811,9 @@ test('authenticated provenance fails closed for missing, untrusted, unknown, rev
   await f.service.revokeInvite(ROOM_ID, revoked.invite.invite_id);
   packet.contacts = [
     { name: 'Legacy', container_id: 'cid-missing' },
-    { name: 'Responder metadata', container_id: 'cid-untrusted', invite_origin: { via: 'invite_redeemed', invite_id: live.invite.invite_id, at: '2026-08-24T12:00:00Z' } },
-    { name: 'Unknown', container_id: 'cid-unknown', invite_origin: { via: 'invite_public', invite_id: 'unknown-invite', at: '2026-08-24T12:00:00Z' } },
-    { name: 'Revoked', container_id: 'cid-revoked', invite_origin: { via: 'invite_public', invite_id: revoked.invite.invite_id, at: '2026-08-24T12:00:00Z' } },
-    { name: 'Valid', container_id: 'cid-valid', invite_origin: { via: 'invite_public', invite_id: live.invite.invite_id, at: '2026-08-24T12:00:00Z' } },
+    { name: 'Unknown', container_id: 'cid-unknown', accepted_via_invite_id: 'unknown-invite' },
+    { name: 'Revoked', container_id: 'cid-revoked', accepted_via_invite_id: revoked.invite.invite_id },
+    { name: 'Valid', container_id: 'cid-valid', accepted_via_invite_id: live.invite.invite_id },
   ];
   const room = await f.service.reconcileRoom(ROOM_ID);
   assert.deepEqual(room.seats.map((seat) => seat.identity), ['cid-valid']);

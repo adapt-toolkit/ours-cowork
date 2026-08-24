@@ -161,7 +161,7 @@ test('SDK room packet maps message/file/reply state and uses only typed public o
   const client = blankClient();
   client.contacts = [{ name: 'Peer', container_id: CID }];
   client.origins = {
-    [CID]: { via: 'invite_one_time', invite_id: 'invite-1', at: '2026-08-24T12:00:00Z' },
+    [CID]: 'invite-1',
   };
   client.invites = [{ invite_id: 'invite-1', mode: 'one_time', assigned: '', created: 'now' }];
   client.messages = [{
@@ -213,7 +213,7 @@ test('SDK room packet maps message/file/reply state and uses only typed public o
   assert.equal(packet.supportsInviteProvenance, true);
   assert.deepEqual(packet.listContacts(), [{
     ...client.contacts[0],
-    invite_origin: client.origins[CID],
+    accepted_via_invite_id: client.origins[CID],
   }]);
   assert.deepEqual(packet.listInvites(), [{ invite_id: 'invite-1', mode: 'one_time' }]);
   assert.deepEqual(await packet.listUnreadMessages(32), [{

@@ -345,7 +345,12 @@ export class IntakePump {
         : candidate);
     await this.store.save(RoomSchema.parse({ ...room, seats }));
     try {
-      const unsigned = { version: 1 as const, kind: 'room_not_member' as const, room_id: roomId };
+      const unsigned = {
+        version: 1 as const,
+        kind: 'room_not_member' as const,
+        room_id: roomId,
+        room_name: room.room_name,
+      };
       await sendRoomBody(packet, item.sender_id, unsigned);
     } catch { /* best effort — the channel is severed or severing */ }
   }
@@ -458,6 +463,7 @@ export class IntakePump {
           version: 1 as const,
           kind: 'room_file' as const,
           room_id: roomId,
+          room_name: room.room_name,
           file_id: file.file_id,
           author,
           filename: file.filename,
@@ -508,6 +514,7 @@ export class IntakePump {
         version: 1 as const,
         kind: wireKind(message!.category),
         room_id: roomId,
+        room_name: room.room_name,
         message_id: message!.message_id,
         // An anonymous author leaves the archive only in alias form.
         author: message!.author_alias === undefined ? message!.author : {

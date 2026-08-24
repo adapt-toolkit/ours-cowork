@@ -66,7 +66,7 @@ export interface RoomPacket {
   listContacts(): Array<{
     name: string;
     container_id: string;
-    invite_origin?: { via: string; invite_id?: string; at: string };
+    accepted_via_invite_id?: string;
   }>;
   /** Reconcile only contacts before retry-sensitive removal work. */
   refreshContacts(): Promise<void>;
@@ -253,7 +253,7 @@ export class SdkRoomPacket implements RoomPacket {
   private contacts: Array<{
     name: string;
     container_id: string;
-    invite_origin?: { via: string; invite_id?: string; at: string };
+    accepted_via_invite_id?: string;
   }> = [];
   private hasInviteProvenance = false;
   private invites: Array<{ invite_id: string; mode: InviteMode }> = [];
@@ -287,7 +287,7 @@ export class SdkRoomPacket implements RoomPacket {
 
   private async refreshContactsUnlocked(): Promise<void> {
     type ContactsWithOrigins = Awaited<ReturnType<OursClient['listContacts']>> & {
-      origins?: Record<string, { via: string; invite_id?: string; at: string }>;
+      origins?: Record<string, string>;
     };
     const listed = await this.client.listContacts() as ContactsWithOrigins;
     this.hasInviteProvenance = listed.origins !== undefined;
@@ -295,7 +295,7 @@ export class SdkRoomPacket implements RoomPacket {
       ...contact,
       ...(listed.origins?.[contact.container_id] === undefined
         ? {}
-        : { invite_origin: { ...listed.origins[contact.container_id] } }),
+        : { accepted_via_invite_id: listed.origins[contact.container_id] }),
     }));
   }
 
@@ -328,12 +328,9 @@ export class SdkRoomPacket implements RoomPacket {
   listContacts(): Array<{
     name: string;
     container_id: string;
-    invite_origin?: { via: string; invite_id?: string; at: string };
+    accepted_via_invite_id?: string;
   }> {
-    return this.contacts.map((contact) => ({
-      ...contact,
-      ...(contact.invite_origin === undefined ? {} : { invite_origin: { ...contact.invite_origin } }),
-    }));
+    return this.contacts.map((contact) => ({ ...contact }));
   }
 
   async listUnreadMessages(limit: number): Promise<InboxItem[]> {

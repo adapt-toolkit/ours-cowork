@@ -287,6 +287,7 @@ test('participant files archive bytes before consume and relay metadata + core b
   ]);
   const metadata = JSON.parse(f.packet.sendCalls[0].body);
   assert.equal(metadata.kind, 'room_file');
+  assert.equal(metadata.room_name, 'Release room');
   assert.equal(metadata.file_id, file.file_id);
   assert.equal(metadata.sha256, file.sha256);
   assert.equal('data_base64' in metadata, false, 'file bytes must use the core binary path, not text JSON');
@@ -426,13 +427,14 @@ test('canonical JSON recursively sorts keys and participant fan-out excludes its
     kind: 'room_msg',
     message_id: message.message_id,
     room_id: ROOM_ID,
+    room_name: 'Release room',
     text: incoming().text,
     version: 1,
   });
   assert.equal('signature' in envelope, false);
   assert.equal('recipient_identities' in envelope, false);
   assert.deepEqual(Object.keys(JSON.parse(f.packet.sendCalls[0].body)).sort(),
-    ['at', 'author', 'kind', 'message_id', 'room_id', 'text', 'version']);
+    ['at', 'author', 'kind', 'message_id', 'room_id', 'room_name', 'text', 'version']);
 });
 
 test('crash before message append leaves the input unread and creates no archive records', async () => {
@@ -926,7 +928,7 @@ test('role-authored messages in anonymous rooms inherit the room-voice exemption
     // No `via` marker and no other new field: author.identity + author.role already
     // discriminate, so the relayed key set stays exactly what it pins above.
     assert.deepEqual(Object.keys(body).sort(),
-      ['at', 'author', 'kind', 'message_id', 'room_id', 'text', 'version']);
+      ['at', 'author', 'kind', 'message_id', 'room_id', 'room_name', 'text', 'version']);
     for (const leak of ['cid-alice', 'cid-bob', 'cid-cara', 'Alice', 'Bob', 'Cara', 'builder #1']) {
       assert.equal(Buffer.from(call.body, 'utf8').includes(leak), false, `${leak} leaked into a role body`);
     }
@@ -1004,7 +1006,8 @@ test('a removed member gets exactly one content-free bounce and no archive resid
   const bounce = JSON.parse(f.packet.sendCalls[0].body);
   assert.equal(bounce.kind, 'room_not_member');
   assert.equal(bounce.room_id, ROOM_ID);
-  assert.deepEqual(Object.keys(bounce).sort(), ['kind', 'room_id', 'version']);
+  assert.equal(bounce.room_name, 'Release room');
+  assert.deepEqual(Object.keys(bounce).sort(), ['kind', 'room_id', 'room_name', 'version']);
   for (const leak of ['cid-bob', 'cid-cara', 'Bob', 'Cara', 'builder #1', 'Alice']) {
     assert.equal(Buffer.from(f.packet.sendCalls[0].body, 'utf8').includes(leak), false, `${leak} leaked into the bounce`);
   }

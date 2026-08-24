@@ -299,12 +299,16 @@ if (process.argv.includes('--e2e-driver')) {
       assert.equal(created.identity_name, `ours-cowork-${roomId}`);
       stage('room-created');
 
+      const supportsOrigins = (await alice.client.listContacts()).origins !== undefined;
       const reviewerInvitation = await runCli([
-        'room', 'invite', roomId, '--mode', 'public', '--role', 'reviewer', '--min-accepts', '1',
+        'room', 'invite', roomId, '--mode', 'public', '--role', 'reviewer',
+        '--min-accepts', supportsOrigins ? '1' : '2',
       ]);
-      const builderInvitation = await runCli([
-        'room', 'invite', roomId, '--mode', 'public', '--role', 'builder', '--min-accepts', '1',
-      ]);
+      const builderInvitation = supportsOrigins
+        ? await runCli([
+          'room', 'invite', roomId, '--mode', 'public', '--role', 'builder', '--min-accepts', '1',
+        ])
+        : reviewerInvitation;
       await Promise.all([
         joinInvite(alice, reviewerInvitation.blob),
         joinInvite(bob, builderInvitation.blob),
@@ -318,7 +322,8 @@ if (process.argv.includes('--e2e-driver')) {
       }, 'room activation');
       assert.deepEqual(new Set(room.seats.map((seat) => seat.identity)), new Set([alice.cid, bob.cid]));
       assert.equal(room.seats.find((seat) => seat.identity === alice.cid).role, 'reviewer');
-      assert.equal(room.seats.find((seat) => seat.identity === bob.cid).role, 'builder');
+      assert.equal(room.seats.find((seat) => seat.identity === bob.cid).role,
+        supportsOrigins ? 'builder' : 'reviewer');
       assert.equal(room.seats.find((seat) => seat.identity === alice.cid).invite_id, reviewerInvitation.invite.invite_id);
       assert.equal(room.seats.find((seat) => seat.identity === bob.cid).invite_id, builderInvitation.invite.invite_id);
       stage('activated');

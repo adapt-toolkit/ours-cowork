@@ -1195,10 +1195,7 @@ export class RoomService {
     const contactsByCid = new Map<string, { displayName: string; inviteId?: string }>();
     for (const contact of packet.listContacts()) {
       if (contactsByCid.has(contact.container_id)) continue;
-      const authenticatedInvite = contact.invite_origin?.invite_id !== undefined
-        && (contact.invite_origin.via === 'invite_one_time' || contact.invite_origin.via === 'invite_public')
-        ? contact.invite_origin.invite_id
-        : undefined;
+      const authenticatedInvite = contact.accepted_via_invite_id;
       contactsByCid.set(contact.container_id, {
         displayName: contact.name,
         ...(authenticatedInvite === undefined ? {} : { inviteId: authenticatedInvite }),

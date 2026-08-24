@@ -93,8 +93,15 @@ class FakePacket {
   ]);
   beforeRemove;
   afterRemove;
+  beforeRefresh;
+  refreshCalls = 0;
 
   listContacts() { return structuredClone(this.contacts); }
+
+  async refreshContacts() {
+    this.refreshCalls++;
+    if (this.beforeRefresh) await this.beforeRefresh();
+  }
 
   async removeContact(identity) {
     this.removeCalls.push(identity);
@@ -325,6 +332,27 @@ test('close uses current unique contacts, records actual outcomes, purges live l
   assert.deepEqual(await f.store.read(ROOM_ID), snapshot);
   assert.deepEqual(f.registry.destroyCalls, [ROOM_ID]);
   assert.deepEqual(f.packet.removeCalls, ['cid-alice', 'cid-outsider']);
+});
+
+test('close refreshes contacts before effects and a refresh failure is a clean retry boundary', async () => {
+  const f = fixture();
+  f.packet.beforeRefresh = () => { throw new Error('contact refresh unavailable'); };
+  await assert.rejects(f.service.closeRoom(ROOM_ID), /contact refresh unavailable/);
+  assert.equal((await f.store.load(ROOM_ID)).state, 'closing');
+  assert.equal(f.packet.removeCalls.length, 0);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'close_notice_intent').length, 0);
+  assert.equal(f.registry.destroyCalls.length, 0);
+
+  f.packet.beforeRefresh = undefined;
+  await assertConverged(f);
+  assert.equal(f.packet.refreshCalls, 2);
+});
+
+test('close does not depend on unrelated invite listing', async () => {
+  const f = fixture();
+  f.packet.listInvites = () => { throw new Error('invite listing unavailable'); };
+  await assertConverged(f);
+  assert.equal(f.packet.refreshCalls, 1);
 });
 
 test('every named close crash boundary resumes without success fabrication', async (t) => {

@@ -265,6 +265,9 @@ if (process.argv.includes('--external-driver')) {
 
       const closed = await runCli(['room', 'close', roomId]);
       assert.equal(closed.state, 'closed');
+      await waitFor(async () => !(await observer.identities())
+        .some((identity) => identity.name === created.identity_name),
+      'room identity deletion from the shared daemon');
       const roomDir = join(stateDir, 'cowork', 'rooms', roomId);
       assert.equal(existsSync(join(roomDir, 'room.json')), true);
       assert.equal(existsSync(join(roomDir, 'archive.jsonl')), true);

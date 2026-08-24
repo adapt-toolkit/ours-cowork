@@ -62,6 +62,8 @@ export interface RoomPacket {
   revokeInvite(inviteId: string): Promise<{ revoked: boolean }>;
   listInvites(): Array<{ invite_id: string; mode: InviteMode }>;
   listContacts(): Array<{ name: string; container_id: string }>;
+  /** Reconcile only contacts before retry-sensitive removal work. */
+  refreshContacts(): Promise<void>;
   listUnreadMessages(limit: number): Promise<InboxItem[]>;
   acknowledgeMessage(expected: InboxItem, onUnexpected: (item: InboxItem) => Promise<void>): Promise<void>;
   listUnreadFiles(limit: number): Promise<FileInboxItem[]>;
@@ -245,6 +247,7 @@ export class SdkRoomPacket implements RoomPacket {
   private contacts: Array<{ name: string; container_id: string }> = [];
   private invites: Array<{ invite_id: string; mode: InviteMode }> = [];
   private refreshWork?: Promise<void>;
+  private contactRefreshWork?: Promise<void>;
 
   constructor(name: string, cid: string, client: OursClient) {
     this.name = name;
@@ -258,12 +261,22 @@ export class SdkRoomPacket implements RoomPacket {
   }
 
   private async refreshUnlocked(): Promise<void> {
-    const contacts = await this.client.listContacts();
-    this.contacts = contacts.contacts.map((contact) => ({ ...contact }));
+    await this.refreshContacts();
     this.invites = (await this.client.listInvites()).flatMap((invite) =>
       invite.mode === 'one_time' || invite.mode === 'public'
         ? [{ invite_id: invite.invite_id, mode: invite.mode }]
         : []);
+  }
+
+  refreshContacts(): Promise<void> {
+    this.contactRefreshWork ??= this.refreshContactsUnlocked()
+      .finally(() => { this.contactRefreshWork = undefined; });
+    return this.contactRefreshWork;
+  }
+
+  private async refreshContactsUnlocked(): Promise<void> {
+    const contacts = await this.client.listContacts();
+    this.contacts = contacts.contacts.map((contact) => ({ ...contact }));
   }
 
   async mintInvite(mode: InviteMode): Promise<{ blob: string; invite_id: string; reusable: boolean }> {
@@ -372,7 +385,11 @@ export class SdkRoomPacket implements RoomPacket {
   async removeContact(contactCid: string): Promise<{ status: RelayStatus; notified: boolean; key_material_retained: true }> {
     const result = await this.client.removeContact({ contact: contactCid });
     const notified = result.notified === true;
-    await this.refresh();
+    // The mutation response is authoritative for this exact target, but it is
+    // not a replacement contact list. Evict only that target synchronously so
+    // a later, unrelated refresh failure cannot resurrect it in this process.
+    // The next close attempt refreshes the complete view before taking effects.
+    this.contacts = this.contacts.filter((contact) => contact.container_id !== contactCid);
     return { status: notified ? 'queued' : 'send_failed', notified, key_material_retained: true };
   }
 

@@ -312,6 +312,35 @@ test('SDK room packet preserves queued deferred sends and accepted introduced wi
   });
 });
 
+test('successful contact removal evicts only its target without a fallible post-mutation refresh', async () => {
+  const client = blankClient();
+  const otherCid = 'CD'.repeat(32);
+  client.contacts = [
+    { name: 'Peer', container_id: CID },
+    { name: 'Other', container_id: otherCid },
+  ];
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  await packet.refresh();
+  client.listContacts = async () => { throw new Error('post-mutation refresh failed'); };
+
+  assert.deepEqual(await packet.removeContact(CID), {
+    status: 'queued', notified: true, key_material_retained: true,
+  });
+  assert.deepEqual(packet.listContacts(), [{ name: 'Other', container_id: otherCid }]);
+  assert.deepEqual(client.calls.find(([name]) => name === 'removeContact'), [
+    'removeContact', { contact: CID },
+  ]);
+});
+
+test('contact-only refresh succeeds without listing invites', async () => {
+  const client = blankClient();
+  client.contacts = [{ name: 'Peer', container_id: CID }];
+  client.listInvites = async () => { throw new Error('invite listing unavailable'); };
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  await packet.refreshContacts();
+  assert.deepEqual(packet.listContacts(), client.contacts);
+});
+
 test('packet registry creates, restores, releases, and removes standard SDK identities', async (t) => {
   const stateDir = mkdtempSync(join(tmpdir(), 'cowork-sdk-registry-'));
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));

@@ -77,6 +77,7 @@ if (process.argv.includes('--e2e-driver')) {
     let brokerExit;
     let oursEnv;
     let coworkEnv;
+    let observer;
     const peerClients = [];
     let completed = false;
     let driverFailure;
@@ -206,6 +207,8 @@ if (process.argv.includes('--e2e-driver')) {
         try { await client.releaseLease(); }
         catch (error) { cleanupErrors.push(new Error(`release peer lease: ${error.message}`)); }
       }
+      try { await observer?.releaseLease(); }
+      catch (error) { cleanupErrors.push(new Error(`release observer lease: ${error.message}`)); }
       if (oursEnv) {
         try { await runOurs(['daemon', 'stop'], 20_000); }
         catch (error) { cleanupErrors.push(new Error(`stop shared ours daemon: ${error.message}`)); }
@@ -263,6 +266,7 @@ if (process.argv.includes('--e2e-driver')) {
       await runOurs(['daemon', 'start']);
       await waitForPort(oursPort);
       const { attachOursClient } = await import('@ours.network/sdk');
+      observer = await attachOursClient({ env: oursEnv, leaseToken: 'cowork-e2e-observer' });
       const [alice, bob, charlie] = await Promise.all([
         createPeer(attachOursClient, 'Alice'),
         createPeer(attachOursClient, 'Bob'),
@@ -370,6 +374,9 @@ if (process.argv.includes('--e2e-driver')) {
 
       const closed = await runCli(['room', 'close', roomId]);
       assert.equal(closed.state, 'closed');
+      await waitFor(async () => !(await observer.identities())
+        .some((identity) => identity.name === created.identity_name),
+      'room identity deletion from the shared daemon');
       await waitFor(() => Promise.all([contacts(alice), contacts(bob), contacts(charlie)]).then((rows) =>
         rows.every((contactsList) => !contactsList.some((contact) => contact.container_id === roomCid))),
       'bilateral SDK contact removal');

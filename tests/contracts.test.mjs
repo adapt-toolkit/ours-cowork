@@ -9,6 +9,9 @@ import {
   CreateRoomInputSchema,
   FileMimeSchema,
   FileNameSchema,
+  friendlyRoomIdentityName,
+  isPersistedRoomIdentityName,
+  isStandardRoomIdentityName,
   LowerCrockfordUlidSchema,
   MessageTextSchema,
   MAX_FILE_BYTES,
@@ -24,6 +27,7 @@ import {
   legacyRoomIdentityName,
   migrateRoomV1,
   roomIdentityName,
+  roomIdentitySlug,
 } from '../src/contracts.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
@@ -137,6 +141,31 @@ test('room names trim, NFC-normalize, count Unicode code points, and reject cont
 
 test('room identity names use a globally unique ASCII SDK-safe contract', () => {
   assert.equal(roomIdentityName(ROOM_ID), `ours-cowork-${ROOM_ID}`);
+  assert.equal(roomIdentitySlug('  Cafe\u0301 launch  '), 'cafe-launch');
+  assert.equal(roomIdentitySlug('研发 🚀'), 'room');
+  assert.equal(roomIdentitySlug('../Path...tokens///'), 'path-tokens');
+  assert.equal(roomIdentitySlug('a'.repeat(64)), 'a'.repeat(25));
+  assert.equal(roomIdentitySlug(`${'a'.repeat(24)}-tail`), 'a'.repeat(24));
+  assert.equal(
+    friendlyRoomIdentityName(ROOM_ID, '  Cafe\u0301 launch  '),
+    `ours-cowork-cafe-launch-${ROOM_ID}`,
+  );
+  const maximum = friendlyRoomIdentityName(ROOM_ID, 'a'.repeat(64));
+  assert.equal(maximum.length, 64);
+  assert.match(maximum, /^[A-Za-z0-9 _.@-]{1,64}$/);
+  for (const name of [
+    roomIdentityName(ROOM_ID),
+    friendlyRoomIdentityName(ROOM_ID, 'Release room'),
+    legacyRoomIdentityName(ROOM_ID),
+  ]) assert.equal(isPersistedRoomIdentityName(ROOM_ID, name), true, name);
+  assert.equal(isStandardRoomIdentityName(ROOM_ID, legacyRoomIdentityName(ROOM_ID)), false);
+  assert.equal(isStandardRoomIdentityName(ROOM_ID, friendlyRoomIdentityName(ROOM_ID, 'Release room')), true);
+  for (const invalid of [
+    `ours-cowork--${ROOM_ID}`,
+    `ours-cowork-${'a'.repeat(26)}-${ROOM_ID}`,
+    `ours-cowork-bad_slug-${ROOM_ID}`,
+    `ours-cowork-release-${ROOM_ID.slice(0, -1)}0`,
+  ]) assert.equal(isPersistedRoomIdentityName(ROOM_ID, invalid), false, invalid);
   assert.equal(legacyRoomIdentityName(ROOM_ID), `cowork-room-${ROOM_ID}`);
   assert.throws(() => roomIdentityName(ROOM_ID.toUpperCase()));
   assert.throws(() => legacyRoomIdentityName(ROOM_ID.toUpperCase()));
@@ -238,6 +267,10 @@ test('only the exact packet-pending room sentinel may have an empty identity CID
   assert.equal(RoomSchema.parse({
     ...pending,
     identity_name: roomIdentityName(pending.room_id),
+  }).identity_cid, '');
+  assert.equal(RoomSchema.parse({
+    ...pending,
+    identity_name: friendlyRoomIdentityName(pending.room_id, pending.room_name),
   }).identity_cid, '');
   assert.throws(() => RoomSchema.parse({ ...pending, status: undefined }));
   assert.throws(() => RoomSchema.parse({ ...pending, state: 'active', activated_at: AT }));

@@ -220,6 +220,7 @@ if (process.argv.includes('--external-driver')) {
       writeFileSync(configPath, JSON.stringify({
         version: 1,
         stateDir: join(stateDir, 'cowork'),
+        roomIdentity: { nameMode: 'friendly' },
         rest: { enabled: false, port: 3052 },
       }), { mode: 0o600 });
       coworkEnv = { ...oursEnv, OURS_COWORK_CONFIG: configPath };
@@ -238,14 +239,14 @@ if (process.argv.includes('--external-driver')) {
       ]);
       const roomId = created.room_id;
       assert.match(roomId, /^[0-7][0-9a-hjkmnp-tv-z]{25}$/);
-      assert.equal(created.identity_name, `ours-cowork-${roomId}`);
+      assert.equal(created.identity_name, `ours-cowork-shared-daemon-room-${roomId}`);
       stage('room-created');
 
       // The room identity was provisioned in the SHARED daemon, not in a
       // second runtime below cowork's own state directory.
       const hosted = await waitFor(async () => (await observer.identities())
         .find((row) => row.name === created.identity_name), 'the room identity inside the shared daemon');
-      assert.equal(hosted.name, `ours-cowork-${roomId}`);
+      assert.equal(hosted.name, `ours-cowork-shared-daemon-room-${roomId}`);
       assert.equal(existsSync(join(stateDir, 'ours-sdk')), false);
 
       const listed = await runCli(['room', 'list']);

@@ -67,7 +67,10 @@ test('config is exact, env overrides are strict, and malformed input fails close
       OURS_COWORK_REST_PORT: '4010',
     });
     assert.deepEqual(config, {
-      version: 1, stateDir: join(dir, 'override'), rest: { enabled: true, port: 4010 },
+      version: 1,
+      stateDir: join(dir, 'override'),
+      roomIdentity: { nameMode: 'stable_id' },
+      rest: { enabled: true, port: 4010 },
     });
     writeFileSync(path, JSON.stringify({ version: 1, stateDir: dir, rest: { enabled: false, port: 3010 }, extra: true }));
     assert.throws(() => loadConfig({ OURS_COWORK_CONFIG: path }), /config/i);
@@ -566,6 +569,48 @@ test('daemon boot uses phased recovery order and shutdown drains before unhostin
     assert.deepEqual(events.slice(-7), [
       'service.reject', 'transports.stop', 'service.drain', 'pid.remove', 'packets.remove', 'host.close', 'lock.release',
     ]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('daemon restart retries packet-pending creation only after a verified orphan is removed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-daemon-orphan-retry-'));
+  const room = { room_id: '01jz6y7n8p9q0r1s2t3v4w5x6y', state: 'provisioning' };
+  const events = [];
+  let orphanPresent = true;
+  let recoveryCalls = 0;
+  const makeDaemon = () => {
+    const service = new FakeService(events, [room]);
+    service.recoverPacket = async (id) => {
+      recoveryCalls += 1;
+      events.push(`restore:${id}`);
+      if (orphanPresent) throw new Error('unproven identity collision; refusing adoption');
+    };
+    return new CoworkDaemon({
+      config: { version: 1, stateDir: dir, rest: { enabled: false, port: 3010 } },
+      prepare: () => ({ socketPath: join(dir, 'management.sock') }),
+      lock: () => ({ release: () => events.push('lock.release') }),
+      host: new FakeHost(events),
+      store: { async list() { return [room]; } },
+      registry: new FakeRegistry(events),
+      service,
+      transports: {
+        async start() { events.push('transports.start'); },
+        async stop() { events.push('transports.stop'); },
+      },
+      writePid: () => events.push('pid.write'),
+      removePid: () => events.push('pid.remove'),
+    });
+  };
+
+  try {
+    await assert.rejects(makeDaemon().boot(), /unproven identity collision/i);
+    assert.equal(events.includes('transports.start'), false, 'failed boot must expose no transport');
+    orphanPresent = false; // operator verified and removed the exact orphan
+    const restarted = makeDaemon();
+    await restarted.boot();
+    assert.equal(recoveryCalls, 2);
+    assert.equal(events.filter((event) => event === 'transports.start').length, 1);
+    await restarted.shutdown();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -5,7 +5,13 @@ import { brotliCompressSync, brotliDecompressSync, constants as zlibConstants } 
 
 import type { OursClient } from '@ours.network/sdk';
 
-import { FileMimeSchema, FileNameSchema, MAX_EXTERNAL_INVITE_BYTES, MAX_FILE_BYTES } from './contracts.ts';
+import {
+  FileMimeSchema,
+  FileNameSchema,
+  isStandardRoomIdentityName,
+  MAX_EXTERNAL_INVITE_BYTES,
+  MAX_FILE_BYTES,
+} from './contracts.ts';
 import type { OursRuntimeClientFactory } from './ours-runtime.ts';
 
 export type InviteMode = 'one_time' | 'public';
@@ -123,20 +129,21 @@ export class PacketRegistry {
     if (this.packets.has(roomId)) throw new Error(`room identity "${roomId}" is already hosted`);
     const localNames = new Set([identityName]);
     const available = await this.host.listIdentityNames(localNames);
+    if (available.has(identityName)) {
+      throw new Error(
+        `shared ours daemon already contains unproven room identity "${identityName}"; ` +
+        'refusing to adopt it without a durably recorded CID',
+      );
+    }
     const client = await this.host.createClient();
     try {
-      let cid: string;
-      if (available.has(identityName)) {
-        cid = (await client.chooseIdentity({ name: identityName, force: false })).cid;
-      } else {
-        const created = await client.createIdentity({
-          name: identityName,
-          bio,
-          exposeLocal: false,
-          localAutoAccept: true,
-        });
-        cid = created.info.cid;
-      }
+      const created = await client.createIdentity({
+        name: identityName,
+        bio,
+        exposeLocal: false,
+        localAutoAccept: true,
+      });
+      const cid = created.info.cid;
       const packet = new SdkRoomPacket(identityName, cid, client);
       await packet.refresh();
       this.packets.set(roomId, packet);
@@ -148,10 +155,13 @@ export class PacketRegistry {
     }
   }
 
-  async restore(roomId: string, expectedCid?: string, identityName = `ours-cowork-${roomId}`): Promise<RoomPacket> {
+  async restore(roomId: string, expectedCid: string, identityName = `ours-cowork-${roomId}`): Promise<RoomPacket> {
     validateRoomId(roomId);
     this.assertStandardIdentity(roomId, identityName);
     this.assertNoLegacyState(roomId);
+    if (expectedCid === undefined || expectedCid.length === 0) {
+      throw new Error(`refusing to restore room identity "${identityName}" without a durably recorded expected CID`);
+    }
     if (this.packets.has(roomId)) throw new Error(`room identity "${roomId}" is already hosted`);
     const available = await this.host.listIdentityNames(new Set([identityName]));
     if (!available.has(identityName)) {
@@ -224,7 +234,7 @@ export class PacketRegistry {
   }
 
   private assertStandardIdentity(roomId: string, identityName: string): void {
-    if (identityName !== `ours-cowork-${roomId}`) throw new LegacyCoworkStateError(roomId);
+    if (!isStandardRoomIdentityName(roomId, identityName)) throw new LegacyCoworkStateError(roomId);
   }
 }
 

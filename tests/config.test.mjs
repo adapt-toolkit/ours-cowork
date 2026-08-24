@@ -8,6 +8,31 @@ import { defaultConfig, ensureRuntimeState, loadConfig } from '../src/config.ts'
 
 test('default configuration enables the loopback web host on port 3052', () => {
   assert.deepEqual(defaultConfig('/home/demo').rest, { enabled: true, port: 3052 });
+  assert.deepEqual(defaultConfig('/home/demo').roomIdentity, { nameMode: 'stable_id' });
+});
+
+test('legacy config files default room identity naming while explicit supported modes are strict', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-config-room-identity-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  const base = {
+    version: 1,
+    stateDir: join(dir, 'state'),
+    rest: { enabled: false, port: 3052 },
+  };
+
+  writeFileSync(path, JSON.stringify(base), { mode: 0o600 });
+  assert.deepEqual(loadConfig({ OURS_COWORK_CONFIG: path }).roomIdentity, { nameMode: 'stable_id' });
+
+  for (const nameMode of ['stable_id', 'friendly']) {
+    writeFileSync(path, JSON.stringify({ ...base, roomIdentity: { nameMode } }), { mode: 0o600 });
+    assert.deepEqual(loadConfig({ OURS_COWORK_CONFIG: path }).roomIdentity, { nameMode });
+  }
+
+  for (const roomIdentity of [{ nameMode: 'custom' }, { nameMode: 'friendly', extra: true }]) {
+    writeFileSync(path, JSON.stringify({ ...base, roomIdentity }), { mode: 0o600 });
+    assert.throws(() => loadConfig({ OURS_COWORK_CONFIG: path }), /invalid cowork config/i);
+  }
 });
 
 test('runtime state does not create or expose a management token', (t) => {

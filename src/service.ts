@@ -5,10 +5,12 @@ import { z } from 'zod';
 import {
   AcceptExternalInviteInputSchema,
   ContainerIdSchema,
+  configuredRoomIdentityName,
   CreateRoomInputSchema,
   DEFAULT_ROLE,
   defaultRoomName,
   InviteModeSchema,
+  isPersistedRoomIdentityName,
   LowerCrockfordUlidSchema,
   MAX_EXTERNAL_INVITE_BYTES,
   MAX_HISTORY_PAGE_BYTES,
@@ -19,12 +21,11 @@ import {
   RoomInviteSchema,
   RoomSchema,
   UpdateRoomInputSchema,
-  legacyRoomIdentityName,
-  roomIdentityName,
   type CommunicationRecord,
   type InviteMode,
   type RelayStatus,
   type Room,
+  type RoomIdentityNameMode,
   type RoomInvite,
   type Seat,
 } from './contracts.ts';
@@ -119,7 +120,7 @@ type MembershipIntentRecord = Extract<CommunicationRecord, { kind: 'membership_i
 export interface RoomPacketRegistry {
   get(roomId: string): RoomPacket | undefined;
   create(roomId: string, identityName?: string, bio?: string): Promise<RoomPacket>;
-  restore?(roomId: string, expectedCid?: string, identityName?: string, bio?: string): Promise<RoomPacket>;
+  restore?(roomId: string, expectedCid: string, identityName?: string, bio?: string): Promise<RoomPacket>;
   destroy(roomId: string): Promise<string[]>;
 }
 
@@ -128,6 +129,7 @@ export interface RoomServiceOptions {
   roomId?: () => string;
   messageId?: () => string;
   provisioningCheckpoint?: (stage: 'metadata') => void;
+  identityNameMode?: RoomIdentityNameMode;
 }
 
 export interface InviteReceipt {
@@ -189,6 +191,7 @@ export class RoomService {
   private readonly nextMessageId: () => string;
   private readonly intake: IntakePump;
   private readonly provisioningCheckpoint: NonNullable<RoomServiceOptions['provisioningCheckpoint']>;
+  private readonly identityNameMode: RoomIdentityNameMode;
 
   constructor(store: Store, packets: RoomPacketRegistry, options: RoomServiceOptions = {}) {
     this.store = store;
@@ -197,6 +200,7 @@ export class RoomService {
     this.nextRoomId = options.roomId ?? generateUlid;
     this.nextMessageId = options.messageId ?? generateUlid;
     this.provisioningCheckpoint = options.provisioningCheckpoint ?? (() => {});
+    this.identityNameMode = options.identityNameMode ?? 'stable_id';
     this.intake = new IntakePump(store, packets, {
       now: this.nowValue,
       messageId: this.nextMessageId,
@@ -209,7 +213,7 @@ export class RoomService {
     const settings = CreateRoomInputSchema.parse(input);
     const roomId = LowerCrockfordUlidSchema.parse(this.nextRoomId());
     const roomName = settings.name ?? defaultRoomName(roomId);
-    const identityName = roomIdentityName(roomId);
+    const identityName = configuredRoomIdentityName(roomId, roomName, this.identityNameMode);
     return this.lock(roomId, async () => {
       const provisional = RoomSchema.parse({
         version: 2,
@@ -270,24 +274,14 @@ export class RoomService {
         );
       }
     } else if (packetPending) {
-      if (this.packets.restore) {
-        try {
-          packet = await this.packets.restore(
-            id,
-            undefined,
-            room.identity_name,
-            `ours-cowork mission room ${id}`,
-          );
-        } catch { /* no live packet was durably established; provision below */ }
-      }
-      if (!packet) {
-        try {
-          packet = await this.packets.create(id, room.identity_name, `ours-cowork mission room ${id}`);
-        } catch (createFailure) {
-          throw new RoomServiceError(`failed to recover room packet "${id}"`, {
-            cause: createFailure,
-          });
-        }
+      try {
+        packet = await this.packets.create(id, room.identity_name, `ours-cowork mission room ${id}`);
+      } catch (createFailure) {
+        throw new RoomServiceError(
+          `failed to recover unproven packet-pending room identity "${room.identity_name}"; ` +
+          'cowork will not adopt an existing identity without a durably recorded CID',
+          { cause: createFailure },
+        );
       }
     } else {
       if (!this.packets.restore) {
@@ -1491,7 +1485,7 @@ export class RoomService {
     return room.identity_cid === ''
       && room.state === 'provisioning'
       && room.status === 'packet_pending'
-      && room.identity_name === roomIdentityName(room.room_id);
+      && isPersistedRoomIdentityName(room.room_id, room.identity_name);
   }
 
   private now(): string {

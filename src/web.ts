@@ -3,7 +3,7 @@ import type * as http from 'node:http';
 import { extname, join } from 'node:path';
 
 const NO_FOLLOW = nodeFs.constants.O_NOFOLLOW ?? 0;
-const CONTENT_SECURITY_POLICY = [
+export const CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
   "script-src 'self'",
   "style-src 'self'",
@@ -163,7 +163,7 @@ function assertDirectoryIdentity(fs: typeof nodeFs, expected: DirectoryIdentity)
   }
 }
 
-function safePathname(url: string | undefined): string | undefined {
+export function safePathname(url: string | undefined): string | undefined {
   if (url === undefined) return undefined;
   const raw = url.split(/[?#]/, 1)[0] ?? '';
   let decoded: string;

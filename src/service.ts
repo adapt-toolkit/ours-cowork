@@ -14,7 +14,10 @@ import {
   LowerCrockfordUlidSchema,
   MAX_EXTERNAL_INVITE_BYTES,
   MAX_HISTORY_PAGE_BYTES,
+  PostAsRoleInputSchema,
   PostMessageInputSchema,
+  RestRoleInputSchema,
+  ROOM_ROLE,
   RoleBriefingDeleteInputSchema,
   RoleBriefingSetInputSchema,
   RoleSchema,
@@ -33,8 +36,6 @@ import { unpackInvite, type RoomPacket } from './packets.ts';
 import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
 import { IntakePump } from './intake.ts';
 import { generateUlid } from './ulid.ts';
-
-const ROOM_ROLE = 'room';
 
 function byteBoundedHistoryPage<T>(records: T[]): T[] {
   const page: T[] = [];
@@ -75,7 +76,7 @@ const HistoryOptionsSchema = z.object({
 }).strict();
 
 /**
- * The participant-facing history projection (§4.4 item 7): message records
+ * The participant-facing history projection: message records
  * only, authors redacted to alias form in anonymous rooms, and no routing
  * identities, so no other participant's cid or contact name ever leaves the
  * operator boundary through this view.
@@ -226,6 +227,7 @@ export class RoomService {
         identity_cid: '',
         mission: { goal: settings.goal, briefing: settings.briefing, briefing_version: 1 },
         role_briefings: {},
+        rest_roles: [],
         anonymous: settings.anonymous ?? false,
         quiet_membership: settings.quiet_membership ?? false,
         membership_epoch: 0,
@@ -338,7 +340,7 @@ export class RoomService {
     return updated;
   }
 
-  /** Author or edit one role's briefing; an edit bumps its version and re-delivers to seats of that role only (spec §3.3). */
+  /** Author or edit one role's briefing; an edit bumps its version and re-delivers to seats of that role only. */
   async setRoleBriefing(roomId: string, input: unknown): Promise<Room> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const request = RoleBriefingSetInputSchema.parse(input);
@@ -527,7 +529,7 @@ export class RoomService {
   }
 
   /**
-   * Operator-only removal (spec §5.2): archive-before-act membership intent,
+   * Operator-only removal: archive-before-act membership intent,
    * seat state flip + epoch bump, core 0.13 bilateral sever with an honest
    * receipt, and an alias-form announcement unless the room or call is quiet.
    */
@@ -546,8 +548,8 @@ export class RoomService {
   }
 
   /**
-   * Removal plus a same-role invite stamped with the seat lineage (spec §5.3).
-   * Owner override OC-2/OC-6: in an anonymous room the flow is unconditionally
+   * Removal plus a same-role invite stamped with the seat lineage.
+   * In an anonymous room the flow is unconditionally
    * silent — the successor inherits the alias and other members see nothing.
    */
   async replaceParticipant(roomId: string, input: unknown): Promise<ReplacementReceipt> {
@@ -644,7 +646,7 @@ export class RoomService {
       recipient_identity: seat.identity,
       role: seat.role,
       // The participant-visible label: the alias in anonymous rooms, the
-      // contact display name otherwise (INV-R3 holds either way).
+      // contact display name otherwise; the anonymous relay stays pseudonymous either way.
       alias: seat.alias ?? seat.display_name,
       epoch: room.membership_epoch + 1,
       notify,
@@ -659,7 +661,7 @@ export class RoomService {
   /**
    * Idempotent completion of a durable removal intent: each step re-checks the
    * archive/state it would produce, so a crash anywhere re-drives cleanly
-   * (INV-R5; the 0.13 sever is replay-safe by design).
+   * The 0.13 sever is replay-safe by design.
    */
   private async completeRemovalUnlocked(
     room: Room,
@@ -1063,38 +1065,127 @@ export class RoomService {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     return this.lock(id, async () => {
       const room = await this.store.load(id);
-      if (room.state !== 'active') {
-        throw new RoomServiceError(`cannot post a room message while room "${id}" is not active`);
+      return this.appendChatUnlocked(id, room, {
+        identity: room.identity_cid,
+        display_name: room.identity_name,
+        role: ROOM_ROLE,
+      }, request.text);
+    });
+  }
+
+  /**
+   * Register a role a REST caller may author under. Idempotent, like
+   * revokeInvite. Registration does not consult seats: a role is a label, not a
+   * channel, so a role may be held by a seat and be REST-addressable at once.
+   */
+  async addRestRole(roomId: string, input: unknown): Promise<Room> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = RestRoleInputSchema.parse(input);
+    // TRAP: "room" is the room's own voice and the console classifies a message
+    // as the room voice on exactly `author.role === 'room'`. Registering it would
+    // let a caller author records indistinguishable from operator posts.
+    if (request.role === ROOM_ROLE) {
+      throw new RoomServiceError(`role "${ROOM_ROLE}" is reserved for the room's own voice`);
+    }
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'register a REST role for');
+      if (room.rest_roles.includes(request.role)) return room;
+      return this.store.save(RoomSchema.parse({
+        ...room,
+        rest_roles: [...room.rest_roles, request.role],
+      }));
+    });
+  }
+
+  /**
+   * Unregister a REST-addressable role. Messages it already authored are left
+   * exactly as posted and no tombstone is kept: there is no secret whose
+   * exposure window an auditor would need to reconstruct.
+   */
+  async removeRestRole(roomId: string, input: unknown): Promise<Room> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = RestRoleInputSchema.parse(input);
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'remove a REST role from');
+      if (!room.rest_roles.includes(request.role)) return room;
+      return this.store.save(RoomSchema.parse({
+        ...room,
+        rest_roles: room.rest_roles.filter((role) => role !== request.role),
+      }));
+    });
+  }
+
+  /**
+   * Author a message under a registered REST role. Room-side
+   * authorship: the shared-daemon room identity signs the bytes, so `identity` is the room's CID
+   * and the role name doubles as `display_name` — using the room's own name there
+   * would render as the room impersonating a foreign role.
+   */
+  async postAsRole(roomId: string, input: unknown): Promise<MessageRecord> {
+    // Same discipline as postMessage: the caller-controlled object is parsed in
+    // full first, so `role` is the only authorship field a caller can supply.
+    const request = PostAsRoleInputSchema.parse(input);
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      // Room state outranks the role: a closed room refuses the post for being
+      // closed, not for the name it was addressed to.
+      this.assertPostable(id, room);
+      // Read from the metadata loaded inside the lock, never a cache: a role
+      // removed a moment earlier is already absent, so there is no revocation lag.
+      if (!room.rest_roles.includes(request.role)) {
+        throw new RoomServiceError(`role "${request.role}" is not registered for REST authorship in room "${id}"`);
       }
-      const appended = await this.store.append(id, {
+      // No author_alias, in anonymous rooms as in named ones: the alias
+      // invariants govern seats, and there is no seat here to substitute.
+      return this.appendChatUnlocked(id, room, {
+        identity: room.identity_cid,
+        display_name: request.role,
+        role: request.role,
+      }, request.text);
+    });
+  }
+
+  /**
+   * The one operator-side chat append: archive the message, then journal one
+   * relay intent per active seat and resume the pump. Shared by postMessage and
+   * postAsRole so the two authorship paths cannot drift apart — only the author
+   * block differs between them. Caller holds the room lock and supplies the room
+   * it loaded inside that lock.
+   */
+  private async appendChatUnlocked(
+    id: string,
+    room: Room,
+    author: { identity: string; display_name: string; role: string },
+    text: string,
+  ): Promise<MessageRecord> {
+    this.assertPostable(id, room);
+    const appended = await this.store.append(id, {
+      version: 1,
+      kind: 'message',
+      room_id: id,
+      at: this.now(),
+      message_id: LowerCrockfordUlidSchema.parse(this.nextMessageId()),
+      author,
+      category: 'chat',
+      text,
+      recipient_identities: uniqueIdentities(activeSeats(room).map((seat) => seat.identity)),
+    });
+    if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong room message kind');
+    for (const recipientIdentity of appended.recipient_identities) {
+      await this.store.append(id, {
         version: 1,
-        kind: 'message',
+        kind: 'relay_intent',
         room_id: id,
         at: this.now(),
-        message_id: LowerCrockfordUlidSchema.parse(this.nextMessageId()),
-        author: {
-          identity: room.identity_cid,
-          display_name: room.identity_name,
-          role: ROOM_ROLE,
-        },
-        category: 'chat',
-        text: request.text,
-        recipient_identities: uniqueIdentities(activeSeats(room).map((seat) => seat.identity)),
+        message_id: appended.message_id,
+        recipient_identity: recipientIdentity,
       });
-      if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong room message kind');
-      for (const recipientIdentity of appended.recipient_identities) {
-        await this.store.append(id, {
-          version: 1,
-          kind: 'relay_intent',
-          room_id: id,
-          at: this.now(),
-          message_id: appended.message_id,
-          recipient_identity: recipientIdentity,
-        });
-      }
-      await this.intake.resumePending(id);
-      return appended;
-    });
+    }
+    await this.intake.resumePending(id);
+    return appended;
   }
 
   private async reconcileUnlocked(room: Room, packet: RoomPacket): Promise<Room> {
@@ -1161,7 +1252,7 @@ export class RoomService {
         participant_id: LowerCrockfordUlidSchema.parse(generateUlid()),
         state: 'active',
         ...(predecessor === undefined ? {} : { replaces_seat: predecessor.participant_id }),
-        // OC-6 (owner override): a replacement into a role inherits the
+        // A replacement into a role inherits the
         // predecessor's alias — the alias binds to the seat/role lineage.
         ...(room.anonymous
           ? { alias: predecessor?.alias ?? mintAlias(seated, invite.role) }
@@ -1206,7 +1297,7 @@ export class RoomService {
       invites,
       membership_epoch: room.membership_epoch + activatedPending.length + newSeats.length,
     });
-    // Re-drive any removal whose intent has no terminal result (INV-R5).
+    // Re-drive any removal whose intent has no terminal result.
     const journal = await this.store.read(next.room_id);
     const completedIntents = new Set(journal
       .filter((record) => record.kind === 'membership_result')
@@ -1358,8 +1449,8 @@ export class RoomService {
   }
 
   /**
-   * Deliver the common briefing followed by the seat's role briefing (spec
-   * §3.3): exactly once per (seat, briefing kind, version) via the message +
+   * Deliver the common briefing followed by the seat's role briefing:
+   * exactly once per (seat, briefing kind, version) via the message +
    * relay-intent ledger. Returns the timestamp of the common briefing message
    * that admitted the earliest of the given recipients (activation time).
    */
@@ -1477,6 +1568,12 @@ export class RoomService {
     const packet = this.packets.get(roomId);
     if (!packet) throw new RoomServiceError(`room packet "${roomId}" is not hosted`);
     return packet;
+  }
+
+  private assertPostable(id: string, room: Room): void {
+    if (room.state !== 'active') {
+      throw new RoomServiceError(`cannot post a room message while room "${id}" is not active`);
+    }
   }
 
   private assertMutable(room: Room, action: string): void {

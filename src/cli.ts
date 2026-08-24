@@ -132,6 +132,8 @@ Room commands:
   participants <room-id>
   history <room-id> [--after <seq>] [--limit <n>] [--view operator|participant]
   message <room-id> --text <text>
+  say <room-id> --role <label> --text <text>
+  rest-role <room-id> --role <label> [--remove]
   close <room-id>
   delete <room-id> --yes
   recover <room-id> [--confirm <old-invite-id> <new-invite-id>]
@@ -367,6 +369,22 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
         room_id: roomId,
         text: requiredFlag(parsed, '--text', 'room message'),
       } };
+    }
+    case 'say': {
+      const parsed = parseOptions(args, ['--role', '--text']);
+      const [roomId] = exactPositionals(parsed, 1, 'room say');
+      return { method: 'room.say', params: {
+        room_id: roomId,
+        role: requiredFlag(parsed, '--role', 'room say'),
+        text: requiredFlag(parsed, '--text', 'room say'),
+      } };
+    }
+    case 'rest-role': {
+      const parsed = parseOptions(args, ['--role'], ['--remove']);
+      const [roomId] = exactPositionals(parsed, 1, 'room rest-role');
+      const role = requiredFlag(parsed, '--role', 'room rest-role');
+      const method = parsed.booleans.has('--remove') ? 'room.role.rest.remove' : 'room.role.rest.add';
+      return { method, params: { room_id: roomId, role } };
     }
     case 'delete': {
       const parsed = parseOptions(args, [], ['--yes']);

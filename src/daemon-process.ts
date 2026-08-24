@@ -62,8 +62,8 @@ async function runWorker(): Promise<number> {
       if (error !== undefined) console.error(error);
       const code = error === undefined ? 0 : 1;
       if (requiresProcessExit) {
-        // SDK 0.10.12 exposes no native broker stop. This private worker owns
-        // the SDK process and is the sole boundary permitted to force exit.
+        // The underlying native runtime exposes no broker stop. This private
+        // worker owns the SDK process and is the sole boundary permitted to force exit.
         process.exit(code);
       }
       if (!disconnected) {

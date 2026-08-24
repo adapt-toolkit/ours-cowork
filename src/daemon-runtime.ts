@@ -236,7 +236,7 @@ export class CoworkDaemon {
         await this.service.closeRoom(room.room_id);
         this.checkpoint();
       }
-      // Task 6 resumePending itself performs inbox snapshot -> complete all
+      // resumePending itself performs inbox snapshot -> complete all
       // intents -> atomic consume -> pending sends, in that exact order.
       for (const room of recoverable.filter((candidate) => candidate.state !== 'closing')) {
         await this.service.resumePending(room.room_id);

@@ -469,7 +469,7 @@ test('established room restore fails clearly when its locally recorded name is a
   );
 });
 
-test('shared host attaches through SDK 2, filters daemon-global names, and releases only its leases', async () => {
+test('shared host attaches through SDK 3, filters daemon-global names, and releases only its leases', async () => {
   const calls = [];
   const watcher = {
     async identities() {

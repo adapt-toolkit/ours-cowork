@@ -158,6 +158,7 @@ function room(overrides = {}) {
     identity_cid: 'cid-room',
     mission: { goal: 'Ship', briefing: 'Read the mission.', briefing_version: 1 },
     role_briefings: {},
+    rest_roles: [],
     anonymous: false,
     quiet_membership: false,
     membership_epoch: 3,
@@ -657,7 +658,7 @@ test('concurrent notify and pump calls serialize one archive message, intent, se
   assert.equal(byKind(records, 'relay_result').length, 1);
 });
 
-test('resumePending reconciles Task 5 briefing intents into canonical room_briefing envelopes', async () => {
+test('resumePending reconciles briefing intents into canonical room_briefing envelopes', async () => {
   const briefingId = MESSAGE_IDS[2];
   const f = fixture({
     records: [
@@ -826,7 +827,7 @@ test('notify chains a dirty replacement after a failed worker and still reports 
   assert.equal(calls, 2, 'dirty shutdown work must be handed to a replacement worker');
 });
 
-// ---- Rooms evolution Phase A3 (spec §4.2, §4.4, §8.3) — anonymity ----
+// ---- Anonymous-room intake and relay privacy -------------------------------
 
 function anonymousRoom(overrides = {}) {
   const base = room();
@@ -859,7 +860,7 @@ test('anonymous rooms relay alias authors with zero real identity bytes in bodie
 
   const records = await f.store.read(ROOM_ID);
   const [message] = byKind(records, 'message');
-  // the archive keeps BOTH the real seat identity and the alias (INV-R4)
+  // The archive keeps both the real seat identity and the alias.
   assert.deepEqual(message.author, { identity: 'cid-alice', display_name: 'Alice', role: 'builder' });
   assert.deepEqual(message.author_alias, {
     participant_id: '01jz6y7n8p9q0r1s2t3v4w5xa1',
@@ -882,7 +883,7 @@ test('anonymous rooms relay alias authors with zero real identity bytes in bodie
     role: 'builder',
   });
 
-  // default-level logs never pair an alias with a cid (§4.4 item 6)
+  // Default-level logs never pair an alias with a CID.
   for (const line of consoleLines) {
     assert.equal(line.includes('cid-alice') && line.includes('builder #1'), false, line);
   }
@@ -909,6 +910,29 @@ test('room-voice messages in anonymous rooms carry the room author and no seat i
       assert.equal(Buffer.from(call.body, 'utf8').includes(leak), false, `${leak} leaked into a room-voice body`);
     }
   }
+});
+
+test('role-authored messages in anonymous rooms inherit the room-voice exemption from aliasing', async () => {
+  // A REST role is room-side authorship, so it takes the same unaliased path the
+  // room's own voice already takes here. The alias invariants constrain SEATS;
+  // There is no seat to substitute, so seat-alias rules do not apply.
+  const f = fixture({ room: anonymousRoom({ rest_roles: ['Bot'] }) });
+  await f.service.postAsRole(ROOM_ID, { role: 'Bot', text: 'Scripted update.' });
+  assert.equal(f.packet.sendCalls.length, 3);
+  for (const call of f.packet.sendCalls) {
+    const body = JSON.parse(call.body);
+    assert.deepEqual(body.author, { identity: 'cid-room', display_name: 'Bot', role: 'Bot' });
+    assert.equal('author_alias' in body, false);
+    // No `via` marker and no other new field: author.identity + author.role already
+    // discriminate, so the relayed key set stays exactly what it pins above.
+    assert.deepEqual(Object.keys(body).sort(),
+      ['at', 'author', 'kind', 'message_id', 'room_id', 'text', 'version']);
+    for (const leak of ['cid-alice', 'cid-bob', 'cid-cara', 'Alice', 'Bob', 'Cara', 'builder #1']) {
+      assert.equal(Buffer.from(call.body, 'utf8').includes(leak), false, `${leak} leaked into a role body`);
+    }
+  }
+  const [message] = byKind(await f.store.read(ROOM_ID), 'message');
+  assert.equal(message.author_alias, undefined);
 });
 
 test('history views: participant redacts to alias form and drops identities; operator keeps both', async () => {
@@ -949,7 +973,7 @@ test('history views: participant redacts to alias form and drops identities; ope
   assert.equal('recipient_identities' in plainView[0], false);
 });
 
-// ---- Rooms evolution Phase A4 (spec §5.2, §8.4) — removed members at intake ----
+// ---- Removed members at intake ---------------------------------------------
 
 function roomWithRemovedAlice(overrides = {}) {
   const base = room();
@@ -1023,7 +1047,7 @@ test('relay intents addressed to a removed seat resolve as skipped_removed and a
   assert.deepEqual(f.packet.sendCalls.map((call) => call.recipient), ['cid-bob']);
 });
 
-// ---- The outbound funnel (§8.3 pin coverage) --------------------------------
+// ---- The outbound privacy-test funnel --------------------------------------
 
 test('there is exactly ONE packet.send call site in src/, and it is the canonical envelope funnel', async () => {
   // WHAT THIS GUARDS, and why a count is the right shape for it.

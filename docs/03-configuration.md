@@ -19,7 +19,7 @@ Cowork overrides are `OURS_COWORK_CONFIG`, `OURS_COWORK_STATE_DIR`, and `OURS_CO
 
 ## Shared ours daemon selection
 
-Cowork uses the SDK 2 shared-daemon selection without wrapping or rewriting it. The wholly default selection is port 3050 with state directory `~/.ours`. For a configured daemon, point `OURS_CONFIG` at the configuration written by `ours config setup`, or set both `OURS_PORT` and `OURS_STATE_DIR`. The SDK proves the daemon's state root through the unauthenticated `/state-dir` route before sending a credential.
+Cowork uses the SDK 3 shared-daemon selection without wrapping or rewriting it. The wholly default selection is port 3050 with state directory `~/.ours`. For a configured daemon, point `OURS_CONFIG` at the configuration written by `ours config setup`, or set both `OURS_PORT` and `OURS_STATE_DIR`. The SDK proves the daemon's state root through the unauthenticated `/state-dir` route before sending a credential.
 
 ```sh
 ours config setup --port 3070 --state-dir /srv/ours

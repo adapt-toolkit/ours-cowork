@@ -125,6 +125,9 @@ test('usage errors exit 2 before touching the daemon', async () => {
     ['room', 'create', '--goal', 'g'],
     ['docs', 'not-a-topic'],
     ['web', 'extra'],
+    ['room', 'say', 'room1', '--text', 'no role'],
+    ['room', 'say', 'room1', '--role', 'Reviewer'],
+    ['room', 'rest-role', 'room1'],
   ]) {
     const result = await runCli(args, { env: { OURS_COWORK_STATE_DIR: join(tmpdir(), 'absent-cowork-cli') } });
     assert.equal(result.code, 2, args.join(' '));
@@ -278,7 +281,7 @@ test('room commands send exactly one JSONL request over management.sock', async 
     { args: ['room', 'delete', 'room1', '--yes'], method: 'room.delete', params: { room_id: 'room1', confirm: true } },
     { args: ['room', 'recover', 'room1'], method: 'room.recover', params: { room_id: 'room1' } },
     { args: ['room', 'recover', 'room1', '--confirm', 'old1', 'new1'], method: 'room.recover.confirm', params: { room_id: 'room1', recovery_of: 'old1', invite_id: 'new1' } },
-    // Rooms evolution Phase A5 verbs
+    // Room membership and briefing verbs
     { args: ['room', 'create', '--goal', 'Ship', '--briefing', 'B', '--anonymous', '--quiet-membership'], method: 'room.create', params: { goal: 'Ship', briefing: 'B', anonymous: true, quiet_membership: true } },
     { args: ['room', 'settings', 'room1', '--quiet-membership', 'false'], method: 'room.settings', params: { room_id: 'room1', quiet_membership: false } },
     { args: ['room', 'invite', 'room1'], method: 'room.invite', params: { room_id: 'room1', mode: 'one_time', min_accepts: 1 } },
@@ -289,6 +292,10 @@ test('room commands send exactly one JSONL request over management.sock', async 
     { args: ['room', 'replace', 'room1', 'cid-participant'], method: 'room.participant.replace', params: { room_id: 'room1', participant: 'cid-participant' } },
     { args: ['room', 'replace', 'room1', 'cid-participant', '--mode', 'public', '--min-accepts', '2'], method: 'room.participant.replace', params: { room_id: 'room1', participant: 'cid-participant', mode: 'public', min_accepts: 2 } },
     { args: ['room', 'history', 'room1', '--view', 'participant'], method: 'room.history', params: { room_id: 'room1', view: 'participant', after: 0 } },
+    // REST role authorship
+    { args: ['room', 'say', 'room1', '--role', 'Reviewer', '--text', 'Reviewed'], method: 'room.say', params: { room_id: 'room1', role: 'Reviewer', text: 'Reviewed' } },
+    { args: ['room', 'rest-role', 'room1', '--role', 'Reviewer'], method: 'room.role.rest.add', params: { room_id: 'room1', role: 'Reviewer' } },
+    { args: ['room', 'rest-role', 'room1', '--role', 'Reviewer', '--remove'], method: 'room.role.rest.remove', params: { room_id: 'room1', role: 'Reviewer' } },
   ];
   for (const expected of cases) {
     await withRpc((request) => ({ result: request.method === 'room.history' ? [] : { ok: true } }), async (rpc) => {

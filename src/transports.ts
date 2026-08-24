@@ -6,7 +6,8 @@ import { basename, dirname, join } from 'node:path';
 
 import { z } from 'zod';
 
-import { createStaticWebHandler, type StaticWebHandler } from './web.ts';
+import { apiDocsAsset } from './openapi.ts';
+import { CONTENT_SECURITY_POLICY, createStaticWebHandler, safePathname, type StaticWebHandler } from './web.ts';
 
 export const MAX_REQUEST_BYTES = 1024 * 1024;
 export const HTTP_HEADERS_TIMEOUT_MS = 5_000;
@@ -113,6 +114,9 @@ export interface RoomServiceApi {
   participants(roomId: string): Promise<unknown>;
   history(roomId: string, options: unknown): Promise<unknown>;
   postMessage(roomId: string, input: unknown): Promise<unknown>;
+  postAsRole(roomId: string, input: unknown): Promise<unknown>;
+  addRestRole(roomId: string, input: unknown): Promise<unknown>;
+  removeRestRole(roomId: string, input: unknown): Promise<unknown>;
   closeRoom(roomId: string): Promise<unknown>;
   deleteRoom(roomId: string, input: unknown): Promise<unknown>;
 }
@@ -132,6 +136,9 @@ const RoleBriefingSetParams = z.object({
   room_id: z.string(), role: z.string(), text: z.string(),
 }).strict();
 const RoleBriefingDeleteParams = z.object({
+  room_id: z.string(), role: z.string(),
+}).strict();
+const RestRoleParams = z.object({
   room_id: z.string(), role: z.string(),
 }).strict();
 const ParticipantRemoveParams = z.object({
@@ -210,6 +217,22 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
     'room.message': { auth: true, run: (params) => {
       const { room_id, ...input } = z.object({ room_id: z.string(), text: z.unknown() }).strict().parse(params);
       return service.postMessage(room_id, input);
+    } },
+    // Role authorship: served over REST, which is the point of the feature. No
+    // secret is ingested in either direction, so the Unix-only rule does not apply.
+    'room.say': { auth: true, run: (params) => {
+      const { room_id, ...input } = z.object({
+        room_id: z.string(), role: z.unknown(), text: z.unknown(),
+      }).strict().parse(params);
+      return service.postAsRole(room_id, input);
+    } },
+    'room.role.rest.add': { auth: true, run: (params) => {
+      const { room_id, ...input } = RestRoleParams.parse(params);
+      return service.addRestRole(room_id, input);
+    } },
+    'room.role.rest.remove': { auth: true, run: (params) => {
+      const { room_id, ...input } = RestRoleParams.parse(params);
+      return service.removeRestRole(room_id, input);
     } },
     'room.close': { auth: true, run: (params) => service.closeRoom(RoomIdParams.parse(params).room_id) },
     'room.delete': { auth: true, run: (params) => {
@@ -404,6 +427,7 @@ export class TransportServer {
       if (request.url !== '/rpc') {
         if (request.method === 'GET') {
           activateResponse();
+          if (await serveApiDocs(request, response)) return;
           if (await this.staticHandler(request, response)) return;
         }
         activateResponse();
@@ -702,6 +726,32 @@ function isJsonMediaType(value: string | undefined): boolean {
   const mediaType = value.split(';', 1)[0]?.trim().toLowerCase();
   return mediaType === 'application/json'
     || (mediaType?.startsWith('application/') === true && mediaType.endsWith('+json'));
+}
+
+/**
+ * Serve the read-only OpenAPI document and its browser UI. These carry no room
+ * state and no secrets, so they follow the static console's exposure rules:
+ * loopback-only listener, `'self'`-only CSP, and no remote asset of any kind.
+ */
+async function serveApiDocs(
+  request: http.IncomingMessage,
+  response: http.ServerResponse,
+): Promise<boolean> {
+  const pathname = safePathname(request.url);
+  if (pathname === undefined) return false;
+  const asset = apiDocsAsset(pathname);
+  if (!asset) return false;
+  const body = Buffer.from(asset.body, 'utf8');
+  response.writeHead(200, {
+    'content-type': asset.contentType,
+    'content-length': body.length,
+    'cache-control': 'no-cache',
+    'content-security-policy': CONTENT_SECURITY_POLICY,
+    'x-content-type-options': 'nosniff',
+  });
+  response.end(body);
+  await responseFinished(response);
+  return true;
 }
 
 function sendJson(response: http.ServerResponse, status: number, value: RpcResponse): void {

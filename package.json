@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@ours.network/sdk": "3.5.0",
+    "better-sqlite3": "11.10.0",
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "zod": "^3.23.8"
@@ -37,6 +38,7 @@
     "@testing-library/jest-dom": "6.6.3",
     "@testing-library/react": "16.1.0",
     "@testing-library/user-event": "14.5.2",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.14.0",
     "@types/react": "18.3.31",
     "@types/react-dom": "18.3.7",

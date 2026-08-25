@@ -25,6 +25,7 @@ const FILE_OUT_WIRE = '66'.repeat(32);
 
 class FakeClient {
   contacts = [];
+  origins;
   invites = [];
   messages = [];
   messageHistory = new Map();
@@ -45,7 +46,12 @@ class FakeClient {
     return { info: { cid: CID } };
   }
 
-  async listContacts() { return { contacts: structuredClone(this.contacts) }; }
+  async listContacts() {
+    return {
+      contacts: structuredClone(this.contacts),
+      ...(this.origins === undefined ? {} : { origins: structuredClone(this.origins) }),
+    };
+  }
   async listInvites() { return structuredClone(this.invites); }
   async listIncomingMessages() { return structuredClone(this.messages); }
   async listIncomingFiles() { return structuredClone(this.files); }
@@ -154,6 +160,9 @@ function blankClient() { return new FakeClient(); }
 test('SDK room packet maps message/file/reply state and uses only typed public operations', async () => {
   const client = blankClient();
   client.contacts = [{ name: 'Peer', container_id: CID }];
+  client.origins = {
+    [CID]: 'invite-1',
+  };
   client.invites = [{ invite_id: 'invite-1', mode: 'one_time', assigned: '', created: 'now' }];
   client.messages = [{
     seq: 1,
@@ -201,7 +210,11 @@ test('SDK room packet maps message/file/reply state and uses only typed public o
   const packet = new SdkRoomPacket(IDENTITY, CID, client);
   await packet.refresh();
 
-  assert.deepEqual(packet.listContacts(), client.contacts);
+  assert.equal(packet.supportsInviteProvenance, true);
+  assert.deepEqual(packet.listContacts(), [{
+    ...client.contacts[0],
+    accepted_via_invite_id: client.origins[CID],
+  }]);
   assert.deepEqual(packet.listInvites(), [{ invite_id: 'invite-1', mode: 'one_time' }]);
   assert.deepEqual(await packet.listUnreadMessages(32), [{
     msg_id: 7,

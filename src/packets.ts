@@ -61,7 +61,13 @@ export interface RoomPacket {
   }>;
   revokeInvite(inviteId: string): Promise<{ revoked: boolean }>;
   listInvites(): Array<{ invite_id: string; mode: InviteMode }>;
-  listContacts(): Array<{ name: string; container_id: string }>;
+  /** Whether contact records carry authenticated core invite provenance. */
+  readonly supportsInviteProvenance: boolean;
+  listContacts(): Array<{
+    name: string;
+    container_id: string;
+    accepted_via_invite_id?: string;
+  }>;
   /** Reconcile only contacts before retry-sensitive removal work. */
   refreshContacts(): Promise<void>;
   listUnreadMessages(limit: number): Promise<InboxItem[]>;
@@ -244,7 +250,12 @@ export class SdkRoomPacket implements RoomPacket {
   readonly name: string;
   readonly cid: string;
   private readonly client: OursClient;
-  private contacts: Array<{ name: string; container_id: string }> = [];
+  private contacts: Array<{
+    name: string;
+    container_id: string;
+    accepted_via_invite_id?: string;
+  }> = [];
+  private hasInviteProvenance = false;
   private invites: Array<{ invite_id: string; mode: InviteMode }> = [];
   private refreshWork?: Promise<void>;
   private contactRefreshWork?: Promise<void>;
@@ -275,8 +286,17 @@ export class SdkRoomPacket implements RoomPacket {
   }
 
   private async refreshContactsUnlocked(): Promise<void> {
-    const contacts = await this.client.listContacts();
-    this.contacts = contacts.contacts.map((contact) => ({ ...contact }));
+    type ContactsWithOrigins = Awaited<ReturnType<OursClient['listContacts']>> & {
+      origins?: Record<string, string>;
+    };
+    const listed = await this.client.listContacts() as ContactsWithOrigins;
+    this.hasInviteProvenance = listed.origins !== undefined;
+    this.contacts = listed.contacts.map((contact) => ({
+      ...contact,
+      ...(listed.origins?.[contact.container_id] === undefined
+        ? {}
+        : { accepted_via_invite_id: listed.origins[contact.container_id] }),
+    }));
   }
 
   async mintInvite(mode: InviteMode): Promise<{ blob: string; invite_id: string; reusable: boolean }> {
@@ -304,7 +324,14 @@ export class SdkRoomPacket implements RoomPacket {
   }
 
   listInvites(): Array<{ invite_id: string; mode: InviteMode }> { return this.invites.map((invite) => ({ ...invite })); }
-  listContacts(): Array<{ name: string; container_id: string }> { return this.contacts.map((contact) => ({ ...contact })); }
+  get supportsInviteProvenance(): boolean { return this.hasInviteProvenance; }
+  listContacts(): Array<{
+    name: string;
+    container_id: string;
+    accepted_via_invite_id?: string;
+  }> {
+    return this.contacts.map((contact) => ({ ...contact }));
+  }
 
   async listUnreadMessages(limit: number): Promise<InboxItem[]> {
     validateBatchLimit(limit);

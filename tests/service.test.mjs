@@ -84,6 +84,7 @@ class MemoryStore {
 }
 
 class FakePacket {
+  supportsInviteProvenance = false;
   name;
   cid;
   mintCalls = [];
@@ -755,13 +756,13 @@ test('confirmed then revoked recovery lineage cannot admit future SDK contacts b
   );
 });
 
-test('one live SDK invite admits unambiguous contacts and must be revoked before another is minted', async () => {
+test('an older SDK retains single-live compatibility until invite provenance is available', async () => {
   const f = fixture();
   await create(f);
   const first = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'first-role', min_accepts: 1 });
   await assert.rejects(
     f.service.createInvite(ROOM_ID, { mode: 'public', role: 'second-role', min_accepts: 1 }),
-    /one live invitation/i,
+    /does not expose authenticated invite provenance/i,
   );
   const packet = f.registry.get(ROOM_ID);
   packet.contacts = [{ name: 'First contact', container_id: 'cid-first' }];
@@ -770,6 +771,52 @@ test('one live SDK invite admits unambiguous contacts and must be revoked before
   await f.service.revokeInvite(ROOM_ID, first.invite.invite_id);
   const second = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'second-role', min_accepts: 1 });
   assert.equal(second.invite.role, 'second-role');
+});
+
+test('concurrent invites admit each authenticated contact into its exact role independent of contact order', async () => {
+  const f = fixture();
+  await create(f);
+  const packet = f.registry.get(ROOM_ID);
+  packet.supportsInviteProvenance = true;
+  const builder = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  const reviewer = await f.service.createInvite(ROOM_ID, { mode: 'one_time', role: 'reviewer', min_accepts: 1 });
+  packet.contacts = [
+    {
+      name: 'Reviewer', container_id: 'cid-reviewer',
+      accepted_via_invite_id: reviewer.invite.invite_id,
+    },
+    {
+      name: 'Builder', container_id: 'cid-builder',
+      accepted_via_invite_id: builder.invite.invite_id,
+    },
+  ];
+
+  const room = await f.service.reconcileRoom(ROOM_ID);
+  assert.deepEqual(room.seats.map((seat) => [seat.identity, seat.role, seat.invite_id]), [
+    ['cid-reviewer', 'reviewer', reviewer.invite.invite_id],
+    ['cid-builder', 'builder', builder.invite.invite_id],
+  ]);
+  assert.deepEqual(room.invites.find((invite) => invite.invite_id === builder.invite.invite_id).accepted_cids, ['cid-builder']);
+  assert.deepEqual(room.invites.find((invite) => invite.invite_id === reviewer.invite.invite_id).accepted_cids, ['cid-reviewer']);
+  assert.equal(room.invites.find((invite) => invite.invite_id === reviewer.invite.invite_id).state, 'consumed');
+});
+
+test('authenticated provenance fails closed for missing, unknown, revoked, and pending invite IDs', async () => {
+  const f = fixture();
+  await create(f);
+  const packet = f.registry.get(ROOM_ID);
+  packet.supportsInviteProvenance = true;
+  const live = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'live-role', min_accepts: 1 });
+  const revoked = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'revoked-role', min_accepts: 1 });
+  await f.service.revokeInvite(ROOM_ID, revoked.invite.invite_id);
+  packet.contacts = [
+    { name: 'Legacy', container_id: 'cid-missing' },
+    { name: 'Unknown', container_id: 'cid-unknown', accepted_via_invite_id: 'unknown-invite' },
+    { name: 'Revoked', container_id: 'cid-revoked', accepted_via_invite_id: revoked.invite.invite_id },
+    { name: 'Valid', container_id: 'cid-valid', accepted_via_invite_id: live.invite.invite_id },
+  ];
+  const room = await f.service.reconcileRoom(ROOM_ID);
+  assert.deepEqual(room.seats.map((seat) => seat.identity), ['cid-valid']);
 });
 
 test('ambiguous recovery save revokes/records the pending replacement and retry converges', async () => {
@@ -822,7 +869,7 @@ test('reconciliation revokes a core invite orphaned before its metadata save', a
   assert.equal((await f.store.load(ROOM_ID)).invites.length, 0);
 });
 
-test('one live SDK invite assigns every unique new contact its configured room role', async () => {
+test('legacy single-live admission deduplicates contacts while preserving its configured role', async () => {
   const f = fixture();
   await create(f);
   const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'trusted-looking label', min_accepts: 2 });

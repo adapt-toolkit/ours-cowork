@@ -393,9 +393,10 @@ export class RoomService {
     return this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'create an invite for');
-      if (room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
+      if (!this.packet(id).supportsInviteProvenance
+        && room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
         throw new RoomServiceError(
-          'standard SDK rooms permit one live invitation at a time so every accepted contact has unambiguous room admission metadata',
+          'the installed ours SDK does not expose authenticated invite provenance; revoke or consume the current invitation before creating another',
         );
       }
       return this.mintInviteUnlocked(room, {
@@ -494,12 +495,13 @@ export class RoomService {
     room: Room,
     request: { mode: InviteMode; role: string; min_accepts: number; replaces_seat?: string },
   ): Promise<InviteReceipt> {
-    if (room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
+    const packet = this.packet(room.room_id);
+    if (!packet.supportsInviteProvenance
+      && room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
       throw new RoomServiceError(
-        'standard SDK rooms permit one live invitation at a time; revoke or consume the current invitation first',
+        'the installed ours SDK does not expose authenticated invite provenance; revoke or consume the current invitation first',
       );
     }
-    const packet = this.packet(room.room_id);
     const minted = await packet.mintInvite(request.mode);
     const invite = RoomInviteSchema.parse({
       invite_id: minted.invite_id,
@@ -1190,17 +1192,19 @@ export class RoomService {
 
   private async reconcileUnlocked(room: Room, packet: RoomPacket): Promise<Room> {
     if (room.state === 'closed' || room.state === 'closing') return room;
-    const contactsByCid = new Map<string, string>();
+    const contactsByCid = new Map<string, { displayName: string; inviteId?: string }>();
     for (const contact of packet.listContacts()) {
-      if (!contactsByCid.has(contact.container_id)) contactsByCid.set(contact.container_id, contact.name);
+      if (contactsByCid.has(contact.container_id)) continue;
+      const authenticatedInvite = contact.accepted_via_invite_id;
+      contactsByCid.set(contact.container_id, {
+        displayName: contact.name,
+        ...(authenticatedInvite === undefined ? {} : { inviteId: authenticatedInvite }),
+      });
     }
     const inviteById = new Map(room.invites.map((invite) => [invite.invite_id, invite]));
     const existingCids = new Set(room.seats
       .filter((seat) => seat.state === 'active' || seat.state === 'pending')
       .map((seat) => seat.identity));
-    // The public standard SDK intentionally does not expose custom actor
-    // contact-origin records. Cowork 1.0 therefore keeps at most one live room
-    // invite and assigns newly accepted contacts to that unambiguous descriptor.
     const lastRemovedAt = new Map<string, string>();
     for (const seat of room.seats) {
       if (seat.state !== 'removed' || seat.removed_at === undefined) continue;
@@ -1213,13 +1217,13 @@ export class RoomService {
     const seatsWithActivations = [...room.seats];
     for (const [seatIndex, seat] of room.seats.entries()) {
       if (seat.state !== 'pending') continue;
-      const displayName = contactsByCid.get(seat.identity);
-      if (displayName === undefined) continue;
+      const contact = contactsByCid.get(seat.identity);
+      if (contact === undefined) continue;
       const { alias: _alias, replaces_seat: _replacesSeat, ...base } = seat;
       const activated: Seat = {
         ...base,
         state: 'active',
-        display_name: displayName,
+        display_name: contact.displayName,
         accepted_at: this.now(),
         ...(_replacesSeat === undefined ? {} : { replaces_seat: _replacesSeat }),
         ...(room.anonymous ? { alias: _alias! } : {}),
@@ -1231,11 +1235,17 @@ export class RoomService {
 
     const eligibleInvites = room.invites.filter((invite) => invite.state === 'live'
       && (invite.recovery_of === undefined || invite.recovery_confirmed === true));
-    const admissionInvite = eligibleInvites.length === 1 ? eligibleInvites[0] : undefined;
-    for (const [cid, displayName] of contactsByCid) {
+    const legacyAdmissionInvite = !packet.supportsInviteProvenance && eligibleInvites.length === 1
+      ? eligibleInvites[0]
+      : undefined;
+    for (const [cid, contact] of contactsByCid) {
       if (existingCids.has(cid)) continue;
-      const invite = admissionInvite;
+      const invite = contact.inviteId === undefined
+        ? legacyAdmissionInvite
+        : inviteById.get(contact.inviteId);
       if (!invite) continue;
+      if (invite.state !== 'live') continue;
+      if (invite.recovery_of !== undefined && invite.recovery_confirmed !== true) continue;
       const removedAt = lastRemovedAt.get(cid);
       if (removedAt !== undefined && invite.created_at <= removedAt) continue;
       const seated = [...seatsWithActivations, ...newSeats];
@@ -1245,7 +1255,7 @@ export class RoomService {
       if (invite.replaces_seat !== undefined && !predecessor) continue;
       newSeats.push({
         identity: cid,
-        display_name: displayName,
+        display_name: contact.displayName,
         role: invite.role,
         invite_id: invite.invite_id,
         accepted_at: this.now(),

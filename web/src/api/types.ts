@@ -289,8 +289,7 @@ export function isRoomDto(value: unknown): value is RoomDto {
 
   const exactPacketPending = value.state === 'provisioning'
     && value.status === 'packet_pending'
-    && (value.identity_name === `cowork-room-${value.room_id}`
-      || value.identity_name === `ours-cowork-room:${value.room_name}`)
+    && isPacketPendingIdentityName(value.room_id, value.room_name, value.identity_name)
     && value.invites.length === 0
     && value.seats.length === 0
     && value.activated_at === undefined
@@ -334,6 +333,17 @@ export function isRoomDto(value: unknown): value is RoomDto {
     }
   }
   return true;
+}
+
+function isPacketPendingIdentityName(roomId: string, roomName: string, identityName: string): boolean {
+  if (identityName === `cowork-room-${roomId}`
+    || identityName === `ours-cowork-room:${roomName}`
+    || identityName === `ours-cowork-${roomId}`) return true;
+  const suffix = `-${roomId}`;
+  if (!identityName.startsWith('ours-cowork-') || !identityName.endsWith(suffix)) return false;
+  const slug = identityName.slice('ours-cowork-'.length, -suffix.length);
+  return slug.length >= 1 && slug.length <= 40 && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug)
+    && identityName.length <= 96;
 }
 
 export function isRoomListDto(value: unknown): value is RoomDto[] {

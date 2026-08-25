@@ -41,6 +41,13 @@ Daemon history responses are capped at 3 MiB of JSON so one 2 MiB file record (a
 
 Participant messages and files are accepted only from durable seats in an active room. A file is opaque binary data: cowork neither interprets its MIME metadata nor executes its contents. Its filename must be a path-free name of at most 255 UTF-8 bytes (not `.`, `..`, or a name containing `/`, `\\`, or NUL); MIME metadata may be empty and is limited to 255 UTF-8 bytes. Zero-byte files are valid. The maximum file size is 2 MiB (2,097,152 bytes), and a larger file is rejected explicitly.
 
+Every participant-facing version-one room envelope includes the authenticated
+top-level `room_name`, including messages, file metadata, and the
+`room_not_member` notice. It is the room's validated presentation name (trimmed,
+Unicode NFC, 1–64 characters, with control and format characters rejected), so
+clients can render the task/room title without deriving it from the SDK identity
+name, slug, or room ID.
+
 Incoming message listings contain authorization metadata but no body. Cowork resolves each selected wire ID through persistent SDK history, verifies that the history row matches the listing, archives the message and complete recipient-intent fan-out, and then asks the SDK to read one oldest unread row. If an older introduction becomes unread between listing and acknowledgement, that authoritative row is archived through the same intake path before cowork retries the expected row. There is no defer operation; an empty acknowledgement means another reader already advanced the expected row.
 
 For a file, cowork reads the identity-scoped immutable blob while the item is still unread and verifies its length and SHA-256 against SDK metadata. It then durably archives the exact bytes as canonical base64 together with the reply reference and every per-recipient relay intent before selecting that exact 64-hex wire ID with `getFiles`. Each other active seat receives two SDK items: an authenticated `room_file` metadata envelope and a binary file containing the original bytes. The SDK receives bytes, never a local filesystem path, so there is no staging-file or path-permission dependency. A seat removed after fan-out is skipped terminally without receiving metadata or bytes. A crash can redrive an unfinished recipient from the cowork archive; an already terminal recipient is not retried.

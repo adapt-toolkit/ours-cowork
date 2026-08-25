@@ -17,7 +17,7 @@ import type { CoworkStore, RoomMutex } from './storage.ts';
 import { generateUlid } from './ulid.ts';
 
 type IntakeStore = Pick<CoworkStore, 'mutex' | 'load' | 'save' | 'append' | 'read'>
-  & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents'>>;
+  & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'relayRecipientsNeedingIntent'>>;
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 type FileRecord = Extract<CommunicationRecord, { kind: 'file' }>;
 type RelayIntentRecord = Extract<CommunicationRecord, { kind: 'relay_intent' }>;
@@ -35,6 +35,8 @@ interface NotificationState {
   dirty: boolean;
   work: Promise<void>;
 }
+
+const JOURNAL_WORK_BATCH_SIZE = 64;
 
 const INTAKE_BATCH_SIZE = 32;
 
@@ -357,49 +359,80 @@ export class IntakePump {
   }
 
   private async completeSnapshotIntents(roomId: string): Promise<void> {
-    const records = this.store.recordsNeedingRelayIntents
-      ? await this.store.recordsNeedingRelayIntents(roomId)
-      : await this.store.read(roomId);
-    for (const message of records.filter(
-      (record): record is MessageRecord => record.kind === 'message',
-    )) await this.completeMessageIntents(roomId, message);
-    for (const file of records.filter(
-      (record): record is FileRecord => record.kind === 'file',
-    )) await this.completeFileIntents(roomId, file);
+    if (!this.store.recordsNeedingRelayIntents) {
+      const records = await this.store.read(roomId);
+      for (const message of records.filter(
+        (record): record is MessageRecord => record.kind === 'message',
+      )) await this.completeMessageIntents(roomId, message);
+      for (const file of records.filter(
+        (record): record is FileRecord => record.kind === 'file',
+      )) await this.completeFileIntents(roomId, file);
+      return;
+    }
+    for (;;) {
+      const records = await this.store.recordsNeedingRelayIntents(
+        roomId, { limit: JOURNAL_WORK_BATCH_SIZE },
+      );
+      if (records.length === 0) return;
+      for (const record of records) {
+        if (record.kind === 'message') await this.completeMessageIntents(roomId, record);
+        else if (record.kind === 'file') await this.completeFileIntents(roomId, record);
+      }
+    }
   }
 
   private async completeFileIntents(roomId: string, file: FileRecord): Promise<void> {
+    if (this.store.relayRecipientsNeedingIntent) {
+      for (const recipientIdentity of await this.store.relayRecipientsNeedingIntent(roomId, file.seq)) {
+        await this.appendFileIntent(roomId, file.file_id, recipientIdentity);
+      }
+      return;
+    }
     const records = await queryStore(this.store, roomId, { kind: 'relay_intent', fileId: file.file_id });
     const intended = new Set(records.map((record) => (record as RelayIntentRecord).recipient_identity));
     for (const recipientIdentity of file.recipient_identities) {
       if (intended.has(recipientIdentity)) continue;
-      await this.store.append(roomId, {
-        version: 1,
-        kind: 'relay_intent',
-        room_id: roomId,
-        at: this.now(),
-        file_id: file.file_id,
-        recipient_identity: recipientIdentity,
-      });
+      await this.appendFileIntent(roomId, file.file_id, recipientIdentity);
       intended.add(recipientIdentity);
     }
   }
 
-  private async completeMessageIntents(roomId: string, message: MessageRecord): Promise<void> {
-    const records = await queryStore(this.store, roomId, { kind: 'relay_intent', messageId: message.message_id });
-    const intended = new Set(records.map((record) => (record as RelayIntentRecord).recipient_identity));
-    for (const recipientIdentity of message.recipient_identities) {
-      if (intended.has(recipientIdentity)) continue;
+  private async appendFileIntent(roomId: string, fileId: string, recipientIdentity: string): Promise<void> {
       await this.store.append(roomId, {
         version: 1,
         kind: 'relay_intent',
         room_id: roomId,
         at: this.now(),
-        message_id: message.message_id,
+        file_id: fileId,
         recipient_identity: recipientIdentity,
       });
+  }
+
+  private async completeMessageIntents(roomId: string, message: MessageRecord): Promise<void> {
+    if (this.store.relayRecipientsNeedingIntent) {
+      for (const recipientIdentity of await this.store.relayRecipientsNeedingIntent(roomId, message.seq)) {
+        await this.appendMessageIntent(roomId, message.message_id, recipientIdentity);
+      }
+      return;
+    }
+    const records = await queryStore(this.store, roomId, { kind: 'relay_intent', messageId: message.message_id });
+    const intended = new Set(records.map((record) => (record as RelayIntentRecord).recipient_identity));
+    for (const recipientIdentity of message.recipient_identities) {
+      if (intended.has(recipientIdentity)) continue;
+      await this.appendMessageIntent(roomId, message.message_id, recipientIdentity);
       intended.add(recipientIdentity);
     }
+  }
+
+  private async appendMessageIntent(roomId: string, messageId: string, recipientIdentity: string): Promise<void> {
+      await this.store.append(roomId, {
+        version: 1,
+        kind: 'relay_intent',
+        room_id: roomId,
+        at: this.now(),
+        message_id: messageId,
+        recipient_identity: recipientIdentity,
+      });
   }
 
   private async relayPendingUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
@@ -410,10 +443,15 @@ export class IntakePump {
     const removedCids = new Set(room.seats
       .filter((seat) => seat.state === 'removed')
       .map((seat) => seat.identity));
-    const pending = await queryStore(this.store, roomId, {
-      kind: 'relay_intent', unresolvedResultKind: 'relay_result',
-    }) as RelayIntentRecord[];
-    for (const intent of pending) {
+    let after = 0;
+    for (;;) {
+      const pending = await queryStore(this.store, roomId, {
+        kind: 'relay_intent', unresolvedResultKind: 'relay_result', after,
+        limit: JOURNAL_WORK_BATCH_SIZE,
+      }) as RelayIntentRecord[];
+      if (pending.length === 0) return;
+      for (const intent of pending) {
+        after = intent.seq;
       const [message] = intent.message_id === undefined ? [] : await queryStore(this.store, roomId, { kind: 'message', messageId: intent.message_id, limit: 1 }) as MessageRecord[];
       const [file] = intent.file_id === undefined ? [] : await queryStore(this.store, roomId, { kind: 'file', fileId: intent.file_id, limit: 1 }) as FileRecord[];
       // A dangling intent is invalid cross-record state. Do not compound it
@@ -527,6 +565,7 @@ export class IntakePump {
         ...(outcome.wire_id === undefined || outcome.wire_id === '' ? {} : { wire_id: outcome.wire_id }),
       });
       if (appended.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
+      }
     }
   }
 

@@ -69,6 +69,15 @@ test('concurrent appends assign durable monotonic sequence and record ids across
   assert.equal(last.record_id, `${ROOM_ID}:25`);
 });
 
+test('append validates caller payload once and does not rehash validated file bytes', () => {
+  const source = readFileSync(new URL('../src/storage.ts', import.meta.url), 'utf8');
+  const append = source.slice(source.indexOf('async append('), source.indexOf('async read('));
+  assert.equal((append.match(/AppendRecordSchema\.parse/g) ?? []).length, 1);
+  assert.equal(append.includes('CommunicationRecordSchema.parse'), false);
+  const persistBlob = source.slice(source.indexOf('private persistBlob('), source.indexOf('private removeUnreferencedBlob('));
+  assert.equal(persistBlob.includes('createHash('), false);
+});
+
 test('bounded reads decode only selected rows, never earlier archive payloads', async (t) => {
   const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
   await store.create(room());
@@ -100,6 +109,69 @@ test('indexed unresolved and source queries avoid archive-wide validation', asyn
   assert.deepEqual(await store.query(ROOM_ID, { kind: 'relay_intent', unresolvedResultKind: 'relay_result' }), []);
 });
 
+test('settled relay history leaves constant bounded work for the next message', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
+  await store.create(room());
+  for (let index = 0; index < 100; index += 1) {
+    const source = await store.append(ROOM_ID, message(index));
+    await store.append(ROOM_ID, {
+      version: 1, kind: 'relay_intent', room_id: ROOM_ID, at: AT,
+      message_id: source.message_id, recipient_identity: 'cid-bob',
+    });
+  }
+  const latest = await store.append(ROOM_ID, message(100));
+  assert.deepEqual(
+    (await store.recordsNeedingRelayIntents(ROOM_ID, { limit: 1 })).map((record) => record.seq),
+    [latest.seq],
+  );
+  assert.deepEqual(await store.relayRecipientsNeedingIntent(ROOM_ID, latest.seq), ['cid-bob']);
+
+  const db = new Database(join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3'), { readonly: true });
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM relay_intent_work').get().count, 1);
+  const plan = db.prepare(`EXPLAIN QUERY PLAN
+    SELECT source.seq FROM relay_intent_work work INDEXED BY relay_work_source
+    JOIN records source ON source.seq = work.record_seq
+    WHERE work.record_seq > ? GROUP BY source.seq ORDER BY source.seq LIMIT ?`).all(0, 1);
+  assert(plan.some((row) => String(row.detail).includes('relay_work_source')));
+  db.close();
+});
+
+test('recipient fan-out work is read in fixed batches', async (t) => {
+  const { store, cleanup } = temporaryStore(); t.after(cleanup); await store.create(room());
+  const recipients = Array.from({ length: 130 }, (_, index) => `cid-${String(index).padStart(3, '0')}`);
+  const source = await store.append(ROOM_ID, message(1, { recipient_identities: recipients }));
+  const first = await store.relayRecipientsNeedingIntent(ROOM_ID, source.seq);
+  assert.equal(first.length, 64);
+  for (const recipient of first) {
+    await store.append(ROOM_ID, {
+      version: 1, kind: 'relay_intent', room_id: ROOM_ID, at: AT,
+      message_id: source.message_id, recipient_identity: recipient,
+    });
+  }
+  assert.equal((await store.relayRecipientsNeedingIntent(ROOM_ID, source.seq)).length, 64);
+});
+
+test('briefing coverage uses recipient-first indexed projections with legacy version-one semantics', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
+  await store.create(room());
+  await store.append(ROOM_ID, message(1, {
+    category: 'briefing', briefing_version: undefined,
+    recipient_identities: ['cid-bob', 'cid-carol'],
+  }));
+  const deliveries = await store.briefingDeliveryTimes(ROOM_ID, {
+    category: 'briefing', briefingVersion: 1,
+  }, ['cid-bob', 'cid-missing']);
+  assert.deepEqual([...deliveries], [['cid-bob', AT]]);
+  const db = new Database(join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3'), { readonly: true });
+  const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT records.at FROM record_recipients recipients
+    INDEXED BY recipients_briefing_delivery JOIN records ON records.seq = recipients.record_seq
+    WHERE recipients.recipient_identity = ? AND recipients.category = ?
+      AND recipients.briefing_role IS ? AND recipients.briefing_version = ?
+    ORDER BY recipients.record_seq LIMIT 1`).all('cid-bob', 'briefing', null, 1);
+  assert(plan.some((row) => String(row.detail).includes('recipients_briefing_delivery')));
+  db.close();
+});
+
 test('file bytes live in immutable external blobs while selected projections retain base64', async (t) => {
   const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
   await store.create(room());
@@ -119,6 +191,25 @@ test('file bytes live in immutable external blobs while selected projections ret
   const db = new Database(join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3'), { readonly: true });
   assert.equal(db.prepare('SELECT payload_json FROM records WHERE seq=?').get(file.seq).payload_json.includes('data_base64'), false);
   db.close();
+});
+
+test('blob references are canonical and digest-bound before any filesystem read', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
+  await store.create(room());
+  const bytes = Buffer.from('safe blob');
+  const { createHash } = await import('node:crypto');
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  const file = await store.append(ROOM_ID, {
+    version: 1, kind: 'file', room_id: ROOM_ID, at: AT,
+    file_id: '01jz6y7n8p9q0r1s2t3v4w5997',
+    author: { identity: 'cid-a', display_name: 'A', role: 'r' },
+    filename: 'a.txt', mime: 'text/plain', size: bytes.length, sha256: digest,
+    data_base64: bytes.toString('base64'), recipient_identities: [], source_file_id: 9,
+  });
+  const outside = join(stateDir, 'outside-owner-file'); writeFileSync(outside, 'do not read', { mode: 0o600 });
+  const path = join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3'); const db = new Database(path);
+  db.prepare('UPDATE records SET blob_path = ? WHERE seq = ?').run('../../outside-owner-file', file.seq); db.close();
+  await assert.rejects(store.query(ROOM_ID, { kind: 'file', fileId: file.file_id, limit: 1 }), /invalid blob reference/);
 });
 
 test('delete is closed-only, fail-closed on residue, and removes SQLite plus blobs', async (t) => {
@@ -274,6 +365,16 @@ test('restart deterministically removes a crash-left unreferenced immutable blob
   assert.equal(existsSync(orphan), false);
 });
 
+test('restart removes only recognized crash-left blob temporaries and rejects arbitrary residue', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup); await store.create(room());
+  const blobs = join(stateDir, 'rooms', ROOM_ID, 'blobs');
+  const temporary = join(blobs, '.tmp-123-0123456789abcdef'); writeFileSync(temporary, 'partial', { mode: 0o600 });
+  await new CoworkStore(stateDir).read(ROOM_ID, { limit: 1 });
+  assert.equal(existsSync(temporary), false);
+  writeFileSync(join(blobs, '.tmp-not-recognized'), 'unknown', { mode: 0o600 });
+  await assert.rejects(new CoworkStore(stateDir).read(ROOM_ID, { limit: 1 }), /unexpected room blob residue/);
+});
+
 test('later opens reject unknown schema versions without executing repair DDL', async (t) => {
   const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup); await store.create(room());
   const path = join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3'); const db = new Database(path); db.pragma('user_version = 99'); db.close();
@@ -288,6 +389,16 @@ test('SQLite main, WAL, SHM, metadata, and blob files are forced private', async
   await store.durability(ROOM_ID);
   for (const candidate of [path, `${path}-wal`, `${path}-shm`]) assert.equal(statSync(candidate).mode & 0o777, 0o600);
   holder.exec('ROLLBACK'); holder.close();
+});
+
+test('SQLite WAL and SHM sidecars fail closed before database open when unsafe', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup); await store.create(room());
+  const path = join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3'); const outside = join(stateDir, 'outside-sidecar');
+  writeFileSync(outside, 'outside', { mode: 0o600 });
+  symlinkSync(outside, `${path}-wal`);
+  await assert.rejects(store.read(ROOM_ID, { limit: 1 }), /SQLite file.*symbolic link/i);
+  unlinkSync(`${path}-wal`); linkSync(outside, `${path}-shm`);
+  await assert.rejects(store.read(ROOM_ID, { limit: 1 }), /SQLite file.*safe regular file|link count/i);
 });
 
 test('delete rejects unexpected residue and resumes after archive removal', async (t) => {

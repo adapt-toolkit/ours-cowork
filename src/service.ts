@@ -74,6 +74,8 @@ const HistoryOptionsSchema = z.object({
   view: z.enum(['operator', 'participant']).optional(),
 }).strict();
 
+const JOURNAL_WORK_BATCH_SIZE = 64;
+
 /**
  * The participant-facing history projection: message records
  * only, authors redacted to alias form in anonymous rooms, and no routing
@@ -113,7 +115,7 @@ const ReplaceParticipantInputSchema = z.object({
 }).strict();
 
 type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | 'append' | 'read' | 'delete'>
-  & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents'>>;
+  & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'briefingDeliveryTimes'>>;
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 type CloseNoticeIntentRecord = Extract<CommunicationRecord, { kind: 'close_notice_intent' }>;
 type MembershipIntentRecord = Extract<CommunicationRecord, { kind: 'membership_intent' }>;
@@ -1304,11 +1306,17 @@ export class RoomService {
       membership_epoch: room.membership_epoch + activatedPending.length + newSeats.length,
     });
     // Re-drive any removal whose intent has no terminal result.
-    const journal = await queryStore(this.store, next.room_id, {
-      kind: 'membership_intent', unresolvedResultKind: 'membership_result',
-    });
-    for (const intent of journal as MembershipIntentRecord[]) {
-      ({ room: next } = await this.completeRemovalUnlocked(next, intent));
+    let membershipAfter = 0;
+    for (;;) {
+      const journal = await queryStore(this.store, next.room_id, {
+        kind: 'membership_intent', unresolvedResultKind: 'membership_result',
+        after: membershipAfter, limit: JOURNAL_WORK_BATCH_SIZE,
+      }) as MembershipIntentRecord[];
+      if (journal.length === 0) break;
+      for (const intent of journal) {
+        membershipAfter = intent.seq;
+        ({ room: next } = await this.completeRemovalUnlocked(next, intent));
+      }
     }
     const requirementsMet = invites
       .filter((invite) => invite.state !== 'revoked')
@@ -1332,16 +1340,21 @@ export class RoomService {
       // result-less intent, so retries never rely on an in-process cache.
       await packet.refreshContacts();
       let contacts = currentContactIdentities(packet);
-      const pending = await queryStore(this.store, roomId, {
-        kind: 'close_notice_intent', unresolvedResultKind: 'close_notice_result',
-      }) as CloseNoticeIntentRecord[];
-
       // A result-less intent plus an absent contact is the only durable proof
       // available after an origin-ambiguous remove. It is explicitly recorded
       // as uncertain, never upgraded into a successful notice claim.
-      for (const intent of pending) {
-        if (contacts.has(intent.recipient_identity)) continue;
-        await this.appendUncertainCloseResult(roomId, intent);
+      let closeAfter = 0;
+      for (;;) {
+        const pending = await queryStore(this.store, roomId, {
+          kind: 'close_notice_intent', unresolvedResultKind: 'close_notice_result',
+          after: closeAfter, limit: JOURNAL_WORK_BATCH_SIZE,
+        }) as CloseNoticeIntentRecord[];
+        if (pending.length === 0) break;
+        for (const intent of pending) {
+          closeAfter = intent.seq;
+          if (contacts.has(intent.recipient_identity)) continue;
+          await this.appendUncertainCloseResult(roomId, intent);
+        }
       }
 
       for (const recipientIdentity of contacts) {
@@ -1400,11 +1413,17 @@ export class RoomService {
 
     // If the packet was already absent, successful bounded purge is proof
     // that result-less contacts no longer exist locally. Preserve uncertainty.
-    const afterPurge = await queryStore(this.store, roomId, {
-      kind: 'close_notice_intent', unresolvedResultKind: 'close_notice_result',
-    });
-    for (const intent of afterPurge as CloseNoticeIntentRecord[]) {
-      await this.appendUncertainCloseResult(roomId, intent);
+    let purgeAfter = 0;
+    for (;;) {
+      const afterPurge = await queryStore(this.store, roomId, {
+        kind: 'close_notice_intent', unresolvedResultKind: 'close_notice_result',
+        after: purgeAfter, limit: JOURNAL_WORK_BATCH_SIZE,
+      }) as CloseNoticeIntentRecord[];
+      if (afterPurge.length === 0) break;
+      for (const intent of afterPurge) {
+        purgeAfter = intent.seq;
+        await this.appendUncertainCloseResult(roomId, intent);
+      }
     }
 
     return this.store.save(RoomSchema.parse({ ...room, state: 'closed', closed_at: this.now() }));
@@ -1483,6 +1502,18 @@ export class RoomService {
       briefing_version: number;
     },
   ): Promise<string> {
+    if (this.store.briefingDeliveryTimes) {
+      const recipientIdentities = uniqueIdentities(recipients.map((seat) => seat.identity));
+      const deliveries = await this.store.briefingDeliveryTimes(room.room_id, {
+        category: briefing.category,
+        briefingRole: briefing.briefing_role,
+        briefingVersion: briefing.briefing_version,
+      }, recipientIdentities);
+      const missing = recipients.filter((seat) => !deliveries.has(seat.identity));
+      const appendedAt = await this.appendBriefingForMissing(room, missing, briefing);
+      return [...deliveries.values(), ...(appendedAt === undefined ? [] : [appendedAt])].sort()[0]
+        ?? this.now();
+    }
     const records = await queryStore(this.store, room.room_id, {
       kind: 'message', category: briefing.category,
     });
@@ -1514,9 +1545,22 @@ export class RoomService {
       }
     }
     const missing = recipients.filter((seat) => !covered.has(seat.identity));
-    let appendedAt: string | undefined;
-    if (missing.length > 0) {
-      const appended = await this.store.append(room.room_id, {
+    const appendedAt = await this.appendBriefingForMissing(room, missing, briefing);
+    return matching[0]?.at ?? appendedAt ?? this.now();
+  }
+
+  private async appendBriefingForMissing(
+    room: Room,
+    missing: Seat[],
+    briefing: {
+      category: 'briefing' | 'role_briefing';
+      briefing_role?: string;
+      text: string;
+      briefing_version: number;
+    },
+  ): Promise<string | undefined> {
+    if (missing.length === 0) return undefined;
+    const appended = await this.store.append(room.room_id, {
         version: 1,
         kind: 'message',
         room_id: room.room_id,
@@ -1528,21 +1572,19 @@ export class RoomService {
         briefing_version: briefing.briefing_version,
         text: briefing.text,
         recipient_identities: uniqueIdentities(missing.map((seat) => seat.identity)),
-      });
-      if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong briefing record kind');
-      appendedAt = appended.at;
-      for (const recipientIdentity of appended.recipient_identities) {
-        await this.store.append(room.room_id, {
+    });
+    if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong briefing record kind');
+    for (const recipientIdentity of appended.recipient_identities) {
+      await this.store.append(room.room_id, {
           version: 1,
           kind: 'relay_intent',
           room_id: room.room_id,
           at: this.now(),
           message_id: appended.message_id,
           recipient_identity: recipientIdentity,
-        });
-      }
+      });
     }
-    return matching[0]?.at ?? appendedAt ?? this.now();
+    return appended.at;
   }
 
   private lock<T>(roomId: string, work: () => T | Promise<T>): Promise<T> {
@@ -1609,7 +1651,7 @@ async function queryStore(
     records = records.filter((record) => !completed.has(record.record_id));
   }
   if (options.descending) records.reverse();
-  return records.slice(0, options.limit);
+  return records.slice(0, options.limit ?? Number.MAX_SAFE_INTEGER);
 }
 
 function isCancelledExternalSeat(seat: Seat): boolean {

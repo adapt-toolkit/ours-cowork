@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import * as nodeFs from 'node:fs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { basename, dirname, join } from 'node:path';
@@ -21,6 +21,7 @@ const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
 const NO_FOLLOW = nodeFs.constants.O_NOFOLLOW ?? 0;
 const SQLITE_SCHEMA_VERSION = 1;
+const DEFAULT_WORK_BATCH_SIZE = 64;
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 
 export type CoworkFs = typeof nodeFs;
@@ -46,6 +47,13 @@ export interface ArchiveQueryOptions {
   unresolvedResultKind?: 'relay_result' | 'membership_result' | 'close_notice_result';
   descending?: boolean;
   limit?: number;
+}
+
+export interface RelayIntentWorkOptions { after?: number; limit?: number }
+export interface BriefingDeliveryKey {
+  category: 'briefing' | 'role_briefing';
+  briefingRole?: string;
+  briefingVersion: number;
 }
 
 export class CoworkStorageError extends Error {
@@ -203,7 +211,10 @@ export class CoworkStore {
         return this.withDatabase(id, (db) => {
           const transaction = db.transaction(() => {
             const next = (db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM records').get() as { next: number }).next;
-            const record = CommunicationRecordSchema.parse({ ...draft, seq: next, record_id: `${id}:${next}` });
+            // AppendRecordSchema already validated the complete caller-controlled
+            // payload once. Sequence and record ID are generated inside this
+            // transaction, so adding them does not warrant a second payload pass.
+            const record = { ...draft, seq: next, record_id: `${id}:${next}` } as CommunicationRecord;
             const stored = { ...storedDraft, seq: next, record_id: record.record_id };
             const values = this.indexValues(record);
             db.prepare(`INSERT INTO records
@@ -213,8 +224,27 @@ export class CoworkStore {
                @recipient_identity,@source_msg_id,@source_file_id,@category,@briefing_role,@briefing_version,@membership_epoch)`)
               .run({ ...values, payload_json: JSON.stringify(stored), blob_path: blob?.path ?? null });
             if (record.kind === 'message' || record.kind === 'file') {
-              const insert = db.prepare('INSERT INTO record_recipients(record_seq, recipient_identity) VALUES (?, ?)');
-              for (const recipient of record.recipient_identities) insert.run(record.seq, recipient);
+              const insert = db.prepare(`INSERT INTO record_recipients
+                (record_seq, recipient_identity, category, briefing_role, briefing_version)
+                VALUES (?, ?, ?, ?, ?)`);
+              const enqueue = db.prepare('INSERT INTO relay_intent_work(record_seq, recipient_identity) VALUES (?, ?)');
+              for (const recipient of record.recipient_identities) {
+                insert.run(
+                  record.seq,
+                  recipient,
+                  record.kind === 'message' ? record.category : null,
+                  record.kind === 'message' ? record.briefing_role ?? null : null,
+                  record.kind === 'message' ? record.briefing_version ?? 1 : null,
+                );
+                enqueue.run(record.seq, recipient);
+              }
+            } else if (record.kind === 'relay_intent') {
+              const sourceColumn = record.message_id === undefined ? 'file_id' : 'message_id';
+              const sourceId = record.message_id ?? record.file_id;
+              db.prepare(`DELETE FROM relay_intent_work
+                WHERE recipient_identity = ? AND record_seq IN (
+                  SELECT seq FROM records WHERE kind = ? AND ${sourceColumn} = ?
+                )`).run(record.recipient_identity, record.message_id === undefined ? 'file' : 'message', sourceId);
             }
             this.beforeRecordCommit?.();
             return record;
@@ -273,20 +303,61 @@ export class CoworkStore {
     ).all(recordSeq) as Array<{ recipient_identity: string }>).map((row) => row.recipient_identity)));
   }
 
-  async recordsNeedingRelayIntents(roomId: string): Promise<CommunicationRecord[]> {
+  async recordsNeedingRelayIntents(
+    roomId: string,
+    options: RelayIntentWorkOptions = {},
+  ): Promise<CommunicationRecord[]> {
     const id = this.roomId(roomId);
+    const after = options.after ?? 0;
+    const limit = options.limit ?? DEFAULT_WORK_BATCH_SIZE;
+    this.validatePage(after, limit);
     return this.mutex(id, () => this.withDatabase(id, (db) => this.decodeRows(id, db.prepare(`
-      SELECT source.seq,source.payload_json,source.blob_path FROM records source
-      WHERE source.kind IN ('message','file') AND EXISTS (
-        SELECT 1 FROM record_recipients recipient
-        WHERE recipient.record_seq = source.seq AND NOT EXISTS (
-          SELECT 1 FROM records intent WHERE intent.kind='relay_intent'
-            AND intent.recipient_identity=recipient.recipient_identity
-            AND ((source.kind='message' AND intent.message_id=source.message_id)
-              OR (source.kind='file' AND intent.file_id=source.file_id))
-        )
-      ) ORDER BY source.seq ASC
-    `).all() as RecordRow[])));
+      SELECT source.seq,source.payload_json,source.blob_path
+      FROM relay_intent_work work INDEXED BY relay_work_source
+      JOIN records source ON source.seq = work.record_seq
+      WHERE work.record_seq > ?
+      GROUP BY source.seq
+      ORDER BY source.seq ASC
+      LIMIT ?
+    `).all(after, limit) as RecordRow[])));
+  }
+
+  async relayRecipientsNeedingIntent(
+    roomId: string,
+    recordSeq: number,
+    limit = DEFAULT_WORK_BATCH_SIZE,
+  ): Promise<string[]> {
+    const id = this.roomId(roomId);
+    if (!Number.isSafeInteger(recordSeq) || recordSeq < 1) throw new CoworkStorageError('record sequence must be a positive safe integer');
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new CoworkStorageError('limit must be a positive safe integer');
+    return this.mutex(id, () => this.withDatabase(id, (db) => (db.prepare(
+      'SELECT recipient_identity FROM relay_intent_work WHERE record_seq = ? ORDER BY recipient_identity LIMIT ?',
+    ).all(recordSeq, limit) as Array<{ recipient_identity: string }>).map((row) => row.recipient_identity)));
+  }
+
+  async briefingDeliveryTimes(
+    roomId: string,
+    key: BriefingDeliveryKey,
+    recipientIdentities: string[],
+  ): Promise<Map<string, string>> {
+    const id = this.roomId(roomId);
+    if (recipientIdentities.length === 0) return new Map();
+    return this.mutex(id, () => this.withDatabase(id, (db) => {
+      const lookup = db.prepare(`SELECT records.at FROM record_recipients recipients
+        INDEXED BY recipients_briefing_delivery
+        JOIN records ON records.seq = recipients.record_seq
+        WHERE recipients.recipient_identity = ? AND recipients.category = ?
+          AND recipients.briefing_role IS ? AND recipients.briefing_version = ?
+        ORDER BY recipients.record_seq ASC LIMIT 1`);
+      const deliveries = new Map<string, string>();
+      for (const recipient of recipientIdentities) {
+        const row = lookup.get(
+          recipient, key.category, key.briefingRole ?? null, key.briefingVersion,
+        ) as { at: string } | undefined;
+        if (row) deliveries.set(recipient, row.at);
+      }
+      return deliveries;
+    }));
   }
 
   async durability(roomId: string): Promise<{ journalMode: string; synchronous: number }> {
@@ -339,6 +410,7 @@ export class CoworkStore {
     }
     let db: Database.Database | undefined;
     try {
+      this.secureSqliteFiles(path);
       db = new Database(path, { fileMustExist: !create });
       if (guardFd !== undefined) this.validateOpenPath(guardFd, path, 'room archive database', 'file', true);
       this.fs.chmodSync(path, FILE_MODE);
@@ -355,8 +427,14 @@ export class CoworkStore {
       );
       CREATE TABLE record_recipients (
         record_seq INTEGER NOT NULL REFERENCES records(seq) ON DELETE CASCADE,
+        recipient_identity TEXT NOT NULL, category TEXT, briefing_role TEXT,
+        briefing_version INTEGER, PRIMARY KEY(record_seq, recipient_identity)
+      );
+      CREATE TABLE relay_intent_work (
+        record_seq INTEGER NOT NULL REFERENCES records(seq) ON DELETE CASCADE,
         recipient_identity TEXT NOT NULL, PRIMARY KEY(record_seq, recipient_identity)
       );
+      CREATE INDEX relay_work_source ON relay_intent_work(record_seq, recipient_identity);
       CREATE INDEX records_kind_seq ON records(kind, seq);
       CREATE INDEX records_message ON records(message_id, kind, seq);
       CREATE INDEX records_file ON records(file_id, kind, seq);
@@ -366,7 +444,9 @@ export class CoworkStore {
       CREATE UNIQUE INDEX records_source_file ON records(source_file_id) WHERE kind='file' AND source_file_id IS NOT NULL;
       CREATE INDEX records_briefing ON records(category, briefing_role, briefing_version, seq);
       CREATE INDEX records_membership_epoch ON records(category, membership_epoch);
-      CREATE INDEX recipients_identity ON record_recipients(recipient_identity, record_seq);`);
+      CREATE INDEX recipients_identity ON record_recipients(recipient_identity, record_seq);
+      CREATE INDEX recipients_briefing_delivery ON record_recipients
+        (recipient_identity, category, briefing_role, briefing_version, record_seq);`);
         db.pragma(`user_version = ${SQLITE_SCHEMA_VERSION}`);
         this.reconciledBlobRooms.add(roomId);
       } else {
@@ -412,7 +492,13 @@ export class CoworkStore {
       try { decoded = JSON.parse(row.payload_json); }
       catch (error) { throw new CoworkStorageError(`malformed JSON in room "${roomId}" archive at sequence ${row.seq}`, { cause: error }); }
       if (row.blob_path !== null) {
-        const bytes = this.readFileNoFollow(join(this.roomDirectory(roomId), row.blob_path), 'room file blob');
+        const subject = decoded as { kind?: unknown; sha256?: unknown };
+        const expectedPath = subject.kind === 'file' && typeof subject.sha256 === 'string'
+          && /^[0-9a-f]{64}$/.test(subject.sha256) ? join('blobs', subject.sha256) : undefined;
+        if (expectedPath === undefined || row.blob_path !== expectedPath) {
+          throw new CoworkStorageError(`invalid blob reference in room "${roomId}" archive at sequence ${row.seq}`);
+        }
+        const bytes = this.readFileNoFollow(join(this.roomDirectory(roomId), expectedPath), 'room file blob');
         decoded = { ...(decoded as object), data_base64: bytes.toString('base64') };
       }
       try {
@@ -424,7 +510,8 @@ export class CoworkStore {
   }
 
   private persistBlob(roomId: string, digest: string, bytes: Buffer): { path: string; created: boolean } {
-    if (createHash('sha256').update(bytes).digest('hex') !== digest) throw new CoworkStorageError('file blob sha256 mismatch');
+    // The sole AppendRecordSchema pass already decoded these bytes and bound
+    // them to this digest; do not repeat the expensive hash on the write path.
     const directory = this.blobsDirectory(roomId); this.ensurePrivateDirectory(directory, true, 'room blobs directory');
     const final = join(directory, digest);
     if (this.lstatIfPresent(final)) {
@@ -468,6 +555,12 @@ export class CoworkStore {
     let changed = false;
     for (const entry of this.fs.readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
+      if (/^\.tmp-[0-9]+-[0-9a-f]{16}$/.test(entry.name)) {
+        this.assertRegularFile(path, 'crash-left room blob temporary file');
+        this.fs.unlinkSync(path);
+        changed = true;
+        continue;
+      }
       if (!/^[0-9a-f]{64}$/.test(entry.name)) throw new CoworkStorageError(`unexpected room blob residue: ${entry.name}`);
       this.assertRegularFile(path, referenced.has(entry.name) ? 'room file blob' : 'unreferenced room file blob');
       this.fs.chmodSync(path, FILE_MODE);
@@ -550,7 +643,10 @@ export class CoworkStore {
   }
 
   private ensureBaseDirectories(): void { this.ensurePrivateDirectory(this.stateDir, true, 'state directory'); this.ensurePrivateDirectory(this.roomsDirectory(), true, 'rooms directory'); }
-  private assertRoomDirectory(roomId: string): void { this.ensureBaseDirectories(); this.ensurePrivateDirectory(this.roomDirectory(roomId), false, `room "${roomId}" directory`); }
+  private assertRoomDirectory(roomId: string): void {
+    this.ensureBaseDirectories();
+    this.ensurePrivateDirectory(this.roomDirectory(roomId), false, `room "${roomId}" directory`);
+  }
   private ensurePrivateDirectory(path: string, create: boolean, label: string): void {
     let stat = this.lstatIfPresent(path);
     if (!stat) { if (!create) throw new CoworkStorageError(`${label} does not exist`); this.createPrivateDirectoryTree(path, label); stat = this.fs.lstatSync(path); }

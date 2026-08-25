@@ -69,7 +69,6 @@ test('config is exact, env overrides are strict, and malformed input fails close
     assert.deepEqual(config, {
       version: 1,
       stateDir: join(dir, 'override'),
-      roomIdentity: { nameMode: 'stable_id' },
       rest: { enabled: true, port: 4010 },
     });
     writeFileSync(path, JSON.stringify({ version: 1, stateDir: dir, rest: { enabled: false, port: 3010 }, extra: true }));

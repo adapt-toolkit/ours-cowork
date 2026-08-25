@@ -240,7 +240,7 @@ if (process.argv.includes('--e2e-driver')) {
 
     try {
       assert(existsSync(CLI), 'build the daemon and CLI before running E2E');
-      assert(existsSync(OURS_CLI), 'install @ours.network/cli 2.0.1 before running E2E');
+      assert(existsSync(OURS_CLI), 'install @ours.network/cli 2.5.0 before running E2E');
       const port = await unusedPort();
 
       broker = spawn(process.execPath, [join(ROOT, 'node_modules/.bin/adapt-broker'), '--host', '127.0.0.1', '--port', String(port), '--test_mode'], {
@@ -296,7 +296,7 @@ if (process.argv.includes('--e2e-driver')) {
       const roomCid = created.identity_cid;
       assert.match(roomId, /^[0-7][0-9a-hjkmnp-tv-z]{25}$/);
       assert.equal(created.room_name, 'Café launch 🤖');
-      assert.equal(created.identity_name, `ours-cowork-${roomId}`);
+      assert.equal(created.identity_name, 'ours-cowork:Café launch 🤖');
       stage('room-created');
 
       const supportsOrigins = (await alice.client.listContacts()).origins !== undefined;

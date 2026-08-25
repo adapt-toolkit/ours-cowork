@@ -8,10 +8,10 @@ import { defaultConfig, ensureRuntimeState, loadConfig } from '../src/config.ts'
 
 test('default configuration enables the loopback web host on port 3052', () => {
   assert.deepEqual(defaultConfig('/home/demo').rest, { enabled: true, port: 3052 });
-  assert.deepEqual(defaultConfig('/home/demo').roomIdentity, { nameMode: 'stable_id' });
+  assert.equal('roomIdentity' in defaultConfig('/home/demo'), false);
 });
 
-test('legacy config files default room identity naming while explicit supported modes are strict', (t) => {
+test('removed room identity naming configuration is rejected', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-config-room-identity-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const path = join(dir, 'config.json');
@@ -22,15 +22,10 @@ test('legacy config files default room identity naming while explicit supported 
   };
 
   writeFileSync(path, JSON.stringify(base), { mode: 0o600 });
-  assert.deepEqual(loadConfig({ OURS_COWORK_CONFIG: path }).roomIdentity, { nameMode: 'stable_id' });
+  assert.equal('roomIdentity' in loadConfig({ OURS_COWORK_CONFIG: path }), false);
 
   for (const nameMode of ['stable_id', 'friendly']) {
     writeFileSync(path, JSON.stringify({ ...base, roomIdentity: { nameMode } }), { mode: 0o600 });
-    assert.deepEqual(loadConfig({ OURS_COWORK_CONFIG: path }).roomIdentity, { nameMode });
-  }
-
-  for (const roomIdentity of [{ nameMode: 'custom' }, { nameMode: 'friendly', extra: true }]) {
-    writeFileSync(path, JSON.stringify({ ...base, roomIdentity }), { mode: 0o600 });
     assert.throws(() => loadConfig({ OURS_COWORK_CONFIG: path }), /invalid cowork config/i);
   }
 });

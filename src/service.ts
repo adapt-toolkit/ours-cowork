@@ -5,7 +5,7 @@ import { z } from 'zod';
 import {
   AcceptExternalInviteInputSchema,
   ContainerIdSchema,
-  configuredRoomIdentityName,
+  roomIdentityName,
   CreateRoomInputSchema,
   DEFAULT_ROLE,
   defaultRoomName,
@@ -28,7 +28,6 @@ import {
   type InviteMode,
   type RelayStatus,
   type Room,
-  type RoomIdentityNameMode,
   type RoomInvite,
   type Seat,
 } from './contracts.ts';
@@ -130,7 +129,6 @@ export interface RoomServiceOptions {
   roomId?: () => string;
   messageId?: () => string;
   provisioningCheckpoint?: (stage: 'metadata') => void;
-  identityNameMode?: RoomIdentityNameMode;
 }
 
 export interface InviteReceipt {
@@ -192,7 +190,6 @@ export class RoomService {
   private readonly nextMessageId: () => string;
   private readonly intake: IntakePump;
   private readonly provisioningCheckpoint: NonNullable<RoomServiceOptions['provisioningCheckpoint']>;
-  private readonly identityNameMode: RoomIdentityNameMode;
 
   constructor(store: Store, packets: RoomPacketRegistry, options: RoomServiceOptions = {}) {
     this.store = store;
@@ -201,7 +198,6 @@ export class RoomService {
     this.nextRoomId = options.roomId ?? generateUlid;
     this.nextMessageId = options.messageId ?? generateUlid;
     this.provisioningCheckpoint = options.provisioningCheckpoint ?? (() => {});
-    this.identityNameMode = options.identityNameMode ?? 'stable_id';
     this.intake = new IntakePump(store, packets, {
       now: this.nowValue,
       messageId: this.nextMessageId,
@@ -214,7 +210,7 @@ export class RoomService {
     const settings = CreateRoomInputSchema.parse(input);
     const roomId = LowerCrockfordUlidSchema.parse(this.nextRoomId());
     const roomName = settings.name ?? defaultRoomName(roomId);
-    const identityName = configuredRoomIdentityName(roomId, roomName, this.identityNameMode);
+    const identityName = roomIdentityName(roomName);
     return this.lock(roomId, async () => {
       const provisional = RoomSchema.parse({
         version: 2,

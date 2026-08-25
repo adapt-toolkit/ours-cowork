@@ -130,7 +130,7 @@ export class PacketRegistry {
   get size(): number { return this.packets.size; }
   get(roomId: string): RoomPacket | undefined { return this.packets.get(roomId); }
 
-  async create(roomId: string, identityName = `ours-cowork-${roomId}`, bio = `ours-cowork mission room ${roomId}`): Promise<RoomPacket> {
+  async create(roomId: string, identityName: string, bio = `ours-cowork mission room ${roomId}`): Promise<RoomPacket> {
     validateRoomId(roomId);
     this.assertStandardIdentity(roomId, identityName);
     this.assertNoLegacyState(roomId);
@@ -163,7 +163,7 @@ export class PacketRegistry {
     }
   }
 
-  async restore(roomId: string, expectedCid: string, identityName = `ours-cowork-${roomId}`): Promise<RoomPacket> {
+  async restore(roomId: string, expectedCid: string, identityName: string): Promise<RoomPacket> {
     validateRoomId(roomId);
     this.assertStandardIdentity(roomId, identityName);
     this.assertNoLegacyState(roomId);

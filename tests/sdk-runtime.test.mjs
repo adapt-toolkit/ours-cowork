@@ -12,8 +12,8 @@ import {
 import { SharedOursHost } from '../src/ours-runtime.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
-const IDENTITY = `ours-cowork-${ROOM_ID}`;
-const FRIENDLY_IDENTITY = `ours-cowork-release-room-${ROOM_ID}`;
+const IDENTITY = 'ours-cowork:Room 01jz6y7n';
+const NAMED_IDENTITY = 'ours-cowork:Release room';
 const CID = 'AB'.repeat(32);
 const MESSAGE_WIRE = 'core-message-wire-in';
 const SECOND_MESSAGE_WIRE = 'core-message-wire-second';
@@ -425,8 +425,8 @@ test('fresh provisioning rejects a colliding name without creating a lease or ad
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
   const host = {
     async listIdentityNames(localNames) {
-      assert.deepEqual(localNames, new Set([FRIENDLY_IDENTITY]));
-      return new Set([FRIENDLY_IDENTITY]);
+      assert.deepEqual(localNames, new Set([NAMED_IDENTITY]));
+      return new Set([NAMED_IDENTITY]);
     },
     async createClient() { assert.fail('a collision must fail before creating a client lease'); },
     onIdentityNotify() { return () => {}; },
@@ -434,32 +434,32 @@ test('fresh provisioning rejects a colliding name without creating a lease or ad
   };
   const registry = new PacketRegistry(host, stateDir);
   await assert.rejects(
-    registry.create(ROOM_ID, FRIENDLY_IDENTITY),
+    registry.create(ROOM_ID, NAMED_IDENTITY),
     /unproven.*refusing to adopt/i,
   );
 });
 
-test('restore accepts persisted friendly names only with an exact durable CID', async (t) => {
+test('restore accepts a persisted named identity only with an exact durable CID', async (t) => {
   const stateDir = mkdtempSync(join(tmpdir(), 'cowork-sdk-friendly-restore-'));
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
   const client = blankClient();
-  client.chooseResult = { name: FRIENDLY_IDENTITY, cid: CID, switchedFrom: null };
+  client.chooseResult = { name: NAMED_IDENTITY, cid: CID, switchedFrom: null };
   const host = {
-    async listIdentityNames() { return new Set([FRIENDLY_IDENTITY]); },
+    async listIdentityNames() { return new Set([NAMED_IDENTITY]); },
     async createClient() { return client; },
     onIdentityNotify() { return () => {}; },
     trackIdentity() { return () => {}; },
   };
   const registry = new PacketRegistry(host, stateDir);
   await assert.rejects(
-    registry.restore(ROOM_ID, undefined, FRIENDLY_IDENTITY),
+    registry.restore(ROOM_ID, undefined, NAMED_IDENTITY),
     /without a durably recorded expected CID/i,
   );
-  const packet = await registry.restore(ROOM_ID, CID, FRIENDLY_IDENTITY);
-  assert.equal(packet.name, FRIENDLY_IDENTITY);
+  const packet = await registry.restore(ROOM_ID, CID, NAMED_IDENTITY);
+  assert.equal(packet.name, NAMED_IDENTITY);
   assert.equal(packet.cid, CID);
   assert.deepEqual(client.calls.find(([name]) => name === 'chooseIdentity'), [
-    'chooseIdentity', { name: FRIENDLY_IDENTITY, force: false },
+    'chooseIdentity', { name: NAMED_IDENTITY, force: false },
   ]);
 });
 

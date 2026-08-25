@@ -1131,4 +1131,10 @@ async function main(): Promise<void> {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === SELF) void main();
+// npm exposes package binaries through a symlink in the global/local bin directory.
+// Comparing the lexical argv path with import.meta.url therefore suppresses main()
+// for the normal `ours-cowork` invocation even though direct `node dist/cli.js`
+// execution works. Resolve both paths through the filesystem before deciding
+// whether this module is the process entrypoint.
+if (process.argv[1]
+  && fs.realpathSync(resolve(process.argv[1])) === fs.realpathSync(SELF)) void main();

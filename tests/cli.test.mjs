@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -60,6 +60,26 @@ async function runCli(args, options = {}) {
   });
   return { code, stdout, stderr };
 }
+
+test('npm-style symlinked binary executes the CLI entrypoint', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cowork-cli-symlink-'));
+  const link = join(directory, 'ours-cowork');
+  try {
+    await symlink(CLI, link);
+    const help = await runCli(['--help'], { cli: link });
+    assert.equal(help.code, 0, help.stderr);
+    assert.match(help.stdout, /Usage:[\s\S]*ours-cowork/);
+
+    const status = await runCli(['status'], {
+      cli: link,
+      env: { OURS_COWORK_STATE_DIR: join(directory, 'absent') },
+    });
+    assert.equal(status.code, 6);
+    assert.match(status.stderr, /stopped/i);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 async function withRawRpc(handler, action) {
   const stateDir = await mkdtemp(join(tmpdir(), 'cowork-cli-raw-'));

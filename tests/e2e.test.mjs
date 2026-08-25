@@ -400,7 +400,7 @@ if (process.argv.includes('--e2e-driver')) {
       'bilateral SDK contact removal');
       const roomDir = join(stateDir, 'cowork', 'rooms', roomId);
       assert.equal(existsSync(join(roomDir, 'room.json')), true);
-      assert.equal(existsSync(join(roomDir, 'archive.jsonl')), true);
+      assert.equal(existsSync(join(roomDir, 'archive.sqlite3')), true);
       const deleted = await runCli(['room', 'delete', roomId, '--yes']);
       assert.deepEqual(deleted, { version: 1, room_id: roomId, deleted: true, scope: 'this_host' });
       assert.equal(existsSync(roomDir), false);

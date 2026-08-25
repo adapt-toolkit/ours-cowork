@@ -269,7 +269,7 @@ if (process.argv.includes('--external-driver')) {
       'room identity deletion from the shared daemon');
       const roomDir = join(stateDir, 'cowork', 'rooms', roomId);
       assert.equal(existsSync(join(roomDir, 'room.json')), true);
-      assert.equal(existsSync(join(roomDir, 'archive.jsonl')), true);
+      assert.equal(existsSync(join(roomDir, 'archive.sqlite3')), true);
       const afterClose = await runCli(['room', 'list']);
       assert.equal(afterClose.find((room) => room.room_id === roomId).state, 'closed');
       stage('closed');

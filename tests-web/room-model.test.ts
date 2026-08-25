@@ -378,16 +378,16 @@ describe('room DTO guards', () => {
 
     expect(isRoomDto(room({
       identity_cid: '', identity_name: `cowork-room-${ROOM_ID}`, status: 'packet_pending', state: 'provisioning',
-    }))).toBe(true);
+    }))).toBe(false);
     expect(isRoomDto(room({
-      identity_cid: '', identity_name: 'ours-cowork-room:Operations', status: 'packet_pending', state: 'provisioning',
+      identity_cid: '', identity_name: 'ours-cowork:Operations', status: 'packet_pending', state: 'provisioning',
     }))).toBe(true);
     expect(isRoomDto(room({
       identity_cid: '', identity_name: `ours-cowork-${ROOM_ID}`, status: 'packet_pending', state: 'provisioning',
-    }))).toBe(true);
+    }))).toBe(false);
     expect(isRoomDto(room({
       identity_cid: '', identity_name: `ours-cowork-operations-${ROOM_ID}`, status: 'packet_pending', state: 'provisioning',
-    }))).toBe(true);
+    }))).toBe(false);
     expect(isRoomDto(room({
       identity_cid: '', identity_name: `ours-cowork-Bad_Slug-${ROOM_ID}`, status: 'packet_pending', state: 'provisioning',
     }))).toBe(false);

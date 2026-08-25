@@ -6,14 +6,11 @@ The default cowork config file is `~/.ours-cowork/config.json`. It contains only
 {
   "version": 1,
   "stateDir": "/absolute/private/path",
-  "roomIdentity": { "nameMode": "stable_id" },
   "rest": { "enabled": true, "port": 3052 }
 }
 ```
 
-`roomIdentity` is optional for compatibility with existing version-1 files. Its strict `nameMode` is `stable_id` (the default) or `friendly`. There is no environment or per-room override: an explicit file value wins over the built-in `stable_id` default. The mode is read only when a new room is created; changing it does not rename or reprovision an existing room.
-
-`stable_id` creates `ours-cowork-<full-room-id>`. `friendly` creates `ours-cowork-<slug>-<full-room-id>`. The slug is derived from the initial normalized room name by NFKD decomposition, removal of combining marks, ASCII lowercase conversion, replacement of each non-`[a-z0-9]` run with one hyphen, edge-hyphen trimming, and truncation to 25 characters followed by trailing-hyphen trimming. An empty result (including an entirely non-Latin or emoji name) becomes `room`. The full 26-character room ID keeps duplicate or collapsed slugs unique; the result satisfies the shared-daemon identity-name character set and 64-character maximum.
+Room identity naming is not configurable. Creation uses exactly `ours-cowork:<normalized room name>`; ID-based and slug-based modes are unsupported.
 
 Cowork overrides are `OURS_COWORK_CONFIG`, `OURS_COWORK_STATE_DIR`, and `OURS_COWORK_REST_PORT`. The default console URL is `http://127.0.0.1:3052/`. Setting the REST port enables the loopback listener on that port. Explicitly setting `rest.enabled` to `false` disables both the web console and HTTP room RPC. Configuration, private files, and the complete cowork state directory must remain owned by the daemon account with the modes enforced at startup.
 

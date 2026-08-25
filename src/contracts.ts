@@ -16,8 +16,6 @@ const MAX_FILE_NAME_BYTES = 255;
 const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;
 export const MAX_ROOM_NAME_CHARACTERS = 64;
-export const MAX_ROOM_IDENTITY_NAME_CHARACTERS = 64;
-export const MAX_FRIENDLY_IDENTITY_SLUG_CHARACTERS = 25;
 
 function utf8Bounded(label: string, maximumBytes: number): z.ZodType<string> {
   return z.string()
@@ -76,75 +74,25 @@ export const RoomNameSchema = z.string()
     }
   });
 
-/** Supported creation-time behavior for the room's immutable SDK identity name. */
-export const RoomIdentityNameModeSchema = z.enum(['stable_id', 'friendly']);
-export type RoomIdentityNameMode = z.infer<typeof RoomIdentityNameModeSchema>;
+/** Authenticated identity prefix for a named Cowork room. */
+export const ROOM_IDENTITY_PREFIX = 'ours-cowork:';
 
-/** ASCII, globally unique SDK identity name for rooms created by vNext. */
-export const ROOM_IDENTITY_PREFIX = 'ours-cowork-';
-const SDK_IDENTITY_NAME_PATTERN = /^[A-Za-z0-9 _.@-]{1,64}$/;
-const FRIENDLY_SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-
-export function roomIdentityName(roomId: string): string {
-  return `${ROOM_IDENTITY_PREFIX}${LowerCrockfordUlidSchema.parse(roomId)}`;
+/** Preserve the exact normalized creation name in the authenticated identity. */
+export function roomIdentityName(roomName: string): string {
+  return `${ROOM_IDENTITY_PREFIX}${RoomNameSchema.parse(roomName)}`;
 }
 
-export function roomIdentitySlug(roomName: string): string {
-  const normalized = RoomNameSchema.parse(roomName)
-    .normalize('NFKD')
-    .replace(/\p{M}+/gu, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  const bounded = normalized
-    .slice(0, MAX_FRIENDLY_IDENTITY_SLUG_CHARACTERS)
-    .replace(/-+$/g, '');
-  return bounded || 'room';
-}
-
-export function friendlyRoomIdentityName(roomId: string, roomName: string): string {
-  const id = LowerCrockfordUlidSchema.parse(roomId);
-  const name = `${ROOM_IDENTITY_PREFIX}${roomIdentitySlug(roomName)}-${id}`;
-  if (name.length > MAX_ROOM_IDENTITY_NAME_CHARACTERS || !SDK_IDENTITY_NAME_PATTERN.test(name)) {
-    throw new TypeError('generated room identity name violates the shared ours daemon contract');
-  }
-  return name;
-}
-
-export function configuredRoomIdentityName(
-  roomId: string,
-  roomName: string,
-  mode: RoomIdentityNameMode,
-): string {
-  return mode === 'friendly'
-    ? friendlyRoomIdentityName(roomId, roomName)
-    : roomIdentityName(roomId);
-}
-
-/** Existing rooms retain this room-id-based identity name without migration. */
-export function legacyRoomIdentityName(roomId: string): string {
-  return `cowork-room-${LowerCrockfordUlidSchema.parse(roomId)}`;
-}
-
-/** Accept exact durable names without recomputing a slug from mutable room_name. */
+/** Validate the immutable authenticated name without consulting mutable room metadata. */
 export function isPersistedRoomIdentityName(roomId: string, identityName: string): boolean {
-  const id = LowerCrockfordUlidSchema.safeParse(roomId);
-  if (!id.success) return false;
-  if (identityName === roomIdentityName(id.data) || identityName === legacyRoomIdentityName(id.data)) return true;
-  const suffix = `-${id.data}`;
-  if (!identityName.startsWith(ROOM_IDENTITY_PREFIX) || !identityName.endsWith(suffix)) return false;
-  const slug = identityName.slice(ROOM_IDENTITY_PREFIX.length, -suffix.length);
-  return slug.length >= 1
-    && slug.length <= MAX_FRIENDLY_IDENTITY_SLUG_CHARACTERS
-    && FRIENDLY_SLUG_PATTERN.test(slug)
-    && identityName.length <= MAX_ROOM_IDENTITY_NAME_CHARACTERS
-    && SDK_IDENTITY_NAME_PATTERN.test(identityName);
+  if (!LowerCrockfordUlidSchema.safeParse(roomId).success || !identityName.startsWith(ROOM_IDENTITY_PREFIX)) {
+    return false;
+  }
+  const parsed = RoomNameSchema.safeParse(identityName.slice(ROOM_IDENTITY_PREFIX.length));
+  return parsed.success && identityName === `${ROOM_IDENTITY_PREFIX}${parsed.data}`;
 }
 
-/** Standard SDK formats are restorable; the exact legacy format remains loadable but refused later. */
 export function isStandardRoomIdentityName(roomId: string, identityName: string): boolean {
-  return isPersistedRoomIdentityName(roomId, identityName)
-    && identityName !== legacyRoomIdentityName(roomId);
+  return isPersistedRoomIdentityName(roomId, identityName);
 }
 export const RoleSchema = utf8Bounded('role', MAX_ROLE_BYTES);
 export const ROOM_ROLE = 'room';

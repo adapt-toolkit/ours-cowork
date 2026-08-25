@@ -296,7 +296,7 @@ if (process.argv.includes('--e2e-driver')) {
       const roomCid = created.identity_cid;
       assert.match(roomId, /^[0-7][0-9a-hjkmnp-tv-z]{25}$/);
       assert.equal(created.room_name, 'Café launch 🤖');
-      assert.equal(created.identity_name, `ours-cowork-${roomId}`);
+      assert.equal(created.identity_name, 'ours-cowork:Room 01jz6y7n');
       stage('room-created');
 
       const supportsOrigins = (await alice.client.listContacts()).origins !== undefined;

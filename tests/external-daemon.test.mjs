@@ -138,7 +138,6 @@ test('cowork configuration is app-local and removed daemon/broker keys fail with
   assert.deepEqual(loadConfig({ OURS_COWORK_CONFIG: cleanPath }), {
     version: 1,
     stateDir: join(dir, 'cowork'),
-    roomIdentity: { nameMode: 'stable_id' },
     rest: { enabled: true, port: 3052 },
   });
 

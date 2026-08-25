@@ -335,15 +335,8 @@ export function isRoomDto(value: unknown): value is RoomDto {
   return true;
 }
 
-function isPacketPendingIdentityName(roomId: string, roomName: string, identityName: string): boolean {
-  if (identityName === `cowork-room-${roomId}`
-    || identityName === `ours-cowork-room:${roomName}`
-    || identityName === `ours-cowork-${roomId}`) return true;
-  const suffix = `-${roomId}`;
-  if (!identityName.startsWith('ours-cowork-') || !identityName.endsWith(suffix)) return false;
-  const slug = identityName.slice('ours-cowork-'.length, -suffix.length);
-  return slug.length >= 1 && slug.length <= 40 && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug)
-    && identityName.length <= 96;
+function isPacketPendingIdentityName(_roomId: string, roomName: string, identityName: string): boolean {
+  return identityName === `ours-cowork:${roomName}`;
 }
 
 export function isRoomListDto(value: unknown): value is RoomDto[] {

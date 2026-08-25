@@ -208,10 +208,10 @@ test('create validates caller input first and provisions exactly one SDK room id
   const room = await create(f);
   assert.deepEqual(f.registry.createCalls, [{
     roomId: ROOM_ID,
-    identityName: `ours-cowork-${ROOM_ID}`,
+    identityName: 'ours-cowork:Room 01jz6y7n',
     bio: `ours-cowork mission room ${ROOM_ID}`,
   }]);
-  assert.equal(room.identity_name, `ours-cowork-${ROOM_ID}`);
+  assert.equal(room.identity_name, 'ours-cowork:Room 01jz6y7n');
   assert.equal(room.room_name, 'Room 01jz6y7n');
   assert.equal(room.identity_cid, `cid-room-${ROOM_ID}`);
   assert.equal(room.state, 'provisioning');
@@ -353,7 +353,7 @@ test('late redemption after cancellation can be severed and safely re-accepted b
   assert.equal(room.membership_epoch, 1);
 });
 
-test('create normalizes duplicate friendly names while assigning globally unique SDK identity names', async () => {
+test('create preserves the exact normalized room name in the authenticated identity', async () => {
   const store = new MemoryStore();
   const registry = new FakeRegistry();
   const ids = [ROOM_ID, '01jz6y7n8p9q0r1s2t3v4w5x70'];
@@ -362,7 +362,6 @@ test('create normalizes duplicate friendly names while assigning globally unique
     roomId: () => ids.shift(),
     messageId: () => MESSAGE_IDS[0],
     now: () => TIMES[timeIndex++],
-    identityNameMode: 'friendly',
   });
 
   const first = await service.createRoom({ name: '  Cafe\u0301 launch  ', goal: 'One', briefing: 'Brief' });
@@ -370,24 +369,18 @@ test('create normalizes duplicate friendly names while assigning globally unique
   assert.equal(first.room_name, 'Café launch');
   assert.equal(second.room_name, 'Café launch');
   assert.notEqual(first.room_id, second.room_id);
-  assert.equal(first.identity_name, `ours-cowork-cafe-launch-${first.room_id}`);
-  assert.equal(second.identity_name, `ours-cowork-cafe-launch-${second.room_id}`);
-  assert.notEqual(first.identity_name, second.identity_name);
-  assert.notEqual(first.identity_cid, second.identity_cid, 'duplicate labels still have distinct authenticated identities');
+  assert.equal(first.identity_name, 'ours-cowork:Café launch');
+  assert.equal(second.identity_name, 'ours-cowork:Café launch');
+  assert.notEqual(first.identity_cid, second.identity_cid, 'the registry fake does not model daemon-global name collisions');
   assert.deepEqual((await service.listRooms()).map((room) => room.room_name), ['Café launch', 'Café launch']);
 });
 
-test('configuration changes affect only future rooms and restore each exact persisted name', async () => {
-  for (const [createdMode, restartedMode] of [
-    ['friendly', 'stable_id'],
-    ['stable_id', 'friendly'],
-  ]) {
-    const f = fixture({ identityNameMode: createdMode });
+test('restart restores the exact persisted room identity name', async () => {
+    const f = fixture();
     const created = await f.service.createRoom({ name: 'Release room', goal: 'Ship', briefing: 'Brief' });
     f.registry.packets.clear();
     f.registry.restoreResult = new FakePacket(created.identity_name, created.identity_cid);
     const restarted = new RoomService(f.store, f.registry, {
-      identityNameMode: restartedMode,
       messageId: () => MESSAGE_IDS[0],
       now: () => TIMES[1],
     });
@@ -401,7 +394,6 @@ test('configuration changes affect only future rooms and restore each exact pers
       identityName: created.identity_name,
       bio: undefined,
     });
-  }
 });
 
 test('recoverRoom resumes the durable provisioning boundary with exactly one live packet', async () => {
@@ -1040,7 +1032,7 @@ test('concurrent reconciliation and a late-seat save retry produce one seat and 
 });
 
 test('projections update settings and page numeric history without exposing invite blobs', async () => {
-  const f = fixture({ identityNameMode: 'friendly' });
+  const f = fixture();
   const created = await f.service.createRoom({ name: 'Initial room', goal: 'Ship', briefing: 'Brief' });
   await f.service.createInvite(ROOM_ID, { mode: 'one_time', role: 'builder', min_accepts: 1 });
   const updated = await f.service.updateRoom(ROOM_ID, { name: '  Renamed room  ', status: 'working', goal: 'New goal' });

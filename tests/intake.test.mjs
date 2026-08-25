@@ -437,6 +437,16 @@ test('canonical JSON recursively sorts keys and participant fan-out excludes its
     ['at', 'author', 'kind', 'message_id', 'room_id', 'room_name', 'text', 'version']);
 });
 
+test('current room wire preserves the exact normalized Unicode display name for Messenger', async () => {
+  const roomName = 'Café launch 🚀 — 東京';
+  const f = fixture({ room: room({ room_name: roomName }) });
+  f.packet.inbox.push(incoming());
+
+  await f.pump.pump(ROOM_ID);
+
+  assert.equal(JSON.parse(f.packet.sendCalls[0].body).room_name, roomName);
+});
+
 test('crash before message append leaves the input unread and creates no archive records', async () => {
   const f = fixture();
   f.packet.inbox.push(incoming());

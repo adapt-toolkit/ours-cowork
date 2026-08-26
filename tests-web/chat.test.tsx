@@ -194,6 +194,65 @@ describe('selected-room paginated history', () => {
     ]);
   });
 
+  it('loads a daemon reply record without poisoning its briefing or later history rows', async () => {
+    const target = room();
+    const history = [
+      message(1, { category: 'briefing', text: 'Archived mission briefing' }),
+      message(2, {
+        text: 'Reply with durable metadata',
+        source_reply_to: {
+          wire_id: 'DB86B3C77C1E0C425269204C158245940AB863E26F6F965F0168116B81260F58',
+          sentence: 2,
+        },
+      }),
+      message(3, { text: 'History after the reply' }),
+    ];
+    const call = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      if (method === 'room.list') return [target];
+      if (method === 'room.show') return target;
+      if (method === 'room.participants') return [];
+      if (method === 'room.history') {
+        const after = Number(params.after);
+        return history.filter((record) => record.seq > after);
+      }
+      throw new Error(`unexpected ${method}`);
+    });
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+
+    expect(await screen.findByText('Archived mission briefing')).toBeVisible();
+    expect(screen.getByText('Reply with durable metadata')).toBeVisible();
+    expect(screen.getByText('History after the reply')).toBeVisible();
+    expect(screen.getByText('3 records')).toBeVisible();
+    expect(screen.queryByText('Briefing room-1')).not.toBeInTheDocument();
+    expect(screen.queryByText(/History refresh failed/)).not.toBeInTheDocument();
+    expect(call.mock.calls.filter(([method]) => method === 'room.history').map(([, params]) => params)).toEqual([
+      { room_id: ROOM_ONE, after: 0, limit: 200 },
+      { room_id: ROOM_ONE, after: 3, limit: 200 },
+    ]);
+  });
+
+  it('keeps the room.show briefing while atomically rejecting malformed reply metadata', async () => {
+    const target = room();
+    const page = [
+      { ...message(1), source_reply_to: { wire_id: '', extra: true } },
+      message(2, { text: 'Must not render after poisoned row' }),
+    ];
+    const call = vi.fn(async (method: string) => {
+      if (method === 'room.list') return [target];
+      if (method === 'room.show') return target;
+      if (method === 'room.participants') return [];
+      if (method === 'room.history') return page;
+      throw new Error(`unexpected ${method}`);
+    });
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+
+    expect(await screen.findByText('Briefing room-1')).toBeVisible();
+    expect(await screen.findByText('History refresh failed: daemon returned an invalid history page')).toBeVisible();
+    expect(screen.queryByText('message 1')).not.toBeInTheDocument();
+    expect(screen.queryByText('Must not render after poisoned row')).not.toBeInTheDocument();
+    expect(screen.getByText('0 records')).toBeVisible();
+  });
+
   it.each([
     ['gapped', [message(2)]],
     ['out-of-order', [message(2), message(1)]],

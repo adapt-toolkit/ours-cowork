@@ -515,6 +515,7 @@ class FakeRegistry {
   events;
   constructor(events) { this.events = events; }
   async unhostAll() { this.events.push('packets.remove'); }
+  async unhost(id) { this.events.push(`unhost:${id}`); }
 }
 
 class FakeService {
@@ -571,7 +572,7 @@ test('daemon boot uses phased recovery order and shutdown drains before unhostin
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('daemon restart retries packet-pending creation only after a verified orphan is removed', async () => {
+test('daemon isolates packet-pending collision and a later restart retries after verified orphan removal', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-daemon-orphan-retry-'));
   const room = { room_id: '01jz6y7n8p9q0r1s2t3v4w5x6y', state: 'provisioning' };
   const events = [];
@@ -602,18 +603,21 @@ test('daemon restart retries packet-pending creation only after a verified orpha
   };
 
   try {
-    await assert.rejects(makeDaemon().boot(), /unproven identity collision/i);
-    assert.equal(events.includes('transports.start'), false, 'failed boot must expose no transport');
+    const degraded = makeDaemon();
+    await degraded.boot();
+    assert.equal(events.includes(`unhost:${room.room_id}`), true);
+    assert.equal(events.includes('transports.start'), true, 'healthy service remains available for explicit recovery');
+    await degraded.shutdown();
     orphanPresent = false; // operator verified and removed the exact orphan
     const restarted = makeDaemon();
     await restarted.boot();
     assert.equal(recoveryCalls, 2);
-    assert.equal(events.filter((event) => event === 'transports.start').length, 1);
+    assert.equal(events.filter((event) => event === 'transports.start').length, 2);
     await restarted.shutdown();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('partial boot failure rolls back transports, PID, packets, host, and lock', async () => {
+test('one room reconciliation failure releases its lease while healthy rooms resume fanout', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-rollback-'));
   const events = [];
   const daemon = new CoworkDaemon({
@@ -621,16 +625,25 @@ test('partial boot failure rolls back transports, PID, packets, host, and lock',
     prepare: () => ({ socketPath: join(dir, 'management.sock') }),
     lock: () => ({ release: () => events.push('lock.release') }),
     host: new FakeHost(events),
-    store: { async list() { return [{ room_id: '01jz6y7n8p9q0r1s2t3v4w5x6y', state: 'active' }]; } },
+    store: { async list() { return [
+      { room_id: '01jz6y7n8p9q0r1s2t3v4w5x6y', state: 'active' },
+      { room_id: '01jz6y7n8p9q0r1s2t3v4w5x6z', state: 'active' },
+    ]; } },
     registry: new FakeRegistry(events),
     service: Object.assign(new FakeService(events, []), {
-      recoverPacket: async () => { throw new Error('restore crash'); },
+      reconcileRoom: async (id) => {
+        events.push(`reconcile:${id}`);
+        if (id.endsWith('6y')) throw new Error('reconcile crash');
+      },
     }),
     transports: { async start() { events.push('transports.start'); }, async stop() { events.push('transports.stop'); } },
     writePid: () => events.push('pid.write'), removePid: () => events.push('pid.remove'),
   });
-  await assert.rejects(daemon.boot(), /restore crash/);
-  assert.deepEqual(events.slice(-4), ['pid.remove', 'packets.remove', 'host.close', 'lock.release']);
+  await daemon.boot();
+  assert(events.includes('unhost:01jz6y7n8p9q0r1s2t3v4w5x6y'));
+  assert.equal(events.includes('pending:01jz6y7n8p9q0r1s2t3v4w5x6y'), false);
+  assert.equal(events.includes('pending:01jz6y7n8p9q0r1s2t3v4w5x6z'), true);
+  assert(events.includes('transports.start'));
   await daemon.shutdown();
   rmSync(dir, { recursive: true, force: true });
 });

@@ -140,6 +140,7 @@ class FakePacket {
     return { status: 'queued', notified: true, key_material_retained: true };
   }
   async sign() { return 'signature'; }
+  async rebind() { this.rebindCalls = (this.rebindCalls ?? 0) + 1; return { name: this.name, cid: this.cid, status: 'rebound' }; }
 }
 
 class FakeRegistry {
@@ -172,6 +173,12 @@ class FakeRegistry {
       return this.restoreResult;
     }
     throw this.restoreFailure;
+  }
+
+  async rebind(roomId) {
+    const packet = this.packets.get(roomId);
+    if (!packet) throw new Error('not hosted');
+    return packet.rebind();
   }
 }
 
@@ -394,6 +401,25 @@ test('restart restores the exact persisted room identity name', async () => {
       identityName: created.identity_name,
       bio: undefined,
     });
+});
+
+test('explicit identity rebind handles hosted and startup-degraded rooms without creating identities', async () => {
+  const f = fixture();
+  const created = await create(f);
+  const createCount = f.registry.createCalls.length;
+  const hosted = await f.service.rebindIdentity(ROOM_ID);
+  assert.deepEqual(hosted, {
+    room_id: ROOM_ID, identity_name: created.identity_name, identity_cid: created.identity_cid,
+    status: 'rebound', fanout: 'resumed',
+  });
+  assert.equal(f.registry.packets.get(ROOM_ID).rebindCalls, 1);
+
+  f.registry.packets.clear();
+  f.registry.restoreResult = new FakePacket(created.identity_name, created.identity_cid);
+  const degraded = await f.service.rebindIdentity(ROOM_ID);
+  assert.equal(degraded.status, 'rebound');
+  assert.equal(f.registry.createCalls.length, createCount, 'established recovery must never create');
+  assert.equal(f.registry.restoreCalls.at(-1).expectedCid, created.identity_cid);
 });
 
 test('recoverRoom resumes the durable provisioning boundary with exactly one live packet', async () => {

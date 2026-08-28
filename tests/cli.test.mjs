@@ -300,6 +300,7 @@ test('room commands send exactly one JSONL request over management.sock', async 
     { args: ['room', 'close', 'room1'], method: 'room.close', params: { room_id: 'room1' } },
     { args: ['room', 'delete', 'room1', '--yes'], method: 'room.delete', params: { room_id: 'room1', confirm: true } },
     { args: ['room', 'recover', 'room1'], method: 'room.recover', params: { room_id: 'room1' } },
+    { args: ['room', 'rebind', 'room1'], method: 'room.rebind', params: { room_id: 'room1' } },
     { args: ['room', 'recover', 'room1', '--confirm', 'old1', 'new1'], method: 'room.recover.confirm', params: { room_id: 'room1', recovery_of: 'old1', invite_id: 'new1' } },
     // Room membership and briefing verbs
     { args: ['room', 'create', '--goal', 'Ship', '--briefing', 'B', '--anonymous', '--quiet-membership'], method: 'room.create', params: { goal: 'Ship', briefing: 'B', anonymous: true, quiet_membership: true } },

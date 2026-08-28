@@ -124,6 +124,7 @@ export interface RoomPacketRegistry {
   get(roomId: string): RoomPacket | undefined;
   create(roomId: string, identityName?: string, bio?: string): Promise<RoomPacket>;
   restore?(roomId: string, expectedCid: string, identityName?: string, bio?: string): Promise<RoomPacket>;
+  rebind?(roomId: string): Promise<{ name: string; cid: string; status: 'rebound' }>;
   destroy(roomId: string): Promise<string[]>;
 }
 
@@ -261,6 +262,36 @@ export class RoomService {
   async recoverPacket(roomId: string): Promise<Room> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     return this.lock(id, async () => this.recoverPacketUnlocked(id, await this.store.load(id)));
+  }
+
+  /** Canonical operator recovery for an established room identity lease. */
+  async rebindIdentity(roomId: string): Promise<{
+    room_id: string;
+    identity_name: string;
+    identity_cid: string;
+    status: 'rebound';
+    fanout: 'resumed';
+  }> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    let room = await this.store.load(id);
+    if (room.state === 'closed' || room.state === 'closing') {
+      throw new RoomServiceError(`cannot rebind room "${id}" while it is ${room.state}`);
+    }
+    if (!this.packets.get(id)) {
+      room = await this.recoverPacket(id);
+    } else {
+      if (!this.packets.rebind) throw new RoomServiceError('room packet registry does not support explicit rebind');
+      await this.packets.rebind(id);
+    }
+    await this.reconcileRoom(id);
+    await this.resumePending(id);
+    return {
+      room_id: id,
+      identity_name: room.identity_name,
+      identity_cid: room.identity_cid,
+      status: 'rebound',
+      fanout: 'resumed',
+    };
   }
 
   private async recoverPacketUnlocked(id: string, initial: Room): Promise<Room> {

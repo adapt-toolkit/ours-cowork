@@ -55,6 +55,7 @@ export interface DaemonStore {
 
 export interface DaemonRegistry {
   unhostAll(): Promise<void>;
+  unhost?(roomId: string): Promise<void>;
 }
 
 export interface DaemonService {
@@ -220,26 +221,47 @@ export class CoworkDaemon {
       const rooms = await this.store.list();
       this.checkpoint();
       const recoverable = rooms.filter((room) => room.state !== 'closed');
+      const healthy = new Set(recoverable.map((room) => room.room_id));
+      const recoverPhase = async (roomId: string, phase: string, work: () => Promise<unknown>): Promise<void> => {
+        if (!healthy.has(roomId)) return;
+        try {
+          await work();
+          this.checkpoint();
+        } catch (error) {
+          healthy.delete(roomId);
+          const unhost = this.registry?.unhost;
+          if (unhost) {
+            await unhost.call(this.registry, roomId).catch((unhostError) => {
+              this.options.log?.(JSON.stringify({
+                event: 'startup_room_unhost_failed', room_id: roomId,
+                error: unhostError instanceof Error ? unhostError.message : String(unhostError),
+              }));
+            });
+          }
+          this.options.log?.(JSON.stringify({
+            event: 'startup_room_recovery_failed',
+            room_id: roomId,
+            phase,
+            error: error instanceof Error ? error.message : String(error),
+          }));
+        }
+      };
       // All packet CIDs are restored (or the exact packet-pending sentinel is
       // completed) before any metadata reconciliation can create intents.
       for (const room of recoverable) {
-        await this.service.recoverPacket(room.room_id);
-        this.checkpoint();
+        await recoverPhase(room.room_id, 'restore', () => this.service!.recoverPacket(room.room_id));
       }
       for (const room of recoverable.filter((candidate) => candidate.state !== 'closing')) {
-        await this.service.reconcileRoom(room.room_id);
-        this.checkpoint();
+        await recoverPhase(room.room_id, 'reconcile', () => this.service!.reconcileRoom(room.room_id));
       }
       // Closing is forward-only and precedes every inbox/send recovery.
       for (const room of recoverable.filter((candidate) => candidate.state === 'closing')) {
-        await this.service.closeRoom(room.room_id);
-        this.checkpoint();
+        await recoverPhase(room.room_id, 'close', () => this.service!.closeRoom(room.room_id));
       }
       // resumePending itself performs inbox snapshot -> complete all
       // intents -> atomic consume -> pending sends, in that exact order.
       for (const room of recoverable.filter((candidate) => candidate.state !== 'closing')) {
-        await this.service.resumePending(room.room_id);
-        this.checkpoint();
+        await recoverPhase(room.room_id, 'fanout', () => this.service!.resumePending(room.room_id));
       }
 
       const realService = this.service as RoomService;

@@ -80,6 +80,7 @@ const NATIVE_MUTATION_METHODS = new Set([
   'room.close',
   'room.recover',
   'room.recover.confirm',
+  'room.rebind',
   'room.participant.remove',
   'room.participant.replace',
 ]);
@@ -137,6 +138,7 @@ Room commands:
   close <room-id>
   delete <room-id> --yes
   recover <room-id> [--confirm <old-invite-id> <new-invite-id>]
+  rebind <room-id>
 
 Run ‘ours-cowork docs’ for the offline documentation index.`;
 }
@@ -405,6 +407,11 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
       }
       exactPositionals(parsed, 1, 'room recover');
       return { method: 'room.recover', params: { room_id: roomId } };
+    }
+    case 'rebind': {
+      const parsed = parseOptions(args, []);
+      const [roomId] = exactPositionals(parsed, 1, 'room rebind');
+      return { method: 'room.rebind', params: { room_id: roomId } };
     }
     default:
       usageError(`unknown room command: ${command}`);

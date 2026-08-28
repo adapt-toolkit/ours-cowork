@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
   LegacyCoworkStateError,
   PacketRegistry,
+  RoomIdentityMismatchError,
   SdkRoomPacket,
 } from '../src/packets.ts';
 import { SharedOursHost } from '../src/ours-runtime.ts';
@@ -156,6 +157,82 @@ class FakeClient {
 }
 
 function blankClient() { return new FakeClient(); }
+
+test('room packet single-flights typed lease recovery and retries only rejected operations', async () => {
+  const client = blankClient();
+  let rejected = 2;
+  client.sendMessage = async (input) => {
+    client.calls.push(['sendMessage', structuredClone(input)]);
+    if (rejected-- > 0) throw Object.assign(new Error('lost lease'), { code: 'NOT_BOUND' });
+    return { kind: 'sent', wireId: MESSAGE_OUT_WIRE };
+  };
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  const results = await Promise.all([
+    packet.send(CID, 'one'),
+    packet.send(CID, 'two'),
+  ]);
+  assert.deepEqual(results.map((result) => result.status), ['queued', 'queued']);
+  assert.equal(client.calls.filter(([name]) => name === 'chooseIdentity').length, 1);
+  assert.equal(client.calls.filter(([name]) => name === 'sendMessage').length, 4);
+});
+
+test('room packet fails CID mismatch immediately without retry or operation replay', async () => {
+  const client = blankClient();
+  client.chooseResult = { name: IDENTITY, cid: 'CD'.repeat(32), switchedFrom: null };
+  client.sendMessage = async () => { throw Object.assign(new Error('lost lease'), { code: 'BINDING_REASSIGNED' }); };
+  const packet = new SdkRoomPacket(IDENTITY, CID, client, { sleep: async () => assert.fail('must not back off') });
+  await assert.rejects(packet.send(CID, 'unsafe'), RoomIdentityMismatchError);
+  assert.equal(client.calls.filter(([name]) => name === 'chooseIdentity').length, 1);
+});
+
+test('room packet never force-binds or replays when a competing live session owns the identity', async () => {
+  const client = blankClient();
+  let sends = 0;
+  client.sendMessage = async () => {
+    sends += 1;
+    throw Object.assign(new Error('lost lease'), { code: 'NOT_BOUND' });
+  };
+  client.chooseFailure = Object.assign(new Error('owned elsewhere'), { code: 'BOUND_ELSEWHERE' });
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  await assert.rejects(packet.send(CID, 'do not steal'), (error) => error.code === 'BOUND_ELSEWHERE');
+  assert.equal(sends, 1);
+  assert.deepEqual(client.calls.filter(([name]) => name === 'chooseIdentity'), [
+    ['chooseIdentity', { name: IDENTITY, force: false }],
+  ]);
+});
+
+test('room packet retries explicitly transient rebind transport errors with bounded backoff', async () => {
+  const client = blankClient();
+  let attempts = 0;
+  client.chooseIdentity = async (input) => {
+    client.calls.push(['chooseIdentity', input]);
+    attempts += 1;
+    if (attempts < 3) throw Object.assign(new Error('socket reset'), { code: 'ECONNRESET' });
+    return client.chooseResult;
+  };
+  const delays = [];
+  const packet = new SdkRoomPacket(IDENTITY, CID, client, {
+    sleep: async (ms) => { delays.push(ms); }, random: () => 0.5,
+  });
+  assert.equal((await packet.rebind()).status, 'rebound');
+  assert.deepEqual(delays, [100, 200]);
+});
+
+test('contact-only reconciliation also auto-recovers a lost lease without recursive recovery', async () => {
+  const client = blankClient();
+  const original = client.listContacts.bind(client);
+  let first = true;
+  client.listContacts = async () => {
+    if (first) {
+      first = false;
+      throw Object.assign(new Error('not bound'), { code: 'NOT_BOUND' });
+    }
+    return original();
+  };
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  await packet.refreshContacts();
+  assert.equal(client.calls.filter(([name]) => name === 'chooseIdentity').length, 1);
+});
 
 test('SDK room packet maps message/file/reply state and uses only typed public operations', async () => {
   const client = blankClient();

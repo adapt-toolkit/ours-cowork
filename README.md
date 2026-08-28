@@ -41,3 +41,4 @@ ours-cowork docs web
 ```
 
 Before production use, read the limitations topic. In particular, backups require a stopped daemon and restore uses the complete state directory.
+Lost room identity leases are recovered automatically with a non-force bind and exact persisted-CID proof. Operators can invoke the same safe path explicitly with `ours-cowork room rebind <room-id>`; it never recreates an established identity or steals a live lease.

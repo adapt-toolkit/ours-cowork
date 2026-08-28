@@ -93,7 +93,7 @@ test('the exhaustive service route table marks every route auth:true', () => {
     'room.briefing.role.delete', 'room.briefing.role.set',
     'room.close', 'room.create', 'room.delete', 'room.history', 'room.invite', 'room.list',
     'room.message', 'room.participant.remove', 'room.participant.replace', 'room.participants',
-    'room.recover', 'room.recover.confirm', 'room.revoke',
+    'room.rebind', 'room.recover', 'room.recover.confirm', 'room.revoke',
     'room.role.rest.add', 'room.role.rest.remove', 'room.say',
     'room.settings', 'room.show',
   ]);

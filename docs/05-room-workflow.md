@@ -14,4 +14,8 @@ Update the display name with `ours-cowork room settings <room-id> --name "New na
 
 Close with `ours-cowork room close <room-id>`. Close is forward-only and removes the live standard SDK room identity while retaining the local archive. Archive deletion is a separate explicit operation described in the limitations topic.
 
+If the shared daemon restarts or a room SDK lease is lost, Cowork automatically attempts a non-force rebind of the room's exact persisted identity name and verifies its pinned CID before resuming the rejected operation. Concurrent recovery joins one attempt; transient connection failures use bounded exponential backoff. A live competing session, missing identity, or CID mismatch fails closed and is never force-bound or recreated. Startup isolates rooms that cannot be safely restored, releases their local leases, and continues serving healthy rooms.
+
+Use `ours-cowork room rebind <room-id>` for explicit recovery. This canonical operation applies the same name-and-CID proof, refreshes SDK contact/invite state, reconciles the room, and resumes durable pending fanout before reporting success. It refuses closing or closed rooms. Structured daemon logs emit `identity_rebind_*` and `startup_room_recovery_failed` events for diagnosis.
+
 Every web action has an equivalent CLI fallback in the room commands above and in the invites and messaging topics.

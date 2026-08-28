@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import test from 'node:test';
 
-import { RoomService } from '../src/service.ts';
+import { RoomService, RoomServiceError } from '../src/service.ts';
 import { MAX_HISTORY_PAGE_BYTES } from '../src/contracts.ts';
 import { packInvite } from '../src/packets.ts';
 
@@ -140,6 +140,7 @@ class FakePacket {
     return { status: 'queued', notified: true, key_material_retained: true };
   }
   async sign() { return 'signature'; }
+  async rebind() { this.rebindCalls = (this.rebindCalls ?? 0) + 1; return { name: this.name, cid: this.cid, status: 'rebound' }; }
 }
 
 class FakeRegistry {
@@ -172,6 +173,12 @@ class FakeRegistry {
       return this.restoreResult;
     }
     throw this.restoreFailure;
+  }
+
+  async rebind(roomId) {
+    const packet = this.packets.get(roomId);
+    if (!packet) throw new Error('not hosted');
+    return packet.rebind();
   }
 }
 
@@ -394,6 +401,60 @@ test('restart restores the exact persisted room identity name', async () => {
       identityName: created.identity_name,
       bio: undefined,
     });
+});
+
+test('explicit identity rebind handles hosted and startup-degraded rooms without creating identities', async () => {
+  const f = fixture();
+  const created = await create(f);
+  const createCount = f.registry.createCalls.length;
+  const hosted = await f.service.rebindIdentity(ROOM_ID);
+  assert.deepEqual(hosted, {
+    room_id: ROOM_ID, identity_name: created.identity_name, identity_cid: created.identity_cid,
+    status: 'rebound', fanout: 'resumed',
+  });
+  assert.equal(f.registry.packets.get(ROOM_ID).rebindCalls, 1);
+
+  f.registry.packets.clear();
+  f.registry.restoreResult = new FakePacket(created.identity_name, created.identity_cid);
+  const degraded = await f.service.rebindIdentity(ROOM_ID);
+  assert.equal(degraded.status, 'rebound');
+  assert.equal(f.registry.createCalls.length, createCount, 'established recovery must never create');
+  assert.equal(f.registry.restoreCalls.at(-1).expectedCid, created.identity_cid);
+});
+
+test('explicit identity rebind safely completes an empty-CID packet-pending sentinel', async () => {
+  const f = fixture();
+  f.registry.failCreate = new Error('interrupted before identity creation');
+  await assert.rejects(create(f), /interrupted before identity creation/);
+  const pending = await f.store.load(ROOM_ID);
+  assert.equal(pending.identity_cid, '');
+  assert.equal(pending.status, 'packet_pending');
+
+  const receipt = await f.service.rebindIdentity(ROOM_ID);
+  const recovered = await f.store.load(ROOM_ID);
+  assert.equal(receipt.status, 'rebound');
+  assert.equal(recovered.identity_cid, `cid-room-${ROOM_ID}`);
+  assert.equal('status' in recovered, false);
+  assert.deepEqual(f.registry.restoreCalls, [], 'an unproven sentinel must never be adopted through restore');
+});
+
+test('empty-CID rebind collision fails closed and close gives intentional recovery guidance', async () => {
+  const f = fixture();
+  f.registry.failCreate = new Error('interrupted before identity creation');
+  await assert.rejects(create(f), /interrupted before identity creation/);
+  const pending = await f.store.load(ROOM_ID);
+  f.registry.failCreate = new Error('shared daemon already contains unproven room identity');
+
+  await assert.rejects(f.service.rebindIdentity(ROOM_ID), /will not adopt.*durably recorded CID/i);
+  assert.deepEqual(await f.store.load(ROOM_ID), pending);
+  assert.deepEqual(f.registry.restoreCalls, []);
+  assert.equal(f.registry.createCalls.length, 2, 'recovery makes one create attempt and never duplicates it');
+  assert.equal(f.registry.packets.has(ROOM_ID), false);
+  await assert.rejects(
+    f.service.closeRoom(ROOM_ID),
+    (error) => error instanceof RoomServiceError && /cannot close.*identity CID is unproven.*room rebind/i.test(error.message),
+  );
+  assert.deepEqual(await f.store.load(ROOM_ID), pending);
 });
 
 test('recoverRoom resumes the durable provisioning boundary with exactly one live packet', async () => {

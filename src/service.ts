@@ -277,7 +277,7 @@ export class RoomService {
     if (room.state === 'closed' || room.state === 'closing') {
       throw new RoomServiceError(`cannot rebind room "${id}" while it is ${room.state}`);
     }
-    if (!this.packets.get(id)) {
+    if (this.isPacketPending(room) || !this.packets.get(id)) {
       room = await this.recoverPacket(id);
     } else {
       if (!this.packets.rebind) throw new RoomServiceError('room packet registry does not support explicit rebind');
@@ -1048,6 +1048,12 @@ export class RoomService {
         // its directory fsync failed. Replacing the exact snapshot repeats
         // that durability barrier before close reports success.
         return this.store.save(room);
+      }
+      if (this.isPacketPending(room)) {
+        throw new RoomServiceError(
+          `cannot close room "${id}" while its identity CID is unproven; ` +
+          'run room rebind first, or verify and remove a colliding orphan identity before retrying recovery',
+        );
       }
       if (room.state === 'closing') {
         // Likewise, never resume external effects from a merely observed

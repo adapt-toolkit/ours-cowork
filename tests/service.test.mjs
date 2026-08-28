@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import test from 'node:test';
 
-import { RoomService } from '../src/service.ts';
+import { RoomService, RoomServiceError } from '../src/service.ts';
 import { MAX_HISTORY_PAGE_BYTES } from '../src/contracts.ts';
 import { packInvite } from '../src/packets.ts';
 
@@ -420,6 +420,41 @@ test('explicit identity rebind handles hosted and startup-degraded rooms without
   assert.equal(degraded.status, 'rebound');
   assert.equal(f.registry.createCalls.length, createCount, 'established recovery must never create');
   assert.equal(f.registry.restoreCalls.at(-1).expectedCid, created.identity_cid);
+});
+
+test('explicit identity rebind safely completes an empty-CID packet-pending sentinel', async () => {
+  const f = fixture();
+  f.registry.failCreate = new Error('interrupted before identity creation');
+  await assert.rejects(create(f), /interrupted before identity creation/);
+  const pending = await f.store.load(ROOM_ID);
+  assert.equal(pending.identity_cid, '');
+  assert.equal(pending.status, 'packet_pending');
+
+  const receipt = await f.service.rebindIdentity(ROOM_ID);
+  const recovered = await f.store.load(ROOM_ID);
+  assert.equal(receipt.status, 'rebound');
+  assert.equal(recovered.identity_cid, `cid-room-${ROOM_ID}`);
+  assert.equal('status' in recovered, false);
+  assert.deepEqual(f.registry.restoreCalls, [], 'an unproven sentinel must never be adopted through restore');
+});
+
+test('empty-CID rebind collision fails closed and close gives intentional recovery guidance', async () => {
+  const f = fixture();
+  f.registry.failCreate = new Error('interrupted before identity creation');
+  await assert.rejects(create(f), /interrupted before identity creation/);
+  const pending = await f.store.load(ROOM_ID);
+  f.registry.failCreate = new Error('shared daemon already contains unproven room identity');
+
+  await assert.rejects(f.service.rebindIdentity(ROOM_ID), /will not adopt.*durably recorded CID/i);
+  assert.deepEqual(await f.store.load(ROOM_ID), pending);
+  assert.deepEqual(f.registry.restoreCalls, []);
+  assert.equal(f.registry.createCalls.length, 2, 'recovery makes one create attempt and never duplicates it');
+  assert.equal(f.registry.packets.has(ROOM_ID), false);
+  await assert.rejects(
+    f.service.closeRoom(ROOM_ID),
+    (error) => error instanceof RoomServiceError && /cannot close.*identity CID is unproven.*room rebind/i.test(error.message),
+  );
+  assert.deepEqual(await f.store.load(ROOM_ID), pending);
 });
 
 test('recoverRoom resumes the durable provisioning boundary with exactly one live packet', async () => {

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import { OursError } from '@ours.network/sdk';
 import {
   LegacyCoworkStateError,
   PacketRegistry,
@@ -35,6 +36,7 @@ class FakeClient {
   calls = [];
   chooseResult = { name: IDENTITY, cid: CID, switchedFrom: null };
   chooseFailure;
+  createFailure;
 
   async chooseIdentity(input) {
     this.calls.push(['chooseIdentity', input]);
@@ -44,6 +46,7 @@ class FakeClient {
 
   async createIdentity(input) {
     this.calls.push(['createIdentity', input]);
+    if (this.createFailure) throw this.createFailure;
     return { info: { cid: CID } };
   }
 
@@ -512,8 +515,98 @@ test('fresh provisioning rejects a colliding name without creating a lease or ad
   const registry = new PacketRegistry(host, stateDir);
   await assert.rejects(
     registry.create(ROOM_ID, NAMED_IDENTITY),
-    /unproven.*refusing to adopt/i,
+    (error) => error instanceof OursError
+      && error.code === 'NAME_TAKEN'
+      && /unproven.*refusing to adopt/i.test(error.message),
   );
+});
+
+test('registry preserves exact typed SDK name refusals and wraps unknown provisioning failures', async (t) => {
+  for (const code of ['NAME_INVALID', 'NAME_TAKEN']) {
+    const stateDir = mkdtempSync(join(tmpdir(), `cowork-sdk-${code.toLowerCase()}-`));
+    t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+    const client = blankClient();
+    const refusal = new OursError(code, `typed ${code}`);
+    client.createFailure = refusal;
+    const host = {
+      async listIdentityNames() { return new Set(); }, async createClient() { return client; },
+      onIdentityNotify() { return () => {}; }, trackIdentity() { return () => {}; },
+    };
+    const registry = new PacketRegistry(host, stateDir);
+    await assert.rejects(registry.create(ROOM_ID, NAMED_IDENTITY), (error) => error === refusal);
+    assert(client.calls.some(([name]) => name === 'releaseLease'));
+  }
+
+  const stateDir = mkdtempSync(join(tmpdir(), 'cowork-sdk-unknown-name-create-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const client = blankClient();
+  const unknown = new Error('transport failed ambiguously');
+  client.createFailure = unknown;
+  const registry = new PacketRegistry({
+    async listIdentityNames() { return new Set(); }, async createClient() { return client; },
+    onIdentityNotify() { return () => {}; }, trackIdentity() { return () => {}; },
+  }, stateDir);
+  await assert.rejects(
+    registry.create(ROOM_ID, NAMED_IDENTITY),
+    (error) => error.cause === unknown && /failed to provision/.test(error.message),
+  );
+});
+
+test('registry wraps a structural OursError lookalike instead of treating it as a typed SDK refusal', async (t) => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'cowork-sdk-spoofed-name-error-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const client = blankClient();
+  const spoof = Object.assign(new Error('ambiguous partial failure'), {
+    name: 'OursError', code: 'NAME_TAKEN',
+  });
+  client.createFailure = spoof;
+  const registry = new PacketRegistry({
+    async listIdentityNames() { return new Set(); }, async createClient() { return client; },
+    onIdentityNotify() { return () => {}; }, trackIdentity() { return () => {}; },
+  }, stateDir);
+  await assert.rejects(
+    registry.create(ROOM_ID, NAMED_IDENTITY),
+    (error) => error !== spoof && error.cause === spoof && /failed to provision/.test(error.message),
+  );
+});
+
+test('concurrent registry creation closes the lookup race with one typed NAME_TAKEN loser', async (t) => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'cowork-sdk-concurrent-name-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  let lookups = 0;
+  let releaseLookups;
+  const lookupGate = new Promise((resolve) => { releaseLookups = resolve; });
+  const collision = new OursError('NAME_TAKEN', 'SDK concurrent winner owns the name');
+  let claimed = false;
+  const clients = [blankClient(), blankClient()];
+  const allClients = [...clients];
+  for (const client of clients) client.createIdentity = async (input) => {
+    client.calls.push(['createIdentity', input]);
+    if (claimed) throw collision;
+    claimed = true;
+    return { info: { cid: CID } };
+  };
+  const host = {
+    async listIdentityNames() {
+      lookups += 1;
+      if (lookups === 2) releaseLookups();
+      await lookupGate;
+      return new Set();
+    },
+    async createClient() { return clients.shift(); },
+    onIdentityNotify() { return () => {}; }, trackIdentity() { return () => {}; },
+  };
+  const registry = new PacketRegistry(host, stateDir);
+  const results = await Promise.allSettled([
+    registry.create(ROOM_ID, NAMED_IDENTITY),
+    registry.create('01jz6y7n8p9q0r1s2t3v4w5x70', NAMED_IDENTITY),
+  ]);
+  assert.equal(results.filter(({ status }) => status === 'fulfilled').length, 1);
+  const rejected = results.find(({ status }) => status === 'rejected');
+  assert.equal(rejected.reason, collision);
+  assert.equal(registry.size, 1);
+  assert.equal(allClients.filter((client) => client.calls.some(([name]) => name === 'releaseLease')).length, 1);
+  assert.equal(lookups, 2);
 });
 
 test('restore accepts a persisted named identity only with an exact durable CID', async (t) => {

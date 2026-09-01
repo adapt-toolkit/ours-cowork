@@ -1,6 +1,6 @@
 {
   "name": "@ours.network/cowork",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Durable ours mission rooms on the shared ours daemon.",
   "type": "module",
   "license": "FSL-1.1-Apache-2.0",

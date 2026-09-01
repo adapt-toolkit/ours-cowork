@@ -343,7 +343,9 @@ export function isRoomDto(value: unknown): value is RoomDto {
 }
 
 function isPacketPendingIdentityName(_roomId: string, roomName: string, identityName: string): boolean {
-  return identityName === `ours-cowork:${roomName}`;
+  const prefix = 'ours-cowork:';
+  const titleBudget = 64 - Array.from(prefix).length;
+  return identityName === `${prefix}${Array.from(roomName).slice(0, titleBudget).join('')}`;
 }
 
 export function isRoomListDto(value: unknown): value is RoomDto[] {

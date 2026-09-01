@@ -368,6 +368,48 @@ export class CoworkStore {
     })));
   }
 
+  /** Roll back only a fresh, empty provisioning sentinel after a proven no-side-effect SDK refusal. */
+  async discardPendingProvisioning(roomId: string, expectedIdentityName: string): Promise<void> {
+    const id = this.roomId(roomId);
+    await this.mutex(id, () => {
+      this.ensureBaseDirectories();
+      const roomDir = this.roomDirectory(id);
+      this.ensurePrivateDirectory(roomDir, false, `room "${id}" directory`);
+      const room = this.loadUnlocked(id);
+      if (room.state !== 'provisioning'
+        || room.status !== 'packet_pending'
+        || room.identity_cid !== ''
+        || room.identity_name !== expectedIdentityName
+        || room.invites.length !== 0
+        || room.seats.length !== 0) {
+        throw new CoworkStorageError(`room "${id}" is not the exact empty provisioning sentinel`);
+      }
+      const blobs = this.blobsDirectory(id);
+      this.ensurePrivateDirectory(blobs, false, `room "${id}" blobs directory`);
+      if (this.fs.readdirSync(blobs).length !== 0) {
+        throw new CoworkStorageError(`room "${id}" provisioning sentinel has file blobs`);
+      }
+      const recordCount = this.withDatabase(id, (db) => (db.prepare(
+        'SELECT COUNT(*) AS count FROM records',
+      ).get() as { count: number }).count);
+      if (recordCount !== 0) throw new CoworkStorageError(`room "${id}" provisioning sentinel has archive records`);
+      const expected = new Set(['archive.sqlite3','archive.sqlite3-wal','archive.sqlite3-shm','blobs','room.json']);
+      const unexpected = this.fs.readdirSync(roomDir).filter((name) => !expected.has(name));
+      if (unexpected.length !== 0) {
+        throw new CoworkStorageError(`room "${id}" provisioning sentinel has unexpected residue: ${unexpected.join(', ')}`);
+      }
+      for (const name of ['archive.sqlite3-wal','archive.sqlite3-shm','archive.sqlite3','room.json']) {
+        const path = join(roomDir, name);
+        if (this.lstatIfPresent(path)) { this.assertRegularFile(path, name); this.fs.unlinkSync(path); }
+      }
+      this.fs.rmdirSync(blobs);
+      this.fsyncDirectory(roomDir);
+      this.fs.rmdirSync(roomDir);
+      this.fsyncDirectory(this.roomsDirectory());
+      this.reconciledBlobRooms.delete(id);
+    });
+  }
+
   async delete(roomId: string): Promise<void> {
     const id = this.roomId(roomId);
     await this.mutex(id, () => {

@@ -222,6 +222,60 @@ test('delete is closed-only, fail-closed on residue, and removes SQLite plus blo
   await store.delete(ROOM_ID);
 });
 
+test('discardPendingProvisioning removes only the exact empty fresh sentinel', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
+  const identityName = 'ours-cowork:Release room';
+  await store.create(room({ identity_name: identityName, identity_cid: '', status: 'packet_pending' }));
+  await assert.rejects(store.discardPendingProvisioning(ROOM_ID, 'ours-cowork:Different'), /exact empty provisioning sentinel/);
+  assert.equal(existsSync(join(stateDir, 'rooms', ROOM_ID)), true);
+  await store.discardPendingProvisioning(ROOM_ID, identityName);
+  assert.equal(existsSync(join(stateDir, 'rooms', ROOM_ID)), false);
+});
+
+test('discardPendingProvisioning preserves every metadata guard mismatch', async (t) => {
+  const identityName = 'ours-cowork:Release room';
+  const mismatches = [
+    ['state', (value) => { value.state = 'active'; }],
+    ['missing status', (value) => { delete value.status; }],
+    ['nonempty CID', (value) => { value.identity_cid = 'cid-room'; }],
+    ['invites', (value) => { value.invites = [{
+      invite_id: 'invite-1', mode: 'public', role: 'reviewer', min_accepts: 1,
+      accepted_cids: [], state: 'live', created_at: AT,
+    }]; }],
+    ['seats', (value) => { value.seats = [{
+      identity: 'cid-member', display_name: 'Member', role: 'reviewer',
+      invite_id: 'invite-1', state: 'active', accepted_at: AT,
+    }]; }],
+  ];
+  for (const [label, mutate] of mismatches) {
+    const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
+    await store.create(room({ identity_name: identityName, identity_cid: '', status: 'packet_pending' }));
+    const roomDir = join(stateDir, 'rooms', ROOM_ID);
+    const metadataPath = join(roomDir, 'room.json');
+    const descriptor = JSON.parse(readFileSync(metadataPath, 'utf8'));
+    mutate(descriptor);
+    writeFileSync(metadataPath, `${JSON.stringify(descriptor, null, 2)}\n`, { mode: 0o600 });
+    const before = readFileSync(metadataPath, 'utf8');
+    await assert.rejects(store.discardPendingProvisioning(ROOM_ID, identityName));
+    assert.equal(existsSync(roomDir), true, `${label} mismatch must preserve the room`);
+    assert.equal(readFileSync(metadataPath, 'utf8'), before, `${label} mismatch must preserve metadata`);
+  }
+});
+
+test('discardPendingProvisioning fails closed on archive, blob, or unexpected residue', async (t) => {
+  for (const residue of ['archive', 'blob', 'unexpected']) {
+    const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
+    const identityName = 'ours-cowork:Release room';
+    await store.create(room({ identity_name: identityName, identity_cid: '', status: 'packet_pending' }));
+    const roomDir = join(stateDir, 'rooms', ROOM_ID);
+    if (residue === 'archive') await store.append(ROOM_ID, message(1));
+    if (residue === 'blob') writeFileSync(join(roomDir, 'blobs', 'residue'), 'x');
+    if (residue === 'unexpected') writeFileSync(join(roomDir, 'unexpected'), 'x');
+    await assert.rejects(store.discardPendingProvisioning(ROOM_ID, identityName), /archive records|file blobs|unexpected.*residue/i);
+    assert.equal(existsSync(roomDir), true, `${residue} mismatch must preserve the room`);
+  }
+});
+
 test('delete rejects SQLite residue when metadata is missing outside its valid removal order', async (t) => {
   const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
   await store.create(room({ state: 'closed', closed_at: AT }));

@@ -30,7 +30,7 @@ Every room operation is carried by the single route `POST /rpc` with the envelop
 
 The room activates after its durable invitation requirements are satisfied. Participants shows admitted identities and their invite roles.
 
-Names are trimmed and Unicode NFC-normalized, must contain 1–64 Unicode characters, and cannot contain Unicode control or format characters. At creation, the normalized name must not collide with an identity already in the shared daemon. Change local room metadata in Room settings. The browser continues to route by the opaque room ID; renaming does not change the URL, storage key, or underlying `ours-cowork:<creation name>` identity. Unnamed creation requests use `Room <first 8 room_id characters>`.
+Names are trimmed and Unicode NFC-normalized, must contain 1–64 Unicode code points, and cannot contain Unicode control or format characters. The SDK identity retains at most the first 52 code points after `ours-cowork:`; retained path separators, surrogates, and Unicode line/paragraph separators are also invalid under the SDK contract. At creation, the bounded name must not collide with an identity already in the shared daemon. Change local room metadata in Room settings. The browser continues to route by the opaque room ID; renaming does not change the URL, storage key, or underlying bounded identity. Unnamed creation requests use `Room <first 8 room_id characters>`.
 
 ## Communication and records
 

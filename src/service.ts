@@ -11,12 +11,14 @@ import {
   defaultRoomName,
   InviteModeSchema,
   isPersistedRoomIdentityName,
+  isStandardRoomIdentityName,
   LowerCrockfordUlidSchema,
   MAX_EXTERNAL_INVITE_BYTES,
   MAX_HISTORY_PAGE_BYTES,
   PostAsRoleInputSchema,
   PostMessageInputSchema,
   RestRoleInputSchema,
+  ROOM_IDENTITY_PREFIX,
   ROOM_ROLE,
   RoleBriefingDeleteInputSchema,
   RoleBriefingSetInputSchema,
@@ -115,6 +117,7 @@ const ReplaceParticipantInputSchema = z.object({
 }).strict();
 
 type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | 'append' | 'read' | 'delete'>
+  & Pick<CoworkStore, 'discardPendingProvisioning'>
   & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'briefingDeliveryTimes'>>;
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 type CloseNoticeIntentRecord = Extract<CommunicationRecord, { kind: 'close_notice_intent' }>;
@@ -122,6 +125,7 @@ type MembershipIntentRecord = Extract<CommunicationRecord, { kind: 'membership_i
 
 export interface RoomPacketRegistry {
   get(roomId: string): RoomPacket | undefined;
+  preflightCreate(roomId: string, identityName: string): Promise<void>;
   create(roomId: string, identityName?: string, bio?: string): Promise<RoomPacket>;
   restore?(roomId: string, expectedCid: string, identityName?: string, bio?: string): Promise<RoomPacket>;
   rebind?(roomId: string): Promise<{ name: string; cid: string; status: 'rebound' }>;
@@ -194,6 +198,7 @@ export class RoomService {
   private readonly nextMessageId: () => string;
   private readonly intake: IntakePump;
   private readonly provisioningCheckpoint: NonNullable<RoomServiceOptions['provisioningCheckpoint']>;
+  private readonly identityNameTails = new Map<string, Promise<void>>();
 
   constructor(store: Store, packets: RoomPacketRegistry, options: RoomServiceOptions = {}) {
     this.store = store;
@@ -215,7 +220,8 @@ export class RoomService {
     const roomId = LowerCrockfordUlidSchema.parse(this.nextRoomId());
     const roomName = settings.name ?? defaultRoomName(roomId);
     const identityName = roomIdentityName(roomName);
-    return this.lock(roomId, async () => {
+    return this.lockIdentityName(identityName, () => this.lock(roomId, async () => {
+      await this.packets.preflightCreate(roomId, identityName);
       const provisional = RoomSchema.parse({
         version: 2,
         room_id: roomId,
@@ -238,15 +244,30 @@ export class RoomService {
         created_at: this.now(),
       });
       await this.store.create(provisional);
-      const packet = await this.packets.create(
-        roomId,
-        identityName,
-        `ours-cowork mission room ${roomId}`,
-      );
+      let packet: RoomPacket;
+      try {
+        packet = await this.packets.create(
+          roomId,
+          identityName,
+          `ours-cowork mission room ${roomId}`,
+        );
+      } catch (error) {
+        if (await isCleanIdentityRefusal(error)) {
+          try {
+            await this.store.discardPendingProvisioning(roomId, identityName);
+          } catch (rollbackError) {
+            throw new AggregateError(
+              [error, rollbackError],
+              `room "${roomId}" identity provisioning was refused and its fresh sentinel could not be discarded`,
+            );
+          }
+        }
+        throw error;
+      }
       this.provisioningCheckpoint('metadata');
       const { status: _packetPending, ...created } = provisional;
       return this.store.save(RoomSchema.parse({ ...created, identity_cid: packet.cid }));
-    });
+    }));
   }
 
   async recoverRoom(roomId: string): Promise<Room> {
@@ -297,7 +318,15 @@ export class RoomService {
   private async recoverPacketUnlocked(id: string, initial: Room): Promise<Room> {
     let room = initial;
     if (room.state === 'closed') return room;
-    const packetPending = this.isPacketPending(room);
+    let packetPending = this.isPacketPending(room);
+    if (packetPending
+      && isPersistedRoomIdentityName(id, room.identity_name)
+      && !isStandardRoomIdentityName(id, room.identity_name)) {
+      const storedCreationName = room.identity_name.slice(ROOM_IDENTITY_PREFIX.length);
+      const correctedIdentityName = roomIdentityName(storedCreationName);
+      room = await this.store.save(RoomSchema.parse({ ...room, identity_name: correctedIdentityName }));
+      packetPending = this.isPacketPending(room);
+    }
     let packet = this.packets.get(id);
     if (packet) {
       if (!packetPending && packet.cid !== room.identity_cid) {
@@ -1628,6 +1657,18 @@ export class RoomService {
     return (this.store.mutex(roomId) as RoomMutex).runExclusive(work);
   }
 
+  private async lockIdentityName<T>(identityName: string, work: () => T | Promise<T>): Promise<T> {
+    const previous = this.identityNameTails.get(identityName) ?? Promise.resolve();
+    const result = previous.then(work, work);
+    const tail = result.then(() => undefined, () => undefined);
+    this.identityNameTails.set(identityName, tail);
+    try {
+      return await result;
+    } finally {
+      if (this.identityNameTails.get(identityName) === tail) this.identityNameTails.delete(identityName);
+    }
+  }
+
   private packet(roomId: string): RoomPacket {
     const packet = this.packets.get(roomId);
     if (!packet) throw new RoomServiceError(`room packet "${roomId}" is not hosted`);
@@ -1656,6 +1697,13 @@ export class RoomService {
   private now(): string {
     return z.string().datetime({ offset: true }).parse(this.nowValue());
   }
+}
+
+async function isCleanIdentityRefusal(error: unknown): Promise<boolean> {
+  const { OursError } = await import('@ours.network/sdk');
+  if (!(error instanceof OursError)) return false;
+  const code = error.code;
+  return code === 'NAME_INVALID' || code === 'NAME_TAKEN';
 }
 
 function activeSeats(room: Room): Seat[] {

@@ -2,9 +2,15 @@ import assert from 'node:assert/strict';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import test from 'node:test';
 
+import { OursError } from '@ours.network/sdk';
 import { RoomService, RoomServiceError } from '../src/service.ts';
-import { MAX_HISTORY_PAGE_BYTES } from '../src/contracts.ts';
-import { packInvite } from '../src/packets.ts';
+import {
+  CoworkIdentityNameError,
+  isStandardRoomIdentityName,
+  MAX_HISTORY_PAGE_BYTES,
+  sdkIdentityNameError,
+} from '../src/contracts.ts';
+import { LegacyCoworkStateError, packInvite } from '../src/packets.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const MESSAGE_IDS = [
@@ -67,6 +73,23 @@ class MemoryStore {
   }
 
   async list() { return [...this.rooms.values()].map((room) => structuredClone(room)); }
+
+  async discardPendingProvisioning(roomId, expectedIdentityName) {
+    const room = this.rooms.get(roomId);
+    const records = this.records.get(roomId);
+    if (!room
+      || room.state !== 'provisioning'
+      || room.status !== 'packet_pending'
+      || room.identity_cid !== ''
+      || room.identity_name !== expectedIdentityName
+      || room.invites.length !== 0
+      || room.seats.length !== 0
+      || records?.length !== 0) {
+      throw new Error(`room ${roomId} is not the exact empty provisioning sentinel`);
+    }
+    this.rooms.delete(roomId);
+    this.records.delete(roomId);
+  }
 
   async append(roomId, draft) {
     if (this.beforeAppend) await this.beforeAppend(draft);
@@ -145,6 +168,8 @@ class FakePacket {
 
 class FakeRegistry {
   packets = new Map();
+  identityNames = new Set();
+  preflightCalls = [];
   createCalls = [];
   restoreCalls = [];
   failCreate;
@@ -153,8 +178,22 @@ class FakeRegistry {
 
   get(roomId) { return this.packets.get(roomId); }
 
+  async preflightCreate(roomId, identityName) {
+    this.preflightCalls.push({ roomId, identityName });
+    const invalid = sdkIdentityNameError(identityName);
+    if (invalid !== undefined) throw new OursError('NAME_INVALID', invalid);
+    if (!isStandardRoomIdentityName(roomId, identityName)) throw new LegacyCoworkStateError(roomId);
+    if (this.identityNames.has(identityName)) {
+      throw new OursError(
+        'NAME_TAKEN',
+        `shared daemon already contains unproven room identity "${identityName}"; refusing to adopt it`,
+      );
+    }
+  }
+
   async create(roomId, identityName, bio) {
     this.createCalls.push({ roomId, identityName, bio });
+    await this.preflightCreate(roomId, identityName);
     if (this.failCreate) {
       const failure = this.failCreate;
       this.failCreate = undefined;
@@ -163,11 +202,15 @@ class FakeRegistry {
     assert.equal(this.packets.has(roomId), false, 'must never provision a duplicate packet');
     const packet = new FakePacket(identityName, `cid-room-${roomId}`);
     this.packets.set(roomId, packet);
+    this.identityNames.add(identityName);
     return packet;
   }
 
   async restore(roomId, expectedCid, identityName, bio) {
     this.restoreCalls.push({ roomId, expectedCid, identityName, bio });
+    const invalid = sdkIdentityNameError(identityName);
+    if (invalid !== undefined) throw new OursError('NAME_INVALID', invalid);
+    if (!isStandardRoomIdentityName(roomId, identityName)) throw new LegacyCoworkStateError(roomId);
     if (this.restoreResult) {
       this.packets.set(roomId, this.restoreResult);
       return this.restoreResult;
@@ -360,7 +403,7 @@ test('late redemption after cancellation can be severed and safely re-accepted b
   assert.equal(room.membership_epoch, 1);
 });
 
-test('create preserves the exact normalized room name in the authenticated identity', async () => {
+test('sequential long-title collisions are deterministic and leave no losing room sentinel', async () => {
   const store = new MemoryStore();
   const registry = new FakeRegistry();
   const ids = [ROOM_ID, '01jz6y7n8p9q0r1s2t3v4w5x70'];
@@ -371,15 +414,96 @@ test('create preserves the exact normalized room name in the authenticated ident
     now: () => TIMES[timeIndex++],
   });
 
-  const first = await service.createRoom({ name: '  Cafe\u0301 launch  ', goal: 'One', briefing: 'Brief' });
-  const second = await service.createRoom({ name: 'Café launch', goal: 'Two', briefing: 'Brief' });
-  assert.equal(first.room_name, 'Café launch');
-  assert.equal(second.room_name, 'Café launch');
-  assert.notEqual(first.room_id, second.room_id);
-  assert.equal(first.identity_name, 'ours-cowork:Café launch');
-  assert.equal(second.identity_name, 'ours-cowork:Café launch');
-  assert.notEqual(first.identity_cid, second.identity_cid, 'the registry fake does not model daemon-global name collisions');
-  assert.deepEqual((await service.listRooms()).map((room) => room.room_name), ['Café launch', 'Café launch']);
+  const shared = 'x'.repeat(52);
+  const first = await service.createRoom({ name: `${shared}${'a'.repeat(12)}`, goal: 'One', briefing: 'Brief' });
+  await assert.rejects(
+    service.createRoom({ name: `${shared}${'b'.repeat(12)}`, goal: 'Two', briefing: 'Brief' }),
+    (error) => error instanceof OursError && error.code === 'NAME_TAKEN',
+  );
+  assert.equal(first.identity_name, `ours-cowork:${shared}`);
+  assert.deepEqual((await service.listRooms()).map((room) => room.room_id), [first.room_id]);
+  assert.equal(registry.packets.size, 1);
+});
+
+test('concurrent same-prefix room creation serializes the full provisioning boundary by identity name', async () => {
+  const store = new MemoryStore();
+  const registry = new FakeRegistry();
+  const ids = [ROOM_ID, '01jz6y7n8p9q0r1s2t3v4w5x70'];
+  let releaseFirst;
+  const firstHeld = new Promise((resolve) => { releaseFirst = resolve; });
+  let firstEnteredResolve;
+  const firstEntered = new Promise((resolve) => { firstEnteredResolve = resolve; });
+  const baseCreate = registry.create.bind(registry);
+  registry.create = async (...args) => {
+    if (registry.createCalls.length === 0) {
+      firstEnteredResolve();
+      await firstHeld;
+    }
+    return baseCreate(...args);
+  };
+  const service = new RoomService(store, registry, {
+    roomId: () => ids.shift(), messageId: () => MESSAGE_IDS[0], now: () => TIMES[0],
+  });
+  const shared = '🤖'.repeat(52);
+  const first = service.createRoom({ name: `${shared}${'a'.repeat(12)}`, goal: 'One', briefing: 'Brief' });
+  await firstEntered;
+  const second = service.createRoom({ name: `${shared}${'b'.repeat(12)}`, goal: 'Two', briefing: 'Brief' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(registry.preflightCalls.length, 1, 'second preflight must wait behind the final-name lock');
+  assert.equal(store.rooms.size, 1, 'only the first sentinel may exist while its provisioning is in flight');
+  releaseFirst();
+  const [one, two] = await Promise.allSettled([first, second]);
+  assert.equal(one.status, 'fulfilled');
+  assert.equal(two.status, 'rejected');
+  assert(two.reason instanceof OursError && two.reason.code === 'NAME_TAKEN');
+  assert.equal(store.rooms.size, 1);
+  assert.equal(registry.packets.size, 1);
+  assert.equal(service.identityNameTails.size, 0, 'the last waiter must release the keyed lock entry');
+});
+
+test('a typed external NAME_TAKEN race discards only the fresh losing sentinel', async () => {
+  const f = fixture();
+  const collision = new OursError('NAME_TAKEN', 'external winner');
+  f.registry.failCreate = collision;
+  await assert.rejects(create(f), (error) => error === collision);
+  assert.equal(f.store.rooms.size, 0);
+  assert.equal(f.store.records.size, 0);
+  assert.equal(f.registry.packets.size, 0);
+});
+
+test('a structural OursError lookalike never authorizes sentinel deletion', async () => {
+  const f = fixture();
+  const spoof = Object.assign(new Error('ambiguous partial failure'), {
+    name: 'OursError', code: 'NAME_TAKEN',
+  });
+  f.registry.failCreate = spoof;
+  await assert.rejects(create(f), (error) => error === spoof);
+  assert.equal(f.store.rooms.size, 1);
+  const retained = await f.store.load(ROOM_ID);
+  assert.equal(retained.identity_cid, '');
+  assert.equal(retained.status, 'packet_pending');
+});
+
+test('a genuine generated NAME_INVALID fails before any durable room or registry side effect', async () => {
+  const f = fixture();
+  await assert.rejects(
+    f.service.createRoom({ name: `${'a'.repeat(51)}/tail`, goal: 'Ship', briefing: 'Brief' }),
+    (error) => error instanceof CoworkIdentityNameError && error.code === 'NAME_INVALID',
+  );
+  assert.equal(f.store.rooms.size, 0);
+  assert.equal(f.registry.preflightCalls.length, 0);
+  assert.equal(f.registry.createCalls.length, 0);
+});
+
+test('rollback failure reports both the typed refusal and uncertain sentinel cleanup', async () => {
+  const f = fixture();
+  const collision = new OursError('NAME_TAKEN', 'external winner');
+  f.registry.failCreate = collision;
+  f.store.discardPendingProvisioning = async () => { throw new Error('disk refused rollback'); };
+  await assert.rejects(create(f), (error) => error instanceof AggregateError
+    && error.errors[0] === collision
+    && /disk refused rollback/.test(String(error.errors[1])));
+  assert.equal(f.store.rooms.size, 1, 'failed guarded cleanup must not claim zero residue');
 });
 
 test('restart restores the exact persisted room identity name', async () => {
@@ -436,6 +560,95 @@ test('explicit identity rebind safely completes an empty-CID packet-pending sent
   assert.equal(recovered.identity_cid, `cid-room-${ROOM_ID}`);
   assert.equal('status' in recovered, false);
   assert.deepEqual(f.registry.restoreCalls, [], 'an unproven sentinel must never be adopted through restore');
+});
+
+test('recovery migrates an installed overlength sentinel from its immutable identity suffix', async () => {
+  const f = fixture();
+  f.registry.failCreate = new Error('installed failure before SDK identity creation');
+  await assert.rejects(create(f), /installed failure/);
+  const pending = await f.store.load(ROOM_ID);
+  const originalCreationName = 'a'.repeat(64);
+  await f.store.save({
+    ...pending,
+    room_name: 'Later mutable label',
+    identity_name: `ours-cowork:${originalCreationName}`,
+  });
+  const recovered = await f.service.recoverPacket(ROOM_ID);
+  assert.equal(recovered.room_name, 'Later mutable label');
+  assert.equal(recovered.identity_name, `ours-cowork:${'a'.repeat(52)}`);
+  assert.equal(recovered.identity_cid, `cid-room-${ROOM_ID}`);
+  assert.equal(f.registry.createCalls.at(-1).identityName, recovered.identity_name);
+});
+
+test('recovery collision preserves the corrected installed sentinel for operator remediation', async () => {
+  const f = fixture();
+  f.registry.failCreate = new Error('installed failure before SDK identity creation');
+  await assert.rejects(create(f), /installed failure/);
+  const pending = await f.store.load(ROOM_ID);
+  const corrected = `ours-cowork:${'a'.repeat(52)}`;
+  await f.store.save({ ...pending, identity_name: `ours-cowork:${'a'.repeat(64)}` });
+  f.registry.identityNames.add(corrected);
+  await assert.rejects(f.service.recoverPacket(ROOM_ID), (error) => error instanceof RoomServiceError
+    && error.cause instanceof OursError
+    && error.cause.code === 'NAME_TAKEN');
+  const retained = await f.store.load(ROOM_ID);
+  assert.equal(retained.identity_name, corrected);
+  assert.equal(retained.identity_cid, '');
+  assert.equal(retained.status, 'packet_pending');
+});
+
+test('recovery never rewrites unsupported empty-CID legacy identity formats', async () => {
+  for (const identityName of [`cowork-room-${ROOM_ID}`, `ours-cowork-${ROOM_ID}`]) {
+    const f = fixture();
+    f.store.rooms.set(ROOM_ID, {
+      ...(await f.store.load(ROOM_ID).catch(() => ({
+        version: 2,
+        room_id: ROOM_ID,
+        room_name: 'Legacy room',
+        mission: { goal: 'Ship', briefing: 'Brief', briefing_version: 1 },
+        role_briefings: {}, rest_roles: [], anonymous: false, quiet_membership: false,
+        membership_epoch: 0, invites: [], seats: [], created_at: TIMES[0],
+      }))),
+      identity_name: identityName,
+      identity_cid: '',
+      state: 'provisioning',
+      status: 'packet_pending',
+    });
+    f.store.records.set(ROOM_ID, []);
+    await assert.rejects(
+      f.service.recoverPacket(ROOM_ID),
+      (error) => error instanceof RoomServiceError && error.cause instanceof LegacyCoworkStateError,
+    );
+    assert.equal((await f.store.load(ROOM_ID)).identity_name, identityName);
+    assert.equal(f.registry.createCalls.length, 0);
+  }
+});
+
+test('installed sentinel migration validates the retained prefix and ignores an invalid truncated tail', async () => {
+  for (const scenario of [
+    { title: `${'a'.repeat(51)}/${'z'.repeat(12)}`, valid: false },
+    { title: `${'a'.repeat(52)}/${'z'.repeat(11)}`, valid: true },
+  ]) {
+    const f = fixture();
+    f.registry.failCreate = new Error('installed failure before SDK identity creation');
+    await assert.rejects(create(f), /installed failure/);
+    const pending = await f.store.load(ROOM_ID);
+    await f.store.save({ ...pending, identity_name: `ours-cowork:${scenario.title}` });
+    if (scenario.valid) {
+      const recovered = await f.service.recoverPacket(ROOM_ID);
+      assert.equal(recovered.identity_name, `ours-cowork:${'a'.repeat(52)}`);
+      assert.notEqual(recovered.identity_cid, '');
+    } else {
+      await assert.rejects(
+        f.service.recoverPacket(ROOM_ID),
+        (error) => error instanceof CoworkIdentityNameError && error.code === 'NAME_INVALID',
+      );
+      const retained = await f.store.load(ROOM_ID);
+      assert.equal(retained.identity_name, `ours-cowork:${scenario.title}`);
+      assert.equal(retained.identity_cid, '');
+      assert.equal(retained.status, 'packet_pending');
+    }
+  }
 });
 
 test('empty-CID rebind collision fails closed and close gives intentional recovery guidance', async () => {
@@ -537,6 +750,8 @@ test('a crash-created orphan remains fail-closed until removal, then boot-style 
 
   // Simulate the operator verifying and removing the orphan, then restarting
   // cowork: the boot recoverPacket phase creates rather than adopting it.
+  f.registry.identityNames.delete((await f.store.load(ROOM_ID)).identity_name);
+  f.registry.failCreate = undefined;
   const recovered = await f.service.recoverPacket(ROOM_ID);
   assert.equal(recovered.identity_cid, `cid-room-${ROOM_ID}`);
   assert.equal('status' in recovered, false);

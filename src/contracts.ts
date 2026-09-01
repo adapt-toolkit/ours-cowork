@@ -16,6 +16,7 @@ const MAX_FILE_NAME_BYTES = 255;
 const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;
 export const MAX_ROOM_NAME_CHARACTERS = 64;
+export const MAX_ROOM_IDENTITY_NAME_CHARACTERS = 64;
 
 function utf8Bounded(label: string, maximumBytes: number): z.ZodType<string> {
   return z.string()
@@ -76,10 +77,45 @@ export const RoomNameSchema = z.string()
 
 /** Authenticated identity prefix for a named Cowork room. */
 export const ROOM_IDENTITY_PREFIX = 'ours-cowork:';
+export const MAX_ROOM_IDENTITY_TITLE_CHARACTERS =
+  MAX_ROOM_IDENTITY_NAME_CHARACTERS - Array.from(ROOM_IDENTITY_PREFIX).length;
+const SDK_IDENTITY_NAME_FORBIDDEN = /[\\/\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
+const SDK_IDENTITY_NAME_RESERVED = new Set(['.', '..', 'contact-book', 'root.json', 'bindings.json']);
 
-/** Preserve the exact normalized creation name in the authenticated identity. */
+/** Cowork-side refusal used before loading the daemon SDK into the supervisor. */
+export class CoworkIdentityNameError extends Error {
+  readonly code = 'NAME_INVALID' as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'CoworkIdentityNameError';
+  }
+}
+
+/** Mirror the SDK 3.5 identity-name contract before crossing a durable boundary. */
+export function sdkIdentityNameError(identityName: string): string | undefined {
+  const length = Array.from(identityName).length;
+  if (length < 1 || length > MAX_ROOM_IDENTITY_NAME_CHARACTERS) {
+    return `name must be 1-${MAX_ROOM_IDENTITY_NAME_CHARACTERS} Unicode characters`;
+  }
+  if (identityName !== identityName.normalize('NFC')) return 'name must use Unicode NFC normalization';
+  if (SDK_IDENTITY_NAME_FORBIDDEN.test(identityName)) {
+    return 'name must not contain control, format, surrogate, line-separator, or path-separator characters';
+  }
+  if (SDK_IDENTITY_NAME_RESERVED.has(identityName)) return `name ${JSON.stringify(identityName)} is reserved`;
+  return undefined;
+}
+
+/** Preserve as much normalized creation text as the SDK identity contract permits. */
 export function roomIdentityName(roomName: string): string {
-  return `${ROOM_IDENTITY_PREFIX}${RoomNameSchema.parse(roomName)}`;
+  const normalized = RoomNameSchema.parse(roomName);
+  const boundedTitle = Array.from(normalized).slice(0, MAX_ROOM_IDENTITY_TITLE_CHARACTERS).join('');
+  const identityName = `${ROOM_IDENTITY_PREFIX}${boundedTitle}`;
+  const detail = sdkIdentityNameError(identityName);
+  if (detail !== undefined) {
+    throw new CoworkIdentityNameError(`generated room identity name is invalid: ${detail}`);
+  }
+  return identityName;
 }
 
 /** Validate the immutable authenticated name without consulting mutable room metadata. */
@@ -92,7 +128,8 @@ export function isPersistedRoomIdentityName(roomId: string, identityName: string
 }
 
 export function isStandardRoomIdentityName(roomId: string, identityName: string): boolean {
-  return isPersistedRoomIdentityName(roomId, identityName);
+  return isPersistedRoomIdentityName(roomId, identityName)
+    && sdkIdentityNameError(identityName) === undefined;
 }
 export const RoleSchema = utf8Bounded('role', MAX_ROLE_BYTES);
 export const ROOM_ROLE = 'room';

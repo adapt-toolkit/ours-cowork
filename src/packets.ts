@@ -11,6 +11,7 @@ import {
   isStandardRoomIdentityName,
   MAX_EXTERNAL_INVITE_BYTES,
   MAX_FILE_BYTES,
+  sdkIdentityNameError,
 } from './contracts.ts';
 import type { OursRuntimeClientFactory } from './ours-runtime.ts';
 
@@ -145,19 +146,24 @@ export class PacketRegistry {
   get size(): number { return this.packets.size; }
   get(roomId: string): RoomPacket | undefined { return this.packets.get(roomId); }
 
-  async create(roomId: string, identityName: string, bio = `ours-cowork mission room ${roomId}`): Promise<RoomPacket> {
+  async preflightCreate(roomId: string, identityName: string): Promise<void> {
     validateRoomId(roomId);
-    this.assertStandardIdentity(roomId, identityName);
+    await this.assertStandardIdentity(roomId, identityName);
     this.assertNoLegacyState(roomId);
     if (this.packets.has(roomId)) throw new Error(`room identity "${roomId}" is already hosted`);
     const localNames = new Set([identityName]);
     const available = await this.host.listIdentityNames(localNames);
     if (available.has(identityName)) {
-      throw new Error(
+      throw await sdkNameError(
+        'NAME_TAKEN',
         `shared ours daemon already contains unproven room identity "${identityName}"; ` +
         'refusing to adopt it without a durably recorded CID',
       );
     }
+  }
+
+  async create(roomId: string, identityName: string, bio = `ours-cowork mission room ${roomId}`): Promise<RoomPacket> {
+    await this.preflightCreate(roomId, identityName);
     const client = await this.host.createClient();
     try {
       const created = await client.createIdentity({
@@ -176,13 +182,16 @@ export class PacketRegistry {
       return packet;
     } catch (error) {
       await client.releaseLease().catch(() => {});
+      if (await isTypedNameRefusal(error)) {
+        throw error;
+      }
       throw new Error(`failed to provision standard SDK identity for room "${roomId}"`, { cause: error });
     }
   }
 
   async restore(roomId: string, expectedCid: string, identityName: string): Promise<RoomPacket> {
     validateRoomId(roomId);
-    this.assertStandardIdentity(roomId, identityName);
+    await this.assertStandardIdentity(roomId, identityName);
     this.assertNoLegacyState(roomId);
     if (expectedCid === undefined || expectedCid.length === 0) {
       throw new Error(`refusing to restore room identity "${identityName}" without a durably recorded expected CID`);
@@ -277,9 +286,23 @@ export class PacketRegistry {
     }
   }
 
-  private assertStandardIdentity(roomId: string, identityName: string): void {
+  private async assertStandardIdentity(roomId: string, identityName: string): Promise<void> {
+    const detail = sdkIdentityNameError(identityName);
+    if (detail !== undefined) throw await sdkNameError('NAME_INVALID', `generated room identity name is invalid: ${detail}`);
     if (!isStandardRoomIdentityName(roomId, identityName)) throw new LegacyCoworkStateError(roomId);
   }
+}
+
+async function sdkNameError(code: 'NAME_INVALID' | 'NAME_TAKEN', message: string): Promise<Error> {
+  const { OursError } = await import('@ours.network/sdk');
+  return new OursError(code, message);
+}
+
+async function isTypedNameRefusal(error: unknown): Promise<boolean> {
+  const { OursError } = await import('@ours.network/sdk');
+  if (!(error instanceof OursError)) return false;
+  const code = error.code;
+  return code === 'NAME_INVALID' || code === 'NAME_TAKEN';
 }
 
 export class SdkRoomPacket implements RoomPacket {

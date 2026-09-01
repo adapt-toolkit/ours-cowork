@@ -6,6 +6,7 @@ import {
   AppendRecordSchema,
   AcceptExternalInviteInputSchema,
   CommunicationRecordSchema,
+  CoworkIdentityNameError,
   CreateRoomInputSchema,
   FileMimeSchema,
   FileNameSchema,
@@ -14,6 +15,7 @@ import {
   LowerCrockfordUlidSchema,
   MessageTextSchema,
   MAX_FILE_BYTES,
+  MAX_ROOM_IDENTITY_TITLE_CHARACTERS,
   PostMessageInputSchema,
   Rfc3339Schema,
   RoleSchema,
@@ -25,6 +27,7 @@ import {
   defaultRoomName,
   migrateRoomV1,
   roomIdentityName,
+  sdkIdentityNameError,
 } from '../src/contracts.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
@@ -137,12 +140,25 @@ test('room names trim, NFC-normalize, count Unicode code points, and reject cont
   assert.deepEqual(UpdateRoomInputSchema.parse({ name: '  Renamed  ' }), { name: 'Renamed' });
 });
 
-test('room identity names preserve the exact normalized creation name', () => {
+test('room identity names preserve normalized text within the 64-code-point SDK boundary', () => {
+  assert.equal(MAX_ROOM_IDENTITY_TITLE_CHARACTERS, 52);
   assert.equal(roomIdentityName('  Cafe\u0301 launch  '), 'ours-cowork:Café launch');
   assert.equal(roomIdentityName('研发 🚀'), 'ours-cowork:研发 🚀');
-  assert.equal(roomIdentityName('a'.repeat(64)), `ours-cowork:${'a'.repeat(64)}`);
+  assert.equal(Array.from(roomIdentityName('a'.repeat(51))).length, 63);
+  assert.equal(Array.from(roomIdentityName('a'.repeat(52))).length, 64);
+  assert.equal(roomIdentityName('a'.repeat(53)), `ours-cowork:${'a'.repeat(52)}`);
+  assert.equal(roomIdentityName('🤖'.repeat(64)), `ours-cowork:${'🤖'.repeat(52)}`);
+  assert.equal(roomIdentityName('e\u0301'.repeat(64)), `ours-cowork:${'é'.repeat(52)}`);
+  assert.equal(roomIdentityName(`${'a'.repeat(52)}/tail`), `ours-cowork:${'a'.repeat(52)}`);
+  assert.throws(
+    () => roomIdentityName(`${'a'.repeat(51)}/tail`),
+    (error) => error instanceof CoworkIdentityNameError && error.code === 'NAME_INVALID',
+  );
   assert.equal(isPersistedRoomIdentityName(ROOM_ID, 'ours-cowork:Café launch'), true);
   assert.equal(isStandardRoomIdentityName(ROOM_ID, 'ours-cowork:Café launch'), true);
+  const installedDefectSentinel = `ours-cowork:${'a'.repeat(64)}`;
+  assert.equal(isPersistedRoomIdentityName(ROOM_ID, installedDefectSentinel), true);
+  assert.equal(isStandardRoomIdentityName(ROOM_ID, installedDefectSentinel), false);
   for (const invalid of [
     '',
     'ours-cowork:',

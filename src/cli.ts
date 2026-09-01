@@ -813,7 +813,11 @@ function serviceEnvironment(config: CoworkConfig): Record<string, string> {
 }
 
 function validateServiceConfiguration(config: CoworkConfig): void {
-  const values = { cowork_cli: SELF, ...serviceEnvironment(config) };
+  const values = {
+    node_executable: process.execPath,
+    cowork_cli: SELF,
+    ...serviceEnvironment(config),
+  };
   for (const [label, value] of Object.entries(values)) {
     if (/[\x00-\x1f\x7f-\x9f]/.test(value)) {
       throw new CliError(EXIT.invalidState, 'invalid_state', `${label} contains a control character unsafe for a service definition`);
@@ -837,7 +841,7 @@ function systemdValueQuote(value: string): string {
  */
 function systemdExecutableQuote(value: string): string {
   if (value.includes('"') || /[\0\n\r]/.test(value)) {
-    throw new CliError(EXIT.invalidState, 'invalid_state', 'cowork CLI path contains a character unsupported by systemd ExecStart');
+    throw new CliError(EXIT.invalidState, 'invalid_state', 'node_executable contains a character unsupported by systemd ExecStart');
   }
   return `"${value.replaceAll('\\', '\\\\').replaceAll('%', '%%')}"`;
 }
@@ -880,7 +884,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=${systemdExecutableQuote(SELF)} serve
+ExecStart=${systemdExecutableQuote(process.execPath)} ${systemdValueQuote(SELF)} serve
 ${environment}
 Restart=on-failure
 RestartSec=5
@@ -923,7 +927,7 @@ function installLaunchd(config: CoworkConfig): string {
 <plist version="1.0"><dict>
   <key>Label</key><string>${LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key><array>
-    <string>${xml(SELF)}</string><string>serve</string>
+    <string>${xml(process.execPath)}</string><string>${xml(SELF)}</string><string>serve</string>
   </array>
   <key>EnvironmentVariables</key><dict>
 ${environment}

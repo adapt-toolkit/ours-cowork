@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import test from 'node:test';
 
 import { RoomService } from '../src/service.ts';
+import { ContactAlreadyAbsentError } from '../src/packets.ts';
 import { MAX_HISTORY_PAGE_BYTES } from '../src/contracts.ts';
 import { packInvite } from '../src/packets.ts';
 
@@ -1490,6 +1491,71 @@ test('removal crash points re-drive from the intent ledger without duplicate epo
   const settled = membershipRecords(await f.store.read(ROOM_ID));
   assert.equal(settled.intents.length, 1);
   assert.equal(settled.results.length, 1);
+});
+
+test('removal recovery treats only an exact-target SDK contact miss as conservative completion', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'builder', min_accepts: 1,
+  });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  await admit(f, invite, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
+  const packet = f.registry.get(ROOM_ID);
+  const originalRemove = packet.removeContact.bind(packet);
+  packet.removeContact = async (contact) => {
+    if (!packet.contacts.some((candidate) => candidate.container_id === contact)) {
+      packet.removeContactCalls = [...(packet.removeContactCalls ?? []), contact];
+      throw new ContactAlreadyAbsentError(contact, new Error('exact SDK contact miss'));
+    }
+    return originalRemove(contact);
+  };
+
+  let loseFirstResult = true;
+  f.store.beforeAppend = (draft) => {
+    if (loseFirstResult && draft.kind === 'membership_result') {
+      loseFirstResult = false;
+      throw new Error('lost response before membership result fsync');
+    }
+  };
+  await assert.rejects(
+    f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' }),
+    /lost response before membership result fsync/,
+  );
+  f.store.beforeAppend = undefined;
+
+  const afterAmbiguousRemoval = await f.service.showRoom(ROOM_ID);
+  const epoch = afterAmbiguousRemoval.membership_epoch;
+  assert.equal(afterAmbiguousRemoval.seats.find((seat) => seat.identity === 'cid-alice').state, 'removed');
+  assert.equal(packet.contacts.some((contact) => contact.container_id === 'cid-alice'), false);
+  assert.deepEqual(membershipRecords(await f.store.read(ROOM_ID)).results, []);
+
+  await f.service.reconcileRoom(ROOM_ID);
+  await f.service.reconcileRoom(ROOM_ID);
+  const settled = membershipRecords(await f.store.read(ROOM_ID));
+  assert.equal(settled.intents.length, 1);
+  assert.equal(settled.results.length, 1);
+  assert.deepEqual({ status: settled.results[0].status, notified: settled.results[0].notified }, {
+    status: 'send_failed', notified: false,
+  });
+  assert.equal((await f.service.showRoom(ROOM_ID)).membership_epoch, epoch);
+  assert.deepEqual(packet.removeContactCalls, ['cid-alice', 'cid-alice']);
+
+  const unrelated = evolutionFixture();
+  await unrelated.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite: unrelatedInvite } = await unrelated.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'builder', min_accepts: 1,
+  });
+  await admit(unrelated, unrelatedInvite, 'cid-alice', 'Alice');
+  const unrelatedPacket = unrelated.registry.get(ROOM_ID);
+  unrelatedPacket.removeContact = async () => {
+    throw new ContactAlreadyAbsentError('cid-someone-else', new Error('different SDK contact miss'));
+  };
+  await assert.rejects(
+    unrelated.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' }),
+    /cid-someone-else/,
+  );
+  assert.equal(membershipRecords(await unrelated.store.read(ROOM_ID)).results.length, 0);
 });
 
 test('a removed cid re-admits only through an invite minted after its removal', async () => {

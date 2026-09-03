@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import { OursError } from '@ours.network/sdk';
 import {
+  ContactAlreadyAbsentError,
   LegacyCoworkStateError,
   PacketRegistry,
   SdkRoomPacket,
@@ -447,6 +449,30 @@ test('successful contact removal evicts only its target without a fallible post-
   assert.deepEqual(client.calls.find(([name]) => name === 'removeContact'), [
     'removeContact', { contact: CID },
   ]);
+});
+
+test('contact removal translates only the SDK exact-target Unknown contact outcome', async () => {
+  const client = blankClient();
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  client.removeContact = async () => {
+    throw new OursError('TX_FAILED', `remove_contact failed: Error: Unknown contact: ${CID}`);
+  };
+  await assert.rejects(packet.removeContact(CID), (error) => {
+    assert(error instanceof ContactAlreadyAbsentError);
+    assert.equal(error.contactCid, CID);
+    return true;
+  });
+
+  const wrongTarget = new OursError(
+    'TX_FAILED',
+    `remove_contact failed: Error: Unknown contact: ${'CD'.repeat(32)}`,
+  );
+  client.removeContact = async () => { throw wrongTarget; };
+  await assert.rejects(packet.removeContact(CID), (error) => error === wrongTarget);
+
+  const unrelated = new OursError('TX_FAILED', 'remove_contact failed: transport unavailable');
+  client.removeContact = async () => { throw unrelated; };
+  await assert.rejects(packet.removeContact(CID), (error) => error === unrelated);
 });
 
 test('contact-only refresh succeeds without listing invites', async () => {

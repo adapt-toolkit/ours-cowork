@@ -108,6 +108,24 @@ export class LegacyCoworkStateError extends Error {
   }
 }
 
+/** Exact SDK proof that the requested contact CID is already absent. */
+export class ContactAlreadyAbsentError extends Error {
+  readonly contactCid: string;
+
+  constructor(contactCid: string, cause: unknown) {
+    super(`contact already absent: ${contactCid}`, { cause });
+    this.name = 'ContactAlreadyAbsentError';
+    this.contactCid = contactCid;
+  }
+}
+
+function isExactSdkMissingContact(error: unknown, contactCid: string): boolean {
+  return error instanceof Error
+    && 'code' in error
+    && error.code === 'TX_FAILED'
+    && error.message === `remove_contact failed: Error: Unknown contact: ${contactCid}`;
+}
+
 /** Standard-SDK room identities selected from the shared daemon by local name. */
 export class PacketRegistry {
   private readonly packets = new Map<string, SdkRoomPacket>();
@@ -446,7 +464,13 @@ export class SdkRoomPacket implements RoomPacket {
   }
 
   async removeContact(contactCid: string): Promise<{ status: RelayStatus; notified: boolean; key_material_retained: true }> {
-    const result = await this.client.removeContact({ contact: contactCid });
+    let result: Awaited<ReturnType<OursClient['removeContact']>>;
+    try {
+      result = await this.client.removeContact({ contact: contactCid });
+    } catch (error) {
+      if (!isExactSdkMissingContact(error, contactCid)) throw error;
+      throw new ContactAlreadyAbsentError(contactCid, error);
+    }
     const notified = result.notified === true;
     // The mutation response is authoritative for this exact target, but it is
     // not a replacement contact list. Evict only that target synchronously so

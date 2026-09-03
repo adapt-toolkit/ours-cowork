@@ -35,7 +35,7 @@ import {
   type RoomInvite,
   type Seat,
 } from './contracts.ts';
-import { unpackInvite, type RoomPacket } from './packets.ts';
+import { ContactAlreadyAbsentError, unpackInvite, type RoomPacket } from './packets.ts';
 import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
 import { IntakePump } from './intake.ts';
 import { generateUlid } from './ulid.ts';
@@ -56,6 +56,10 @@ function byteBoundedHistoryPage<T>(records: T[]): T[] {
     bytes += nextBytes;
   }
   return page;
+}
+
+function isExactMissingContact(error: unknown, contactCid: string): boolean {
+  return error instanceof ContactAlreadyAbsentError && error.contactCid === contactCid;
 }
 
 const CreateInviteInputSchema = z.object({
@@ -823,7 +827,16 @@ export class RoomService {
         key_material_retained: true,
       };
     } else {
-      outcome = await this.packet(current.room_id).removeContact(intent.recipient_identity);
+      try {
+        outcome = await this.packet(current.room_id).removeContact(intent.recipient_identity);
+      } catch (error) {
+        // The intent and removed seat are already durable. An exact-target
+        // SDK miss is the replay signature of a prior daemon-side removal
+        // whose response/result fsync was lost. Record conservative completion
+        // without claiming that this attempt sent a peer notification.
+        if (!isExactMissingContact(error, intent.recipient_identity)) throw error;
+        outcome = { status: 'send_failed', notified: false, key_material_retained: true };
+      }
       const result = await this.store.append(current.room_id, {
         version: 1,
         kind: 'membership_result',

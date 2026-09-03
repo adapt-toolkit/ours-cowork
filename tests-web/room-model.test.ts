@@ -27,6 +27,7 @@ import {
 const AT = '2026-08-03T00:00:00.000Z';
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x70';
 const MESSAGE_ID = '01jz6y7n8p9q0r1s2t3v4w5x71';
+const CALLER_CID = 'A'.repeat(64);
 
 function message(seq: number, overrides: Partial<MessageRecordDto> = {}): MessageRecordDto {
   return {
@@ -124,7 +125,7 @@ describe('room DTO guards', () => {
       state: 'active',
       invites: [],
       seats: [{
-        identity: 'cid-alice', display_name: 'Alice', role: 'builder', invite_id: 'invite-1',
+        identity: CALLER_CID, display_name: 'Alice', role: 'builder', invite_id: 'invite-1',
         accepted_at: AT, participant_id: '01jz6y7n8p9q0r1s2t3v4w5x72', state: 'active',
       }],
       created_at: AT,
@@ -145,6 +146,27 @@ describe('room DTO guards', () => {
     expect(isRoomDto({ ...daemonRoom, rest_roles: [''] })).toBe(false);
     expect(isRoomDto({ ...daemonRoom, rest_roles: ['room'] })).toBe(false);
     expect(isRoomDto({ ...daemonRoom, rest_roles: ['Reviewer', 'Reviewer'] })).toBe(false);
+    expect(daemonRoom.command_grants).toEqual([]);
+    const grantedRoom = {
+      ...daemonRoom,
+      command_grants: [{ caller_cid: CALLER_CID, command: 'list-members' }],
+    } as const;
+    expect(isRoomDto(grantedRoom)).toBe(true);
+    expect(isRoomDto({ ...daemonRoom, command_grants: undefined })).toBe(false);
+    expect(isRoomDto({ ...daemonRoom, command_grants: [{ caller_cid: CALLER_CID, command: 'unknown' }] })).toBe(false);
+    expect(isRoomDto({ ...daemonRoom, command_grants: [{ caller_cid: CALLER_CID.toLowerCase(), command: 'list-members' }] })).toBe(false);
+    expect(isRoomDto({
+      ...grantedRoom,
+      command_grants: [grantedRoom.command_grants[0], grantedRoom.command_grants[0]],
+    })).toBe(false);
+    expect(isRoomDto({
+      ...daemonRoom,
+      command_grants: [{ caller_cid: 'B'.repeat(64), command: 'list-members' }],
+    })).toBe(false);
+    expect(isRoomDto({
+      ...grantedRoom,
+      seats: [{ ...grantedRoom.seats[0]!, state: 'removed', removed_at: AT, removed_epoch: 0 }],
+    })).toBe(false);
 
     const externalPending = RoomSchema.parse({
       ...daemonRoom,
@@ -333,6 +355,7 @@ describe('room DTO guards', () => {
       seats: [{ identity: 'cid-alice', display_name: 'Alice', role: 'builder', invite_id: source.invite_id, accepted_at: AT }],
     });
     expect(isRoomDto(valid)).toBe(true);
+    expect(isRoomDto({ ...valid, command_grants: [] })).toBe(false);
     expect(isRoomDto(room({ room_name: 'Café launch 🤖' }))).toBe(true);
 
     const invalid = [

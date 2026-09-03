@@ -7,6 +7,7 @@ import { basename, dirname, join } from 'node:path';
 import { z } from 'zod';
 
 import { apiDocsAsset } from './openapi.ts';
+import { ContainerIdSchema, RuntimeCommandNameSchema } from './contracts.ts';
 import { CONTENT_SECURITY_POLICY, createStaticWebHandler, safePathname, type StaticWebHandler } from './web.ts';
 
 export const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -112,6 +113,9 @@ export interface RoomServiceApi {
   listRooms(): Promise<unknown>;
   showRoom(roomId: string): Promise<unknown>;
   participants(roomId: string): Promise<unknown>;
+  runtimeCommandGrants(roomId: string): Promise<unknown>;
+  grantRuntimeCommand(roomId: string, input: unknown): Promise<unknown>;
+  revokeRuntimeCommand(roomId: string, input: unknown): Promise<unknown>;
   history(roomId: string, options: unknown): Promise<unknown>;
   postMessage(roomId: string, input: unknown): Promise<unknown>;
   postAsRole(roomId: string, input: unknown): Promise<unknown>;
@@ -140,6 +144,9 @@ const RoleBriefingDeleteParams = z.object({
 }).strict();
 const RestRoleParams = z.object({
   room_id: z.string(), role: z.string(),
+}).strict();
+const RuntimeCommandGrantParams = z.object({
+  room_id: z.string(), caller_cid: ContainerIdSchema, command: RuntimeCommandNameSchema,
 }).strict();
 const ParticipantRemoveParams = z.object({
   room_id: z.string(), participant: z.string(), notify: z.boolean().optional(),
@@ -210,6 +217,16 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
     } },
     'room.show': { auth: true, run: (params) => service.showRoom(RoomIdParams.parse(params).room_id) },
     'room.participants': { auth: true, run: (params) => service.participants(RoomIdParams.parse(params).room_id) },
+    'room.command.grants': { auth: true, run: (params) =>
+      service.runtimeCommandGrants(RoomIdParams.parse(params).room_id) },
+    'room.command.grant': { auth: true, run: (params) => {
+      const { room_id, ...input } = RuntimeCommandGrantParams.parse(params);
+      return service.grantRuntimeCommand(room_id, input);
+    } },
+    'room.command.revoke': { auth: true, run: (params) => {
+      const { room_id, ...input } = RuntimeCommandGrantParams.parse(params);
+      return service.revokeRuntimeCommand(room_id, input);
+    } },
     'room.history': { auth: true, run: (params) => {
       const { room_id, ...options } = HistoryParams.parse(params);
       return service.history(room_id, options);

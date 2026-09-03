@@ -467,11 +467,32 @@ function roomV2(overrides = {}) {
   };
 }
 
+test('runtime-command grants default empty and bind unique commands to active CIDs', () => {
+  assert.deepEqual(RoomSchema.parse(roomV2()).command_grants, []);
+  const cid = 'A'.repeat(64);
+  const granted = roomV2({
+    seats: [seatV2({ identity: cid })],
+    command_grants: [{ caller_cid: cid.toLowerCase(), command: 'list-members' }],
+  });
+  assert.deepEqual(RoomSchema.parse(granted).command_grants, [
+    { caller_cid: cid, command: 'list-members' },
+  ]);
+  assert.throws(() => RoomSchema.parse({
+    ...granted,
+    command_grants: [granted.command_grants[0], granted.command_grants[0]],
+  }), /unique/i);
+  assert.throws(() => RoomSchema.parse({
+    ...granted,
+    seats: [seatV2({ identity: cid, state: 'removed', removed_at: AT, removed_epoch: 0 })],
+  }), /active room identity/i);
+});
+
 test('room schema v2 round-trips briefing versions, anonymity, and membership fields', () => {
   const value = roomV2({
     anonymous: true,
     quiet_membership: true,
     membership_epoch: 2,
+    command_grants: [],
     role_briefings: {
       reviewer: { text: 'Review the diffs.', version: 3, updated_at: AT },
       Participant: { text: 'Welcome.', version: 1, updated_at: AT },

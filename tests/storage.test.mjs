@@ -21,6 +21,7 @@ function room(overrides = {}) {
     mission: { goal: 'Ship it', briefing: 'Work together.', briefing_version: 1 },
     role_briefings: {},
     rest_roles: [],
+    command_grants: [],
     anonymous: false,
     quiet_membership: false,
     membership_epoch: 0,

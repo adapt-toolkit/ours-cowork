@@ -260,6 +260,41 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     example: { room_id: EXAMPLE_ROOM_ID },
   },
   {
+    method: 'room.command.grants',
+    summary: 'List runtime-command grants',
+    description: 'Lists the default-deny grants that bind one active participant CID to one '
+      + 'room runtime command.',
+    params: params({ room_id: roomIdProperty }, ['room_id']),
+    result: 'An array of `{caller_cid, command}` grants.',
+    example: { room_id: EXAMPLE_ROOM_ID },
+  },
+  {
+    method: 'room.command.grant',
+    summary: 'Authorize a runtime command caller',
+    description: 'Idempotently grants one command to one exact active participant CID. Display '
+      + 'names and roles are never authority.',
+    params: params({
+      room_id: roomIdProperty,
+      caller_cid: { type: 'string', pattern: '^[0-9A-Fa-f]{64}$', description: 'Authenticated caller CID.' },
+      command: { type: 'string', enum: ['list-members', 'remove-member'] },
+    }, ['room_id', 'caller_cid', 'command']),
+    result: 'The complete sorted grant list after the idempotent update.',
+    example: { room_id: EXAMPLE_ROOM_ID, caller_cid: 'A'.repeat(64), command: 'list-members' },
+  },
+  {
+    method: 'room.command.revoke',
+    summary: 'Revoke a runtime command caller',
+    description: 'Idempotently removes one exact CID/command grant. Revocation is persisted '
+      + 'before subsequent command dispatch can acquire the room mutex.',
+    params: params({
+      room_id: roomIdProperty,
+      caller_cid: { type: 'string', pattern: '^[0-9A-Fa-f]{64}$', description: 'Authenticated caller CID.' },
+      command: { type: 'string', enum: ['list-members', 'remove-member'] },
+    }, ['room_id', 'caller_cid', 'command']),
+    result: 'The complete sorted grant list after the idempotent update.',
+    example: { room_id: EXAMPLE_ROOM_ID, caller_cid: 'A'.repeat(64), command: 'remove-member' },
+  },
+  {
     method: 'room.history',
     summary: 'Read room history',
     description: 'Reads one page of the room\'s ordered communication archive. The operator view '

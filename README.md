@@ -7,9 +7,9 @@ ours-cowork web
 ours-cowork docs
 ```
 
-`ours-cowork web` starts the daemon if it is absent, waits for the console, and opens `http://127.0.0.1:3052/`. Create a room with a friendly display name first, then add each invitation requirement from its Invite panel. Names are trimmed, normalized to Unicode NFC, and may contain 1–64 Unicode characters excluding control and format characters. Duplicate names are allowed. The Communication view contains the human-readable room chat; operational records remain in Events and the complete ordered stream remains in Archive.
+`ours-cowork web` starts the daemon if it is absent, waits for the console, and opens `http://127.0.0.1:3052/`. Create a room with a name first, then add each invitation requirement from its Invite panel. Names are trimmed, normalized to Unicode NFC, and may contain 1–64 Unicode characters excluding control and format characters. The bounded identity name must not collide with an identity in the shared daemon. The Communication view contains the human-readable room chat; operational records remain in Events and the complete ordered stream remains in Archive.
 
-The friendly `room_name` is presentation metadata. By default, new rooms use the globally unique SDK identity `ours-cowork-<room_id>`. Operators may configure `roomIdentity.nameMode` as `friendly`; new rooms then use `ours-cowork-<bounded-ascii-slug>-<room_id>`. The full room ID preserves uniqueness, and the exact authenticated name is frozen at creation independently of later display-name or configuration changes. Identity CIDs, not names, remain the authorization and routing keys. Pre-1.0 rooms using `cowork-room-<room_id>` or `ours-cowork-room:<name>` custom packet state are detected and refused: back them up with the old release, recreate them, and re-invite their participants.
+Each room identity is `ours-cowork:<bounded room name>`. Cowork NFC-normalizes the creation name and retains its first 52 Unicode code points so the complete SDK identity stays within 64 code points. The authenticated identity name is frozen at creation; later room settings may change `room_name` but do not rename the identity, CID, contacts, or history. Identity CIDs, not names, remain the authorization and routing keys. Because identity names are daemon-global, equal names—including distinct long titles with the same retained prefix—collide cleanly. Earlier unreleased ID- and slug-based identity formats are unsupported; no migration is provided for this unreleased major.
 
 The localhost HTTP console has no authentication. Keep it bound to `127.0.0.1`; do not proxy, forward, or expose the port to other hosts. Room state is refreshed by periodic polling, not pushed to the browser.
 
@@ -19,7 +19,7 @@ Start or install the shared daemon with `@ours.network/cli` 2.7.0 before startin
 
 The shared daemon retains application payload history outside its protocol packets: each identity has a `history.sqlite3` database and immutable content-addressed file blobs. Cowork authorizes unread metadata by authenticated CID, reads the corresponding persistent history or blob, durably archives the room item and its complete fan-out, and only then advances that exact SDK unread item. There is no packet-inbox fallback, defer queue, host outbox, or cross-store transaction.
 
-The package keeps its room metadata and archives in its own state directory. Only identity names are used to select cowork rooms from the daemon-global identity list; this bookkeeping is not a provenance or authorization boundary. Operator room commands use one JSONL request over `management.sock`. Use `--json` for automation; its stdout is a single JSON value and diagnostics are included in that value.
+The package keeps room metadata and a per-room indexed `archive.sqlite3` in its own state directory. The archive uses WAL with `synchronous=FULL`; a record is durable at the completed SQLite commit. File bytes are immutable content-addressed blobs written and directory-synced before their referencing transaction, so interruption can leave only an unreferenced blob, never a committed partial file. Only identity names are used to select cowork rooms from the daemon-global identity list; this bookkeeping is not a provenance or authorization boundary. Operator room commands use one JSONL request over `management.sock`. Use `--json` for automation; its stdout is a single JSON value and diagnostics are included in that value.
 
 Ordinary ours-mcp identities can join only as remote participants over the ours protocol.
 
@@ -41,3 +41,4 @@ ours-cowork docs web
 ```
 
 Before production use, read the limitations topic. In particular, backups require a stopped daemon and restore uses the complete state directory.
+Lost room identity leases are recovered automatically with a non-force bind and exact persisted-CID proof. Operators can invoke the same safe path explicitly with `ours-cowork room rebind <room-id>`; it never recreates an established identity or steals a live lease.

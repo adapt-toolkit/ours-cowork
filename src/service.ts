@@ -6,12 +6,13 @@ import type { CommandContext, JsonValue } from '@ours.network/sdk';
 import {
   AcceptExternalInviteInputSchema,
   ContainerIdSchema,
-  configuredRoomIdentityName,
+  roomIdentityName,
   CreateRoomInputSchema,
   DEFAULT_ROLE,
   defaultRoomName,
   InviteModeSchema,
   isPersistedRoomIdentityName,
+  isStandardRoomIdentityName,
   LowerCrockfordUlidSchema,
   MAX_EXTERNAL_INVITE_BYTES,
   MAX_HISTORY_PAGE_BYTES,
@@ -21,6 +22,7 @@ import {
   RemoveMemberCommandInputSchema,
   RestRoleInputSchema,
   RuntimeCommandGrantInputSchema,
+  ROOM_IDENTITY_PREFIX,
   ROOM_ROLE,
   RoleBriefingDeleteInputSchema,
   RoleBriefingSetInputSchema,
@@ -32,7 +34,6 @@ import {
   type InviteMode,
   type RelayStatus,
   type Room,
-  type RoomIdentityNameMode,
   type RoomInvite,
   type RuntimeCommandGrant,
   type RuntimeCommandName,
@@ -85,6 +86,8 @@ const HistoryOptionsSchema = z.object({
   view: z.enum(['operator', 'participant']).optional(),
 }).strict();
 
+const JOURNAL_WORK_BATCH_SIZE = 64;
+
 /**
  * The participant-facing history projection: message records
  * only, authors redacted to alias form in anonymous rooms, and no routing
@@ -123,15 +126,19 @@ const ReplaceParticipantInputSchema = z.object({
   min_accepts: z.number().int().positive().safe().optional(),
 }).strict();
 
-type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | 'append' | 'read' | 'delete'>;
+type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | 'append' | 'read' | 'delete'>
+  & Pick<CoworkStore, 'discardPendingProvisioning'>
+  & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'briefingDeliveryTimes'>>;
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 type CloseNoticeIntentRecord = Extract<CommunicationRecord, { kind: 'close_notice_intent' }>;
 type MembershipIntentRecord = Extract<CommunicationRecord, { kind: 'membership_intent' }>;
 
 export interface RoomPacketRegistry {
   get(roomId: string): RoomPacket | undefined;
+  preflightCreate(roomId: string, identityName: string): Promise<void>;
   create(roomId: string, identityName?: string, bio?: string): Promise<RoomPacket>;
   restore?(roomId: string, expectedCid: string, identityName?: string, bio?: string): Promise<RoomPacket>;
+  rebind?(roomId: string): Promise<{ name: string; cid: string; status: 'rebound' }>;
   destroy(roomId: string): Promise<string[]>;
 }
 
@@ -140,7 +147,6 @@ export interface RoomServiceOptions {
   roomId?: () => string;
   messageId?: () => string;
   provisioningCheckpoint?: (stage: 'metadata') => void;
-  identityNameMode?: RoomIdentityNameMode;
 }
 
 export interface InviteReceipt {
@@ -202,7 +208,7 @@ export class RoomService {
   private readonly nextMessageId: () => string;
   private readonly intake: IntakePump;
   private readonly provisioningCheckpoint: NonNullable<RoomServiceOptions['provisioningCheckpoint']>;
-  private readonly identityNameMode: RoomIdentityNameMode;
+  private readonly identityNameTails = new Map<string, Promise<void>>();
 
   constructor(store: Store, packets: RoomPacketRegistry, options: RoomServiceOptions = {}) {
     this.store = store;
@@ -211,7 +217,6 @@ export class RoomService {
     this.nextRoomId = options.roomId ?? generateUlid;
     this.nextMessageId = options.messageId ?? generateUlid;
     this.provisioningCheckpoint = options.provisioningCheckpoint ?? (() => {});
-    this.identityNameMode = options.identityNameMode ?? 'stable_id';
     this.intake = new IntakePump(store, packets, {
       now: this.nowValue,
       messageId: this.nextMessageId,
@@ -224,8 +229,9 @@ export class RoomService {
     const settings = CreateRoomInputSchema.parse(input);
     const roomId = LowerCrockfordUlidSchema.parse(this.nextRoomId());
     const roomName = settings.name ?? defaultRoomName(roomId);
-    const identityName = configuredRoomIdentityName(roomId, roomName, this.identityNameMode);
-    return this.lock(roomId, async () => {
+    const identityName = roomIdentityName(roomName);
+    return this.lockIdentityName(identityName, () => this.lock(roomId, async () => {
+      await this.packets.preflightCreate(roomId, identityName);
       const provisional = RoomSchema.parse({
         version: 2,
         room_id: roomId,
@@ -248,17 +254,32 @@ export class RoomService {
         created_at: this.now(),
       });
       await this.store.create(provisional);
-      const packet = await this.packets.create(
-        roomId,
-        identityName,
-        `ours-cowork mission room ${roomId}`,
-      );
+      let packet: RoomPacket;
+      try {
+        packet = await this.packets.create(
+          roomId,
+          identityName,
+          `ours-cowork mission room ${roomId}`,
+        );
+      } catch (error) {
+        if (await isCleanIdentityRefusal(error)) {
+          try {
+            await this.store.discardPendingProvisioning(roomId, identityName);
+          } catch (rollbackError) {
+            throw new AggregateError(
+              [error, rollbackError],
+              `room "${roomId}" identity provisioning was refused and its fresh sentinel could not be discarded`,
+            );
+          }
+        }
+        throw error;
+      }
       this.provisioningCheckpoint('metadata');
       const { status: _packetPending, ...created } = provisional;
       const room = await this.store.save(RoomSchema.parse({ ...created, identity_cid: packet.cid }));
       await this.registerRuntimeCommands(roomId, packet);
       return room;
-    });
+    }));
   }
 
   async recoverRoom(roomId: string): Promise<Room> {
@@ -276,10 +297,48 @@ export class RoomService {
     return this.lock(id, async () => this.recoverPacketUnlocked(id, await this.store.load(id)));
   }
 
+  /** Canonical operator recovery for an established room identity lease. */
+  async rebindIdentity(roomId: string): Promise<{
+    room_id: string;
+    identity_name: string;
+    identity_cid: string;
+    status: 'rebound';
+    fanout: 'resumed';
+  }> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    let room = await this.store.load(id);
+    if (room.state === 'closed' || room.state === 'closing') {
+      throw new RoomServiceError(`cannot rebind room "${id}" while it is ${room.state}`);
+    }
+    if (this.isPacketPending(room) || !this.packets.get(id)) {
+      room = await this.recoverPacket(id);
+    } else {
+      if (!this.packets.rebind) throw new RoomServiceError('room packet registry does not support explicit rebind');
+      await this.packets.rebind(id);
+    }
+    await this.reconcileRoom(id);
+    await this.resumePending(id);
+    return {
+      room_id: id,
+      identity_name: room.identity_name,
+      identity_cid: room.identity_cid,
+      status: 'rebound',
+      fanout: 'resumed',
+    };
+  }
+
   private async recoverPacketUnlocked(id: string, initial: Room): Promise<Room> {
     let room = initial;
     if (room.state === 'closed') return room;
-    const packetPending = this.isPacketPending(room);
+    let packetPending = this.isPacketPending(room);
+    if (packetPending
+      && isPersistedRoomIdentityName(id, room.identity_name)
+      && !isStandardRoomIdentityName(id, room.identity_name)) {
+      const storedCreationName = room.identity_name.slice(ROOM_IDENTITY_PREFIX.length);
+      const correctedIdentityName = roomIdentityName(storedCreationName);
+      room = await this.store.save(RoomSchema.parse({ ...room, identity_name: correctedIdentityName }));
+      packetPending = this.isPacketPending(room);
+    }
     let packet = this.packets.get(id);
     if (packet) {
       if (!packetPending && packet.cid !== room.identity_cid) {
@@ -526,9 +585,10 @@ export class RoomService {
     return this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'create an invite for');
-      if (room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
+      if (!this.packet(id).supportsInviteProvenance
+        && room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
         throw new RoomServiceError(
-          'standard SDK rooms permit one live invitation at a time so every accepted contact has unambiguous room admission metadata',
+          'the installed ours SDK does not expose authenticated invite provenance; revoke or consume the current invitation before creating another',
         );
       }
       return this.mintInviteUnlocked(room, {
@@ -627,12 +687,13 @@ export class RoomService {
     room: Room,
     request: { mode: InviteMode; role: string; min_accepts: number; replaces_seat?: string },
   ): Promise<InviteReceipt> {
-    if (room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
+    const packet = this.packet(room.room_id);
+    if (!packet.supportsInviteProvenance
+      && room.invites.some((invite) => invite.state === 'live' || invite.state === 'receipt_pending')) {
       throw new RoomServiceError(
-        'standard SDK rooms permit one live invitation at a time; revoke or consume the current invitation first',
+        'the installed ours SDK does not expose authenticated invite provenance; revoke or consume the current invitation first',
       );
     }
-    const packet = this.packet(room.room_id);
     const minted = await packet.mintInvite(request.mode);
     const invite = RoomInviteSchema.parse({
       invite_id: minted.invite_id,
@@ -836,9 +897,9 @@ export class RoomService {
         membership_epoch: Math.max(current.membership_epoch, intent.epoch),
       }));
     }
-    const records = await this.store.read(current.room_id);
-    const existing = records.find((record) =>
-      record.kind === 'membership_result' && record.intent_record_id === intent.record_id);
+    const [existing] = await queryStore(this.store, current.room_id, {
+      kind: 'membership_result', intentRecordId: intent.record_id, limit: 1,
+    });
     let outcome: { status: RelayStatus; notified: boolean; key_material_retained: true };
     if (existing !== undefined && existing.kind === 'membership_result') {
       outcome = {
@@ -887,11 +948,10 @@ export class RoomService {
   }
 
   private async ensureMembershipNotice(room: Room, intent: MembershipIntentRecord): Promise<void> {
-    const records = await this.store.read(room.room_id);
-    const already = records.some((record) => record.kind === 'message'
-      && record.category === 'membership'
-      && record.membership?.action === 'remove'
-      && record.membership.epoch === intent.epoch);
+    const records = await queryStore(this.store, room.room_id, {
+      kind: 'message', category: 'membership', membershipEpoch: intent.epoch, limit: 1,
+    });
+    const already = records.length > 0;
     if (already) return;
     const remaining = activeSeats(room);
     if (remaining.length === 0) return;
@@ -1176,9 +1236,9 @@ export class RoomService {
   ): Promise<CommunicationRecord[] | ParticipantHistoryRecord[]> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const { view, ...page } = HistoryOptionsSchema.parse(options);
-    const records = await this.store.read(id, view === 'participant'
-      ? { after: page.after }
-      : page as ArchiveReadOptions);
+    const records = view === 'participant'
+      ? await queryStore(this.store, id, { kind: 'message', after: page.after, limit: page.limit })
+      : await this.store.read(id, page as ArchiveReadOptions);
     if (view !== 'participant') return byteBoundedHistoryPage(records);
     const projected = records
       .filter((record): record is MessageRecord => record.kind === 'message')
@@ -1215,6 +1275,12 @@ export class RoomService {
         // its directory fsync failed. Replacing the exact snapshot repeats
         // that durability barrier before close reports success.
         return this.store.save(room);
+      }
+      if (this.isPacketPending(room)) {
+        throw new RoomServiceError(
+          `cannot close room "${id}" while its identity CID is unproven; ` +
+          'run room rebind first, or verify and remove a colliding orphan identity before retrying recovery',
+        );
       }
       if (room.state === 'closing') {
         // Likewise, never resume external effects from a merely observed
@@ -1388,17 +1454,19 @@ export class RoomService {
 
   private async reconcileUnlocked(room: Room, packet: RoomPacket): Promise<Room> {
     if (room.state === 'closed' || room.state === 'closing') return room;
-    const contactsByCid = new Map<string, string>();
+    const contactsByCid = new Map<string, { displayName: string; inviteId?: string }>();
     for (const contact of packet.listContacts()) {
-      if (!contactsByCid.has(contact.container_id)) contactsByCid.set(contact.container_id, contact.name);
+      if (contactsByCid.has(contact.container_id)) continue;
+      const authenticatedInvite = contact.accepted_via_invite_id;
+      contactsByCid.set(contact.container_id, {
+        displayName: contact.name,
+        ...(authenticatedInvite === undefined ? {} : { inviteId: authenticatedInvite }),
+      });
     }
     const inviteById = new Map(room.invites.map((invite) => [invite.invite_id, invite]));
     const existingCids = new Set(room.seats
       .filter((seat) => seat.state === 'active' || seat.state === 'pending')
       .map((seat) => seat.identity));
-    // The public standard SDK intentionally does not expose custom actor
-    // contact-origin records. Cowork 1.0 therefore keeps at most one live room
-    // invite and assigns newly accepted contacts to that unambiguous descriptor.
     const lastRemovedAt = new Map<string, string>();
     for (const seat of room.seats) {
       if (seat.state !== 'removed' || seat.removed_at === undefined) continue;
@@ -1411,13 +1479,13 @@ export class RoomService {
     const seatsWithActivations = [...room.seats];
     for (const [seatIndex, seat] of room.seats.entries()) {
       if (seat.state !== 'pending') continue;
-      const displayName = contactsByCid.get(seat.identity);
-      if (displayName === undefined) continue;
+      const contact = contactsByCid.get(seat.identity);
+      if (contact === undefined) continue;
       const { alias: _alias, replaces_seat: _replacesSeat, ...base } = seat;
       const activated: Seat = {
         ...base,
         state: 'active',
-        display_name: displayName,
+        display_name: contact.displayName,
         accepted_at: this.now(),
         ...(_replacesSeat === undefined ? {} : { replaces_seat: _replacesSeat }),
         ...(room.anonymous ? { alias: _alias! } : {}),
@@ -1429,11 +1497,17 @@ export class RoomService {
 
     const eligibleInvites = room.invites.filter((invite) => invite.state === 'live'
       && (invite.recovery_of === undefined || invite.recovery_confirmed === true));
-    const admissionInvite = eligibleInvites.length === 1 ? eligibleInvites[0] : undefined;
-    for (const [cid, displayName] of contactsByCid) {
+    const legacyAdmissionInvite = !packet.supportsInviteProvenance && eligibleInvites.length === 1
+      ? eligibleInvites[0]
+      : undefined;
+    for (const [cid, contact] of contactsByCid) {
       if (existingCids.has(cid)) continue;
-      const invite = admissionInvite;
+      const invite = contact.inviteId === undefined
+        ? legacyAdmissionInvite
+        : inviteById.get(contact.inviteId);
       if (!invite) continue;
+      if (invite.state !== 'live') continue;
+      if (invite.recovery_of !== undefined && invite.recovery_confirmed !== true) continue;
       const removedAt = lastRemovedAt.get(cid);
       if (removedAt !== undefined && invite.created_at <= removedAt) continue;
       const seated = [...seatsWithActivations, ...newSeats];
@@ -1443,7 +1517,7 @@ export class RoomService {
       if (invite.replaces_seat !== undefined && !predecessor) continue;
       newSeats.push({
         identity: cid,
-        display_name: displayName,
+        display_name: contact.displayName,
         role: invite.role,
         invite_id: invite.invite_id,
         accepted_at: this.now(),
@@ -1496,15 +1570,17 @@ export class RoomService {
       membership_epoch: room.membership_epoch + activatedPending.length + newSeats.length,
     });
     // Re-drive any removal whose intent has no terminal result.
-    const journal = await this.store.read(next.room_id);
-    const completedIntents = new Set(journal
-      .filter((record) => record.kind === 'membership_result')
-      .map((record) => record.kind === 'membership_result' ? record.intent_record_id : ''));
-    for (const intent of journal.filter(
-      (record): record is MembershipIntentRecord => record.kind === 'membership_intent',
-    )) {
-      if (completedIntents.has(intent.record_id)) continue;
-      ({ room: next } = await this.completeRemovalUnlocked(next, intent));
+    let membershipAfter = 0;
+    for (;;) {
+      const journal = await queryStore(this.store, next.room_id, {
+        kind: 'membership_intent', unresolvedResultKind: 'membership_result',
+        after: membershipAfter, limit: JOURNAL_WORK_BATCH_SIZE,
+      }) as MembershipIntentRecord[];
+      if (journal.length === 0) break;
+      for (const intent of journal) {
+        membershipAfter = intent.seq;
+        ({ room: next } = await this.completeRemovalUnlocked(next, intent));
+      }
     }
     const requirementsMet = invites
       .filter((invite) => invite.state !== 'revoked')
@@ -1527,35 +1603,30 @@ export class RoomService {
       // caller observed a transport failure. Reconcile before interpreting a
       // result-less intent, so retries never rely on an in-process cache.
       await packet.refreshContacts();
-      let records = await this.store.read(roomId);
       let contacts = currentContactIdentities(packet);
-      const completed = new Set(records
-        .filter((record) => record.kind === 'close_notice_result')
-        .map((record) => record.kind === 'close_notice_result' ? record.intent_record_id : ''));
-      const pending = records.filter(
-        (record): record is CloseNoticeIntentRecord =>
-          record.kind === 'close_notice_intent' && !completed.has(record.record_id),
-      );
-
       // A result-less intent plus an absent contact is the only durable proof
       // available after an origin-ambiguous remove. It is explicitly recorded
       // as uncertain, never upgraded into a successful notice claim.
-      for (const intent of pending) {
-        if (contacts.has(intent.recipient_identity)) continue;
-        await this.appendUncertainCloseResult(roomId, intent);
-        completed.add(intent.record_id);
+      let closeAfter = 0;
+      for (;;) {
+        const pending = await queryStore(this.store, roomId, {
+          kind: 'close_notice_intent', unresolvedResultKind: 'close_notice_result',
+          after: closeAfter, limit: JOURNAL_WORK_BATCH_SIZE,
+        }) as CloseNoticeIntentRecord[];
+        if (pending.length === 0) break;
+        for (const intent of pending) {
+          closeAfter = intent.seq;
+          if (contacts.has(intent.recipient_identity)) continue;
+          await this.appendUncertainCloseResult(roomId, intent);
+        }
       }
 
       for (const recipientIdentity of contacts) {
-        records = await this.store.read(roomId);
-        const currentCompleted = new Set(records
-          .filter((record) => record.kind === 'close_notice_result')
-          .map((record) => record.kind === 'close_notice_result' ? record.intent_record_id : ''));
-        let intent = [...records].reverse().find(
-          (record): record is CloseNoticeIntentRecord => record.kind === 'close_notice_intent'
-            && record.recipient_identity === recipientIdentity
-            && !currentCompleted.has(record.record_id),
-        );
+        const [existingIntent] = await queryStore(this.store, roomId, {
+          kind: 'close_notice_intent', recipientIdentity,
+          unresolvedResultKind: 'close_notice_result', descending: true, limit: 1,
+        });
+        let intent = existingIntent as CloseNoticeIntentRecord | undefined;
         if (!intent) {
           const appended = await this.store.append(roomId, {
             version: 1,
@@ -1606,16 +1677,17 @@ export class RoomService {
 
     // If the packet was already absent, successful bounded purge is proof
     // that result-less contacts no longer exist locally. Preserve uncertainty.
-    const afterPurge = await this.store.read(roomId);
-    const completedAfterPurge = new Set(afterPurge
-      .filter((record) => record.kind === 'close_notice_result')
-      .map((record) => record.kind === 'close_notice_result' ? record.intent_record_id : ''));
-    for (const intent of afterPurge.filter(
-      (record): record is CloseNoticeIntentRecord =>
-        record.kind === 'close_notice_intent' && !completedAfterPurge.has(record.record_id),
-    )) {
-      await this.appendUncertainCloseResult(roomId, intent);
-      completedAfterPurge.add(intent.record_id);
+    let purgeAfter = 0;
+    for (;;) {
+      const afterPurge = await queryStore(this.store, roomId, {
+        kind: 'close_notice_intent', unresolvedResultKind: 'close_notice_result',
+        after: purgeAfter, limit: JOURNAL_WORK_BATCH_SIZE,
+      }) as CloseNoticeIntentRecord[];
+      if (afterPurge.length === 0) break;
+      for (const intent of afterPurge) {
+        purgeAfter = intent.seq;
+        await this.appendUncertainCloseResult(roomId, intent);
+      }
     }
 
     return this.store.save(RoomSchema.parse({ ...room, state: 'closed', closed_at: this.now() }));
@@ -1694,7 +1766,21 @@ export class RoomService {
       briefing_version: number;
     },
   ): Promise<string> {
-    const records = await this.store.read(room.room_id);
+    if (this.store.briefingDeliveryTimes) {
+      const recipientIdentities = uniqueIdentities(recipients.map((seat) => seat.identity));
+      const deliveries = await this.store.briefingDeliveryTimes(room.room_id, {
+        category: briefing.category,
+        briefingRole: briefing.briefing_role,
+        briefingVersion: briefing.briefing_version,
+      }, recipientIdentities);
+      const missing = recipients.filter((seat) => !deliveries.has(seat.identity));
+      const appendedAt = await this.appendBriefingForMissing(room, missing, briefing);
+      return [...deliveries.values(), ...(appendedAt === undefined ? [] : [appendedAt])].sort()[0]
+        ?? this.now();
+    }
+    const records = await queryStore(this.store, room.room_id, {
+      kind: 'message', category: briefing.category,
+    });
     // A pre-evolution briefing record carries no version stamp; it delivered
     // what is now version 1, so migration alone never re-sends anything.
     const matching = records.filter((record): record is MessageRecord =>
@@ -1702,16 +1788,12 @@ export class RoomService {
       && record.category === briefing.category
       && record.briefing_role === briefing.briefing_role
       && (record.briefing_version ?? 1) === briefing.briefing_version);
-    const intentsByMessage = new Map<string, Set<string>>();
-    for (const record of records) {
-      if (record.kind !== 'relay_intent' || record.message_id === undefined) continue;
-      const intents = intentsByMessage.get(record.message_id) ?? new Set<string>();
-      intents.add(record.recipient_identity);
-      intentsByMessage.set(record.message_id, intents);
-    }
     const covered = new Set<string>();
     for (const message of matching) {
-      const intents = intentsByMessage.get(message.message_id) ?? new Set<string>();
+      const intentRecords = await queryStore(this.store, room.room_id, {
+        kind: 'relay_intent', messageId: message.message_id,
+      });
+      const intents = new Set(intentRecords.map((record) => (record as Extract<CommunicationRecord, { kind: 'relay_intent' }>).recipient_identity));
       for (const recipientIdentity of message.recipient_identities) {
         covered.add(recipientIdentity);
         if (!intents.has(recipientIdentity)) {
@@ -1727,9 +1809,22 @@ export class RoomService {
       }
     }
     const missing = recipients.filter((seat) => !covered.has(seat.identity));
-    let appendedAt: string | undefined;
-    if (missing.length > 0) {
-      const appended = await this.store.append(room.room_id, {
+    const appendedAt = await this.appendBriefingForMissing(room, missing, briefing);
+    return matching[0]?.at ?? appendedAt ?? this.now();
+  }
+
+  private async appendBriefingForMissing(
+    room: Room,
+    missing: Seat[],
+    briefing: {
+      category: 'briefing' | 'role_briefing';
+      briefing_role?: string;
+      text: string;
+      briefing_version: number;
+    },
+  ): Promise<string | undefined> {
+    if (missing.length === 0) return undefined;
+    const appended = await this.store.append(room.room_id, {
         version: 1,
         kind: 'message',
         room_id: room.room_id,
@@ -1741,25 +1836,35 @@ export class RoomService {
         briefing_version: briefing.briefing_version,
         text: briefing.text,
         recipient_identities: uniqueIdentities(missing.map((seat) => seat.identity)),
-      });
-      if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong briefing record kind');
-      appendedAt = appended.at;
-      for (const recipientIdentity of appended.recipient_identities) {
-        await this.store.append(room.room_id, {
+    });
+    if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong briefing record kind');
+    for (const recipientIdentity of appended.recipient_identities) {
+      await this.store.append(room.room_id, {
           version: 1,
           kind: 'relay_intent',
           room_id: room.room_id,
           at: this.now(),
           message_id: appended.message_id,
           recipient_identity: recipientIdentity,
-        });
-      }
+      });
     }
-    return matching[0]?.at ?? appendedAt ?? this.now();
+    return appended.at;
   }
 
   private lock<T>(roomId: string, work: () => T | Promise<T>): Promise<T> {
     return (this.store.mutex(roomId) as RoomMutex).runExclusive(work);
+  }
+
+  private async lockIdentityName<T>(identityName: string, work: () => T | Promise<T>): Promise<T> {
+    const previous = this.identityNameTails.get(identityName) ?? Promise.resolve();
+    const result = previous.then(work, work);
+    const tail = result.then(() => undefined, () => undefined);
+    this.identityNameTails.set(identityName, tail);
+    try {
+      return await result;
+    } finally {
+      if (this.identityNameTails.get(identityName) === tail) this.identityNameTails.delete(identityName);
+    }
   }
 
   private packet(roomId: string): RoomPacket {
@@ -1792,8 +1897,44 @@ export class RoomService {
   }
 }
 
+async function isCleanIdentityRefusal(error: unknown): Promise<boolean> {
+  const { OursError } = await import('@ours.network/sdk');
+  if (!(error instanceof OursError)) return false;
+  const code = error.code;
+  return code === 'NAME_INVALID' || code === 'NAME_TAKEN';
+}
+
 function activeSeats(room: Room): Seat[] {
   return room.seats.filter((seat) => seat.state === 'active');
+}
+
+async function queryStore(
+  store: Store,
+  roomId: string,
+  options: Parameters<CoworkStore['query']>[1],
+): Promise<CommunicationRecord[]> {
+  if (store.query) return store.query(roomId, options);
+  let records = await store.read(roomId);
+  records = records.filter((record) => {
+    const value = record as CommunicationRecord & Record<string, unknown>;
+    const membership = value.membership as { epoch?: number } | undefined;
+    return (options.kind === undefined || record.kind === options.kind)
+      && (options.after === undefined || record.seq > options.after)
+      && (options.messageId === undefined || value.message_id === options.messageId)
+      && (options.fileId === undefined || value.file_id === options.fileId)
+      && (options.intentRecordId === undefined || value.intent_record_id === options.intentRecordId)
+      && (options.recipientIdentity === undefined || value.recipient_identity === options.recipientIdentity)
+      && (options.category === undefined || value.category === options.category)
+      && (options.membershipEpoch === undefined || membership?.epoch === options.membershipEpoch);
+  });
+  if (options.unresolvedResultKind) {
+    const completed = new Set((await store.read(roomId))
+      .filter((record) => record.kind === options.unresolvedResultKind)
+      .map((record) => (record as CommunicationRecord & { intent_record_id: string }).intent_record_id));
+    records = records.filter((record) => !completed.has(record.record_id));
+  }
+  if (options.descending) records.reverse();
+  return records.slice(0, options.limit ?? Number.MAX_SAFE_INTEGER);
 }
 
 function isCancelledExternalSeat(seat: Seat): boolean {

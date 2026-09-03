@@ -11,6 +11,7 @@ import {
   isStandardRoomIdentityName,
   MAX_EXTERNAL_INVITE_BYTES,
   MAX_FILE_BYTES,
+  sdkIdentityNameError,
 } from './contracts.ts';
 import type { OursRuntimeClientFactory } from './ours-runtime.ts';
 
@@ -63,6 +64,8 @@ export interface RoomRuntimeCommandHandlers {
 export interface RoomPacket {
   readonly name: string;
   readonly cid: string;
+  /** Prove and restore this packet's exact persisted daemon identity lease. */
+  rebind(): Promise<{ name: string; cid: string; status: 'rebound' }>;
   mintInvite(mode: InviteMode): Promise<{ blob: string; invite_id: string; reusable: boolean }>;
   addContact(invite: string): Promise<{
     invite_id: string;
@@ -72,7 +75,13 @@ export interface RoomPacket {
   }>;
   revokeInvite(inviteId: string): Promise<{ revoked: boolean }>;
   listInvites(): Array<{ invite_id: string; mode: InviteMode }>;
-  listContacts(): Array<{ name: string; container_id: string }>;
+  /** Whether contact records carry authenticated core invite provenance. */
+  readonly supportsInviteProvenance: boolean;
+  listContacts(): Array<{
+    name: string;
+    container_id: string;
+    accepted_via_invite_id?: string;
+  }>;
   /** Reconcile only contacts before retry-sensitive removal work. */
   refreshContacts(): Promise<void>;
   /** Replace the room identity's public catalog with the bounded cowork command set. */
@@ -96,6 +105,8 @@ export interface PacketRegistryOptions {
   fs?: typeof fs;
   log?: (...parts: unknown[]) => void;
   onNotify?: (roomId: string, event: string) => void;
+  rebindSleep?: (ms: number) => Promise<void>;
+  rebindRandom?: () => number;
 }
 
 export class LegacyCoworkStateError extends Error {
@@ -126,6 +137,13 @@ function isExactSdkMissingContact(error: unknown, contactCid: string): boolean {
     && error.message === `remove_contact failed: Error: Unknown contact: ${contactCid}`;
 }
 
+export class RoomIdentityMismatchError extends Error {
+  constructor(expected: string, found: string) {
+    super(`room identity CID mismatch during rebind: expected "${expected}", found "${found}"`);
+    this.name = 'RoomIdentityMismatchError';
+  }
+}
+
 /** Standard-SDK room identities selected from the shared daemon by local name. */
 export class PacketRegistry {
   private readonly packets = new Map<string, SdkRoomPacket>();
@@ -135,6 +153,8 @@ export class PacketRegistry {
   private readonly fs: typeof fs;
   private readonly log: (...parts: unknown[]) => void;
   private readonly onNotify: (roomId: string, event: string) => void;
+  private readonly rebindSleep: (ms: number) => Promise<void>;
+  private readonly rebindRandom: () => number;
   private readonly unsubscribe: () => void;
 
   constructor(host: OursRuntimeClientFactory, stateDir: string, options: PacketRegistryOptions = {}) {
@@ -143,6 +163,8 @@ export class PacketRegistry {
     this.fs = options.fs ?? fs;
     this.log = options.log ?? (() => {});
     this.onNotify = options.onNotify ?? (() => {});
+    this.rebindSleep = options.rebindSleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.rebindRandom = options.rebindRandom ?? Math.random;
     this.unsubscribe = host.onIdentityNotify((name) => {
       const found = [...this.packets.entries()].find(([, packet]) => packet.name === name);
       if (!found) return;
@@ -157,19 +179,24 @@ export class PacketRegistry {
   get size(): number { return this.packets.size; }
   get(roomId: string): RoomPacket | undefined { return this.packets.get(roomId); }
 
-  async create(roomId: string, identityName = `ours-cowork-${roomId}`, bio = `ours-cowork mission room ${roomId}`): Promise<RoomPacket> {
+  async preflightCreate(roomId: string, identityName: string): Promise<void> {
     validateRoomId(roomId);
-    this.assertStandardIdentity(roomId, identityName);
+    await this.assertStandardIdentity(roomId, identityName);
     this.assertNoLegacyState(roomId);
     if (this.packets.has(roomId)) throw new Error(`room identity "${roomId}" is already hosted`);
     const localNames = new Set([identityName]);
     const available = await this.host.listIdentityNames(localNames);
     if (available.has(identityName)) {
-      throw new Error(
+      throw await sdkNameError(
+        'NAME_TAKEN',
         `shared ours daemon already contains unproven room identity "${identityName}"; ` +
         'refusing to adopt it without a durably recorded CID',
       );
     }
+  }
+
+  async create(roomId: string, identityName: string, bio = `ours-cowork mission room ${roomId}`): Promise<RoomPacket> {
+    await this.preflightCreate(roomId, identityName);
     const client = await this.host.createClient();
     try {
       const created = await client.createIdentity({
@@ -179,20 +206,25 @@ export class PacketRegistry {
         localAutoAccept: true,
       });
       const cid = created.info.cid;
-      const packet = new SdkRoomPacket(identityName, cid, client);
+      const packet = new SdkRoomPacket(identityName, cid, client, {
+        roomId, log: this.log, sleep: this.rebindSleep, random: this.rebindRandom,
+      });
       await packet.refresh();
       this.packets.set(roomId, packet);
       this.track(roomId, identityName);
       return packet;
     } catch (error) {
       await client.releaseLease().catch(() => {});
+      if (await isTypedNameRefusal(error)) {
+        throw error;
+      }
       throw new Error(`failed to provision standard SDK identity for room "${roomId}"`, { cause: error });
     }
   }
 
-  async restore(roomId: string, expectedCid: string, identityName = `ours-cowork-${roomId}`): Promise<RoomPacket> {
+  async restore(roomId: string, expectedCid: string, identityName: string): Promise<RoomPacket> {
     validateRoomId(roomId);
-    this.assertStandardIdentity(roomId, identityName);
+    await this.assertStandardIdentity(roomId, identityName);
     this.assertNoLegacyState(roomId);
     if (expectedCid === undefined || expectedCid.length === 0) {
       throw new Error(`refusing to restore room identity "${identityName}" without a durably recorded expected CID`);
@@ -208,7 +240,9 @@ export class PacketRegistry {
       if (expectedCid !== undefined && bound.cid !== expectedCid) {
         throw new Error(`restored room identity CID mismatch: expected "${expectedCid}", found "${bound.cid}"`);
       }
-      const packet = new SdkRoomPacket(identityName, bound.cid, client);
+      const packet = new SdkRoomPacket(identityName, bound.cid, client, {
+        roomId, log: this.log, sleep: this.rebindSleep, random: this.rebindRandom,
+      });
       await packet.refresh();
       this.packets.set(roomId, packet);
       this.track(roomId, identityName);
@@ -217,6 +251,23 @@ export class PacketRegistry {
       await client.releaseLease().catch(() => {});
       throw error;
     }
+  }
+
+  async rebind(roomId: string): Promise<{ name: string; cid: string; status: 'rebound' }> {
+    validateRoomId(roomId);
+    const packet = this.packets.get(roomId);
+    if (!packet) throw new Error(`room packet "${roomId}" is not hosted`);
+    return packet.rebind();
+  }
+
+  /** Release one local SDK lease without deleting the persisted daemon identity. */
+  async unhost(roomId: string): Promise<void> {
+    validateRoomId(roomId);
+    const packet = this.packets.get(roomId);
+    if (!packet) return;
+    this.untrack(roomId);
+    this.packets.delete(roomId);
+    await packet.close();
   }
 
   async destroy(roomId: string): Promise<string[]> {
@@ -268,33 +319,124 @@ export class PacketRegistry {
     }
   }
 
-  private assertStandardIdentity(roomId: string, identityName: string): void {
+  private async assertStandardIdentity(roomId: string, identityName: string): Promise<void> {
+    const detail = sdkIdentityNameError(identityName);
+    if (detail !== undefined) throw await sdkNameError('NAME_INVALID', `generated room identity name is invalid: ${detail}`);
     if (!isStandardRoomIdentityName(roomId, identityName)) throw new LegacyCoworkStateError(roomId);
   }
+}
+
+async function sdkNameError(code: 'NAME_INVALID' | 'NAME_TAKEN', message: string): Promise<Error> {
+  const { OursError } = await import('@ours.network/sdk');
+  return new OursError(code, message);
+}
+
+async function isTypedNameRefusal(error: unknown): Promise<boolean> {
+  const { OursError } = await import('@ours.network/sdk');
+  if (!(error instanceof OursError)) return false;
+  const code = error.code;
+  return code === 'NAME_INVALID' || code === 'NAME_TAKEN';
 }
 
 export class SdkRoomPacket implements RoomPacket {
   readonly name: string;
   readonly cid: string;
   private readonly client: OursClient;
-  private contacts: Array<{ name: string; container_id: string }> = [];
+  private readonly roomId: string;
+  private readonly log: (...parts: unknown[]) => void;
+  private readonly rebindSleep: (ms: number) => Promise<void>;
+  private readonly rebindRandom: () => number;
+  private rebindWork?: Promise<{ name: string; cid: string; status: 'rebound' }>;
+  private contacts: Array<{
+    name: string;
+    container_id: string;
+    accepted_via_invite_id?: string;
+  }> = [];
+  private hasInviteProvenance = false;
   private invites: Array<{ invite_id: string; mode: InviteMode }> = [];
   private refreshWork?: Promise<void>;
   private contactRefreshWork?: Promise<void>;
 
-  constructor(name: string, cid: string, client: OursClient) {
+  constructor(
+    name: string,
+    cid: string,
+    client: OursClient,
+    recovery: {
+      roomId?: string;
+      log?: (...parts: unknown[]) => void;
+      sleep?: (ms: number) => Promise<void>;
+      random?: () => number;
+    } = {},
+  ) {
+    this.roomId = recovery.roomId ?? name;
     this.name = name;
     this.cid = cid;
     this.client = client;
+    this.log = recovery.log ?? (() => {});
+    this.rebindSleep = recovery.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.rebindRandom = recovery.random ?? Math.random;
+  }
+
+  rebind(): Promise<{ name: string; cid: string; status: 'rebound' }> {
+    this.rebindWork ??= this.rebindUnlocked().finally(() => { this.rebindWork = undefined; });
+    return this.rebindWork;
+  }
+
+  private async rebindUnlocked(): Promise<{ name: string; cid: string; status: 'rebound' }> {
+    this.observe('identity_rebind_detected');
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      this.observe('identity_rebind_attempt', { attempt });
+      try {
+        const bound = await this.client.chooseIdentity({ name: this.name, force: false });
+        if (bound.cid !== this.cid) {
+          throw new RoomIdentityMismatchError(this.cid, bound.cid);
+        }
+        // Direct calls are intentional: calling refresh()/runBound() while the
+        // single-flight promise is active would recursively wait on itself.
+        await this.refreshUnlocked();
+        this.observe('identity_rebind_succeeded', { attempt });
+        return { name: this.name, cid: this.cid, status: 'rebound' };
+      } catch (error) {
+        lastError = error;
+        const code = sdkErrorCode(error);
+        if (error instanceof RoomIdentityMismatchError || !isTransientTransportError(error) || attempt === 3) {
+          this.observe('identity_rebind_failed', {
+            attempt,
+            code: code ?? (error instanceof RoomIdentityMismatchError ? 'CID_MISMATCH' : 'RECOVERY_FAILED'),
+          });
+          throw error;
+        }
+        const delay_ms = Math.round(100 * (2 ** (attempt - 1)) * (0.75 + this.rebindRandom() * 0.5));
+        this.observe('identity_rebind_retry', { attempt, delay_ms });
+        await this.rebindSleep(delay_ms);
+      }
+    }
+    throw lastError;
+  }
+
+  private async runBound<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      const code = sdkErrorCode(error);
+      if (code !== 'NOT_BOUND' && code !== 'BINDING_REASSIGNED') throw error;
+      await this.rebind();
+      return operation();
+    }
+  }
+
+  private observe(event: string, detail: Record<string, unknown> = {}): void {
+    this.log(JSON.stringify({ event, room_id: this.roomId, identity_name: this.name, identity_cid: this.cid, ...detail }));
   }
 
   refresh(): Promise<void> {
-    this.refreshWork ??= this.refreshUnlocked().finally(() => { this.refreshWork = undefined; });
+    this.refreshWork ??= this.runBound(() => this.refreshUnlocked()).finally(() => { this.refreshWork = undefined; });
     return this.refreshWork;
   }
 
   private async refreshUnlocked(): Promise<void> {
-    await this.refreshContacts();
+    await this.refreshContactsUnlocked();
     this.invites = (await this.client.listInvites()).flatMap((invite) =>
       invite.mode === 'one_time' || invite.mode === 'public'
         ? [{ invite_id: invite.invite_id, mode: invite.mode }]
@@ -302,25 +444,34 @@ export class SdkRoomPacket implements RoomPacket {
   }
 
   refreshContacts(): Promise<void> {
-    this.contactRefreshWork ??= this.refreshContactsUnlocked()
+    this.contactRefreshWork ??= this.runBound(() => this.refreshContactsUnlocked())
       .finally(() => { this.contactRefreshWork = undefined; });
     return this.contactRefreshWork;
   }
 
   private async refreshContactsUnlocked(): Promise<void> {
-    const contacts = await this.client.listContacts();
-    this.contacts = contacts.contacts.map((contact) => ({ ...contact }));
+    type ContactsWithOrigins = Awaited<ReturnType<OursClient['listContacts']>> & {
+      origins?: Record<string, string>;
+    };
+    const listed = await this.client.listContacts() as ContactsWithOrigins;
+    this.hasInviteProvenance = listed.origins !== undefined;
+    this.contacts = listed.contacts.map((contact) => ({
+      ...contact,
+      ...(listed.origins?.[contact.container_id] === undefined
+        ? {}
+        : { accepted_via_invite_id: listed.origins[contact.container_id] }),
+    }));
   }
 
   async mintInvite(mode: InviteMode): Promise<{ blob: string; invite_id: string; reusable: boolean }> {
-    const result = await this.client.generateInvite({ mode });
+    const result = await this.runBound(() => this.client.generateInvite({ mode }));
     await this.refresh();
     return { blob: result.blob, invite_id: result.inviteId, reusable: mode === 'public' };
   }
 
   async addContact(invite: string): Promise<{ invite_id: string; container_id: string; inviter_name: string; pending_name: string }> {
     const decoded = unpackInvite(invite, MAX_EXTERNAL_INVITE_BYTES);
-    const result = await this.client.addContact({ invite });
+    const result = await this.runBound(() => this.client.addContact({ invite }));
     await this.refresh();
     return {
       invite_id: createHash('sha256').update(decoded).digest('hex'),
@@ -331,16 +482,23 @@ export class SdkRoomPacket implements RoomPacket {
   }
 
   async revokeInvite(inviteId: string): Promise<{ revoked: boolean }> {
-    const result = await this.client.revokeInvite({ invite_id: inviteId });
+    const result = await this.runBound(() => this.client.revokeInvite({ invite_id: inviteId }));
     await this.refresh();
     return { revoked: result.revoked };
   }
 
   listInvites(): Array<{ invite_id: string; mode: InviteMode }> { return this.invites.map((invite) => ({ ...invite })); }
-  listContacts(): Array<{ name: string; container_id: string }> { return this.contacts.map((contact) => ({ ...contact })); }
+  get supportsInviteProvenance(): boolean { return this.hasInviteProvenance; }
+  listContacts(): Array<{
+    name: string;
+    container_id: string;
+    accepted_via_invite_id?: string;
+  }> {
+    return this.contacts.map((contact) => ({ ...contact }));
+  }
 
   async registerRuntimeCommands(handlers: RoomRuntimeCommandHandlers): Promise<void> {
-    await this.client.registerCommands([
+    await this.runBound(() => this.client.registerCommands([
       {
         name: 'list-members',
         description: 'List the room roster using contact-safe member fields.',
@@ -363,16 +521,16 @@ export class SdkRoomPacket implements RoomPacket {
         },
         handler: handlers.removeMember,
       },
-    ]);
+    ]));
   }
 
   async drainRuntimeCommands(onUnexpected: (item: InboxItem) => Promise<void>): Promise<void> {
     for (;;) {
-      const [oldest] = (await this.client.listIncomingMessages())
+      const [oldest] = (await this.runBound(() => this.client.listIncomingMessages()))
         .filter((message) => message.status === 'unread')
         .sort((left, right) => left.seq - right.seq);
       if (oldest === undefined || oldest.message_kind === undefined || oldest.message_kind === 'text') return;
-      const pulled = await this.client.getMessages({ limit: 1 });
+      const pulled = await this.runBound(() => this.client.getMessages({ limit: 1 }));
       if (pulled.messages.length > 1) throw new Error('SDK returned more than one message for limit 1');
       for (const history of pulled.messages) await onUnexpected(messageItem(history, 'read'));
       if (pulled.messages.length === 0
@@ -385,7 +543,7 @@ export class SdkRoomPacket implements RoomPacket {
 
   async listUnreadMessages(limit: number): Promise<InboxItem[]> {
     validateBatchLimit(limit);
-    const unread = (await this.client.listIncomingMessages())
+    const unread = (await this.runBound(() => this.client.listIncomingMessages()))
       .filter((message) => message.status === 'unread')
       .sort((left, right) => left.seq - right.seq);
     const barrier = unread.findIndex((message) =>
@@ -394,7 +552,7 @@ export class SdkRoomPacket implements RoomPacket {
       .filter((message) => message.message_kind === undefined || message.message_kind === 'text')
       .slice(0, limit);
     return Promise.all(metadata.map(async (listed) => {
-      const history = await this.client.getHistoryItem({ wire_id: listed.wire_id });
+      const history = await this.runBound(() => this.client.getHistoryItem({ wire_id: listed.wire_id }));
       if (history === null) throw new Error(`SDK history is missing unread message ${listed.wire_id}`);
       assertListedMessage(listed, history);
       return messageItem(history);
@@ -406,7 +564,7 @@ export class SdkRoomPacket implements RoomPacket {
     onUnexpected: (item: InboxItem) => Promise<void>,
   ): Promise<void> {
     for (;;) {
-      const pulled = await this.client.getMessages({ limit: 1 });
+      const pulled = await this.runBound(() => this.client.getMessages({ limit: 1 }));
       if (pulled.messages.length > 1) throw new Error('SDK returned more than one message for limit 1');
       const [history] = pulled.messages;
       if (history === undefined) return;
@@ -421,15 +579,15 @@ export class SdkRoomPacket implements RoomPacket {
 
   async listUnreadFiles(limit: number): Promise<FileInboxItem[]> {
     validateBatchLimit(limit);
-    const unread = (await this.client.listIncomingFiles())
+    const unread = (await this.runBound(() => this.client.listIncomingFiles()))
       .filter((file) => file.status === 'unread')
       .sort((left, right) => left.seq - right.seq)
       .slice(0, limit);
-    return Promise.all(unread.map(async (file) => fileItem(file, await this.client.fetchFile(file.wire_id))));
+    return Promise.all(unread.map(async (file) => fileItem(file, await this.runBound(() => this.client.fetchFile(file.wire_id)))));
   }
 
   async acknowledgeFile(expected: FileInboxItem): Promise<void> {
-    const pulled = await this.client.getFiles({ wire_ids: [expected.wire_id] });
+    const pulled = await this.runBound(() => this.client.getFiles({ wire_ids: [expected.wire_id] }));
     if (pulled.files.length !== 1) {
       throw new Error(`SDK did not acknowledge selected file ${expected.wire_id}`);
     }
@@ -437,21 +595,21 @@ export class SdkRoomPacket implements RoomPacket {
   }
 
   async send(contactCid: string, body: string, replyTo?: ReplyReference): Promise<{ status: RelayStatus; wire_id?: string }> {
-    return sendResult(await this.client.sendMessage({
+    return sendResult(await this.runBound(() => this.client.sendMessage({
       contact: contactCid,
       text: body,
       ...(replyTo === undefined ? {} : {
         reply_to_wire_id: replyTo.wire_id,
         ...(replyTo.sentence === undefined ? {} : { reply_to_sentence: replyTo.sentence }),
       }),
-    }));
+    })));
   }
 
   async sendFile(contactCid: string, filename: string, mime: string, data: Buffer, replyTo?: ReplyReference): Promise<{ status: RelayStatus; wire_id?: string }> {
     const validName = FileNameSchema.parse(filename);
     const validMime = FileMimeSchema.parse(mime);
     if (data.length > MAX_FILE_BYTES) throw new RangeError(`room files must be at most ${MAX_FILE_BYTES} bytes (2 MiB)`);
-    return sendResult(await this.client.sendFile({
+    return sendResult(await this.runBound(() => this.client.sendFile({
       contact: contactCid,
       data_base64: data.toString('base64'),
       filename: validName,
@@ -460,13 +618,13 @@ export class SdkRoomPacket implements RoomPacket {
         reply_to_wire_id: replyTo.wire_id,
         ...(replyTo.sentence === undefined ? {} : { reply_to_sentence: replyTo.sentence }),
       }),
-    }));
+    })));
   }
 
   async removeContact(contactCid: string): Promise<{ status: RelayStatus; notified: boolean; key_material_retained: true }> {
     let result: Awaited<ReturnType<OursClient['removeContact']>>;
     try {
-      result = await this.client.removeContact({ contact: contactCid });
+      result = await this.runBound(() => this.client.removeContact({ contact: contactCid }));
     } catch (error) {
       if (!isExactSdkMissingContact(error, contactCid)) throw error;
       throw new ContactAlreadyAbsentError(contactCid, error);
@@ -486,6 +644,17 @@ export class SdkRoomPacket implements RoomPacket {
     await this.client.removeIdentity({ name: this.name });
     await this.client.releaseLease();
   }
+}
+
+function sdkErrorCode(error: unknown): string | undefined {
+  if (error === null || typeof error !== 'object' || !('code' in error)) return undefined;
+  return typeof error.code === 'string' ? error.code : undefined;
+}
+
+function isTransientTransportError(error: unknown): boolean {
+  if (error === null || typeof error !== 'object' || !('code' in error)) return false;
+  return new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT'])
+    .has(String(error.code));
 }
 
 function sendResult(result: SendOutcome | FileSendOutcome): { status: RelayStatus; wire_id?: string } {

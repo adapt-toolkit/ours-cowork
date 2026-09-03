@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import test, { after } from 'node:test';
+import { pathToFileURL } from 'node:url';
 
 import {
   NATIVE_RPC_TIMEOUT_MS,
@@ -30,12 +31,13 @@ after(() => rm(CLEAN_CONFIG_DIR, { recursive: true, force: true }));
 
 async function runCli(args, options = {}) {
   const cli = options.cli ?? CLI;
-  const nodeArgs = options.platform === undefined
+  const nodeArgs = options.platform === undefined && options.reportedExecPath === undefined
     ? [cli, ...args]
     : ['--input-type=module', '--eval', `
-      Object.defineProperty(process, 'platform', { value: ${JSON.stringify(options.platform)} });
+      ${options.platform === undefined ? '' : `Object.defineProperty(process, 'platform', { value: ${JSON.stringify(options.platform)} });`}
+      ${options.reportedExecPath === undefined ? '' : `Object.defineProperty(process, 'execPath', { value: ${JSON.stringify(options.reportedExecPath)} });`}
       process.argv = [process.execPath, ${JSON.stringify(cli)}, ...${JSON.stringify(args)}];
-      await import(${JSON.stringify(new URL(`file://${cli}`).href)});
+      await import(${JSON.stringify(pathToFileURL(cli).href)});
     `];
   const env = { ...process.env };
   for (const key of ['OURS_CONFIG', 'OURS_PORT', 'OURS_STATE_DIR']) delete env[key];
@@ -60,6 +62,52 @@ async function runCli(args, options = {}) {
   });
   return { code, stdout, stderr };
 }
+
+function decodeXmlText(value) {
+  return value
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&amp;', '&');
+}
+
+function launchdProgramArguments(plist) {
+  const block = plist.match(/<key>ProgramArguments<\/key><array>([\s\S]*?)<\/array>/)?.[1];
+  assert.notEqual(block, undefined, 'launchd plist has ProgramArguments');
+  return [...block.matchAll(/<string>([\s\S]*?)<\/string>/g)]
+    .map((match) => decodeXmlText(match[1]));
+}
+
+function systemdQuotedValue(value) {
+  return `"${value
+    .replaceAll('\\', '\\\\')
+    .replaceAll('"', '\\"')
+    .replaceAll('%', '%%')
+    .replaceAll('$', '$$')}"`;
+}
+
+function systemdQuotedExecutable(value) {
+  return `"${value.replaceAll('\\', '\\\\').replaceAll('%', '%%')}"`;
+}
+
+test('npm-style symlinked binary executes the CLI entrypoint', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cowork-cli-symlink-'));
+  const link = join(directory, 'ours-cowork');
+  try {
+    await symlink(CLI, link);
+    const help = await runCli(['--help'], { cli: link });
+    assert.equal(help.code, 0, help.stderr);
+    assert.match(help.stdout, /Usage:[\s\S]*ours-cowork/);
+
+    const status = await runCli(['status'], {
+      cli: link,
+      env: { OURS_COWORK_STATE_DIR: join(directory, 'absent') },
+    });
+    assert.equal(status.code, 6);
+    assert.match(status.stderr, /stopped/i);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 async function withRawRpc(handler, action) {
   const stateDir = await mkdtemp(join(tmpdir(), 'cowork-cli-raw-'));
@@ -283,6 +331,7 @@ test('room commands send exactly one JSONL request over management.sock', async 
     { args: ['room', 'close', 'room1'], method: 'room.close', params: { room_id: 'room1' } },
     { args: ['room', 'delete', 'room1', '--yes'], method: 'room.delete', params: { room_id: 'room1', confirm: true } },
     { args: ['room', 'recover', 'room1'], method: 'room.recover', params: { room_id: 'room1' } },
+    { args: ['room', 'rebind', 'room1'], method: 'room.rebind', params: { room_id: 'room1' } },
     { args: ['room', 'recover', 'room1', '--confirm', 'old1', 'new1'], method: 'room.recover.confirm', params: { room_id: 'room1', recovery_of: 'old1', invite_id: 'new1' } },
     // Room membership and briefing verbs
     { args: ['room', 'create', '--goal', 'Ship', '--briefing', 'B', '--anonymous', '--quiet-membership'], method: 'room.create', params: { goal: 'Ship', briefing: 'B', anonymous: true, quiet_membership: true } },
@@ -764,12 +813,16 @@ test('offline docs cover operations and exact limitations without exposing a man
   assert.match(web.stdout, /http:\/\/127\.0\.0\.1:3052\//);
 });
 
-test('generated service definitions execute the cowork CLI directly and uninstall retains state', async () => {
+test('systemd captures absolute Node and canonical npm-style CLI paths and uninstall retains state', async () => {
   const home = await mkdtemp(join(tmpdir(), 'cowork-service-home-'));
   const stateDir = join(home, 'state');
   const binDir = join(home, 'bin');
+  const emptyPath = join(home, 'empty-path');
+  const cliLink = join(binDir, 'ours-cowork');
   await mkdir(stateDir, { mode: 0o700 });
   await mkdir(binDir, { mode: 0o700 });
+  await mkdir(emptyPath, { mode: 0o700 });
+  await symlink(CLI, cliLink);
   for (const name of ['systemctl', 'loginctl']) {
     const path = join(binDir, name);
     await writeFile(path, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
@@ -781,11 +834,25 @@ test('generated service definitions execute the cowork CLI directly and uninstal
     OURS_COWORK_STATE_DIR: stateDir,
   };
   try {
-    const installed = await runCli(['install-service'], { env });
+    const installed = await runCli(['install-service'], { cli: cliLink, env });
     assert.equal(installed.code, 0, installed.stderr);
     const unitPath = join(home, '.config', 'systemd', 'user', 'ours-cowork.service');
     const unit = await readFile(unitPath, 'utf8');
-    assert.match(unit, new RegExp(`^ExecStart="${CLI.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}" serve$`, 'm'));
+    const execStart = unit.match(/^ExecStart="([^"\\]+)" "([^"\\]+)" serve$/m);
+    assert.notEqual(execStart, null, unit);
+    assert.deepEqual(execStart.slice(1), [process.execPath, CLI]);
+    const explicitRuntime = spawnSync(execStart[1], [execStart[2], '--help'], {
+      encoding: 'utf8',
+      env: { HOME: home, PATH: emptyPath, OURS_COWORK_STATE_DIR: stateDir },
+    });
+    assert.equal(explicitRuntime.status, 0, explicitRuntime.stderr);
+    assert.match(explicitRuntime.stdout, /Usage:[\s\S]*ours-cowork/);
+    const shebangLookup = spawnSync(execStart[2], ['--help'], {
+      encoding: 'utf8',
+      env: { HOME: home, PATH: emptyPath, OURS_COWORK_STATE_DIR: stateDir },
+    });
+    assert.notEqual(shebangLookup.status, 0);
+    assert.match(shebangLookup.stderr, /env:.*node.*(?:No such file|not found)/i);
     const externalDaemonPattern = new RegExp(`${['ours', 'mcp'].join('-')}|(?:^|[ /])\\.ours(?:[ /]|$)`, 'im');
     assert.doesNotMatch(unit, externalDaemonPattern);
     assert.doesNotMatch(unit, /management-token|Bearer/i);
@@ -858,6 +925,67 @@ test('a service definition carries the standard shared-daemon selection and neve
   }
 });
 
+test('launchd captures exact absolute argv with XML-sensitive paths and runs without PATH lookup', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'cowork-launchd-argv-'));
+  const unusual = join(home, 'cowork <runtime> & package');
+  const copiedCli = join(unusual, 'cli <entry> &.js');
+  const copiedNode = join(unusual, 'node <runtime> &');
+  const stateDir = join(home, 'state');
+  const binDir = join(home, 'bin');
+  const emptyPath = join(home, 'empty-path');
+  await mkdir(unusual, { recursive: true, mode: 0o700 });
+  await mkdir(stateDir, { mode: 0o700 });
+  await mkdir(binDir, { mode: 0o700 });
+  await mkdir(emptyPath, { mode: 0o700 });
+  await writeFile(copiedCli, await readFile(CLI));
+  await chmod(copiedCli, 0o700);
+  await writeFile(join(binDir, 'launchctl'), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+  await chmod(join(binDir, 'launchctl'), 0o700);
+  try {
+    const installed = await runCli(['install-service'], {
+      platform: 'darwin',
+      cli: copiedCli,
+      reportedExecPath: copiedNode,
+      env: { HOME: home, PATH: `${binDir}:${process.env.PATH}`, OURS_COWORK_STATE_DIR: stateDir },
+    });
+    assert.equal(installed.code, 0, installed.stderr);
+    const plist = await readFile(join(home, 'Library', 'LaunchAgents', 'network.ours.cowork.plist'), 'utf8');
+    const argv = launchdProgramArguments(plist);
+    assert.deepEqual(argv, [copiedNode, copiedCli, 'serve']);
+    assert.match(plist, /node &lt;runtime&gt; &amp;/);
+    assert.match(plist, /cli &lt;entry&gt; &amp;\.js/);
+
+    const cliLink = join(binDir, 'ours-cowork');
+    await symlink(CLI, cliLink);
+    const reinstalled = await runCli(['install-service'], {
+      platform: 'darwin',
+      cli: cliLink,
+      env: { HOME: home, PATH: `${binDir}:${process.env.PATH}`, OURS_COWORK_STATE_DIR: stateDir },
+    });
+    assert.equal(reinstalled.code, 0, reinstalled.stderr);
+    const replaced = await readFile(join(home, 'Library', 'LaunchAgents', 'network.ours.cowork.plist'), 'utf8');
+    const replacedArgv = launchdProgramArguments(replaced);
+    assert.deepEqual(replacedArgv, [process.execPath, CLI, 'serve']);
+    assert.equal(replaced.includes(copiedNode), false);
+    assert.equal(replaced.includes(copiedCli), false);
+
+    const explicitRuntime = spawnSync(replacedArgv[0], [replacedArgv[1], '--help'], {
+      encoding: 'utf8',
+      env: { HOME: home, PATH: emptyPath, OURS_COWORK_STATE_DIR: stateDir },
+    });
+    assert.equal(explicitRuntime.status, 0, explicitRuntime.stderr);
+    assert.match(explicitRuntime.stdout, /Usage:[\s\S]*ours-cowork/);
+    const shebangLookup = spawnSync(replacedArgv[1], ['--help'], {
+      encoding: 'utf8',
+      env: { HOME: home, PATH: emptyPath, OURS_COWORK_STATE_DIR: stateDir },
+    });
+    assert.notEqual(shebangLookup.status, 0);
+    assert.match(shebangLookup.stderr, /env:.*node.*(?:No such file|not found)/i);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test('failed systemd and launchd unloads retain their service definitions and report failure', async () => {
   for (const platform of ['linux', 'darwin']) {
     const home = await mkdtemp(join(tmpdir(), `cowork-${platform}-uninstall-`));
@@ -886,10 +1014,11 @@ test('failed systemd and launchd unloads retain their service definitions and re
   }
 });
 
-test('systemd ExecStart quotes a cowork CLI path containing spaces and special characters', async () => {
+test('systemd ExecStart independently quotes runtime and CLI paths with spaces and special characters', async () => {
   const home = await mkdtemp(join(tmpdir(), 'cowork-systemd-quote-'));
   const unusual = join(home, 'cowork path % $');
   const copiedCli = join(unusual, 'cli.js');
+  const copiedNode = join(unusual, 'node runtime % $');
   const binDir = join(home, 'bin');
   const stateDir = join(home, 'state');
   await mkdir(unusual, { recursive: true, mode: 0o700 });
@@ -897,23 +1026,81 @@ test('systemd ExecStart quotes a cowork CLI path containing spaces and special c
   await mkdir(stateDir, { mode: 0o700 });
   await writeFile(copiedCli, await readFile(CLI));
   await chmod(copiedCli, 0o700);
+  await symlink(process.execPath, copiedNode);
   for (const name of ['systemctl', 'loginctl']) {
     await writeFile(join(binDir, name), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
     await chmod(join(binDir, name), 0o700);
   }
   try {
     const result = await runCli(['install-service'], {
+      platform: 'linux',
       cli: copiedCli,
+      reportedExecPath: copiedNode,
       env: { HOME: home, PATH: `${binDir}:${process.env.PATH}`, OURS_COWORK_STATE_DIR: stateDir },
     });
     assert.equal(result.code, 0, result.stderr);
     const unitPath = join(home, '.config', 'systemd', 'user', 'ours-cowork.service');
     const unit = await readFile(unitPath, 'utf8');
-    assert.match(unit, /^ExecStart="(?:[^"\\]|\\.)+" serve$/m);
+    assert.equal(
+      unit.split('\n').find((line) => line.startsWith('ExecStart=')),
+      `ExecStart=${systemdQuotedExecutable(copiedNode)} ${systemdQuotedValue(copiedCli)} serve`,
+    );
     if (spawnSync('systemd-analyze', ['--version']).status === 0) {
       const verified = spawnSync('systemd-analyze', ['verify', unitPath], { encoding: 'utf8' });
       assert.equal(verified.status, 0, verified.stderr);
     }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('reinstall replaces captured runtime and CLI paths without stale or duplicate argv', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'cowork-systemd-reinstall-'));
+  const firstDir = join(home, 'first runtime and package');
+  const secondDir = join(home, 'second runtime and package');
+  const firstCli = join(firstDir, 'cli.js');
+  const secondCli = join(secondDir, 'cli.js');
+  const firstNode = join(firstDir, 'node');
+  const secondNode = join(secondDir, 'node');
+  const binDir = join(home, 'bin');
+  const stateDir = join(home, 'state');
+  await mkdir(firstDir, { recursive: true, mode: 0o700 });
+  await mkdir(secondDir, { recursive: true, mode: 0o700 });
+  await mkdir(binDir, { mode: 0o700 });
+  await mkdir(stateDir, { mode: 0o700 });
+  for (const cli of [firstCli, secondCli]) {
+    await writeFile(cli, await readFile(CLI));
+    await chmod(cli, 0o700);
+  }
+  for (const name of ['systemctl', 'loginctl']) {
+    await writeFile(join(binDir, name), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+    await chmod(join(binDir, name), 0o700);
+  }
+  const env = { HOME: home, PATH: `${binDir}:${process.env.PATH}`, OURS_COWORK_STATE_DIR: stateDir };
+  const unitPath = join(home, '.config', 'systemd', 'user', 'ours-cowork.service');
+  try {
+    const first = await runCli(['install-service'], {
+      platform: 'linux', cli: firstCli, reportedExecPath: firstNode, env,
+    });
+    assert.equal(first.code, 0, first.stderr);
+    const firstUnit = await readFile(unitPath, 'utf8');
+    assert.equal(
+      firstUnit.split('\n').find((line) => line.startsWith('ExecStart=')),
+      `ExecStart=${systemdQuotedExecutable(firstNode)} ${systemdQuotedValue(firstCli)} serve`,
+    );
+
+    const second = await runCli(['install-service'], {
+      platform: 'linux', cli: secondCli, reportedExecPath: secondNode, env,
+    });
+    assert.equal(second.code, 0, second.stderr);
+    const secondUnit = await readFile(unitPath, 'utf8');
+    assert.equal(secondUnit.match(/^ExecStart=/gm)?.length, 1);
+    assert.equal(
+      secondUnit.split('\n').find((line) => line.startsWith('ExecStart=')),
+      `ExecStart=${systemdQuotedExecutable(secondNode)} ${systemdQuotedValue(secondCli)} serve`,
+    );
+    assert.equal(secondUnit.includes(firstNode), false);
+    assert.equal(secondUnit.includes(firstCli), false);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -945,5 +1132,45 @@ test('service install rejects control characters before creating or replacing a 
     } finally {
       await rm(home, { recursive: true, force: true });
     }
+  }
+});
+
+test('service install identifies an unsafe Node executable and preserves the existing definition', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'cowork-systemd-node-control-'));
+  const binDir = join(home, 'bin');
+  const stateDir = join(home, 'state');
+  const unsafeNode = join(home, 'node\nruntime');
+  const unitPath = join(home, '.config', 'systemd', 'user', 'ours-cowork.service');
+  const existing = Buffer.from('existing unit must remain byte-for-byte\n\0tail');
+  await mkdir(binDir, { mode: 0o700 });
+  await mkdir(stateDir, { mode: 0o700 });
+  await mkdir(resolve(unitPath, '..'), { recursive: true, mode: 0o700 });
+  await writeFile(unitPath, existing);
+  for (const name of ['systemctl', 'loginctl']) {
+    await writeFile(join(binDir, name), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+    await chmod(join(binDir, name), 0o700);
+  }
+  try {
+    const result = await runCli(['install-service', '--json'], {
+      platform: 'linux',
+      reportedExecPath: unsafeNode,
+      env: { HOME: home, PATH: `${binDir}:${process.env.PATH}`, OURS_COWORK_STATE_DIR: stateDir },
+    });
+    assert.equal(result.code, 4, result.stdout);
+    assert.equal(result.stderr, '');
+    assert.match(JSON.parse(result.stdout).error.message, /node_executable.*control character/i);
+    assert.deepEqual(await readFile(unitPath), existing);
+
+    const quoteResult = await runCli(['install-service', '--json'], {
+      platform: 'linux',
+      reportedExecPath: join(home, 'node"runtime'),
+      env: { HOME: home, PATH: `${binDir}:${process.env.PATH}`, OURS_COWORK_STATE_DIR: stateDir },
+    });
+    assert.equal(quoteResult.code, 4, quoteResult.stdout);
+    assert.equal(quoteResult.stderr, '');
+    assert.match(JSON.parse(quoteResult.stdout).error.message, /node_executable.*unsupported by systemd ExecStart/i);
+    assert.deepEqual(await readFile(unitPath), existing);
+  } finally {
+    await rm(home, { recursive: true, force: true });
   }
 });

@@ -12,7 +12,8 @@ import { fileURLToPath } from 'node:url';
 const THIS_FILE = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(THIS_FILE), '..');
 const CLI = join(ROOT, 'dist', 'cli.js');
-const OURS_CLI = join(ROOT, 'node_modules', '@ours.network', 'cli', 'dist', 'cli.js');
+const OURS_CLI = process.env.COWORK_OURS_CLI_PATH
+  ?? join(ROOT, 'node_modules', '@ours.network', 'cli', 'dist', 'cli.js');
 const SUCCESS = 'COWORK_E2E_DRIVER_SUCCESS';
 const FAILURE = 'COWORK_E2E_DRIVER_FAILURE';
 const sleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
@@ -371,13 +372,23 @@ if (process.argv.includes('--e2e-driver')) {
       const roomCid = created.identity_cid;
       assert.match(roomId, /^[0-7][0-9a-hjkmnp-tv-z]{25}$/);
       assert.equal(created.room_name, 'Café launch 🤖');
-      assert.equal(created.identity_name, `ours-cowork-${roomId}`);
+      assert.equal(created.identity_name, 'ours-cowork:Café launch 🤖');
       stage('room-created');
 
-      const invitation = await runCli([
-        'room', 'invite', roomId, '--mode', 'public', '--role', 'reviewer', '--min-accepts', '2',
+      const supportsOrigins = (await alice.client.listContacts()).origins !== undefined;
+      const reviewerInvitation = await runCli([
+        'room', 'invite', roomId, '--mode', 'public', '--role', 'reviewer',
+        '--min-accepts', supportsOrigins ? '1' : '2',
       ]);
-      await Promise.all([joinInvite(alice, invitation.blob), joinInvite(bob, invitation.blob)]);
+      const builderInvitation = supportsOrigins
+        ? await runCli([
+          'room', 'invite', roomId, '--mode', 'public', '--role', 'builder', '--min-accepts', '1',
+        ])
+        : reviewerInvitation;
+      await Promise.all([
+        joinInvite(alice, reviewerInvitation.blob),
+        joinInvite(bob, builderInvitation.blob),
+      ]);
       await waitFor(() => Promise.all([contacts(alice), contacts(bob)]).then(([a, b]) =>
         a.some((contact) => contact.container_id === roomCid)
           && b.some((contact) => contact.container_id === roomCid)), 'SDK invite redemptions');
@@ -386,7 +397,11 @@ if (process.argv.includes('--e2e-driver')) {
         return candidate.state === 'active' ? candidate : undefined;
       }, 'room activation');
       assert.deepEqual(new Set(room.seats.map((seat) => seat.identity)), new Set([alice.cid, bob.cid]));
-      assert(room.seats.every((seat) => seat.role === 'reviewer'));
+      assert.equal(room.seats.find((seat) => seat.identity === alice.cid).role, 'reviewer');
+      assert.equal(room.seats.find((seat) => seat.identity === bob.cid).role,
+        supportsOrigins ? 'builder' : 'reviewer');
+      assert.equal(room.seats.find((seat) => seat.identity === alice.cid).invite_id, reviewerInvitation.invite.invite_id);
+      assert.equal(room.seats.find((seat) => seat.identity === bob.cid).invite_id, builderInvitation.invite.invite_id);
       stage('activated');
 
       const aliceBriefing = await waitFor(async () => (await messages(alice)).find((message) => {
@@ -442,13 +457,16 @@ if (process.argv.includes('--e2e-driver')) {
       room = await runCli(['room', 'show', roomId]);
       assert.equal(room.identity_cid, roomCid);
       assert.equal(room.identity_name, created.identity_name);
-      const oldInvite = room.invites.find((invite) => invite.invite_id === invitation.invite.invite_id);
+      const oldInvite = room.invites.find((invite) => invite.invite_id === reviewerInvitation.invite.invite_id);
       assert.equal(oldInvite.state, 'live');
-      await joinInvite(charlie, invitation.blob);
+      await joinInvite(charlie, reviewerInvitation.blob);
       await waitFor(async () => (await contacts(charlie)).some((contact) => contact.container_id === roomCid),
         'Charlie live invite redemption after cowork restart');
       await waitFor(async () => (await runCli(['room', 'participants', roomId]))
         .some((seat) => seat.identity === charlie.cid), 'shared-daemon invite admission after cowork restart');
+      room = await runCli(['room', 'show', roomId]);
+      assert.equal(room.seats.find((seat) => seat.identity === charlie.cid).role, 'reviewer');
+      assert.equal(room.seats.find((seat) => seat.identity === charlie.cid).invite_id, reviewerInvitation.invite.invite_id);
       stage('restart-and-live-invite');
 
       room = await runCli(['room', 'show', roomId]);
@@ -580,7 +598,7 @@ if (process.argv.includes('--e2e-driver')) {
         && record.intent_record_id === recoveryIntents[0].record_id).length, 1);
       assert.equal((await runCli(['room', 'show', roomId])).membership_epoch, room.membership_epoch + 1);
 
-      await joinInvite(successor, invitation.blob);
+      await joinInvite(successor, reviewerInvitation.blob);
       await waitFor(async () => (await runCli(['room', 'participants', roomId]))
         .some((seat) => seat.identity === successor.cid && seat.state === 'active'),
       'successor admission after repeated removal recovery');
@@ -612,7 +630,7 @@ if (process.argv.includes('--e2e-driver')) {
       'bilateral SDK contact removal');
       const roomDir = join(stateDir, 'cowork', 'rooms', roomId);
       assert.equal(existsSync(join(roomDir, 'room.json')), true);
-      assert.equal(existsSync(join(roomDir, 'archive.jsonl')), true);
+      assert.equal(existsSync(join(roomDir, 'archive.sqlite3')), true);
       const deleted = await runCli(['room', 'delete', roomId, '--yes']);
       assert.deepEqual(deleted, { version: 1, room_id: roomId, deleted: true, scope: 'this_host' });
       assert.equal(existsSync(roomDir), false);

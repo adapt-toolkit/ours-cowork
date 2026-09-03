@@ -364,9 +364,12 @@ export class RoomService {
       && record.command?.sender_cid === context.sender_cid
       && record.command.idempotency_key === request.idempotency_key);
 
-    // Resolve a durable replay before checking current membership. This keeps a
-    // successfully authorized self-removal retryable after its seat is removed.
+    // Resolve a durable replay before checking current membership so a
+    // previously authorized mutation remains retryable if membership changes.
     if (prior !== undefined) {
+      if (prior.recipient_identity === context.sender_cid) {
+        return { ok: false, error: 'cannot_remove_self' };
+      }
       if (prior.participant_id !== request.participant_id
         || prior.command?.expected_membership_epoch !== request.expected_membership_epoch) {
         return { ok: false, error: 'idempotency_conflict' };
@@ -394,6 +397,9 @@ export class RoomService {
     const target = room.seats.find((seat) =>
       seat.state === 'active' && seat.participant_id === request.participant_id);
     if (!target) return { ok: false, error: 'member_not_found' };
+    if (target.identity === context.sender_cid) {
+      return { ok: false, error: 'cannot_remove_self' };
+    }
 
     const intent = await this.store.append(roomId, {
       version: 1,

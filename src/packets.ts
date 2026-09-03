@@ -367,10 +367,13 @@ export class SdkRoomPacket implements RoomPacket {
 
   async listUnreadMessages(limit: number): Promise<InboxItem[]> {
     validateBatchLimit(limit);
-    const metadata = (await this.client.listIncomingMessages())
-      .filter((message) => message.status === 'unread'
-        && (message.message_kind === undefined || message.message_kind === 'text'))
-      .sort((left, right) => left.seq - right.seq)
+    const unread = (await this.client.listIncomingMessages())
+      .filter((message) => message.status === 'unread')
+      .sort((left, right) => left.seq - right.seq);
+    const barrier = unread.findIndex((message) =>
+      message.message_kind !== undefined && message.message_kind !== 'text');
+    const metadata = (barrier < 0 ? unread : unread.slice(0, barrier))
+      .filter((message) => message.message_kind === undefined || message.message_kind === 'text')
       .slice(0, limit);
     return Promise.all(metadata.map(async (listed) => {
       const history = await this.client.getHistoryItem({ wire_id: listed.wire_id });

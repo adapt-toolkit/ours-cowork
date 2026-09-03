@@ -395,6 +395,39 @@ if (process.argv.includes('--e2e-driver')) {
         member.participant_id === room.seats[0].participant_id), true);
       assert.equal(JSON.stringify(listedOutcome).includes(alice.cid), false);
 
+      const aliceSeat = room.seats.find((seat) => seat.identity === alice.cid);
+      const selfRequest = await alice.client.sendCommand({
+        contact: roomCid,
+        command: 'remove-member',
+        arguments: {
+          participant_id: aliceSeat.participant_id,
+          expected_membership_epoch: room.membership_epoch,
+          confirm: true,
+          idempotency_key: 'e2e-reject-self-removal-1',
+        },
+      });
+      const selfResult = await waitFor(async () => {
+        const pulled = await alice.client.getMessages();
+        return pulled.command_results.find((result) =>
+          result.reply_to?.wire_id === selfRequest.wireId);
+      }, 'correlated self-removal refusal');
+      assert.equal(selfResult.reply_to.wire_id, selfRequest.wireId);
+      assert.deepEqual(JSON.parse(selfResult.body), {
+        ok: true, result: { ok: false, error: 'cannot_remove_self' },
+      });
+      const afterSelfRefusal = await runCli(['room', 'show', roomId]);
+      assert.equal(afterSelfRefusal.membership_epoch, room.membership_epoch);
+      assert.equal(afterSelfRefusal.seats.find((seat) =>
+        seat.participant_id === aliceSeat.participant_id).state, 'active');
+      assert.equal((await contacts(alice)).some((contact) =>
+        contact.container_id === roomCid), true);
+      const afterSelfHistory = await runCli([
+        'room', 'history', roomId, '--after', '0', '--limit', '1000',
+      ]);
+      assert.equal(afterSelfHistory.some((record) =>
+        record.kind === 'membership_intent'
+          && record.command?.idempotency_key === 'e2e-reject-self-removal-1'), false);
+
       const charlieSeat = room.seats.find((seat) => seat.identity === charlie.cid);
       const removeArguments = {
         participant_id: charlieSeat.participant_id,
@@ -402,9 +435,16 @@ if (process.argv.includes('--e2e-driver')) {
         confirm: true,
         idempotency_key: 'e2e-remove-charlie-1',
       };
+      await runCli(['stop']);
+      await send(charlie, roomCid, 'before typed removal barrier');
       const removeRequest = await alice.client.sendCommand({
         contact: roomCid, command: 'remove-member', arguments: removeArguments,
       });
+      await send(charlie, roomCid, 'after typed removal barrier');
+      await send(alice, roomCid, 'after typed barrier sentinel');
+      await runCli(['start']);
+      await waitFor(async () => (await runCli(['status'])).running === true,
+        'cowork restart for queued typed ordering');
       const removeResult = await waitFor(async () => {
         const pulled = await alice.client.getMessages();
         return pulled.command_results.find((result) =>
@@ -424,6 +464,20 @@ if (process.argv.includes('--e2e-driver')) {
       await waitFor(async () => (await runCli(['room', 'participants', roomId]))
         .find((seat) => seat.participant_id === charlieSeat.participant_id)?.state === 'removed',
       'typed removal persistence');
+      const barrierHistory = await waitFor(async () => {
+        const history = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
+        return history.some((record) => record.kind === 'message'
+          && record.text === 'after typed barrier sentinel') ? history : undefined;
+      }, 'post-barrier sentinel archive');
+      assert.equal(barrierHistory.some((record) => record.kind === 'message'
+        && record.text === 'before typed removal barrier'), true);
+      assert.equal(barrierHistory.some((record) => record.kind === 'message'
+        && record.text === 'after typed removal barrier'), false);
+      // A removed sender receives Cowork's existing content-free bounce. Drop
+      // that peer-side warning channel before the later close-contract check.
+      if ((await contacts(charlie)).some((contact) => contact.container_id === roomCid)) {
+        await charlie.client.removeContact({ contact: roomCid });
+      }
       stage('typed-commands');
 
       const closed = await runCli(['room', 'close', roomId]);

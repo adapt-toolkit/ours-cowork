@@ -333,10 +333,7 @@ test('SDK room packet drains typed rows without exposing them as chat or losing 
     date: '2026-08-15T08:00:00Z', reply_to: null,
   });
   const packet = new SdkRoomPacket(IDENTITY, CID, client);
-  assert.deepEqual(await packet.listUnreadMessages(32), [{
-    msg_id: 8, sender_id: CID, sender_name: 'Peer', text: 'raced text',
-    date: '2026-08-15T08:00:00.000Z', wire_id: SECOND_MESSAGE_WIRE, reply_to: null,
-  }]);
+  assert.deepEqual(await packet.listUnreadMessages(32), []);
 
   client.getMessages = async (input) => {
     client.calls.push(['getMessages', structuredClone(input)]);
@@ -347,6 +344,10 @@ test('SDK room packet drains typed rows without exposing them as chat or losing 
   const unexpected = [];
   await packet.drainRuntimeCommands(async (item) => unexpected.push(item));
   assert.deepEqual(unexpected, []);
+  assert.deepEqual(await packet.listUnreadMessages(32), [{
+    msg_id: 8, sender_id: CID, sender_name: 'Peer', text: 'raced text',
+    date: '2026-08-15T08:00:00.000Z', wire_id: SECOND_MESSAGE_WIRE, reply_to: null,
+  }]);
   assert.equal(text.status, 'unread');
 
   // If the SDK snapshot races and returns an ordinary row, Cowork hands that
@@ -366,6 +367,40 @@ test('SDK room packet drains typed rows without exposing them as chat or losing 
   };
   await packet.drainRuntimeCommands(async (item) => unexpected.push(item));
   assert.deepEqual(unexpected.map((item) => item.wire_id), [SECOND_MESSAGE_WIRE]);
+});
+
+test('SDK room packet stops a text snapshot at the first typed ordering barrier', async () => {
+  const client = blankClient();
+  const rows = [
+    { seq: 1, msg_id: 7, wire_id: MESSAGE_WIRE, message_kind: 'text', body: 'before command' },
+    { seq: 2, msg_id: 8, wire_id: 'wire-command-barrier', message_kind: 'command', body: '{}' },
+    { seq: 3, msg_id: 9, wire_id: SECOND_MESSAGE_WIRE, message_kind: 'text', body: 'after command' },
+  ].map((row) => ({
+    ...row,
+    from: { id: CID, name: 'Peer' },
+    status: 'unread', inbox_state: 'unread', encryption: 'e2e', reply_to: null,
+    date: '2026-08-15T08:00:00Z', occurred_at_ms: Date.parse('2026-08-15T08:00:00Z') + row.seq,
+  }));
+  client.messages = rows;
+  for (const row of rows.filter((candidate) => candidate.message_kind === 'text')) {
+    client.messageHistory.set(row.wire_id, {
+      ...row, peer: row.from, direction: 'in', text: row.body,
+      transport: 'double_ratchet', delivery_state: null, human_read_at_ms: null,
+    });
+  }
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  const first = await packet.listUnreadMessages(32);
+  assert.deepEqual(first.map((item) => item.text), ['before command']);
+  await packet.acknowledgeMessage(first[0], async () => assert.fail('the oldest text must be exact'));
+
+  client.getMessages = async (input) => {
+    client.calls.push(['getMessages', structuredClone(input)]);
+    rows[1].status = 'read';
+    rows[1].inbox_state = 'read';
+    return { messages: [], command_results: [], commands_handled: 1, remaining: 1 };
+  };
+  await packet.drainRuntimeCommands(async () => assert.fail('the typed row must not become chat'));
+  assert.deepEqual((await packet.listUnreadMessages(32)).map((item) => item.text), ['after command']);
 });
 
 test('SDK room packet treats an empty message acknowledgement as an already-read expected row', async () => {

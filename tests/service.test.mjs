@@ -1337,11 +1337,25 @@ test('runtime membership commands authorize by trusted CID, redact the roster, a
     sender_cid: 'cid-outsider', sender_name: 'Alice', request_wire_id: 'wire-remove-outsider',
   }), { ok: false, error: 'unauthorized' });
   assert.equal(membershipRecords(await f.store.read(ROOM_ID)).intents.length, 0);
+  assert.deepEqual(await packet.runtimeCommands.removeMember(baseRequest, aliceContext), {
+    ok: false, error: 'cannot_remove_self',
+  });
+  assert.equal(membershipRecords(await f.store.read(ROOM_ID)).intents.length, 0);
+  assert.deepEqual(packet.removeContactCalls ?? [], []);
+  const afterSelfRefusal = await f.service.showRoom(ROOM_ID);
+  assert.equal(afterSelfRefusal.membership_epoch, roomBefore.membership_epoch);
+  assert.equal(afterSelfRefusal.seats.find((seat) =>
+    seat.participant_id === alice.participant_id).state, 'active');
 
-  const removed = await packet.runtimeCommands.removeMember(baseRequest, aliceContext);
+  const removeRequest = {
+    ...baseRequest,
+    participant_id: bob.participant_id,
+    idempotency_key: 'remove-bob-1',
+  };
+  const removed = await packet.runtimeCommands.removeMember(removeRequest, aliceContext);
   assert.deepEqual(removed, {
     ok: true,
-    participant_id: alice.participant_id,
+    participant_id: bob.participant_id,
     membership_epoch: roomBefore.membership_epoch + 1,
     removed: true,
   });
@@ -1353,25 +1367,23 @@ test('runtime membership commands authorize by trusted CID, redact the roster, a
     sender_cid: 'cid-alice',
     sender_participant_id: alice.participant_id,
     request_wire_id: 'wire-remove-alice-1',
-    idempotency_key: 'remove-self-1',
+    idempotency_key: 'remove-bob-1',
     expected_membership_epoch: roomBefore.membership_epoch,
   });
-  assert.deepEqual(packet.removeContactCalls, ['cid-alice']);
+  assert.deepEqual(packet.removeContactCalls, ['cid-bob']);
 
-  // The caller is now removed, but the durable sender-CID/key pair still makes
-  // delivery retries deterministic and does not repeat the mutation.
-  assert.deepEqual(await packet.runtimeCommands.removeMember(baseRequest, {
+  assert.deepEqual(await packet.runtimeCommands.removeMember(removeRequest, {
     ...aliceContext, request_wire_id: 'wire-remove-alice-retry',
   }), removed);
   assert.deepEqual(await packet.runtimeCommands.removeMember({
-    ...baseRequest, participant_id: bob.participant_id,
+    ...removeRequest, participant_id: alice.participant_id,
   }, { ...aliceContext, request_wire_id: 'wire-remove-alice-conflict' }), {
     ok: false, error: 'idempotency_conflict',
   });
   const settledMembership = membershipRecords(await f.store.read(ROOM_ID));
   assert.equal(settledMembership.intents.length, 1);
   assert.equal(settledMembership.results.length, 1);
-  assert.deepEqual(packet.removeContactCalls, ['cid-alice']);
+  assert.deepEqual(packet.removeContactCalls, ['cid-bob']);
   assert.equal((await f.service.showRoom(ROOM_ID)).membership_epoch, roomBefore.membership_epoch + 1);
 });
 

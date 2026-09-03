@@ -236,6 +236,14 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     example: { room_id: EXAMPLE_ROOM_ID, recovery_of: 'inv-01', invite_id: 'inv-02' },
   },
   {
+    method: 'room.rebind',
+    summary: 'Rebind an established room identity',
+    description: 'Safely restores the exact persisted room identity with a non-force lease claim and CID proof, then resumes durable room fanout. It never creates or renames an identity.',
+    params: params({ room_id: roomIdProperty }, ['room_id']),
+    result: 'A structured rebind receipt after identity proof, reconciliation, and pending fanout resumption.',
+    example: { room_id: EXAMPLE_ROOM_ID },
+  },
+  {
     method: 'room.list',
     summary: 'List rooms',
     description: 'Lists every room held on this host. Takes no parameters.',

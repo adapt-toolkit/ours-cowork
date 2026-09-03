@@ -258,6 +258,40 @@ describe('room DTO guards', () => {
     expect(isHistoryDto(records)).toBe(true);
   });
 
+  it('accepts every daemon reply-reference field on messages and files with strict nested parity', () => {
+    const participantId = '01jz6y7n8p9q0r1s2t3v4w5x72';
+    const reply = { wire_id: 'DB86B3C77C1E0C425269204C158245940AB863E26F6F965F0168116B81260F58', sentence: 2 };
+    const daemonRecords = [
+      CommunicationRecordSchema.parse(message(1, {
+        author_alias: { participant_id: participantId, alias: 'builder #1' },
+        source_msg_id: 7,
+        source_wire_id: 'wire-message-7',
+        source_reply_to: reply,
+      })),
+      CommunicationRecordSchema.parse(file(2, {
+        author_alias: { participant_id: participantId, alias: 'builder #1' },
+        sha256: '3d1f57c984978ef98a18378c8166c1cb8ede02c03eeb6aee7e2f121dfeee3e56',
+        source_reply_to: { wire_id: reply.wire_id },
+      })),
+    ];
+
+    expect(isHistoryDto(daemonRecords)).toBe(true);
+    for (const source_reply_to of [
+      null,
+      'wire-parent',
+      { wire_id: 42 },
+      { wire_id: '' },
+      { wire_id: reply.wire_id, sentence: 0 },
+      { wire_id: reply.wire_id, sentence: '2' },
+      { wire_id: reply.wire_id, sentence: 1.5 },
+      { wire_id: reply.wire_id, sentence: Number.MAX_SAFE_INTEGER + 1 },
+      { wire_id: reply.wire_id, extra: true },
+    ]) {
+      expect(isHistoryDto([{ ...daemonRecords[0], source_reply_to }])).toBe(false);
+      expect(isHistoryDto([{ ...daemonRecords[1], source_reply_to }])).toBe(false);
+    }
+  });
+
   it('preserves the daemon category-field and membership delivery invariants', () => {
     const participantId = '01jz6y7n8p9q0r1s2t3v4w5x72';
     const briefing = message(1, { category: 'briefing', briefing_version: 2 });
@@ -401,10 +435,28 @@ describe('room DTO guards', () => {
 
     expect(isRoomDto(room({
       identity_cid: '', identity_name: `cowork-room-${ROOM_ID}`, status: 'packet_pending', state: 'provisioning',
+    }))).toBe(false);
+    expect(isRoomDto(room({
+      identity_cid: '', identity_name: 'ours-cowork:Operations', status: 'packet_pending', state: 'provisioning',
+    }))).toBe(true);
+    const longName = '🤖'.repeat(64);
+    expect(isRoomDto(room({
+      room_name: longName,
+      identity_cid: '', identity_name: `ours-cowork:${'🤖'.repeat(52)}`, status: 'packet_pending', state: 'provisioning',
     }))).toBe(true);
     expect(isRoomDto(room({
-      identity_cid: '', identity_name: 'ours-cowork-room:Operations', status: 'packet_pending', state: 'provisioning',
-    }))).toBe(true);
+      room_name: longName,
+      identity_cid: '', identity_name: `ours-cowork:${longName}`, status: 'packet_pending', state: 'provisioning',
+    }))).toBe(false);
+    expect(isRoomDto(room({
+      identity_cid: '', identity_name: `ours-cowork-${ROOM_ID}`, status: 'packet_pending', state: 'provisioning',
+    }))).toBe(false);
+    expect(isRoomDto(room({
+      identity_cid: '', identity_name: `ours-cowork-operations-${ROOM_ID}`, status: 'packet_pending', state: 'provisioning',
+    }))).toBe(false);
+    expect(isRoomDto(room({
+      identity_cid: '', identity_name: `ours-cowork-Bad_Slug-${ROOM_ID}`, status: 'packet_pending', state: 'provisioning',
+    }))).toBe(false);
   });
 });
 

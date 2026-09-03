@@ -25,12 +25,12 @@ Every room operation is carried by the single route `POST /rpc` with the envelop
 
 1. Choose Create room and enter the friendly Name, Goal, and Briefing. The name is shown in the room list, workspace header, and room details.
 2. Submit once. The new room is selected and its Invite panel opens.
-3. Add one invitation requirement at a time. Choose one-time or public mode and set the minimum acceptances for a public invite. Revoke or consume it before creating another; the standard-SDK room keeps only one live invite so contact admission remains unambiguous.
+3. Add one or more invitation requirements. Choose one-time or public mode and set the minimum acceptances for a public invite. Each contact is admitted into the exact role authenticated by the invite it redeemed. An older SDK without invite provenance will ask you to revoke or consume the current invite before creating another.
 4. Copy every invite from its blocking receipt before choosing Done. The secret is shown once and is not retained in browser storage, the URL, logs, or durable room metadata.
 
 The room activates after its durable invitation requirements are satisfied. Participants shows admitted identities and their invite roles.
 
-Friendly names are trimmed and Unicode NFC-normalized, must contain 1–64 Unicode characters, and cannot contain Unicode control or format characters. Duplicate names are allowed. Change a name in Room settings. The browser continues to route by the opaque room ID; renaming does not change the URL, storage key, or underlying room identity. Existing unnamed rooms appear as `Room <first 8 room_id characters>`.
+Names are trimmed and Unicode NFC-normalized, must contain 1–64 Unicode code points, and cannot contain Unicode control or format characters. The SDK identity retains at most the first 52 code points after `ours-cowork:`; retained path separators, surrogates, and Unicode line/paragraph separators are also invalid under the SDK contract. At creation, the bounded name must not collide with an identity already in the shared daemon. Change local room metadata in Room settings. The browser continues to route by the opaque room ID; renaming does not change the URL, storage key, or underlying bounded identity. Unnamed creation requests use `Room <first 8 room_id characters>`.
 
 ## Communication and records
 

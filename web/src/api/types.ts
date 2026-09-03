@@ -114,6 +114,11 @@ export interface MembershipNoticeDto {
   epoch: number;
 }
 
+export interface ReplyReferenceDto {
+  wire_id: string;
+  sentence?: number;
+}
+
 interface RecordCommonDto {
   version: 1;
   room_id: string;
@@ -135,6 +140,7 @@ export interface MessageRecordDto extends RecordCommonDto {
   recipient_identities: string[];
   source_msg_id?: number;
   source_wire_id?: string;
+  source_reply_to?: ReplyReferenceDto;
 }
 
 export interface RelayIntentRecordDto extends RecordCommonDto {
@@ -168,6 +174,7 @@ export interface FileRecordDto extends RecordCommonDto {
   recipient_identities: string[];
   source_file_id: number;
   source_wire_id?: string;
+  source_reply_to?: ReplyReferenceDto;
 }
 
 export interface MembershipIntentRecordDto extends RecordCommonDto {
@@ -301,8 +308,7 @@ export function isRoomDto(value: unknown): value is RoomDto {
 
   const exactPacketPending = value.state === 'provisioning'
     && value.status === 'packet_pending'
-    && (value.identity_name === `cowork-room-${value.room_id}`
-      || value.identity_name === `ours-cowork-room:${value.room_name}`)
+    && isPacketPendingIdentityName(value.room_id, value.room_name, value.identity_name)
     && value.invites.length === 0
     && value.seats.length === 0
     && value.activated_at === undefined
@@ -346,6 +352,12 @@ export function isRoomDto(value: unknown): value is RoomDto {
     }
   }
   return true;
+}
+
+function isPacketPendingIdentityName(_roomId: string, roomName: string, identityName: string): boolean {
+  const prefix = 'ours-cowork:';
+  const titleBudget = 64 - Array.from(prefix).length;
+  return identityName === `${prefix}${Array.from(roomName).slice(0, titleBudget).join('')}`;
 }
 
 export function isRoomListDto(value: unknown): value is RoomDto[] {
@@ -445,7 +457,7 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
       return hasExactKeys(
         value,
         [...RECORD_COMMON_KEYS, 'message_id', 'author', 'category', 'text', 'recipient_identities'],
-        ['author_alias', 'briefing_role', 'briefing_version', 'membership', 'source_msg_id', 'source_wire_id'],
+        ['author_alias', 'briefing_role', 'briefing_version', 'membership', 'source_msg_id', 'source_wire_id', 'source_reply_to'],
       )
         && isLowerCrockfordUlid(value.message_id)
         && isAuthor(value.author)
@@ -454,7 +466,8 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
         && isUtf8Bounded(value.text, MAX_TEXT_BYTES)
         && isUniqueStringArray(value.recipient_identities)
         && (value.source_msg_id === undefined || isNonNegativeSafeInteger(value.source_msg_id))
-        && optionalString(value.source_wire_id);
+        && optionalString(value.source_wire_id)
+        && (value.source_reply_to === undefined || isReplyReference(value.source_reply_to));
     case 'relay_intent':
       return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'recipient_identity'], ['message_id', 'file_id'])
         && hasExactlyOneRelaySubject(value)
@@ -469,7 +482,7 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
         && optionalString(value.metadata_wire_id);
     case 'file': {
       const decodedSize = canonicalBase64DecodedSize(value.data_base64);
-      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'file_id', 'author', 'filename', 'mime', 'size', 'sha256', 'data_base64', 'recipient_identities', 'source_file_id'], ['author_alias', 'source_wire_id'])
+      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'file_id', 'author', 'filename', 'mime', 'size', 'sha256', 'data_base64', 'recipient_identities', 'source_file_id'], ['author_alias', 'source_wire_id', 'source_reply_to'])
         && isLowerCrockfordUlid(value.file_id)
         && isAuthor(value.author)
         && (value.author_alias === undefined || isAuthorAlias(value.author_alias))
@@ -482,7 +495,8 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
         && decodedSize === value.size
         && isUniqueStringArray(value.recipient_identities)
         && isNonNegativeSafeInteger(value.source_file_id)
-        && optionalString(value.source_wire_id);
+        && optionalString(value.source_wire_id)
+        && (value.source_reply_to === undefined || isReplyReference(value.source_reply_to));
     }
     case 'membership_intent':
       return hasExactKeys(
@@ -669,6 +683,13 @@ function isMembershipNotice(value: unknown): value is MembershipNoticeDto {
     && optionalString(value.alias)
     && (value.role === undefined || isUtf8Bounded(value.role, MAX_ROLE_BYTES))
     && isNonNegativeSafeInteger(value.epoch);
+}
+
+function isReplyReference(value: unknown): value is ReplyReferenceDto {
+  return isRecord(value)
+    && hasExactKeys(value, ['wire_id'], ['sentence'])
+    && isString(value.wire_id)
+    && (value.sentence === undefined || isPositiveSafeInteger(value.sentence));
 }
 
 function isMessageCategory(value: Record<string, unknown>): boolean {

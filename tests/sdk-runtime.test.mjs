@@ -9,13 +9,14 @@ import {
   ContactAlreadyAbsentError,
   LegacyCoworkStateError,
   PacketRegistry,
+  RoomIdentityMismatchError,
   SdkRoomPacket,
 } from '../src/packets.ts';
 import { SharedOursHost } from '../src/ours-runtime.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
-const IDENTITY = `ours-cowork-${ROOM_ID}`;
-const FRIENDLY_IDENTITY = `ours-cowork-release-room-${ROOM_ID}`;
+const IDENTITY = 'ours-cowork:Room 01jz6y7n';
+const NAMED_IDENTITY = 'ours-cowork:Release room';
 const CID = 'AB'.repeat(32);
 const MESSAGE_WIRE = 'core-message-wire-in';
 const SECOND_MESSAGE_WIRE = 'core-message-wire-second';
@@ -27,6 +28,7 @@ const FILE_OUT_WIRE = '66'.repeat(32);
 
 class FakeClient {
   contacts = [];
+  origins;
   invites = [];
   messages = [];
   messageHistory = new Map();
@@ -36,6 +38,7 @@ class FakeClient {
   chooseResult = { name: IDENTITY, cid: CID, switchedFrom: null };
   chooseFailure;
   registeredCommands = [];
+  createFailure;
 
   async chooseIdentity(input) {
     this.calls.push(['chooseIdentity', input]);
@@ -45,10 +48,16 @@ class FakeClient {
 
   async createIdentity(input) {
     this.calls.push(['createIdentity', input]);
+    if (this.createFailure) throw this.createFailure;
     return { info: { cid: CID } };
   }
 
-  async listContacts() { return { contacts: structuredClone(this.contacts) }; }
+  async listContacts() {
+    return {
+      contacts: structuredClone(this.contacts),
+      ...(this.origins === undefined ? {} : { origins: structuredClone(this.origins) }),
+    };
+  }
   async listInvites() { return structuredClone(this.invites); }
   async listIncomingMessages() { return structuredClone(this.messages); }
   async listIncomingFiles() { return structuredClone(this.files); }
@@ -159,9 +168,88 @@ class FakeClient {
 
 function blankClient() { return new FakeClient(); }
 
+test('room packet single-flights typed lease recovery and retries only rejected operations', async () => {
+  const client = blankClient();
+  let rejected = 2;
+  client.sendMessage = async (input) => {
+    client.calls.push(['sendMessage', structuredClone(input)]);
+    if (rejected-- > 0) throw Object.assign(new Error('lost lease'), { code: 'NOT_BOUND' });
+    return { kind: 'sent', wireId: MESSAGE_OUT_WIRE };
+  };
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  const results = await Promise.all([
+    packet.send(CID, 'one'),
+    packet.send(CID, 'two'),
+  ]);
+  assert.deepEqual(results.map((result) => result.status), ['queued', 'queued']);
+  assert.equal(client.calls.filter(([name]) => name === 'chooseIdentity').length, 1);
+  assert.equal(client.calls.filter(([name]) => name === 'sendMessage').length, 4);
+});
+
+test('room packet fails CID mismatch immediately without retry or operation replay', async () => {
+  const client = blankClient();
+  client.chooseResult = { name: IDENTITY, cid: 'CD'.repeat(32), switchedFrom: null };
+  client.sendMessage = async () => { throw Object.assign(new Error('lost lease'), { code: 'BINDING_REASSIGNED' }); };
+  const packet = new SdkRoomPacket(IDENTITY, CID, client, { sleep: async () => assert.fail('must not back off') });
+  await assert.rejects(packet.send(CID, 'unsafe'), RoomIdentityMismatchError);
+  assert.equal(client.calls.filter(([name]) => name === 'chooseIdentity').length, 1);
+});
+
+test('room packet never force-binds or replays when a competing live session owns the identity', async () => {
+  const client = blankClient();
+  let sends = 0;
+  client.sendMessage = async () => {
+    sends += 1;
+    throw Object.assign(new Error('lost lease'), { code: 'NOT_BOUND' });
+  };
+  client.chooseFailure = Object.assign(new Error('owned elsewhere'), { code: 'BOUND_ELSEWHERE' });
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  await assert.rejects(packet.send(CID, 'do not steal'), (error) => error.code === 'BOUND_ELSEWHERE');
+  assert.equal(sends, 1);
+  assert.deepEqual(client.calls.filter(([name]) => name === 'chooseIdentity'), [
+    ['chooseIdentity', { name: IDENTITY, force: false }],
+  ]);
+});
+
+test('room packet retries explicitly transient rebind transport errors with bounded backoff', async () => {
+  const client = blankClient();
+  let attempts = 0;
+  client.chooseIdentity = async (input) => {
+    client.calls.push(['chooseIdentity', input]);
+    attempts += 1;
+    if (attempts < 3) throw Object.assign(new Error('socket reset'), { code: 'ECONNRESET' });
+    return client.chooseResult;
+  };
+  const delays = [];
+  const packet = new SdkRoomPacket(IDENTITY, CID, client, {
+    sleep: async (ms) => { delays.push(ms); }, random: () => 0.5,
+  });
+  assert.equal((await packet.rebind()).status, 'rebound');
+  assert.deepEqual(delays, [100, 200]);
+});
+
+test('contact-only reconciliation also auto-recovers a lost lease without recursive recovery', async () => {
+  const client = blankClient();
+  const original = client.listContacts.bind(client);
+  let first = true;
+  client.listContacts = async () => {
+    if (first) {
+      first = false;
+      throw Object.assign(new Error('not bound'), { code: 'NOT_BOUND' });
+    }
+    return original();
+  };
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  await packet.refreshContacts();
+  assert.equal(client.calls.filter(([name]) => name === 'chooseIdentity').length, 1);
+});
+
 test('SDK room packet maps message/file/reply state and uses only typed public operations', async () => {
   const client = blankClient();
   client.contacts = [{ name: 'Peer', container_id: CID }];
+  client.origins = {
+    [CID]: 'invite-1',
+  };
   client.invites = [{ invite_id: 'invite-1', mode: 'one_time', assigned: '', created: 'now' }];
   client.messages = [{
     seq: 1,
@@ -209,7 +297,11 @@ test('SDK room packet maps message/file/reply state and uses only typed public o
   const packet = new SdkRoomPacket(IDENTITY, CID, client);
   await packet.refresh();
 
-  assert.deepEqual(packet.listContacts(), client.contacts);
+  assert.equal(packet.supportsInviteProvenance, true);
+  assert.deepEqual(packet.listContacts(), [{
+    ...client.contacts[0],
+    accepted_via_invite_id: client.origins[CID],
+  }]);
   assert.deepEqual(packet.listInvites(), [{ invite_id: 'invite-1', mode: 'one_time' }]);
   assert.deepEqual(await packet.listUnreadMessages(32), [{
     msg_id: 7,
@@ -296,6 +388,15 @@ test('SDK room packet promotes an older raced message through intake before ackn
 
 test('SDK room packet publishes only the bounded membership commands and keeps handlers local', async () => {
   const client = blankClient();
+  const registerCommands = client.registerCommands.bind(client);
+  let leaseLost = true;
+  client.registerCommands = async (commands) => {
+    if (leaseLost) {
+      leaseLost = false;
+      throw Object.assign(new Error('not bound'), { code: 'NOT_BOUND' });
+    }
+    return registerCommands(commands);
+  };
   const packet = new SdkRoomPacket(IDENTITY, CID, client);
   const handlers = {
     listMembers: async () => ({ ok: true }),
@@ -315,6 +416,7 @@ test('SDK room packet publishes only the bounded membership commands and keeps h
     'participant_id', 'expected_membership_epoch', 'confirm', 'idempotency_key',
   ]);
   assert.deepEqual(client.registeredCommands[1].input_schema.properties.confirm, { const: true });
+  assert.equal(client.calls.filter(([name]) => name === 'chooseIdentity').length, 1);
 });
 
 test('SDK room packet drains typed rows without exposing them as chat or losing a raced text row', async () => {
@@ -337,6 +439,15 @@ test('SDK room packet drains typed rows without exposing them as chat or losing 
   const packet = new SdkRoomPacket(IDENTITY, CID, client);
   assert.deepEqual(await packet.listUnreadMessages(32), []);
 
+  const listIncomingMessages = client.listIncomingMessages.bind(client);
+  let leaseLost = true;
+  client.listIncomingMessages = async () => {
+    if (leaseLost) {
+      leaseLost = false;
+      throw Object.assign(new Error('binding reassigned'), { code: 'BINDING_REASSIGNED' });
+    }
+    return listIncomingMessages();
+  };
   client.getMessages = async (input) => {
     client.calls.push(['getMessages', structuredClone(input)]);
     command.status = 'read';
@@ -346,6 +457,7 @@ test('SDK room packet drains typed rows without exposing them as chat or losing 
   const unexpected = [];
   await packet.drainRuntimeCommands(async (item) => unexpected.push(item));
   assert.deepEqual(unexpected, []);
+  assert.equal(client.calls.filter(([name]) => name === 'chooseIdentity').length, 1);
   assert.deepEqual(await packet.listUnreadMessages(32), [{
     msg_id: 8, sender_id: CID, sender_name: 'Peer', text: 'raced text',
     date: '2026-08-15T08:00:00.000Z', wire_id: SECOND_MESSAGE_WIRE, reply_to: null,
@@ -555,8 +667,8 @@ test('fresh provisioning rejects a colliding name without creating a lease or ad
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
   const host = {
     async listIdentityNames(localNames) {
-      assert.deepEqual(localNames, new Set([FRIENDLY_IDENTITY]));
-      return new Set([FRIENDLY_IDENTITY]);
+      assert.deepEqual(localNames, new Set([NAMED_IDENTITY]));
+      return new Set([NAMED_IDENTITY]);
     },
     async createClient() { assert.fail('a collision must fail before creating a client lease'); },
     onIdentityNotify() { return () => {}; },
@@ -564,32 +676,122 @@ test('fresh provisioning rejects a colliding name without creating a lease or ad
   };
   const registry = new PacketRegistry(host, stateDir);
   await assert.rejects(
-    registry.create(ROOM_ID, FRIENDLY_IDENTITY),
-    /unproven.*refusing to adopt/i,
+    registry.create(ROOM_ID, NAMED_IDENTITY),
+    (error) => error instanceof OursError
+      && error.code === 'NAME_TAKEN'
+      && /unproven.*refusing to adopt/i.test(error.message),
   );
 });
 
-test('restore accepts persisted friendly names only with an exact durable CID', async (t) => {
+test('registry preserves exact typed SDK name refusals and wraps unknown provisioning failures', async (t) => {
+  for (const code of ['NAME_INVALID', 'NAME_TAKEN']) {
+    const stateDir = mkdtempSync(join(tmpdir(), `cowork-sdk-${code.toLowerCase()}-`));
+    t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+    const client = blankClient();
+    const refusal = new OursError(code, `typed ${code}`);
+    client.createFailure = refusal;
+    const host = {
+      async listIdentityNames() { return new Set(); }, async createClient() { return client; },
+      onIdentityNotify() { return () => {}; }, trackIdentity() { return () => {}; },
+    };
+    const registry = new PacketRegistry(host, stateDir);
+    await assert.rejects(registry.create(ROOM_ID, NAMED_IDENTITY), (error) => error === refusal);
+    assert(client.calls.some(([name]) => name === 'releaseLease'));
+  }
+
+  const stateDir = mkdtempSync(join(tmpdir(), 'cowork-sdk-unknown-name-create-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const client = blankClient();
+  const unknown = new Error('transport failed ambiguously');
+  client.createFailure = unknown;
+  const registry = new PacketRegistry({
+    async listIdentityNames() { return new Set(); }, async createClient() { return client; },
+    onIdentityNotify() { return () => {}; }, trackIdentity() { return () => {}; },
+  }, stateDir);
+  await assert.rejects(
+    registry.create(ROOM_ID, NAMED_IDENTITY),
+    (error) => error.cause === unknown && /failed to provision/.test(error.message),
+  );
+});
+
+test('registry wraps a structural OursError lookalike instead of treating it as a typed SDK refusal', async (t) => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'cowork-sdk-spoofed-name-error-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const client = blankClient();
+  const spoof = Object.assign(new Error('ambiguous partial failure'), {
+    name: 'OursError', code: 'NAME_TAKEN',
+  });
+  client.createFailure = spoof;
+  const registry = new PacketRegistry({
+    async listIdentityNames() { return new Set(); }, async createClient() { return client; },
+    onIdentityNotify() { return () => {}; }, trackIdentity() { return () => {}; },
+  }, stateDir);
+  await assert.rejects(
+    registry.create(ROOM_ID, NAMED_IDENTITY),
+    (error) => error !== spoof && error.cause === spoof && /failed to provision/.test(error.message),
+  );
+});
+
+test('concurrent registry creation closes the lookup race with one typed NAME_TAKEN loser', async (t) => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'cowork-sdk-concurrent-name-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  let lookups = 0;
+  let releaseLookups;
+  const lookupGate = new Promise((resolve) => { releaseLookups = resolve; });
+  const collision = new OursError('NAME_TAKEN', 'SDK concurrent winner owns the name');
+  let claimed = false;
+  const clients = [blankClient(), blankClient()];
+  const allClients = [...clients];
+  for (const client of clients) client.createIdentity = async (input) => {
+    client.calls.push(['createIdentity', input]);
+    if (claimed) throw collision;
+    claimed = true;
+    return { info: { cid: CID } };
+  };
+  const host = {
+    async listIdentityNames() {
+      lookups += 1;
+      if (lookups === 2) releaseLookups();
+      await lookupGate;
+      return new Set();
+    },
+    async createClient() { return clients.shift(); },
+    onIdentityNotify() { return () => {}; }, trackIdentity() { return () => {}; },
+  };
+  const registry = new PacketRegistry(host, stateDir);
+  const results = await Promise.allSettled([
+    registry.create(ROOM_ID, NAMED_IDENTITY),
+    registry.create('01jz6y7n8p9q0r1s2t3v4w5x70', NAMED_IDENTITY),
+  ]);
+  assert.equal(results.filter(({ status }) => status === 'fulfilled').length, 1);
+  const rejected = results.find(({ status }) => status === 'rejected');
+  assert.equal(rejected.reason, collision);
+  assert.equal(registry.size, 1);
+  assert.equal(allClients.filter((client) => client.calls.some(([name]) => name === 'releaseLease')).length, 1);
+  assert.equal(lookups, 2);
+});
+
+test('restore accepts a persisted named identity only with an exact durable CID', async (t) => {
   const stateDir = mkdtempSync(join(tmpdir(), 'cowork-sdk-friendly-restore-'));
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
   const client = blankClient();
-  client.chooseResult = { name: FRIENDLY_IDENTITY, cid: CID, switchedFrom: null };
+  client.chooseResult = { name: NAMED_IDENTITY, cid: CID, switchedFrom: null };
   const host = {
-    async listIdentityNames() { return new Set([FRIENDLY_IDENTITY]); },
+    async listIdentityNames() { return new Set([NAMED_IDENTITY]); },
     async createClient() { return client; },
     onIdentityNotify() { return () => {}; },
     trackIdentity() { return () => {}; },
   };
   const registry = new PacketRegistry(host, stateDir);
   await assert.rejects(
-    registry.restore(ROOM_ID, undefined, FRIENDLY_IDENTITY),
+    registry.restore(ROOM_ID, undefined, NAMED_IDENTITY),
     /without a durably recorded expected CID/i,
   );
-  const packet = await registry.restore(ROOM_ID, CID, FRIENDLY_IDENTITY);
-  assert.equal(packet.name, FRIENDLY_IDENTITY);
+  const packet = await registry.restore(ROOM_ID, CID, NAMED_IDENTITY);
+  assert.equal(packet.name, NAMED_IDENTITY);
   assert.equal(packet.cid, CID);
   assert.deepEqual(client.calls.find(([name]) => name === 'chooseIdentity'), [
-    'chooseIdentity', { name: FRIENDLY_IDENTITY, force: false },
+    'chooseIdentity', { name: NAMED_IDENTITY, force: false },
   ]);
 });
 

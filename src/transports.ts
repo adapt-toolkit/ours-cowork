@@ -108,6 +108,7 @@ export interface RoomServiceApi {
   revokeInvite(roomId: string, inviteId: string): Promise<unknown>;
   recoverInvites(roomId: string): Promise<unknown>;
   confirmRecoveredInvite(roomId: string, recoveryOf: string, inviteId: string): Promise<unknown>;
+  rebindIdentity(roomId: string): Promise<unknown>;
   removeParticipant(roomId: string, input: unknown): Promise<unknown>;
   replaceParticipant(roomId: string, input: unknown): Promise<unknown>;
   listRooms(): Promise<unknown>;
@@ -211,6 +212,7 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
       const value = RecoverConfirmParams.parse(params);
       return service.confirmRecoveredInvite(value.room_id, value.recovery_of, value.invite_id);
     } },
+    'room.rebind': { auth: true, run: (params) => service.rebindIdentity(RoomIdParams.parse(params).room_id) },
     'room.list': { auth: true, run: (params) => {
       z.object({}).strict().parse(params);
       return service.listRooms();

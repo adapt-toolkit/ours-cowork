@@ -244,7 +244,9 @@ test('built distribution remains standalone and delegates packet ownership to th
   assert.deepEqual(WEB_RELEASE_ARTIFACTS.filter((path) => !builtWebFiles.map(normalized).includes(path)), []);
   assert.match(readFileSync(join(ROOT, 'dist', 'cli.js'), 'utf8'), /room_name/);
   assert.match(readFileSync(join(ROOT, 'dist', 'cli.js'), 'utf8'), /--name/);
-  assert.match(readFileSync(join(ROOT, 'dist', 'web', 'assets', 'app.js'), 'utf8'), /room_name/);
+  const builtApp = readFileSync(join(ROOT, 'dist', 'web', 'assets', 'app.js'), 'utf8');
+  assert.match(builtApp, /room_name/);
+  assert.match(builtApp, /source_reply_to/);
   assert.equal(existsSync(join(ROOT, 'dist', 'mufl_code')), false);
   const daemon = readFileSync(join(ROOT, 'dist', 'daemon.js'), 'utf8');
   assert.match(daemon, /attachOursClient/);

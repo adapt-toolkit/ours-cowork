@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import { join } from 'node:path';
 import { brotliCompressSync, brotliDecompressSync, constants as zlibConstants } from 'node:zlib';
 
-import type { OursClient } from '@ours.network/sdk';
+import type { CommandContext, JsonValue, OursClient } from '@ours.network/sdk';
 
 import {
   FileMimeSchema,
@@ -49,6 +49,17 @@ export interface FileInboxItem {
   reply_to: ReplyReference | null;
 }
 
+export interface RoomRuntimeCommandHandlers {
+  listMembers(
+    input: JsonValue,
+    context: Readonly<CommandContext>,
+  ): JsonValue | Promise<JsonValue>;
+  removeMember(
+    input: JsonValue,
+    context: Readonly<CommandContext>,
+  ): JsonValue | Promise<JsonValue>;
+}
+
 export interface RoomPacket {
   readonly name: string;
   readonly cid: string;
@@ -64,6 +75,10 @@ export interface RoomPacket {
   listContacts(): Array<{ name: string; container_id: string }>;
   /** Reconcile only contacts before retry-sensitive removal work. */
   refreshContacts(): Promise<void>;
+  /** Replace the room identity's public catalog with the bounded cowork command set. */
+  registerRuntimeCommands?(handlers: RoomRuntimeCommandHandlers): Promise<void>;
+  /** Consume leading typed rows while the caller holds the room mutex. */
+  drainRuntimeCommands?(onUnexpected: (item: InboxItem) => Promise<void>): Promise<void>;
   listUnreadMessages(limit: number): Promise<InboxItem[]>;
   acknowledgeMessage(expected: InboxItem, onUnexpected: (item: InboxItem) => Promise<void>): Promise<void>;
   listUnreadFiles(limit: number): Promise<FileInboxItem[]>;
@@ -306,10 +321,55 @@ export class SdkRoomPacket implements RoomPacket {
   listInvites(): Array<{ invite_id: string; mode: InviteMode }> { return this.invites.map((invite) => ({ ...invite })); }
   listContacts(): Array<{ name: string; container_id: string }> { return this.contacts.map((contact) => ({ ...contact })); }
 
+  async registerRuntimeCommands(handlers: RoomRuntimeCommandHandlers): Promise<void> {
+    await this.client.registerCommands([
+      {
+        name: 'list-members',
+        description: 'List the room roster using contact-safe member fields.',
+        input_schema: { type: 'object', additionalProperties: false },
+        handler: handlers.listMembers,
+      },
+      {
+        name: 'remove-member',
+        description: 'Remove one room member by stable participant ID with revision and consent gates.',
+        input_schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['participant_id', 'expected_membership_epoch', 'confirm', 'idempotency_key'],
+          properties: {
+            participant_id: { type: 'string', pattern: '^[0-7][0-9a-hjkmnp-tv-z]{25}$' },
+            expected_membership_epoch: { type: 'integer', minimum: 0 },
+            confirm: { const: true },
+            idempotency_key: { type: 'string', pattern: '^[A-Za-z0-9._:-]{1,128}$' },
+          },
+        },
+        handler: handlers.removeMember,
+      },
+    ]);
+  }
+
+  async drainRuntimeCommands(onUnexpected: (item: InboxItem) => Promise<void>): Promise<void> {
+    for (;;) {
+      const [oldest] = (await this.client.listIncomingMessages())
+        .filter((message) => message.status === 'unread')
+        .sort((left, right) => left.seq - right.seq);
+      if (oldest === undefined || oldest.message_kind === undefined || oldest.message_kind === 'text') return;
+      const pulled = await this.client.getMessages({ limit: 1 });
+      if (pulled.messages.length > 1) throw new Error('SDK returned more than one message for limit 1');
+      for (const history of pulled.messages) await onUnexpected(messageItem(history, 'read'));
+      if (pulled.messages.length === 0
+        && pulled.commands_handled === 0
+        && pulled.command_results.length === 0) {
+        throw new Error(`SDK did not consume leading typed message ${oldest.wire_id}`);
+      }
+    }
+  }
+
   async listUnreadMessages(limit: number): Promise<InboxItem[]> {
     validateBatchLimit(limit);
     const metadata = (await this.client.listIncomingMessages())
-      .filter((message) => message.status === 'unread')
+      .filter((message) => message.status === 'unread'
+        && (message.message_kind === undefined || message.message_kind === 'text'))
       .sort((left, right) => left.seq - right.seq)
       .slice(0, limit);
     return Promise.all(metadata.map(async (listed) => {

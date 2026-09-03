@@ -33,6 +33,7 @@ class FakeClient {
   calls = [];
   chooseResult = { name: IDENTITY, cid: CID, switchedFrom: null };
   chooseFailure;
+  registeredCommands = [];
 
   async chooseIdentity(input) {
     this.calls.push(['chooseIdentity', input]);
@@ -49,6 +50,11 @@ class FakeClient {
   async listInvites() { return structuredClone(this.invites); }
   async listIncomingMessages() { return structuredClone(this.messages); }
   async listIncomingFiles() { return structuredClone(this.files); }
+
+  async registerCommands(commands) {
+    this.registeredCommands = commands;
+    this.calls.push(['registerCommands', commands.map(({ handler: _handler, ...command }) => structuredClone(command))]);
+  }
 
   async getHistoryItem(input) {
     this.calls.push(['getHistoryItem', structuredClone(input)]);
@@ -284,6 +290,82 @@ test('SDK room packet promotes an older raced message through intake before ackn
     [['getMessages', { limit: 1 }], ['getMessages', { limit: 1 }]],
   );
   assert.equal(client.messages.every((message) => message.status === 'read'), true);
+});
+
+test('SDK room packet publishes only the bounded membership commands and keeps handlers local', async () => {
+  const client = blankClient();
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  const handlers = {
+    listMembers: async () => ({ ok: true }),
+    removeMember: async () => ({ ok: true }),
+  };
+  await packet.registerRuntimeCommands(handlers);
+  assert.deepEqual(client.registeredCommands.map((command) => command.name), [
+    'list-members', 'remove-member',
+  ]);
+  assert.equal(client.registeredCommands.some((command) => command.name === 'add-seat'), false);
+  assert.equal(client.registeredCommands[0].handler, handlers.listMembers);
+  assert.equal(client.registeredCommands[1].handler, handlers.removeMember);
+  assert.deepEqual(client.registeredCommands[0].input_schema, {
+    type: 'object', additionalProperties: false,
+  });
+  assert.deepEqual(client.registeredCommands[1].input_schema.required, [
+    'participant_id', 'expected_membership_epoch', 'confirm', 'idempotency_key',
+  ]);
+  assert.deepEqual(client.registeredCommands[1].input_schema.properties.confirm, { const: true });
+});
+
+test('SDK room packet drains typed rows without exposing them as chat or losing a raced text row', async () => {
+  const client = blankClient();
+  const command = {
+    seq: 1, msg_id: 7, from: { id: CID, name: 'Peer' }, status: 'unread',
+    inbox_state: 'unread', wire_id: 'wire-command', message_kind: 'command',
+  };
+  const text = {
+    seq: 2, msg_id: 8, from: { id: CID, name: 'Peer' }, status: 'unread',
+    inbox_state: 'unread', wire_id: SECOND_MESSAGE_WIRE, message_kind: 'text',
+    date: '2026-08-15T08:00:00Z', occurred_at_ms: Date.parse('2026-08-15T08:00:00Z'),
+    reply_to: null,
+  };
+  client.messages = [command, text];
+  client.messageHistory.set(SECOND_MESSAGE_WIRE, {
+    ...text, peer: text.from, direction: 'in', text: 'raced text', body: 'raced text',
+    date: '2026-08-15T08:00:00Z', reply_to: null,
+  });
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  assert.deepEqual(await packet.listUnreadMessages(32), [{
+    msg_id: 8, sender_id: CID, sender_name: 'Peer', text: 'raced text',
+    date: '2026-08-15T08:00:00.000Z', wire_id: SECOND_MESSAGE_WIRE, reply_to: null,
+  }]);
+
+  client.getMessages = async (input) => {
+    client.calls.push(['getMessages', structuredClone(input)]);
+    command.status = 'read';
+    command.inbox_state = 'read';
+    return { messages: [], command_results: [], commands_handled: 1, remaining: 1 };
+  };
+  const unexpected = [];
+  await packet.drainRuntimeCommands(async (item) => unexpected.push(item));
+  assert.deepEqual(unexpected, []);
+  assert.equal(text.status, 'unread');
+
+  // If the SDK snapshot races and returns an ordinary row, Cowork hands that
+  // row straight to intake instead of silently consuming it.
+  command.status = 'unread';
+  command.inbox_state = 'unread';
+  client.getMessages = async () => {
+    command.status = 'read';
+    text.status = 'read';
+    return {
+      messages: [{
+        ...structuredClone(client.messageHistory.get(SECOND_MESSAGE_WIRE)),
+        status: 'read', inbox_state: 'read',
+      }],
+      command_results: [], commands_handled: 0, remaining: 0,
+    };
+  };
+  await packet.drainRuntimeCommands(async (item) => unexpected.push(item));
+  assert.deepEqual(unexpected.map((item) => item.wire_id), [SECOND_MESSAGE_WIRE]);
 });
 
 test('SDK room packet treats an empty message acknowledgement as an already-read expected row', async () => {

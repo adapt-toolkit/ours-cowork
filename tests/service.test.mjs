@@ -99,6 +99,7 @@ class FakePacket {
     inviter_name: 'External inviter',
     pending_name: '',
   };
+  runtimeCommands;
 
   constructor(name, cid) { this.name = name; this.cid = cid; }
 
@@ -127,6 +128,7 @@ class FakePacket {
 
   listInvites() { return structuredClone(this.invites); }
   listContacts() { return structuredClone(this.contacts); }
+  async registerRuntimeCommands(handlers) { this.runtimeCommands = handlers; }
   listUnreadMessages() { return Promise.resolve([]); }
   listUnreadFiles() { return Promise.resolve([]); }
   acknowledgeFile() { return Promise.resolve(); }
@@ -1277,6 +1279,100 @@ test('removeParticipant journals intent/result, severs the channel, bumps the ep
 
   // a second removal of the same participant is an explicit error
   await assert.rejects(f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' }), /active/i);
+});
+
+test('runtime membership commands authorize by trusted CID, redact the roster, and durably replay removal', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'builder', min_accepts: 1,
+  });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  await admit(f, invite, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
+  const packet = f.registry.get(ROOM_ID);
+  const roomBefore = await f.service.showRoom(ROOM_ID);
+  const alice = roomBefore.seats.find((seat) => seat.identity === 'cid-alice');
+  const bob = roomBefore.seats.find((seat) => seat.identity === 'cid-bob');
+  const aliceContext = Object.freeze({
+    sender_cid: 'cid-alice',
+    sender_name: 'Bob (spoofed)',
+    request_wire_id: 'wire-remove-alice-1',
+  });
+
+  const listed = await packet.runtimeCommands.listMembers({}, aliceContext);
+  assert.deepEqual(listed, {
+    ok: true,
+    membership_epoch: roomBefore.membership_epoch,
+    members: roomBefore.seats.map((seat) => ({
+      participant_id: seat.participant_id,
+      role: seat.role,
+      state: seat.state,
+    })),
+  });
+  const serialized = JSON.stringify(listed);
+  for (const secret of ['cid-alice', 'cid-bob', 'Alice', 'Bob', 'invite_id', 'accepted_at']) {
+    assert.equal(serialized.includes(secret), false, `list result leaked ${secret}`);
+  }
+  assert.deepEqual(await packet.runtimeCommands.listMembers({}, {
+    sender_cid: 'cid-outsider', sender_name: 'Alice', request_wire_id: 'wire-list-outsider',
+  }), { ok: false, error: 'unauthorized' });
+
+  const baseRequest = {
+    participant_id: alice.participant_id,
+    expected_membership_epoch: roomBefore.membership_epoch,
+    confirm: true,
+    idempotency_key: 'remove-self-1',
+  };
+  assert.deepEqual(await packet.runtimeCommands.removeMember({ ...baseRequest, confirm: false }, aliceContext), {
+    ok: false, error: 'invalid_request',
+  });
+  assert.deepEqual(await packet.runtimeCommands.removeMember({
+    ...baseRequest, expected_membership_epoch: roomBefore.membership_epoch - 1,
+  }, aliceContext), {
+    ok: false,
+    error: 'stale_membership_epoch',
+    membership_epoch: roomBefore.membership_epoch,
+  });
+  assert.deepEqual(await packet.runtimeCommands.removeMember(baseRequest, {
+    sender_cid: 'cid-outsider', sender_name: 'Alice', request_wire_id: 'wire-remove-outsider',
+  }), { ok: false, error: 'unauthorized' });
+  assert.equal(membershipRecords(await f.store.read(ROOM_ID)).intents.length, 0);
+
+  const removed = await packet.runtimeCommands.removeMember(baseRequest, aliceContext);
+  assert.deepEqual(removed, {
+    ok: true,
+    participant_id: alice.participant_id,
+    membership_epoch: roomBefore.membership_epoch + 1,
+    removed: true,
+  });
+  const firstRecords = await f.store.read(ROOM_ID);
+  const firstMembership = membershipRecords(firstRecords);
+  assert.equal(firstMembership.intents.length, 1);
+  assert.equal(firstMembership.results.length, 1);
+  assert.deepEqual(firstMembership.intents[0].command, {
+    sender_cid: 'cid-alice',
+    sender_participant_id: alice.participant_id,
+    request_wire_id: 'wire-remove-alice-1',
+    idempotency_key: 'remove-self-1',
+    expected_membership_epoch: roomBefore.membership_epoch,
+  });
+  assert.deepEqual(packet.removeContactCalls, ['cid-alice']);
+
+  // The caller is now removed, but the durable sender-CID/key pair still makes
+  // delivery retries deterministic and does not repeat the mutation.
+  assert.deepEqual(await packet.runtimeCommands.removeMember(baseRequest, {
+    ...aliceContext, request_wire_id: 'wire-remove-alice-retry',
+  }), removed);
+  assert.deepEqual(await packet.runtimeCommands.removeMember({
+    ...baseRequest, participant_id: bob.participant_id,
+  }, { ...aliceContext, request_wire_id: 'wire-remove-alice-conflict' }), {
+    ok: false, error: 'idempotency_conflict',
+  });
+  const settledMembership = membershipRecords(await f.store.read(ROOM_ID));
+  assert.equal(settledMembership.intents.length, 1);
+  assert.equal(settledMembership.results.length, 1);
+  assert.deepEqual(packet.removeContactCalls, ['cid-alice']);
+  assert.equal((await f.service.showRoom(ROOM_ID)).membership_epoch, roomBefore.membership_epoch + 1);
 });
 
 test('quiet_membership and notify:false suppress the announcement but never the journal', async () => {

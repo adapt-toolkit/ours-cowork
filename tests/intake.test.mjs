@@ -84,6 +84,13 @@ class FakePacket {
   beforeConsumeFile;
   afterConsumeFile;
   beforeSendFile;
+  drainCalls = 0;
+  onDrain;
+
+  async drainRuntimeCommands(onUnexpected) {
+    this.drainCalls += 1;
+    if (this.onDrain) await this.onDrain(onUnexpected);
+  }
 
   async listUnreadMessages(limit) {
     this.listCalls.push(['messages', limit]);
@@ -608,6 +615,22 @@ test('an older row promoted after listing takes the full intake path before the 
   assert.equal(byKind(records, 'relay_intent').length, 4);
   assert.equal(byKind(records, 'relay_result').length, 4);
   assert.deepEqual(f.packet.inbox, []);
+});
+
+test('typed command draining runs under the room mutex before each ordinary inbox snapshot', async () => {
+  const f = fixture();
+  let first = true;
+  f.packet.onDrain = async (onUnexpected) => {
+    if (!first) return;
+    first = false;
+    await onUnexpected(incoming({ text: 'Raced ordinary row', wire_id: 'wire-raced-text' }));
+  };
+  await f.pump.pump(ROOM_ID);
+  const messages = (await f.store.read(ROOM_ID)).filter((record) => record.kind === 'message');
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].source_wire_id, 'wire-raced-text');
+  assert.equal(f.packet.drainCalls >= 1, true);
+  assert.deepEqual(f.packet.listCalls.slice(0, 2).map(([kind]) => kind), ['messages', 'files']);
 });
 
 test('an empty acknowledgement response treats the durably archived expected row as already read', async () => {

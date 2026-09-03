@@ -666,6 +666,30 @@ export const AcceptExternalInviteInputSchema = z.object({
   replaces_seat: LowerCrockfordUlidSchema.optional(),
 }).strict();
 
+/** Public runtime-command inputs are deliberately smaller than operator APIs. */
+export const ListMembersCommandInputSchema = z.object({}).strict();
+
+export const CommandIdempotencyKeySchema = z.string().regex(
+  /^[A-Za-z0-9._:-]{1,128}$/,
+  'must contain 1-128 portable idempotency-key characters',
+);
+
+export const RemoveMemberCommandInputSchema = z.object({
+  participant_id: LowerCrockfordUlidSchema,
+  expected_membership_epoch: z.number().int().nonnegative().safe(),
+  confirm: z.literal(true),
+  idempotency_key: CommandIdempotencyKeySchema,
+}).strict();
+
+/** Durable provenance for one authorized remote membership mutation. */
+export const RuntimeCommandAuditSchema = z.object({
+  sender_cid: NonEmptyStringSchema,
+  sender_participant_id: LowerCrockfordUlidSchema,
+  request_wire_id: NonEmptyStringSchema,
+  idempotency_key: CommandIdempotencyKeySchema,
+  expected_membership_epoch: z.number().int().nonnegative().safe(),
+}).strict();
+
 export const AuthorSnapshotSchema = z.object({
   identity: NonEmptyStringSchema,
   display_name: NonEmptyStringSchema,
@@ -793,6 +817,7 @@ const MembershipIntentShape = {
   alias: NonEmptyStringSchema.optional(),
   epoch: PositiveSafeIntegerSchema,
   notify: z.boolean(),
+  command: RuntimeCommandAuditSchema.optional(),
 } as const;
 
 const MembershipResultShape = {

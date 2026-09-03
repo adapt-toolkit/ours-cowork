@@ -239,7 +239,7 @@ if (process.argv.includes('--e2e-driver')) {
 
     try {
       assert(existsSync(CLI), 'build the daemon and CLI before running E2E');
-      assert(existsSync(OURS_CLI), 'install @ours.network/cli 2.0.1 before running E2E');
+      assert(existsSync(OURS_CLI), 'install @ours.network/cli 2.7.0 before running E2E');
       const port = await unusedPort();
 
       broker = spawn(process.execPath, [join(ROOT, 'node_modules/.bin/adapt-broker'), '--host', '127.0.0.1', '--port', String(port), '--test_mode'], {
@@ -371,6 +371,60 @@ if (process.argv.includes('--e2e-driver')) {
       await waitFor(async () => (await runCli(['room', 'participants', roomId]))
         .some((seat) => seat.identity === charlie.cid), 'shared-daemon invite admission after cowork restart');
       stage('restart-and-live-invite');
+
+      room = await runCli(['room', 'show', roomId]);
+      const catalog = await waitFor(async () => {
+        const commands = await alice.client.listContactCommands({ contact: roomCid });
+        return commands.length === 2 ? commands : undefined;
+      }, 'bounded room command catalog');
+      assert.deepEqual(catalog.map((command) => command.name), ['list-members', 'remove-member']);
+      const listRequest = await alice.client.sendCommand({
+        contact: roomCid, command: 'list-members', arguments: {},
+      });
+      const listResult = await waitFor(async () => {
+        const pulled = await alice.client.getMessages();
+        return pulled.command_results.find((result) =>
+          result.reply_to?.wire_id === listRequest.wireId);
+      }, 'correlated list-members result');
+      assert.equal(listResult.reply_to.wire_id, listRequest.wireId);
+      const listedOutcome = JSON.parse(listResult.body);
+      assert.equal(listedOutcome.ok, true);
+      assert.equal(listedOutcome.result.ok, true);
+      assert.equal(listedOutcome.result.membership_epoch, room.membership_epoch);
+      assert.equal(listedOutcome.result.members.some((member) =>
+        member.participant_id === room.seats[0].participant_id), true);
+      assert.equal(JSON.stringify(listedOutcome).includes(alice.cid), false);
+
+      const charlieSeat = room.seats.find((seat) => seat.identity === charlie.cid);
+      const removeArguments = {
+        participant_id: charlieSeat.participant_id,
+        expected_membership_epoch: room.membership_epoch,
+        confirm: true,
+        idempotency_key: 'e2e-remove-charlie-1',
+      };
+      const removeRequest = await alice.client.sendCommand({
+        contact: roomCid, command: 'remove-member', arguments: removeArguments,
+      });
+      const removeResult = await waitFor(async () => {
+        const pulled = await alice.client.getMessages();
+        return pulled.command_results.find((result) =>
+          result.reply_to?.wire_id === removeRequest.wireId);
+      }, 'correlated remove-member result');
+      assert.equal(removeResult.reply_to.wire_id, removeRequest.wireId);
+      const removedOutcome = JSON.parse(removeResult.body);
+      assert.deepEqual(removedOutcome, {
+        ok: true,
+        result: {
+          ok: true,
+          participant_id: charlieSeat.participant_id,
+          membership_epoch: room.membership_epoch + 1,
+          removed: true,
+        },
+      });
+      await waitFor(async () => (await runCli(['room', 'participants', roomId]))
+        .find((seat) => seat.participant_id === charlieSeat.participant_id)?.state === 'removed',
+      'typed removal persistence');
+      stage('typed-commands');
 
       const closed = await runCli(['room', 'close', roomId]);
       assert.equal(closed.state, 'closed');

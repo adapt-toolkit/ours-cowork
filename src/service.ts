@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { z } from 'zod';
+import type { CommandContext, JsonValue } from '@ours.network/sdk';
 
 import {
   AcceptExternalInviteInputSchema,
@@ -14,8 +15,10 @@ import {
   LowerCrockfordUlidSchema,
   MAX_EXTERNAL_INVITE_BYTES,
   MAX_HISTORY_PAGE_BYTES,
+  ListMembersCommandInputSchema,
   PostAsRoleInputSchema,
   PostMessageInputSchema,
+  RemoveMemberCommandInputSchema,
   RestRoleInputSchema,
   ROOM_ROLE,
   RoleBriefingDeleteInputSchema,
@@ -245,7 +248,9 @@ export class RoomService {
       );
       this.provisioningCheckpoint('metadata');
       const { status: _packetPending, ...created } = provisional;
-      return this.store.save(RoomSchema.parse({ ...created, identity_cid: packet.cid }));
+      const room = await this.store.save(RoomSchema.parse({ ...created, identity_cid: packet.cid }));
+      await this.registerRuntimeCommands(roomId, packet);
+      return room;
     });
   }
 
@@ -308,7 +313,118 @@ export class RoomService {
       const { status: _packetPending, ...established } = room;
       room = await this.store.save(RoomSchema.parse({ ...established, identity_cid: packet.cid }));
     }
+    await this.registerRuntimeCommands(id, packet);
     return room;
+  }
+
+  private async registerRuntimeCommands(roomId: string, packet: RoomPacket): Promise<void> {
+    await packet.registerRuntimeCommands?.({
+      listMembers: (input, context) => this.listMembersCommandUnlocked(roomId, input, context),
+      removeMember: (input, context) => this.removeMemberCommandUnlocked(roomId, input, context),
+    });
+  }
+
+  /** Called only by the intake pump while it already owns the room mutex. */
+  private async listMembersCommandUnlocked(
+    roomId: string,
+    input: JsonValue,
+    context: Readonly<CommandContext>,
+  ): Promise<JsonValue> {
+    const request = ListMembersCommandInputSchema.safeParse(input);
+    if (!request.success) return { ok: false, error: 'invalid_request' };
+    const room = await this.store.load(roomId);
+    if (room.state !== 'active') return { ok: false, error: 'room_unavailable' };
+    const caller = room.seats.find((seat) =>
+      seat.state === 'active' && seat.identity === context.sender_cid);
+    if (!caller) return { ok: false, error: 'unauthorized' };
+    return {
+      ok: true,
+      membership_epoch: room.membership_epoch,
+      members: room.seats.map((seat) => ({
+        participant_id: seat.participant_id,
+        role: seat.role,
+        state: seat.state,
+      })),
+    };
+  }
+
+  /** Called only by the intake pump while it already owns the room mutex. */
+  private async removeMemberCommandUnlocked(
+    roomId: string,
+    input: JsonValue,
+    context: Readonly<CommandContext>,
+  ): Promise<JsonValue> {
+    const parsed = RemoveMemberCommandInputSchema.safeParse(input);
+    if (!parsed.success) return { ok: false, error: 'invalid_request' };
+    const request = parsed.data;
+    const room = await this.store.load(roomId);
+    const records = await this.store.read(roomId);
+    const prior = records.find((record): record is MembershipIntentRecord =>
+      record.kind === 'membership_intent'
+      && record.command?.sender_cid === context.sender_cid
+      && record.command.idempotency_key === request.idempotency_key);
+
+    // Resolve a durable replay before checking current membership. This keeps a
+    // successfully authorized self-removal retryable after its seat is removed.
+    if (prior !== undefined) {
+      if (prior.participant_id !== request.participant_id
+        || prior.command?.expected_membership_epoch !== request.expected_membership_epoch) {
+        return { ok: false, error: 'idempotency_conflict' };
+      }
+      const completed = await this.completeRemovalUnlocked(room, prior);
+      return {
+        ok: true,
+        participant_id: prior.participant_id,
+        membership_epoch: completed.receipt.epoch,
+        removed: true,
+      };
+    }
+
+    if (room.state !== 'active') return { ok: false, error: 'room_unavailable' };
+    const caller = room.seats.find((seat) =>
+      seat.state === 'active' && seat.identity === context.sender_cid);
+    if (!caller) return { ok: false, error: 'unauthorized' };
+    if (room.membership_epoch !== request.expected_membership_epoch) {
+      return {
+        ok: false,
+        error: 'stale_membership_epoch',
+        membership_epoch: room.membership_epoch,
+      };
+    }
+    const target = room.seats.find((seat) =>
+      seat.state === 'active' && seat.participant_id === request.participant_id);
+    if (!target) return { ok: false, error: 'member_not_found' };
+
+    const intent = await this.store.append(roomId, {
+      version: 1,
+      kind: 'membership_intent',
+      room_id: roomId,
+      at: this.now(),
+      action: 'remove',
+      participant_id: target.participant_id,
+      recipient_identity: target.identity,
+      role: target.role,
+      alias: target.alias ?? target.display_name,
+      epoch: room.membership_epoch + 1,
+      notify: !room.quiet_membership,
+      command: {
+        sender_cid: context.sender_cid,
+        sender_participant_id: caller.participant_id,
+        request_wire_id: context.request_wire_id,
+        idempotency_key: request.idempotency_key,
+        expected_membership_epoch: request.expected_membership_epoch,
+      },
+    });
+    if (intent.kind !== 'membership_intent') {
+      throw new RoomServiceError('storage returned the wrong membership intent kind');
+    }
+    const completed = await this.completeRemovalUnlocked(room, intent);
+    return {
+      ok: true,
+      participant_id: target.participant_id,
+      membership_epoch: completed.receipt.epoch,
+      removed: true,
+    };
   }
 
   async updateRoom(roomId: string, input: unknown): Promise<Room> {

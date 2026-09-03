@@ -36,6 +36,16 @@ export const LowerCrockfordUlidSchema = z.string().regex(
   'must be a 26-character lowercase Crockford ULID',
 );
 
+export const ContainerIdSchema = z.string().regex(/^[0-9a-f]{64}$/i, 'must be a 64-character hexadecimal CID')
+  .transform((value) => value.toUpperCase());
+
+export const RuntimeCommandNameSchema = z.enum(['list-members', 'remove-member']);
+
+export const RuntimeCommandGrantSchema = z.object({
+  caller_cid: ContainerIdSchema,
+  command: RuntimeCommandNameSchema,
+}).strict();
+
 function isStrictRfc3339(value: string): boolean {
   const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/.exec(value);
   if (!match) return false;
@@ -467,6 +477,8 @@ const CurrentRoomSchema = z.object({
       seen.add(role);
     }
   }),
+  /** Operator-managed, default-deny grants for the room identity's runtime commands. */
+  command_grants: z.array(RuntimeCommandGrantSchema),
   anonymous: z.boolean(),
   quiet_membership: z.boolean(),
   membership_epoch: z.number().int().nonnegative().safe(),
@@ -527,6 +539,25 @@ const CurrentRoomSchema = z.object({
       });
     }
   }
+  const seenCommandGrants = new Set<string>();
+  for (const [index, grant] of room.command_grants.entries()) {
+    const key = `${grant.caller_cid}\0${grant.command}`;
+    if (seenCommandGrants.has(key)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['command_grants', index],
+        message: 'runtime command grants must be unique by caller CID and command',
+      });
+    }
+    seenCommandGrants.add(key);
+    if (!room.seats.some((seat) => seat.state === 'active' && seat.identity === grant.caller_cid)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['command_grants', index, 'caller_cid'],
+        message: 'runtime command grants require an active room identity',
+      });
+    }
+  }
   for (const [index, seat] of room.seats.entries()) {
     if (seat.replaces_seat === undefined) continue;
     const predecessor = byParticipant.get(seat.replaces_seat);
@@ -562,8 +593,8 @@ export function defaultRoomName(roomId: string): string {
 }
 
 /**
- * room_name and rest_roles were added additively to metadata v2. Accept an
- * otherwise-valid room missing either one long enough for the default to apply.
+ * room_name, rest_roles, and command_grants were added additively to metadata
+ * v2. Accept an otherwise-valid room missing any one long enough for defaults.
  *
  * TRAP: each default is injected independently. A single guard on the first
  * field would skip the second on every room that already carries the first —
@@ -579,6 +610,7 @@ export const RoomSchema = z.preprocess((value) => {
     }
   }
   if (!Object.hasOwn(value, 'rest_roles')) patch.rest_roles = [];
+  if (!Object.hasOwn(value, 'command_grants')) patch.command_grants = [];
   if (Object.keys(patch).length === 0) return value;
   return { ...value, ...patch };
 }, CurrentRoomSchema);
@@ -594,6 +626,7 @@ export function migrateRoomV1(
     mission: { ...room.mission, briefing_version: 1 },
     role_briefings: {},
     rest_roles: [],
+    command_grants: [],
     anonymous: false,
     quiet_membership: false,
     membership_epoch: 0,
@@ -653,9 +686,6 @@ export const RestRoleInputSchema = z.object({
   role: RoleSchema,
 }).strict();
 
-export const ContainerIdSchema = z.string().regex(/^[0-9a-f]{64}$/i, 'must be a 64-character hexadecimal CID')
-  .transform((value) => value.toUpperCase());
-
 export const AcceptExternalInviteInputSchema = z.object({
   role: RoleSchema,
   invite: z.string().refine(
@@ -680,6 +710,9 @@ export const RemoveMemberCommandInputSchema = z.object({
   confirm: z.literal(true),
   idempotency_key: CommandIdempotencyKeySchema,
 }).strict();
+
+/** Local operator input for one exact per-room, per-command caller grant. */
+export const RuntimeCommandGrantInputSchema = RuntimeCommandGrantSchema;
 
 /** Durable provenance for one authorized remote membership mutation. */
 export const RuntimeCommandAuditSchema = z.object({
@@ -974,6 +1007,8 @@ export type RoomState = z.infer<typeof RoomStateSchema>;
 export type SeatState = z.infer<typeof SeatStateSchema>;
 export type InviteMode = z.infer<typeof InviteModeSchema>;
 export type RelayStatus = z.infer<typeof RelayStatusSchema>;
+export type RuntimeCommandName = z.infer<typeof RuntimeCommandNameSchema>;
+export type RuntimeCommandGrant = z.infer<typeof RuntimeCommandGrantSchema>;
 export type Seat = z.infer<typeof SeatSchema>;
 export type RoomInvite = z.infer<typeof RoomInviteSchema>;
 export type Room = z.infer<typeof RoomSchema>;

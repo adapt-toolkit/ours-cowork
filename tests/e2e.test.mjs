@@ -435,6 +435,9 @@ if (process.argv.includes('--e2e-driver')) {
       assert.deepEqual(archivedFile.source_reply_to, { wire_id: aliceBriefing.wire_id });
       stage('files');
 
+      await runCli(['room', 'command-grant', roomId, alice.cid, 'list-members']);
+      await runCli(['room', 'command-grant', roomId, alice.cid, 'remove-member']);
+
       await restartCoworkAfterFullExit();
       room = await runCli(['room', 'show', roomId]);
       assert.equal(room.identity_cid, roomCid);

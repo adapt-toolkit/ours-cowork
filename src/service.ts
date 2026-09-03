@@ -20,6 +20,7 @@ import {
   PostMessageInputSchema,
   RemoveMemberCommandInputSchema,
   RestRoleInputSchema,
+  RuntimeCommandGrantInputSchema,
   ROOM_ROLE,
   RoleBriefingDeleteInputSchema,
   RoleBriefingSetInputSchema,
@@ -33,6 +34,8 @@ import {
   type Room,
   type RoomIdentityNameMode,
   type RoomInvite,
+  type RuntimeCommandGrant,
+  type RuntimeCommandName,
   type Seat,
 } from './contracts.ts';
 import { ContactAlreadyAbsentError, unpackInvite, type RoomPacket } from './packets.ts';
@@ -340,7 +343,9 @@ export class RoomService {
     if (room.state !== 'active') return { ok: false, error: 'room_unavailable' };
     const caller = room.seats.find((seat) =>
       seat.state === 'active' && seat.identity === context.sender_cid);
-    if (!caller) return { ok: false, error: 'unauthorized' };
+    if (!caller || !this.hasRuntimeCommandGrant(room, context.sender_cid, 'list-members')) {
+      return { ok: false, error: 'unauthorized' };
+    }
     return {
       ok: true,
       membership_epoch: room.membership_epoch,
@@ -362,6 +367,12 @@ export class RoomService {
     if (!parsed.success) return { ok: false, error: 'invalid_request' };
     const request = parsed.data;
     const room = await this.store.load(roomId);
+    if (room.state !== 'active') return { ok: false, error: 'room_unavailable' };
+    const caller = room.seats.find((seat) =>
+      seat.state === 'active' && seat.identity === context.sender_cid);
+    if (!caller || !this.hasRuntimeCommandGrant(room, context.sender_cid, 'remove-member')) {
+      return { ok: false, error: 'unauthorized' };
+    }
     const records = await this.store.read(roomId);
     const prior = records.find((record): record is MembershipIntentRecord =>
       record.kind === 'membership_intent'
@@ -387,10 +398,6 @@ export class RoomService {
       };
     }
 
-    if (room.state !== 'active') return { ok: false, error: 'room_unavailable' };
-    const caller = room.seats.find((seat) =>
-      seat.state === 'active' && seat.identity === context.sender_cid);
-    if (!caller) return { ok: false, error: 'unauthorized' };
     if (room.membership_epoch !== request.expected_membership_epoch) {
       return {
         ok: false,
@@ -724,6 +731,11 @@ export class RoomService {
     return seat;
   }
 
+  private hasRuntimeCommandGrant(room: Room, callerCid: string, command: RuntimeCommandName): boolean {
+    return room.command_grants.some((grant) =>
+      grant.caller_cid === callerCid && grant.command === command);
+  }
+
   private async beginRemovalUnlocked(room: Room, seat: Seat, notify: boolean): Promise<RemovalReceipt> {
     if (seat.state === 'pending' || isCancelledExternalSeat(seat)) {
       let cancelled = seat;
@@ -739,7 +751,13 @@ export class RoomService {
       const seats = room.seats.map((candidate): Seat => candidate.participant_id === seat.participant_id
         ? cancelled
         : candidate);
-      if (seat.state === 'pending') await this.store.save(RoomSchema.parse({ ...room, seats }));
+      if (seat.state === 'pending') {
+        await this.store.save(RoomSchema.parse({
+          ...room,
+          seats,
+          command_grants: room.command_grants.filter((grant) => grant.caller_cid !== seat.identity),
+        }));
+      }
       const established = this.packet(room.room_id).listContacts()
         .some((contact) => contact.container_id === seat.identity);
       if (established) {
@@ -813,6 +831,8 @@ export class RoomService {
       current = await this.store.save(RoomSchema.parse({
         ...current,
         seats,
+        command_grants: current.command_grants.filter((grant) =>
+          grant.caller_cid !== intent.recipient_identity),
         membership_epoch: Math.max(current.membership_epoch, intent.epoch),
       }));
     }
@@ -1105,6 +1125,49 @@ export class RoomService {
 
   async participants(roomId: string): Promise<Seat[]> {
     return (await this.showRoom(roomId)).seats;
+  }
+
+  /** List the operator-managed runtime-command grants for one room. */
+  async runtimeCommandGrants(roomId: string): Promise<RuntimeCommandGrant[]> {
+    return (await this.showRoom(roomId)).command_grants.map((grant) => ({ ...grant }));
+  }
+
+  /** Grant one exact command to one active authenticated room identity. Idempotent. */
+  async grantRuntimeCommand(roomId: string, input: unknown): Promise<RuntimeCommandGrant[]> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = RuntimeCommandGrantInputSchema.parse(input);
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'authorize runtime commands for');
+      if (!room.seats.some((seat) => seat.state === 'active' && seat.identity === request.caller_cid)) {
+        throw new RoomServiceError(`runtime command caller "${request.caller_cid}" is not an active room identity`);
+      }
+      if (this.hasRuntimeCommandGrant(room, request.caller_cid, request.command)) {
+        return room.command_grants.map((grant) => ({ ...grant }));
+      }
+      const commandGrants = [...room.command_grants, request]
+        .sort((left, right) => left.caller_cid.localeCompare(right.caller_cid)
+          || left.command.localeCompare(right.command));
+      const saved = await this.store.save(RoomSchema.parse({ ...room, command_grants: commandGrants }));
+      return saved.command_grants.map((grant) => ({ ...grant }));
+    });
+  }
+
+  /** Revoke one exact command grant. Absence is already the requested state. */
+  async revokeRuntimeCommand(roomId: string, input: unknown): Promise<RuntimeCommandGrant[]> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = RuntimeCommandGrantInputSchema.parse(input);
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'revoke runtime commands from');
+      const commandGrants = room.command_grants.filter((grant) =>
+        grant.caller_cid !== request.caller_cid || grant.command !== request.command);
+      if (commandGrants.length === room.command_grants.length) {
+        return room.command_grants.map((grant) => ({ ...grant }));
+      }
+      const saved = await this.store.save(RoomSchema.parse({ ...room, command_grants: commandGrants }));
+      return saved.command_grants.map((grant) => ({ ...grant }));
+    });
   }
 
   async history(

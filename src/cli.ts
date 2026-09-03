@@ -82,6 +82,8 @@ const NATIVE_MUTATION_METHODS = new Set([
   'room.recover.confirm',
   'room.participant.remove',
   'room.participant.replace',
+  'room.command.grant',
+  'room.command.revoke',
 ]);
 
 export function rpcTimeoutForMethod(method: string): number {
@@ -130,6 +132,9 @@ Room commands:
   list
   show <room-id>
   participants <room-id>
+  command-grants <room-id>
+  command-grant <room-id> <caller-cid> <list-members|remove-member>
+  command-revoke <room-id> <caller-cid> <list-members|remove-member>
   history <room-id> [--after <seq>] [--limit <n>] [--view operator|participant]
   message <room-id> --text <text>
   say <room-id> --role <label> --text <text>
@@ -348,6 +353,25 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
     case 'close': {
       const [roomId] = exactPositionals(parseOptions(args), 1, `room ${command}`);
       return { method: `room.${command}`, params: { room_id: roomId } };
+    }
+    case 'command-grants': {
+      const [roomId] = exactPositionals(parseOptions(args), 1, 'room command-grants');
+      return { method: 'room.command.grants', params: { room_id: roomId } };
+    }
+    case 'command-grant':
+    case 'command-revoke': {
+      const [roomId, callerCid, runtimeCommand] = exactPositionals(
+        parseOptions(args), 3, `room ${command}`,
+      );
+      if (runtimeCommand !== 'list-members' && runtimeCommand !== 'remove-member') {
+        usageError('runtime command must be list-members or remove-member');
+      }
+      return {
+        method: command === 'command-grant'
+          ? 'room.command.grant'
+          : 'room.command.revoke',
+        params: { room_id: roomId, caller_cid: callerCid, command: runtimeCommand },
+      };
     }
     case 'history': {
       const parsed = parseOptions(args, ['--after', '--limit', '--view']);

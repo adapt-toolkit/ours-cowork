@@ -91,7 +91,8 @@ test('the exhaustive service route table marks every route auth:true', () => {
   const routes = createServiceRoutes(service);
   assert.deepEqual(Object.keys(routes).sort(), [
     'room.briefing.role.delete', 'room.briefing.role.set',
-    'room.close', 'room.create', 'room.delete', 'room.history', 'room.invite', 'room.list',
+    'room.close', 'room.command.grant', 'room.command.grants', 'room.command.revoke',
+    'room.create', 'room.delete', 'room.history', 'room.invite', 'room.list',
     'room.message', 'room.participant.remove', 'room.participant.replace', 'room.participants',
     'room.recover', 'room.recover.confirm', 'room.revoke',
     'room.role.rest.add', 'room.role.rest.remove', 'room.say',
@@ -150,6 +151,14 @@ test('room membership and briefing verbs are reachable over authenticated RPC wi
   await send('room.participant.replace', { room_id: 'r1', participant: 'cid-a', mode: 'public', min_accepts: 2 });
   assert.deepEqual(calls.at(-1), ['replaceParticipant', 'r1', { participant: 'cid-a', mode: 'public', min_accepts: 2 }]);
 
+  const cid = 'A'.repeat(64);
+  await send('room.command.grants', { room_id: 'r1' });
+  assert.deepEqual(calls.at(-1), ['runtimeCommandGrants', 'r1']);
+  await send('room.command.grant', { room_id: 'r1', caller_cid: cid, command: 'list-members' });
+  assert.deepEqual(calls.at(-1), ['grantRuntimeCommand', 'r1', { caller_cid: cid, command: 'list-members' }]);
+  await send('room.command.revoke', { room_id: 'r1', caller_cid: cid, command: 'remove-member' });
+  assert.deepEqual(calls.at(-1), ['revokeRuntimeCommand', 'r1', { caller_cid: cid, command: 'remove-member' }]);
+
   // configurability rides existing verbs: create flags, settings toggle, history view
   await send('room.create', { name: 'Launch room', goal: 'g', briefing: 'b', anonymous: true, quiet_membership: true });
   assert.deepEqual(calls.at(-1), ['createRoom', { name: 'Launch room', goal: 'g', briefing: 'b', anonymous: true, quiet_membership: true }]);
@@ -169,6 +178,8 @@ test('room membership and briefing verbs are reachable over authenticated RPC wi
     ['room.briefing.role.set', { room_id: 'r1', role: 'x', text: 't', extra: true }],
     ['room.participant.remove', { room_id: 'r1', participant: 'cid-a', alias: 'spoof' }],
     ['room.participant.replace', { room_id: 'r1', participant: 'cid-a', replaces_seat: 'spoof' }],
+    ['room.command.grant', { room_id: 'r1', caller_cid: cid, command: 'unknown' }],
+    ['room.command.revoke', { room_id: 'r1', caller_cid: 'Alice', command: 'list-members' }],
   ]) {
     const before = calls.length;
     const response = await send(method, params);

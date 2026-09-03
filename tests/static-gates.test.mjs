@@ -292,7 +292,11 @@ test('CI repeats E2E and invokes the asserted release gate', () => {
   assert.deepEqual(mainTestRunnerViolations(manifest.scripts.test, manifest.devDependencies), []);
   assert.equal(manifest.scripts['test:release'], 'node --test tests/static-gates.test.mjs');
   assert.equal(manifest.scripts['test:browser'], 'node --test tests/browser-smoke.test.mjs');
-  assert.match(workflow, /node-version:\s*20/);
+  assert.deepEqual(workflow.match(/node-version:\s*\d+/g), [
+    'node-version: 22',
+    'node-version: 22',
+    'node-version: 22',
+  ]);
 });
 
 test('nightly runs the release gates and publishes a prerelease without release or repository authority', () => {
@@ -343,7 +347,10 @@ test('nightly runs the release gates and publishes a prerelease without release 
   ]) {
     assert(gateJob.includes(command), `${command} missing from the nightly gate job`);
   }
-  assert.match(workflow, /node-version:\s*20/);
+  assert.deepEqual(workflow.match(/node-version:\s*\d+/g), [
+    'node-version: 22',
+    'node-version: 22',
+  ]);
 });
 
 test('main runner rejects loaderless Node and undeclared direct loaders while covering every native suite', () => {

@@ -47,6 +47,11 @@ export interface RoleBriefingDto {
   updated_at: string;
 }
 
+export interface RuntimeCommandGrantDto {
+  caller_cid: string;
+  command: 'list-members' | 'remove-member';
+}
+
 export interface RoomDto {
   version: 1 | 2;
   room_id: string;
@@ -56,6 +61,7 @@ export interface RoomDto {
   mission: MissionDto;
   role_briefings?: Record<string, RoleBriefingDto>;
   rest_roles?: string[];
+  command_grants?: RuntimeCommandGrantDto[];
   anonymous?: boolean;
   quiet_membership?: boolean;
   membership_epoch?: number;
@@ -217,6 +223,7 @@ const INVITE_STATES = new Set<unknown>(['live', 'consumed', 'revoked', 'replacem
 const RELAY_STATUSES = new Set<unknown>(['queued', 'send_failed', 'skipped_removed']);
 const DELIVERY_STATUSES = new Set<unknown>(['queued', 'send_failed']);
 const LOWER_CROCKFORD_ULID = /^[0-7][0-9a-hjkmnp-tv-z]{25}$/;
+const CANONICAL_CONTAINER_ID = /^[0-9A-F]{64}$/;
 const MAX_TEXT_BYTES = 262_144;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_FILE_NAME_BYTES = 255;
@@ -224,7 +231,7 @@ const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;
 const RECORD_COMMON_KEYS = ['version', 'room_id', 'seq', 'record_id', 'at', 'kind'] as const;
 const ROOM_V1_KEYS = ['version', 'room_id', 'room_name', 'identity_name', 'identity_cid', 'mission', 'state', 'invites', 'seats', 'created_at'] as const;
-const ROOM_V2_KEYS = [...ROOM_V1_KEYS, 'role_briefings', 'rest_roles', 'anonymous', 'quiet_membership', 'membership_epoch'] as const;
+const ROOM_V2_KEYS = [...ROOM_V1_KEYS, 'role_briefings', 'rest_roles', 'command_grants', 'anonymous', 'quiet_membership', 'membership_epoch'] as const;
 
 export function isRoomDto(value: unknown): value is RoomDto {
   if (!isRecord(value) || (value.version !== 1 && value.version !== 2)) return false;
@@ -247,6 +254,7 @@ export function isRoomDto(value: unknown): value is RoomDto {
 
   if (v2 && (!isRoleBriefingMap(value.role_briefings)
     || !isRestRoleList(value.rest_roles)
+    || !isRuntimeCommandGrantList(value.command_grants)
     || typeof value.anonymous !== 'boolean'
     || typeof value.quiet_membership !== 'boolean'
     || !isNonNegativeSafeInteger(value.membership_epoch))) return false;
@@ -259,12 +267,14 @@ export function isRoomDto(value: unknown): value is RoomDto {
     const seats = value.seats as ParticipantDto[];
     if (new Set(seats.map((seat) => seat.participant_id)).size !== seats.length) return false;
     const authorizedCids = new Set<string>();
+    const activeCids = new Set<string>();
     const activeAliases = new Set<string>();
     for (const seat of seats) {
       if (seat.state === 'pending' || seat.state === 'active') {
         if (authorizedCids.has(seat.identity)) return false;
         authorizedCids.add(seat.identity);
       }
+      if (seat.state === 'active') activeCids.add(seat.identity);
       if (value.anonymous ? seat.alias === undefined : seat.alias !== undefined) return false;
       if (seat.state === 'removed') {
         if (seat.removed_at === undefined || seat.removed_epoch === undefined
@@ -277,6 +287,8 @@ export function isRoomDto(value: unknown): value is RoomDto {
         activeAliases.add(seat.alias);
       }
     }
+    if (!(value.command_grants as RuntimeCommandGrantDto[])
+      .every((grant) => activeCids.has(grant.caller_cid))) return false;
     const byParticipant = new Map(seats.map((seat) => [seat.participant_id, seat]));
     for (const seat of seats) {
       if (seat.replaces_seat === undefined) continue;
@@ -592,6 +604,22 @@ function isRestRoleList(value: unknown): value is string[] {
   return Array.isArray(value)
     && value.every((role) => isUtf8Bounded(role, MAX_ROLE_BYTES) && role.length > 0 && role !== 'room')
     && new Set(value).size === value.length;
+}
+
+function isRuntimeCommandGrantList(value: unknown): value is RuntimeCommandGrantDto[] {
+  if (!Array.isArray(value)) return false;
+  const seen = new Set<string>();
+  for (const grant of value) {
+    if (!isRecord(grant)
+      || !hasExactKeys(grant, ['caller_cid', 'command'])
+      || typeof grant.caller_cid !== 'string'
+      || !CANONICAL_CONTAINER_ID.test(grant.caller_cid)
+      || (grant.command !== 'list-members' && grant.command !== 'remove-member')) return false;
+    const key = `${grant.caller_cid}\0${grant.command}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+  }
+  return true;
 }
 
 function isRoomInvite(value: unknown): value is RoomInviteDto {

@@ -24,7 +24,6 @@ export interface ParticipantDto {
   alias?: string;
   removed_at?: string;
   removed_epoch?: number;
-  replaces_seat?: string;
   bounced_at?: string;
 }
 
@@ -37,7 +36,6 @@ export interface RoomInviteDto {
   state: InviteState;
   recovery_of?: string;
   recovery_confirmed?: boolean;
-  replaces_seat?: string;
   created_at: string;
 }
 
@@ -296,14 +294,6 @@ export function isRoomDto(value: unknown): value is RoomDto {
     }
     if (!(value.command_grants as RuntimeCommandGrantDto[])
       .every((grant) => activeCids.has(grant.caller_cid))) return false;
-    const byParticipant = new Map(seats.map((seat) => [seat.participant_id, seat]));
-    for (const seat of seats) {
-      if (seat.replaces_seat === undefined) continue;
-      const predecessor = byParticipant.get(seat.replaces_seat);
-      if (!predecessor || predecessor === seat || predecessor.state !== 'removed'
-        || predecessor.role !== seat.role
-        || (value.anonymous && predecessor.alias !== seat.alias)) return false;
-    }
   }
 
   const exactPacketPending = value.state === 'provisioning'
@@ -568,7 +558,7 @@ function isParticipant(value: unknown, requireV2?: boolean): value is Participan
     v2
       ? ['identity', 'display_name', 'role', 'invite_id', 'participant_id', 'state']
       : ['identity', 'display_name', 'role', 'invite_id', 'accepted_at'],
-    v2 ? ['accepted_at', 'requested_at', 'invite_sha256', 'alias', 'removed_at', 'removed_epoch', 'replaces_seat', 'bounced_at'] : [],
+    v2 ? ['accepted_at', 'requested_at', 'invite_sha256', 'alias', 'removed_at', 'removed_epoch', 'bounced_at'] : [],
   )) return false;
   if (!isString(value.identity)
     || !isString(value.display_name)
@@ -583,7 +573,6 @@ function isParticipant(value: unknown, requireV2?: boolean): value is Participan
       && optionalString(value.alias)
       && optionalStrictRfc3339(value.removed_at)
       && (value.removed_epoch === undefined || isNonNegativeSafeInteger(value.removed_epoch))
-      && (value.replaces_seat === undefined || isLowerCrockfordUlid(value.replaces_seat))
       && optionalStrictRfc3339(value.bounced_at))) return false;
   if ((value.requested_at === undefined) !== (value.invite_sha256 === undefined)) return false;
   if (value.state === 'pending') {
@@ -638,7 +627,7 @@ function isRuntimeCommandGrantList(value: unknown): value is RuntimeCommandGrant
 
 function isRoomInvite(value: unknown): value is RoomInviteDto {
   if (!isRecord(value)
-    || !hasExactKeys(value, ['invite_id', 'mode', 'role', 'min_accepts', 'accepted_cids', 'state', 'created_at'], ['recovery_of', 'recovery_confirmed', 'replaces_seat'])
+    || !hasExactKeys(value, ['invite_id', 'mode', 'role', 'min_accepts', 'accepted_cids', 'state', 'created_at'], ['recovery_of', 'recovery_confirmed'])
     || !isString(value.invite_id)
     || !INVITE_MODES.has(value.mode)
     || !isUtf8Bounded(value.role, MAX_ROLE_BYTES)
@@ -647,7 +636,6 @@ function isRoomInvite(value: unknown): value is RoomInviteDto {
     || !INVITE_STATES.has(value.state)
     || !optionalString(value.recovery_of)
     || (value.recovery_confirmed !== undefined && typeof value.recovery_confirmed !== 'boolean')
-    || (value.replaces_seat !== undefined && !isLowerCrockfordUlid(value.replaces_seat))
     || !isStrictRfc3339(value.created_at)) return false;
   const invite = value as unknown as RoomInviteDto;
   if (invite.mode === 'one_time' && invite.min_accepts !== 1) return false;

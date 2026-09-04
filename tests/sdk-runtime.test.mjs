@@ -413,7 +413,7 @@ test('SDK room packet publishes only the bounded membership commands and keeps h
     type: 'object', additionalProperties: false,
   });
   assert.deepEqual(client.registeredCommands[1].input_schema.required, [
-    'participant_id', 'expected_membership_epoch', 'confirm', 'idempotency_key',
+    'participant_id', 'expected_membership_epoch', 'confirm',
   ]);
   assert.deepEqual(client.registeredCommands[1].input_schema.properties.confirm, { const: true });
   assert.equal(client.calls.filter(([name]) => name === 'chooseIdentity').length, 1);

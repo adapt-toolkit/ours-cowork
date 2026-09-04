@@ -44,7 +44,7 @@ export interface ArchiveQueryOptions {
   recipientIdentity?: string;
   category?: string;
   membershipEpoch?: number;
-  unresolvedResultKind?: 'relay_result' | 'membership_result' | 'close_notice_result';
+  unresolvedResultKind?: 'relay_result' | 'close_notice_result';
   descending?: boolean;
   limit?: number;
 }

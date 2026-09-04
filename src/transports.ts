@@ -110,7 +110,6 @@ export interface RoomServiceApi {
   confirmRecoveredInvite(roomId: string, recoveryOf: string, inviteId: string): Promise<unknown>;
   rebindIdentity(roomId: string): Promise<unknown>;
   removeParticipant(roomId: string, input: unknown): Promise<unknown>;
-  replaceParticipant(roomId: string, input: unknown): Promise<unknown>;
   listRooms(): Promise<unknown>;
   showRoom(roomId: string): Promise<unknown>;
   participants(roomId: string): Promise<unknown>;
@@ -152,19 +151,11 @@ const RuntimeCommandGrantParams = z.object({
 const ParticipantRemoveParams = z.object({
   room_id: z.string(), participant: z.string(), notify: z.boolean().optional(),
 }).strict();
-const ParticipantReplaceParams = z.object({
-  room_id: z.string(),
-  participant: z.string(),
-  notify: z.boolean().optional(),
-  mode: z.enum(['one_time', 'public']).optional(),
-  min_accepts: z.number().optional(),
-}).strict();
 const ExternalInviteAcceptParams = z.object({
   room_id: z.string(),
   role: z.string(),
   invite: z.string(),
   expected_cid: z.string().optional(),
-  replaces_seat: z.string().optional(),
 }).strict();
 
 export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRouteTable {
@@ -198,10 +189,6 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
     'room.participant.remove': { auth: true, run: (params) => {
       const { room_id, ...input } = ParticipantRemoveParams.parse(params);
       return service.removeParticipant(room_id, input);
-    } },
-    'room.participant.replace': { auth: true, run: (params) => {
-      const { room_id, ...input } = ParticipantReplaceParams.parse(params);
-      return service.replaceParticipant(room_id, input);
     } },
     'room.revoke': { auth: true, run: (params) => {
       const value = InviteRevokeParams.parse(params);

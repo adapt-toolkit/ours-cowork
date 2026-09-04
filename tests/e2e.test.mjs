@@ -500,7 +500,6 @@ if (process.argv.includes('--e2e-driver')) {
           participant_id: aliceSeat.participant_id,
           expected_membership_epoch: room.membership_epoch,
           confirm: true,
-          idempotency_key: 'e2e-reject-self-removal-1',
         },
       });
       const selfResult = await waitFor(async () => {
@@ -522,15 +521,13 @@ if (process.argv.includes('--e2e-driver')) {
         'room', 'history', roomId, '--after', '0', '--limit', '1000',
       ]);
       assert.equal(afterSelfHistory.some((record) =>
-        record.kind === 'membership_intent'
-          && record.command?.idempotency_key === 'e2e-reject-self-removal-1'), false);
+        record.kind === 'membership_intent' || record.kind === 'membership_result'), false);
 
       const charlieSeat = room.seats.find((seat) => seat.identity === charlie.cid);
       const removeArguments = {
         participant_id: charlieSeat.participant_id,
         expected_membership_epoch: room.membership_epoch,
         confirm: true,
-        idempotency_key: 'e2e-remove-charlie-1',
       };
       await runCli(['stop']);
       await send(charlie, roomCid, 'before typed removal barrier');
@@ -550,25 +547,19 @@ if (process.argv.includes('--e2e-driver')) {
       }, 'correlated ambiguous remove-member failure');
       assert.equal(ambiguousResult.reply_to.wire_id, removeRequest.wireId);
       assert.deepEqual(JSON.parse(ambiguousResult.body), { ok: false, error: 'handler_failed' });
-      await waitFor(async () => (await runCli(['room', 'participants', roomId]))
-        .find((seat) => seat.participant_id === charlieSeat.participant_id)?.state === 'removed',
-      'durable seat removal before result fsync');
+      assert.equal((await runCli(['room', 'participants', roomId]))
+        .find((seat) => seat.participant_id === charlieSeat.participant_id)?.state, 'active');
 
       await restartCoworkAfterFullExit();
       const recoveredRoom = await runCli(['room', 'show', roomId]);
-      assert.equal(recoveredRoom.membership_epoch, room.membership_epoch + 1);
+      assert.equal(recoveredRoom.membership_epoch, room.membership_epoch);
+      assert.equal(recoveredRoom.seats.find((seat) =>
+        seat.participant_id === charlieSeat.participant_id).state, 'active');
       let recoveryHistory = await runCli([
         'room', 'history', roomId, '--after', '0', '--limit', '1000',
       ]);
-      const recoveryIntents = recoveryHistory.filter((record) => record.kind === 'membership_intent'
-        && record.command?.idempotency_key === removeArguments.idempotency_key);
-      const recoveryResults = recoveryHistory.filter((record) => record.kind === 'membership_result'
-        && record.intent_record_id === recoveryIntents[0]?.record_id);
-      assert.equal(recoveryIntents.length, 1);
-      assert.equal(recoveryResults.length, 1);
-      assert.deepEqual({ status: recoveryResults[0].status, notified: recoveryResults[0].notified }, {
-        status: 'send_failed', notified: false,
-      });
+      assert.equal(recoveryHistory.some((record) =>
+        record.kind === 'membership_intent' || record.kind === 'membership_result'), false);
 
       const replayRequest = await alice.client.sendCommand({
         contact: roomCid, command: 'remove-member', arguments: removeArguments,
@@ -592,10 +583,8 @@ if (process.argv.includes('--e2e-driver')) {
       recoveryHistory = await runCli([
         'room', 'history', roomId, '--after', '0', '--limit', '1000',
       ]);
-      assert.equal(recoveryHistory.filter((record) => record.kind === 'membership_intent'
-        && record.command?.idempotency_key === removeArguments.idempotency_key).length, 1);
-      assert.equal(recoveryHistory.filter((record) => record.kind === 'membership_result'
-        && record.intent_record_id === recoveryIntents[0].record_id).length, 1);
+      assert.equal(recoveryHistory.some((record) =>
+        record.kind === 'membership_intent' || record.kind === 'membership_result'), false);
       assert.equal((await runCli(['room', 'show', roomId])).membership_epoch, room.membership_epoch + 1);
 
       await joinInvite(successor, reviewerInvitation.blob);
@@ -610,13 +599,13 @@ if (process.argv.includes('--e2e-driver')) {
       assert.equal(barrierHistory.some((record) => record.kind === 'message'
         && record.text === 'before typed removal barrier'), true);
       assert.equal(barrierHistory.some((record) => record.kind === 'message'
-        && record.text === 'after typed removal barrier'), false);
+        && record.text === 'after typed removal barrier'), true);
       // A removed sender receives Cowork's existing content-free bounce. Drop
       // that peer-side warning channel before the later close-contract check.
       if ((await contacts(charlie)).some((contact) => contact.container_id === roomCid)) {
         await charlie.client.removeContact({ contact: roomCid });
       }
-      stage('typed-command-removal-recovery');
+      stage('typed-command-removal-retry');
 
       const closed = await runCli(['room', 'close', roomId]);
       assert.equal(closed.state, 'closed');

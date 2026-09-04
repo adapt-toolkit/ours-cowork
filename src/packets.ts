@@ -511,12 +511,11 @@ export class SdkRoomPacket implements RoomPacket {
         input_schema: {
           type: 'object',
           additionalProperties: false,
-          required: ['participant_id', 'expected_membership_epoch', 'confirm', 'idempotency_key'],
+          required: ['participant_id', 'expected_membership_epoch', 'confirm'],
           properties: {
             participant_id: { type: 'string', pattern: '^[0-7][0-9a-hjkmnp-tv-z]{25}$' },
             expected_membership_epoch: { type: 'integer', minimum: 0 },
             confirm: { const: true },
-            idempotency_key: { type: 'string', pattern: '^[A-Za-z0-9._:-]{1,128}$' },
           },
         },
         handler: handlers.removeMember,

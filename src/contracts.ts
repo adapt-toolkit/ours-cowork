@@ -190,6 +190,8 @@ export const SeatSchema = z.object({
   alias: NonEmptyStringSchema.optional(),
   removed_at: Rfc3339Schema.optional(),
   removed_epoch: z.number().int().nonnegative().safe().optional(),
+  // Read and discard prerelease successor lineage. New rooms expose only
+  // independent add/remove membership operations.
   replaces_seat: LowerCrockfordUlidSchema.optional(),
   bounced_at: Rfc3339Schema.optional(),
 }).strict().superRefine((seat, context) => {
@@ -247,7 +249,7 @@ export const SeatSchema = z.object({
       message: 'external admission metadata requires both requested_at and invite_sha256',
     });
   }
-});
+}).transform(({ replaces_seat: _legacyReplacesSeat, ...seat }) => seat);
 
 export const RoomInviteSchema = z.object({
   invite_id: NonEmptyStringSchema,
@@ -259,6 +261,8 @@ export const RoomInviteSchema = z.object({
   recovery_of: NonEmptyStringSchema.optional(),
   recovery_confirmed: z.boolean().optional(),
   created_at: Rfc3339Schema,
+  // Read and discard prerelease successor lineage. Invite recovery lineage
+  // remains separate and is represented by recovery_of.
   replaces_seat: LowerCrockfordUlidSchema.optional(),
 }).strict().superRefine((invite, context) => {
   if (invite.mode === 'one_time' && invite.min_accepts !== 1) {
@@ -312,7 +316,7 @@ export const RoomInviteSchema = z.object({
       message: 'receipt_pending invites cannot have accepted CIDs',
     });
   }
-});
+}).transform(({ replaces_seat: _legacyReplacesSeat, ...invite }) => invite);
 
 const MissionV1Schema = z.object({
   goal: MissionTextSchema,
@@ -543,33 +547,6 @@ const CurrentRoomSchema = z.object({
       });
     }
   }
-  for (const [index, seat] of room.seats.entries()) {
-    if (seat.replaces_seat === undefined) continue;
-    const predecessor = byParticipant.get(seat.replaces_seat);
-    if (!predecessor || predecessor === seat || predecessor.state !== 'removed') {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['seats', index, 'replaces_seat'],
-        message: 'replaces_seat must reference a removed seat in this room',
-      });
-      continue;
-    }
-    if (predecessor.role !== seat.role) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['seats', index, 'role'],
-        message: 'a replacement seat must inherit the predecessor role',
-      });
-    }
-    if (room.anonymous && seat.alias !== predecessor.alias) {
-      // The alias binds to the seat/role lineage.
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['seats', index, 'alias'],
-        message: 'an anonymous replacement seat must inherit the predecessor alias',
-      });
-    }
-  }
 });
 
 /** Deterministic display name for metadata created before room_name existed. */
@@ -678,7 +655,6 @@ export const AcceptExternalInviteInputSchema = z.object({
     `invite input must be at most ${MAX_EXTERNAL_INVITE_BYTES} UTF-8 bytes`,
   ),
   expected_cid: ContainerIdSchema.optional(),
-  replaces_seat: LowerCrockfordUlidSchema.optional(),
 }).strict();
 
 /** Public runtime-command inputs are deliberately smaller than operator APIs. */
@@ -693,13 +669,12 @@ export const RemoveMemberCommandInputSchema = z.object({
   participant_id: LowerCrockfordUlidSchema,
   expected_membership_epoch: z.number().int().nonnegative().safe(),
   confirm: z.literal(true),
-  idempotency_key: CommandIdempotencyKeySchema,
 }).strict();
 
 /** Local operator input for one exact per-room, per-command caller grant. */
 export const RuntimeCommandGrantInputSchema = RuntimeCommandGrantSchema;
 
-/** Durable provenance for one authorized remote membership mutation. */
+/** Legacy provenance retained only to decode prerelease membership journals. */
 export const RuntimeCommandAuditSchema = z.object({
   sender_cid: NonEmptyStringSchema,
   sender_participant_id: LowerCrockfordUlidSchema,
@@ -826,6 +801,8 @@ const FileShape = {
   source_reply_to: ReplyReferenceSchema.optional(),
 } as const;
 
+// Legacy prerelease removal journal records remain readable as archive history,
+// but are deliberately excluded from AppendRecordSchema below.
 const MembershipIntentShape = {
   kind: z.literal('membership_intent'),
   action: z.enum(['remove']),
@@ -978,8 +955,6 @@ export const AppendRecordSchema = z.discriminatedUnion('kind', [
   z.object({ ...AppendCommonShape, ...FileShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayIntentShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayResultShape }).strict(),
-  z.object({ ...AppendCommonShape, ...MembershipIntentShape }).strict(),
-  z.object({ ...AppendCommonShape, ...MembershipResultShape }).strict(),
   z.object({ ...AppendCommonShape, ...CloseNoticeIntentShape }).strict(),
   z.object({ ...AppendCommonShape, ...CloseNoticeResultShape }).strict(),
 ]).superRefine((record, context) => {

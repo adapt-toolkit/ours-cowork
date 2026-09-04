@@ -164,8 +164,9 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
   {
     method: 'room.participant.remove',
     summary: 'Remove a participant',
-    description: 'Removes one participant seat, bumps the membership epoch, and severs the '
-      + 'contact. The receipt reports what actually happened, including retained key material.',
+    description: 'Directly removes the contact, then records the seat as removed and bumps the '
+      + 'membership epoch. An already-absent exact contact completes successfully without a '
+      + 'durable removal intent.',
     params: params({
       room_id: roomIdProperty,
       participant: {
@@ -176,31 +177,8 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
       notify: notifyProperty,
     }, ['room_id', 'participant']),
     result: 'A removal receipt with `participant_id`, `epoch`, `status`, `notified`, and '
-      + '`key_material_retained`.',
+      + '`key_material_retained`; `status` is `already_absent` for an idempotent no-op.',
     example: { room_id: EXAMPLE_ROOM_ID, participant: 'Reviewer-1', notify: true },
-  },
-  {
-    method: 'room.participant.replace',
-    summary: 'Replace a participant',
-    description: 'Removes one participant seat and mints a replacement invitation requirement in '
-      + 'the same operation.',
-    params: params({
-      room_id: roomIdProperty,
-      participant: {
-        type: 'string',
-        minLength: 1,
-        description: 'Participant id, identity, display name, or alias.',
-      },
-      notify: notifyProperty,
-      mode: inviteModeProperty,
-      min_accepts: {
-        type: 'integer',
-        minimum: 1,
-        description: 'Acceptances required for the replacement invitation requirement.',
-      },
-    }, ['room_id', 'participant']),
-    result: 'An invite receipt for the replacement, extended with the `removal` receipt.',
-    example: { room_id: EXAMPLE_ROOM_ID, participant: 'Reviewer-1', mode: 'one_time' },
   },
   {
     method: 'room.revoke',

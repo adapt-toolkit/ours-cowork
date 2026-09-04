@@ -23,6 +23,7 @@ import {
   RoomNameSchema,
   RoomSchema,
   RoomV1Schema,
+  SeatSchema,
   UpdateRoomInputSchema,
   defaultRoomName,
   migrateRoomV1,
@@ -501,7 +502,7 @@ test('room schema v2 round-trips briefing versions, anonymity, and membership fi
       }),
       seatV2({
         identity: 'cid-carol', display_name: 'Carol', participant_id: PID_3,
-        alias: 'reviewer #2', replaces_seat: PID_2,
+        alias: 'reviewer #3',
       }),
     ],
   });
@@ -544,37 +545,20 @@ test('room schema v2 rejects v1 payloads and invalid membership/anonymity combos
       seatV2({ identity: 'cid-bob', display_name: 'Bob', participant_id: PID_2, alias: 'reviewer #1' }),
     ],
   })));
-  // replacement lineage: predecessor must exist, be removed, and share the role
-  assert.throws(() => RoomSchema.parse(roomV2({ seats: [seatV2({ replaces_seat: PID_2 })] })));
-  assert.throws(() => RoomSchema.parse(roomV2({
-    membership_epoch: 1,
-    seats: [
-      seatV2({ state: 'removed', removed_at: AT, removed_epoch: 1 }),
-      seatV2({ identity: 'cid-bob', display_name: 'Bob', participant_id: PID_2, role: 'writer', replaces_seat: PID_1 }),
-    ],
-  })));
-  // An anonymous replacement inherits the predecessor alias.
-  assert.throws(() => RoomSchema.parse(roomV2({
-    anonymous: true,
-    membership_epoch: 2,
-    seats: [
-      seatV2({ alias: 'reviewer #1', state: 'removed', removed_at: AT, removed_epoch: 1 }),
-      seatV2({ identity: 'cid-bob', display_name: 'Bob', participant_id: PID_2, alias: 'reviewer #2', replaces_seat: PID_1 }),
-    ],
-  })));
   // role briefing keys obey role bounds
   assert.throws(() => RoomSchema.parse(roomV2({
     role_briefings: { ['x'.repeat(257)]: { text: 't', version: 1, updated_at: AT } },
   })));
 });
 
-test('room invites may stamp a replacement seat lineage', () => {
+test('legacy participant replacement lineage is accepted only to be discarded', () => {
   const invite = {
     invite_id: 'invite-1', mode: 'one_time', role: 'reviewer', min_accepts: 1,
     accepted_cids: [], state: 'live', created_at: AT, replaces_seat: PID_1,
   };
-  assert.equal(RoomInviteSchema.parse(invite).replaces_seat, PID_1);
+  assert.equal(Object.hasOwn(RoomInviteSchema.parse(invite), 'replaces_seat'), false);
   assert.throws(() => RoomInviteSchema.parse({ ...invite, replaces_seat: '' }));
+  assert.equal(Object.hasOwn(SeatSchema.parse(seatV2({ replaces_seat: PID_1 })), 'replaces_seat'), false);
 });
 
 test('create input accepts per-room anonymity and quiet membership configuration', () => {
@@ -651,7 +635,7 @@ test('message records gain role_briefing and membership categories with pinned p
   }));
 });
 
-test('membership intent and result records ride the archive pump contracts', () => {
+test('legacy membership journals remain readable but cannot be appended', () => {
   const intent = {
     version: 1, room_id: ROOM_ID, seq: 5, record_id: `${ROOM_ID}:5`, at: AT,
     kind: 'membership_intent', action: 'remove', participant_id: PID_1,
@@ -668,5 +652,7 @@ test('membership intent and result records ride the archive pump contracts', () 
   assert.throws(() => CommunicationRecordSchema.parse({ ...result, key_material_retained: false }));
   assert.throws(() => CommunicationRecordSchema.parse({ ...intent, action: 'promote' }));
   const { seq: _s, record_id: _r, ...appendIntent } = intent;
-  assert.equal(AppendRecordSchema.parse(appendIntent).kind, 'membership_intent');
+  const { seq: _rs, record_id: _rr, ...appendResult } = result;
+  assert.throws(() => AppendRecordSchema.parse(appendIntent));
+  assert.throws(() => AppendRecordSchema.parse(appendResult));
 });

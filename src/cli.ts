@@ -82,7 +82,6 @@ const NATIVE_MUTATION_METHODS = new Set([
   'room.recover.confirm',
   'room.rebind',
   'room.participant.remove',
-  'room.participant.replace',
   'room.command.grant',
   'room.command.revoke',
 ]);
@@ -126,10 +125,9 @@ Room commands:
   settings <room-id> [--name <display-name>] [--goal <text>] [--briefing <text>] [--status <text>] [--quiet-membership true|false]
   role-briefing <room-id> --role <label> (--text <text> | --delete)
   invite <room-id> [--role <label>] [--mode one_time|public] [--min-accepts <n>]
-  accept <room-id> --role <label> (--invite-file <path> | --invite-stdin) [--expected-cid <64-hex>] [--replaces <participant-id>]
+  accept <room-id> --role <label> (--invite-file <path> | --invite-stdin) [--expected-cid <64-hex>]
   revoke <room-id> <invite-id>
   remove <room-id> <participant> [--silent]
-  replace <room-id> <participant> [--mode one_time|public] [--min-accepts <n>] [--silent]
   list
   show <room-id>
   participants <room-id>
@@ -293,7 +291,7 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
     case 'accept': {
       const parsed = parseOptions(
         args,
-        ['--role', '--invite-file', '--expected-cid', '--replaces'],
+        ['--role', '--invite-file', '--expected-cid'],
         ['--invite-stdin'],
       );
       const [roomId] = exactPositionals(parsed, 1, 'room accept');
@@ -312,9 +310,6 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
         ...(parsed.values['--expected-cid'] === undefined
           ? {}
           : { expected_cid: parsed.values['--expected-cid'] }),
-        ...(parsed.values['--replaces'] === undefined
-          ? {}
-          : { replaces_seat: parsed.values['--replaces'] }),
       } };
     }
     case 'remove': {
@@ -323,21 +318,6 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
       return { method: 'room.participant.remove', params: {
         room_id: roomId,
         participant,
-        ...(parsed.booleans.has('--silent') ? { notify: false } : {}),
-      } };
-    }
-    case 'replace': {
-      const parsed = parseOptions(args, ['--mode', '--min-accepts'], ['--silent']);
-      const [roomId, participant] = exactPositionals(parsed, 2, 'room replace');
-      const mode = parsed.values['--mode'];
-      if (mode !== undefined && mode !== 'one_time' && mode !== 'public') usageError('--mode must be one_time or public');
-      return { method: 'room.participant.replace', params: {
-        room_id: roomId,
-        participant,
-        ...(mode === undefined ? {} : { mode }),
-        ...(parsed.values['--min-accepts'] === undefined
-          ? {}
-          : { min_accepts: parseInteger(parsed.values['--min-accepts'], '--min-accepts', 1) }),
         ...(parsed.booleans.has('--silent') ? { notify: false } : {}),
       } };
     }

@@ -689,6 +689,17 @@ export class RoomService {
 
   private async beginRemovalUnlocked(room: Room, seat: Seat, notify: boolean): Promise<RemovalReceipt> {
     if (seat.state === 'pending' || isCancelledExternalSeat(seat)) {
+      const established = this.packet(room.room_id).listContacts()
+        .some((contact) => contact.container_id === seat.identity);
+      let outcome: { status: RelayStatus | 'already_absent'; notified: boolean } | undefined;
+      if (established) {
+        try {
+          outcome = await this.packet(room.room_id).removeContact(seat.identity);
+        } catch (error) {
+          if (!isExactMissingContact(error, seat.identity)) throw error;
+          outcome = { status: 'already_absent', notified: false };
+        }
+      }
       let cancelled = seat;
       if (seat.state === 'pending') {
         const removedAt = this.now();
@@ -709,16 +720,7 @@ export class RoomService {
           command_grants: room.command_grants.filter((grant) => grant.caller_cid !== seat.identity),
         }));
       }
-      const established = this.packet(room.room_id).listContacts()
-        .some((contact) => contact.container_id === seat.identity);
-      if (established) {
-        let outcome: { status: RelayStatus | 'already_absent'; notified: boolean };
-        try {
-          outcome = await this.packet(room.room_id).removeContact(seat.identity);
-        } catch (error) {
-          if (!isExactMissingContact(error, seat.identity)) throw error;
-          outcome = { status: 'already_absent', notified: false };
-        }
+      if (outcome !== undefined) {
         return {
           room_id: room.room_id,
           participant_id: seat.participant_id,

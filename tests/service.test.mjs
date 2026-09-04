@@ -362,6 +362,24 @@ test('pending external seats can be cancelled without authority or epoch gain', 
   assert.equal((await f.store.read(ROOM_ID)).length, 0);
 });
 
+test('a failed removal of a just-established pending contact leaves the seat retryable', async () => {
+  const f = fixture();
+  await create(f);
+  const pending = await f.service.acceptExternalInvite(ROOM_ID, {
+    role: 'reviewer', invite: packInvite(Buffer.from('complete during cancellation')),
+  });
+  const packet = f.registry.get(ROOM_ID);
+  packet.contacts = [{ name: 'External inviter', container_id: pending.identity }];
+  packet.removeContact = async () => { throw new Error('daemon removal unavailable'); };
+
+  await assert.rejects(
+    f.service.removeParticipant(ROOM_ID, { participant: pending.participant_id }),
+    /daemon removal unavailable/,
+  );
+  assert.equal((await f.service.showRoom(ROOM_ID)).seats[0].state, 'pending');
+  assert.equal((await f.service.showRoom(ROOM_ID)).membership_epoch, 0);
+});
+
 test('late redemption after cancellation can be severed and safely re-accepted by the operator', async () => {
   const f = fixture();
   await create(f);

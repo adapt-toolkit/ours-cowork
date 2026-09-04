@@ -1752,6 +1752,117 @@ test('runtime membership commands authorize by trusted CID, redact the roster, a
   assert.equal((await f.service.showRoom(ROOM_ID)).membership_epoch, roomBefore.membership_epoch + 1);
 });
 
+test('role command policy follows authenticated invite membership without trusting the role label or display name', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  assert.deepEqual(await f.service.setRuntimeRoleCommands(ROOM_ID, {
+    role: 'Configurable owner role', commands: ['remove-member', 'list-members'],
+  }), [{ role: 'Configurable owner role', commands: ['list-members', 'remove-member'] }]);
+  const configured = await f.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'Configurable owner role', min_accepts: 1,
+  });
+  await admit(f, configured.invite, ALICE_CID, 'Ordinary-looking display name');
+  const packet = f.registry.get(ROOM_ID);
+  const context = {
+    sender_cid: ALICE_CID,
+    sender_name: 'forged display Owner',
+    request_wire_id: 'wire-role-policy',
+  };
+  const listed = await packet.runtimeCommands.listMembers({}, context);
+  assert.equal(listed.ok, true);
+
+  assert.deepEqual(await packet.runtimeCommands.listMembers({}, {
+    sender_cid: OUTSIDER_CID, sender_name: 'Configurable owner role', request_wire_id: 'wire-forged-role',
+  }), { ok: false, error: 'unauthorized' }, 'message metadata cannot forge stored membership');
+
+  await f.service.grantRuntimeCommand(ROOM_ID, {
+    caller_cid: ALICE_CID, command: 'list-members',
+  });
+  await f.service.setRuntimeRoleCommands(ROOM_ID, {
+    role: 'Configurable owner role', commands: [],
+  });
+  assert.equal((await packet.runtimeCommands.listMembers({}, context)).ok, true,
+    'removing role policy preserves an overlapping explicit per-CID grant');
+  assert.deepEqual(await packet.runtimeCommands.removeMember({
+    participant_id: (await f.service.showRoom(ROOM_ID)).seats[0].participant_id,
+    expected_membership_epoch: (await f.service.showRoom(ROOM_ID)).membership_epoch,
+    confirm: true,
+  }, context), { ok: false, error: 'unauthorized' }, 'role policy commands are removed exactly');
+  await f.service.revokeRuntimeCommand(ROOM_ID, {
+    caller_cid: ALICE_CID, command: 'list-members',
+  });
+  assert.deepEqual(await packet.runtimeCommands.listMembers({}, context), {
+    ok: false, error: 'unauthorized',
+  });
+});
+
+test('an unconfigured Owner-looking role and display label receive no command authority', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const invite = await f.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'Owner', min_accepts: 1,
+  });
+  await admit(f, invite.invite, ALICE_CID, 'Owner');
+  assert.deepEqual(await f.registry.get(ROOM_ID).runtimeCommands.listMembers({}, {
+    sender_cid: ALICE_CID, sender_name: 'Owner', request_wire_id: 'wire-unconfigured-owner-label',
+  }), { ok: false, error: 'unauthorized' });
+});
+
+test('external admission inherits durable role commands only after the exact authenticated contact activates', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  await f.service.setRuntimeRoleCommands(ROOM_ID, {
+    role: 'Fleet configured owner', commands: ['list-members', 'remove-member'],
+  });
+  const secret = packInvite(Buffer.from('fleet owner public invite'));
+  f.registry.get(ROOM_ID).addResult.container_id = ALICE_CID;
+  const pending = await f.service.acceptExternalInvite(ROOM_ID, {
+    role: 'Fleet configured owner', invite: secret, expected_cid: ALICE_CID,
+  });
+  const packet = f.registry.get(ROOM_ID);
+  const context = { sender_cid: ALICE_CID, sender_name: 'anything', request_wire_id: 'wire-pending' };
+  assert.deepEqual(await packet.runtimeCommands.listMembers({}, context), {
+    ok: false, error: 'room_unavailable',
+  });
+  packet.contacts = [{ name: 'Authenticated owner contact', container_id: ALICE_CID }];
+  const active = await f.service.reconcileRoom(ROOM_ID);
+  assert.equal(active.seats.find((seat) => seat.participant_id === pending.participant_id).state, 'active');
+  assert.equal((await packet.runtimeCommands.listMembers({}, context)).ok, true);
+
+  const restarted = new RoomService(f.store, f.registry);
+  await restarted.recoverRoom(ROOM_ID);
+  assert.equal((await packet.runtimeCommands.listMembers({}, {
+    ...context, request_wire_id: 'wire-after-restart',
+  })).ok, true, 'role policy survives restart reconciliation');
+
+  await restarted.removeParticipant(ROOM_ID, { participant: pending.participant_id, notify: false });
+  assert.deepEqual(await packet.runtimeCommands.listMembers({}, {
+    ...context, request_wire_id: 'wire-removed-owner',
+  }), { ok: false, error: 'unauthorized' }, 'a stale former seat cannot inherit its old role policy');
+});
+
+test('role command policy persistence is atomic, actionable, and retryable', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  let fail = true;
+  f.store.beforeSave = (room) => {
+    if (fail && room.role_command_grants.length > 0) {
+      fail = false;
+      throw new Error('role command persistence unavailable');
+    }
+  };
+  await assert.rejects(f.service.setRuntimeRoleCommands(ROOM_ID, {
+    role: 'Fleet owner', commands: ['list-members', 'remove-member'],
+  }), /role command persistence unavailable/);
+  assert.deepEqual((await f.service.showRoom(ROOM_ID)).role_command_grants, []);
+  assert.deepEqual(await f.service.setRuntimeRoleCommands(ROOM_ID, {
+    role: 'Fleet owner', commands: ['list-members', 'remove-member'],
+  }), [{ role: 'Fleet owner', commands: ['list-members', 'remove-member'] }]);
+  assert.deepEqual(await f.service.setRuntimeRoleCommands(ROOM_ID, {
+    role: 'Fleet owner', commands: ['remove-member', 'list-members'],
+  }), [{ role: 'Fleet owner', commands: ['list-members', 'remove-member'] }], 'retry converges');
+});
+
 test('quiet_membership and notify:false suppress the announcement without a removal journal', async () => {
   const f = evolutionFixture();
   await f.service.createRoom({ goal: 'Ship', briefing: 'Common.', quiet_membership: true });

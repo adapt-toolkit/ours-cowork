@@ -22,6 +22,7 @@ import {
   RemoveMemberCommandInputSchema,
   RestRoleInputSchema,
   RuntimeCommandGrantInputSchema,
+  RuntimeRoleCommandGrantInputSchema,
   ROOM_IDENTITY_PREFIX,
   ROOM_ROLE,
   RoleBriefingDeleteInputSchema,
@@ -37,6 +38,7 @@ import {
   type RoomInvite,
   type RuntimeCommandGrant,
   type RuntimeCommandName,
+  type RuntimeRoleCommandGrant,
   type Seat,
 } from './contracts.ts';
 import { ContactAlreadyAbsentError, unpackInvite, type RoomPacket } from './packets.ts';
@@ -683,8 +685,12 @@ export class RoomService {
   }
 
   private hasRuntimeCommandGrant(room: Room, callerCid: string, command: RuntimeCommandName): boolean {
-    return room.command_grants.some((grant) =>
-      grant.caller_cid === callerCid && grant.command === command);
+    if (room.command_grants.some((grant) =>
+      grant.caller_cid === callerCid && grant.command === command)) return true;
+    const caller = room.seats.find((seat) =>
+      seat.state === 'active' && seat.identity === callerCid);
+    return caller !== undefined && room.role_command_grants.some((grant) =>
+      grant.role === caller.role && grant.commands.includes(command));
   }
 
   private async beginRemovalUnlocked(room: Room, seat: Seat, notify: boolean): Promise<RemovalReceipt> {
@@ -1025,6 +1031,38 @@ export class RoomService {
     return (await this.showRoom(roomId)).command_grants.map((grant) => ({ ...grant }));
   }
 
+  /** List command-invocation policies inherited by active authenticated seats of exact roles. */
+  async runtimeRoleCommandGrants(roomId: string): Promise<RuntimeRoleCommandGrant[]> {
+    return (await this.showRoom(roomId)).role_command_grants
+      .map((grant) => ({ role: grant.role, commands: [...grant.commands] }));
+  }
+
+  /** Replace one exact role's command-invocation policy. Empty commands remove it. Idempotent. */
+  async setRuntimeRoleCommands(roomId: string, input: unknown): Promise<RuntimeRoleCommandGrant[]> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = RuntimeRoleCommandGrantInputSchema.parse(input);
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'set runtime commands for');
+      const commands = [...request.commands].sort();
+      const retained = room.role_command_grants.filter((grant) => grant.role !== request.role);
+      const roleCommandGrants = commands.length === 0
+        ? retained
+        : [...retained, { role: request.role, commands }]
+          .sort((left, right) => left.role.localeCompare(right.role));
+      if (JSON.stringify(roleCommandGrants) === JSON.stringify(room.role_command_grants)) {
+        return room.role_command_grants
+          .map((grant) => ({ role: grant.role, commands: [...grant.commands] }));
+      }
+      const saved = await this.store.save(RoomSchema.parse({
+        ...room,
+        role_command_grants: roleCommandGrants,
+      }));
+      return saved.role_command_grants
+        .map((grant) => ({ role: grant.role, commands: [...grant.commands] }));
+    });
+  }
+
   /** Grant one exact command to one active authenticated room identity. Idempotent. */
   async grantRuntimeCommand(roomId: string, input: unknown): Promise<RuntimeCommandGrant[]> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
@@ -1035,7 +1073,11 @@ export class RoomService {
       if (!room.seats.some((seat) => seat.state === 'active' && seat.identity === request.caller_cid)) {
         throw new RoomServiceError(`runtime command caller "${request.caller_cid}" is not an active room identity`);
       }
-      if (this.hasRuntimeCommandGrant(room, request.caller_cid, request.command)) {
+      // An inherited role permission is deliberately not an explicit grant:
+      // recording the same CID+command here promotes it to independent
+      // operator-managed authority that survives later role-policy removal.
+      if (room.command_grants.some((grant) =>
+        grant.caller_cid === request.caller_cid && grant.command === request.command)) {
         return room.command_grants.map((grant) => ({ ...grant }));
       }
       const commandGrants = [...room.command_grants, request]

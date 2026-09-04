@@ -50,6 +50,11 @@ export interface RuntimeCommandGrantDto {
   command: 'list-members' | 'remove-member';
 }
 
+export interface RuntimeRoleCommandGrantDto {
+  role: string;
+  commands: Array<'list-members' | 'remove-member'>;
+}
+
 export interface RoomDto {
   version: 1 | 2;
   room_id: string;
@@ -60,6 +65,7 @@ export interface RoomDto {
   role_briefings?: Record<string, RoleBriefingDto>;
   rest_roles?: string[];
   command_grants?: RuntimeCommandGrantDto[];
+  role_command_grants?: RuntimeRoleCommandGrantDto[];
   anonymous?: boolean;
   quiet_membership?: boolean;
   membership_epoch?: number;
@@ -236,7 +242,7 @@ const MAX_MIME_BYTES = 255;
 const MAX_ROLE_BYTES = 256;
 const RECORD_COMMON_KEYS = ['version', 'room_id', 'seq', 'record_id', 'at', 'kind'] as const;
 const ROOM_V1_KEYS = ['version', 'room_id', 'room_name', 'identity_name', 'identity_cid', 'mission', 'state', 'invites', 'seats', 'created_at'] as const;
-const ROOM_V2_KEYS = [...ROOM_V1_KEYS, 'role_briefings', 'rest_roles', 'command_grants', 'anonymous', 'quiet_membership', 'membership_epoch'] as const;
+const ROOM_V2_KEYS = [...ROOM_V1_KEYS, 'role_briefings', 'rest_roles', 'command_grants', 'role_command_grants', 'anonymous', 'quiet_membership', 'membership_epoch'] as const;
 
 export function isRoomDto(value: unknown): value is RoomDto {
   if (!isRecord(value) || (value.version !== 1 && value.version !== 2)) return false;
@@ -260,6 +266,7 @@ export function isRoomDto(value: unknown): value is RoomDto {
   if (v2 && (!isRoleBriefingMap(value.role_briefings)
     || !isRestRoleList(value.rest_roles)
     || !isRuntimeCommandGrantList(value.command_grants)
+    || !isRuntimeRoleCommandGrantList(value.role_command_grants)
     || typeof value.anonymous !== 'boolean'
     || typeof value.quiet_membership !== 'boolean'
     || !isNonNegativeSafeInteger(value.membership_epoch))) return false;
@@ -621,6 +628,21 @@ function isRuntimeCommandGrantList(value: unknown): value is RuntimeCommandGrant
     const key = `${grant.caller_cid}\0${grant.command}`;
     if (seen.has(key)) return false;
     seen.add(key);
+  }
+  return true;
+}
+
+function isRuntimeRoleCommandGrantList(value: unknown): value is RuntimeRoleCommandGrantDto[] {
+  if (!Array.isArray(value)) return false;
+  const roles = new Set<string>();
+  for (const grant of value) {
+    if (!isRecord(grant) || !hasExactKeys(grant, ['role', 'commands'])
+      || !isUtf8Bounded(grant.role, MAX_ROLE_BYTES)
+      || !Array.isArray(grant.commands)
+      || new Set(grant.commands).size !== grant.commands.length
+      || grant.commands.some((command) => command !== 'list-members' && command !== 'remove-member')
+      || roles.has(grant.role)) return false;
+    roles.add(grant.role);
   }
   return true;
 }

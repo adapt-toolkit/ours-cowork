@@ -143,6 +143,22 @@ export function isStandardRoomIdentityName(roomId: string, identityName: string)
 }
 export const RoleSchema = utf8Bounded('role', MAX_ROLE_BYTES);
 export const ROOM_ROLE = 'room';
+export const RuntimeRoleCommandGrantSchema = z.object({
+  role: RoleSchema,
+  commands: z.array(RuntimeCommandNameSchema).superRefine((commands, context) => {
+    const seen = new Set<string>();
+    for (const [index, command] of commands.entries()) {
+      if (seen.has(command)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index],
+          message: 'runtime role commands must be unique',
+        });
+      }
+      seen.add(command);
+    }
+  }),
+}).strict();
 export const MissionTextSchema = utf8Bounded('mission text', MAX_TEXT_BYTES);
 export const MessageTextSchema = utf8Bounded('message text', MAX_TEXT_BYTES);
 export const FileNameSchema = utf8Bounded('file name', MAX_FILE_NAME_BYTES)
@@ -468,6 +484,20 @@ const CurrentRoomSchema = z.object({
   }),
   /** Operator-managed, default-deny grants for the room identity's runtime commands. */
   command_grants: z.array(RuntimeCommandGrantSchema),
+  /** Operator-managed command policy inherited by authenticated active seats of an exact role. */
+  role_command_grants: z.array(RuntimeRoleCommandGrantSchema).superRefine((grants, context) => {
+    const seen = new Set<string>();
+    for (const [index, grant] of grants.entries()) {
+      if (seen.has(grant.role)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index, 'role'],
+          message: 'runtime role command grants must be unique by role',
+        });
+      }
+      seen.add(grant.role);
+    }
+  }),
   anonymous: z.boolean(),
   quiet_membership: z.boolean(),
   membership_epoch: z.number().int().nonnegative().safe(),
@@ -555,7 +585,7 @@ export function defaultRoomName(roomId: string): string {
 }
 
 /**
- * room_name, rest_roles, and command_grants were added additively to metadata
+ * room_name, rest_roles, command_grants, and role_command_grants were added additively to metadata
  * v2. Accept an otherwise-valid room missing any one long enough for defaults.
  *
  * TRAP: each default is injected independently. A single guard on the first
@@ -573,6 +603,7 @@ export const RoomSchema = z.preprocess((value) => {
   }
   if (!Object.hasOwn(value, 'rest_roles')) patch.rest_roles = [];
   if (!Object.hasOwn(value, 'command_grants')) patch.command_grants = [];
+  if (!Object.hasOwn(value, 'role_command_grants')) patch.role_command_grants = [];
   if (Object.keys(patch).length === 0) return value;
   return { ...value, ...patch };
 }, CurrentRoomSchema);
@@ -589,6 +620,7 @@ export function migrateRoomV1(
     role_briefings: {},
     rest_roles: [],
     command_grants: [],
+    role_command_grants: [],
     anonymous: false,
     quiet_membership: false,
     membership_epoch: 0,
@@ -673,6 +705,9 @@ export const RemoveMemberCommandInputSchema = z.object({
 
 /** Local operator input for one exact per-room, per-command caller grant. */
 export const RuntimeCommandGrantInputSchema = RuntimeCommandGrantSchema;
+
+/** Replace the complete command-invocation policy for one exact room role. */
+export const RuntimeRoleCommandGrantInputSchema = RuntimeRoleCommandGrantSchema;
 
 /** Legacy provenance retained only to decode prerelease membership journals. */
 export const RuntimeCommandAuditSchema = z.object({
@@ -969,6 +1004,7 @@ export type InviteMode = z.infer<typeof InviteModeSchema>;
 export type RelayStatus = z.infer<typeof RelayStatusSchema>;
 export type RuntimeCommandName = z.infer<typeof RuntimeCommandNameSchema>;
 export type RuntimeCommandGrant = z.infer<typeof RuntimeCommandGrantSchema>;
+export type RuntimeRoleCommandGrant = z.infer<typeof RuntimeRoleCommandGrantSchema>;
 export type Seat = z.infer<typeof SeatSchema>;
 export type RoomInvite = z.infer<typeof RoomInviteSchema>;
 export type Room = z.infer<typeof RoomSchema>;

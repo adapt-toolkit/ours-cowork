@@ -19,6 +19,7 @@ function room(overrides = {}) {
     role_briefings: {},
     rest_roles: [],
     command_grants: [],
+    role_command_grants: [],
     anonymous: false,
     quiet_membership: false,
     membership_epoch: 0,

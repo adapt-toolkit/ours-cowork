@@ -92,6 +92,7 @@ test('the exhaustive service route table marks every route auth:true', () => {
   assert.deepEqual(Object.keys(routes).sort(), [
     'room.briefing.role.delete', 'room.briefing.role.set',
     'room.close', 'room.command.grant', 'room.command.grants', 'room.command.revoke',
+    'room.command.role.grants', 'room.command.role.set',
     'room.create', 'room.delete', 'room.history', 'room.invite', 'room.list',
     'room.message', 'room.participant.remove', 'room.participants',
     'room.rebind', 'room.recover', 'room.recover.confirm', 'room.revoke',
@@ -160,10 +161,21 @@ test('room membership and briefing verbs are reachable over authenticated RPC wi
   const cid = 'A'.repeat(64);
   await send('room.command.grants', { room_id: 'r1' });
   assert.deepEqual(calls.at(-1), ['runtimeCommandGrants', 'r1']);
+  await send('room.command.role.grants', { room_id: 'r1' });
+  assert.deepEqual(calls.at(-1), ['runtimeRoleCommandGrants', 'r1']);
+  await send('room.command.role.set', {
+    room_id: 'r1', role: 'Configurable owner', commands: ['list-members', 'remove-member'],
+  });
+  assert.deepEqual(calls.at(-1), ['setRuntimeRoleCommands', 'r1', {
+    role: 'Configurable owner', commands: ['list-members', 'remove-member'],
+  }]);
   await send('room.command.grant', { room_id: 'r1', caller_cid: cid, command: 'list-members' });
   assert.deepEqual(calls.at(-1), ['grantRuntimeCommand', 'r1', { caller_cid: cid, command: 'list-members' }]);
   await send('room.command.revoke', { room_id: 'r1', caller_cid: cid, command: 'remove-member' });
   assert.deepEqual(calls.at(-1), ['revokeRuntimeCommand', 'r1', { caller_cid: cid, command: 'remove-member' }]);
+  assert.equal((await send('room.command.role.set', {
+    room_id: 'r1', role: 'x', commands: ['filesystem-admin'],
+  })).error.code, 'invalid_params');
 
   // configurability rides existing verbs: create flags, settings toggle, history view
   await send('room.create', { name: 'Launch room', goal: 'g', briefing: 'b', anonymous: true, quiet_membership: true });

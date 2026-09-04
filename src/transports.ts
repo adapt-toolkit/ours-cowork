@@ -114,6 +114,8 @@ export interface RoomServiceApi {
   showRoom(roomId: string): Promise<unknown>;
   participants(roomId: string): Promise<unknown>;
   runtimeCommandGrants(roomId: string): Promise<unknown>;
+  runtimeRoleCommandGrants(roomId: string): Promise<unknown>;
+  setRuntimeRoleCommands(roomId: string, input: unknown): Promise<unknown>;
   grantRuntimeCommand(roomId: string, input: unknown): Promise<unknown>;
   revokeRuntimeCommand(roomId: string, input: unknown): Promise<unknown>;
   history(roomId: string, options: unknown): Promise<unknown>;
@@ -147,6 +149,9 @@ const RestRoleParams = z.object({
 }).strict();
 const RuntimeCommandGrantParams = z.object({
   room_id: z.string(), caller_cid: ContainerIdSchema, command: RuntimeCommandNameSchema,
+}).strict();
+const RuntimeRoleCommandGrantParams = z.object({
+  room_id: z.string(), role: z.string(), commands: z.array(RuntimeCommandNameSchema),
 }).strict();
 const ParticipantRemoveParams = z.object({
   room_id: z.string(), participant: z.string(), notify: z.boolean().optional(),
@@ -208,6 +213,12 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
     'room.participants': { auth: true, run: (params) => service.participants(RoomIdParams.parse(params).room_id) },
     'room.command.grants': { auth: true, run: (params) =>
       service.runtimeCommandGrants(RoomIdParams.parse(params).room_id) },
+    'room.command.role.grants': { auth: true, run: (params) =>
+      service.runtimeRoleCommandGrants(RoomIdParams.parse(params).room_id) },
+    'room.command.role.set': { auth: true, run: (params) => {
+      const { room_id, ...input } = RuntimeRoleCommandGrantParams.parse(params);
+      return service.setRuntimeRoleCommands(room_id, input);
+    } },
     'room.command.grant': { auth: true, run: (params) => {
       const { room_id, ...input } = RuntimeCommandGrantParams.parse(params);
       return service.grantRuntimeCommand(room_id, input);

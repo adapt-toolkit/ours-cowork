@@ -255,6 +255,30 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     example: { room_id: EXAMPLE_ROOM_ID },
   },
   {
+    method: 'room.command.role.grants',
+    summary: 'List role runtime-command policies',
+    description: 'Lists durable role policies. A command is authorized only while an authenticated '
+      + 'active seat has the exact configured role.',
+    params: params({ room_id: roomIdProperty }, ['room_id']),
+    result: 'An array of `{role, commands}` policies.',
+    example: { room_id: EXAMPLE_ROOM_ID },
+  },
+  {
+    method: 'room.command.role.set',
+    summary: 'Set a role runtime-command policy',
+    description: 'Atomically replaces the command policy for one exact role. An empty command '
+      + 'list removes the policy without removing independent per-CID grants.',
+    params: params({
+      room_id: roomIdProperty,
+      role: { type: 'string', minLength: 1, description: 'Exact admitted seat role.' },
+      commands: { type: 'array', uniqueItems: true, items: {
+        type: 'string', enum: ['list-members', 'remove-member'],
+      } },
+    }, ['room_id', 'role', 'commands']),
+    result: 'The complete sorted role-policy list after the idempotent update.',
+    example: { room_id: EXAMPLE_ROOM_ID, role: 'Owner', commands: ['list-members', 'remove-member'] },
+  },
+  {
     method: 'room.command.grant',
     summary: 'Authorize a runtime command caller',
     description: 'Idempotently grants one command to one exact active participant CID. Display '

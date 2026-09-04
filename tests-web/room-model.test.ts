@@ -147,6 +147,16 @@ describe('room DTO guards', () => {
     expect(isRoomDto({ ...daemonRoom, rest_roles: ['room'] })).toBe(false);
     expect(isRoomDto({ ...daemonRoom, rest_roles: ['Reviewer', 'Reviewer'] })).toBe(false);
     expect(daemonRoom.command_grants).toEqual([]);
+    expect(daemonRoom.role_command_grants).toEqual([]);
+    expect(isRoomDto({
+      ...daemonRoom,
+      role_command_grants: [{ role: 'builder', commands: ['list-members', 'remove-member'] }],
+    })).toBe(true);
+    expect(isRoomDto({ ...daemonRoom, role_command_grants: undefined })).toBe(false);
+    expect(isRoomDto({
+      ...daemonRoom,
+      role_command_grants: [{ role: 'builder', commands: ['list-members', 'list-members'] }],
+    })).toBe(false);
     const grantedRoom = {
       ...daemonRoom,
       command_grants: [{ caller_cid: CALLER_CID, command: 'list-members' }],

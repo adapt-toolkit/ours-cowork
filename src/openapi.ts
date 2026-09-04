@@ -164,8 +164,9 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
   {
     method: 'room.participant.remove',
     summary: 'Remove a participant',
-    description: 'Removes one participant seat, bumps the membership epoch, and severs the '
-      + 'contact. The receipt reports what actually happened, including retained key material.',
+    description: 'Directly removes the contact, then records the seat as removed and bumps the '
+      + 'membership epoch. An already-absent exact contact completes successfully without a '
+      + 'durable removal intent.',
     params: params({
       room_id: roomIdProperty,
       participant: {
@@ -176,7 +177,7 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
       notify: notifyProperty,
     }, ['room_id', 'participant']),
     result: 'A removal receipt with `participant_id`, `epoch`, `status`, `notified`, and '
-      + '`key_material_retained`.',
+      + '`key_material_retained`; `status` is `already_absent` for an idempotent no-op.',
     example: { room_id: EXAMPLE_ROOM_ID, participant: 'Reviewer-1', notify: true },
   },
   {

@@ -124,7 +124,6 @@ type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | '
   & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'briefingDeliveryTimes'>>;
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 type CloseNoticeIntentRecord = Extract<CommunicationRecord, { kind: 'close_notice_intent' }>;
-type MembershipIntentRecord = Extract<CommunicationRecord, { kind: 'membership_intent' }>;
 
 export interface RoomPacketRegistry {
   get(roomId: string): RoomPacket | undefined;
@@ -162,7 +161,7 @@ export interface RemovalReceipt {
   room_id: string;
   participant_id: string;
   epoch: number;
-  status: RelayStatus | 'cancelled_pending';
+  status: RelayStatus | 'already_absent' | 'cancelled_pending';
   notified: boolean;
   key_material_retained: true;
 }
@@ -420,31 +419,17 @@ export class RoomService {
     if (!caller || !this.hasRuntimeCommandGrant(room, context.sender_cid, 'remove-member')) {
       return { ok: false, error: 'unauthorized' };
     }
-    const records = await this.store.read(roomId);
-    const prior = records.find((record): record is MembershipIntentRecord =>
-      record.kind === 'membership_intent'
-      && record.command?.sender_cid === context.sender_cid
-      && record.command.idempotency_key === request.idempotency_key);
-
-    // Resolve a durable replay before checking current membership so a
-    // previously authorized mutation remains retryable if membership changes.
-    if (prior !== undefined) {
-      if (prior.recipient_identity === context.sender_cid) {
-        return { ok: false, error: 'cannot_remove_self' };
-      }
-      if (prior.participant_id !== request.participant_id
-        || prior.command?.expected_membership_epoch !== request.expected_membership_epoch) {
-        return { ok: false, error: 'idempotency_conflict' };
-      }
-      const completed = await this.completeRemovalUnlocked(room, prior);
+    const target = room.seats.find((seat) =>
+      seat.participant_id === request.participant_id);
+    if (!target) return { ok: false, error: 'member_not_found' };
+    if (target.state === 'removed') {
       return {
         ok: true,
-        participant_id: prior.participant_id,
-        membership_epoch: completed.receipt.epoch,
+        participant_id: target.participant_id,
+        membership_epoch: target.removed_epoch ?? room.membership_epoch,
         removed: true,
       };
     }
-
     if (room.membership_epoch !== request.expected_membership_epoch) {
       return {
         ok: false,
@@ -452,41 +437,15 @@ export class RoomService {
         membership_epoch: room.membership_epoch,
       };
     }
-    const target = room.seats.find((seat) =>
-      seat.state === 'active' && seat.participant_id === request.participant_id);
-    if (!target) return { ok: false, error: 'member_not_found' };
+    if (target.state !== 'active') return { ok: false, error: 'member_not_found' };
     if (target.identity === context.sender_cid) {
       return { ok: false, error: 'cannot_remove_self' };
     }
-
-    const intent = await this.store.append(roomId, {
-      version: 1,
-      kind: 'membership_intent',
-      room_id: roomId,
-      at: this.now(),
-      action: 'remove',
-      participant_id: target.participant_id,
-      recipient_identity: target.identity,
-      role: target.role,
-      alias: target.alias ?? target.display_name,
-      epoch: room.membership_epoch + 1,
-      notify: !room.quiet_membership,
-      command: {
-        sender_cid: context.sender_cid,
-        sender_participant_id: caller.participant_id,
-        request_wire_id: context.request_wire_id,
-        idempotency_key: request.idempotency_key,
-        expected_membership_epoch: request.expected_membership_epoch,
-      },
-    });
-    if (intent.kind !== 'membership_intent') {
-      throw new RoomServiceError('storage returned the wrong membership intent kind');
-    }
-    const completed = await this.completeRemovalUnlocked(room, intent);
+    const receipt = await this.beginRemovalUnlocked(room, target, !room.quiet_membership);
     return {
       ok: true,
       participant_id: target.participant_id,
-      membership_epoch: completed.receipt.epoch,
+      membership_epoch: receipt.epoch,
       removed: true,
     };
   }
@@ -693,11 +652,7 @@ export class RoomService {
     };
   }
 
-  /**
-   * Operator-only removal: archive-before-act membership intent,
-   * seat state flip + epoch bump, core 0.13 bilateral sever with an honest
-   * receipt, and an alias-form announcement unless the room or call is quiet.
-   */
+  /** Operator-only direct contact removal followed by the local seat update. */
   async removeParticipant(roomId: string, input: unknown): Promise<RemovalReceipt> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const request = RemoveParticipantInputSchema.parse(input);
@@ -708,7 +663,9 @@ export class RoomService {
       const notify = (request.notify ?? true) && !room.quiet_membership;
       return this.beginRemovalUnlocked(room, seat, notify);
     });
-    await this.intake.resumePending(id);
+    // Membership notices are ordinary best-effort messages. Their delivery
+    // must never turn an already-completed removal into a failed operation.
+    try { await this.intake.resumePending(id); } catch { /* removal is already complete */ }
     return receipt;
   }
 
@@ -716,10 +673,10 @@ export class RoomService {
     const matches = (candidate: Seat): boolean =>
       candidate.identity === participant || candidate.participant_id === participant;
     const seat = room.seats.find((candidate) => candidate.state !== 'removed' && matches(candidate))
-      ?? room.seats.find((candidate) => isCancelledExternalSeat(candidate) && matches(candidate));
+      ?? room.seats.find((candidate) => matches(candidate));
     if (!seat) {
       throw new RoomServiceError(
-        `"${participant}" is not a pending, active, or recoverable cancelled participant of room "${room.room_id}"`,
+        `"${participant}" is not a participant of room "${room.room_id}"`,
       );
     }
     return seat;
@@ -755,7 +712,13 @@ export class RoomService {
       const established = this.packet(room.room_id).listContacts()
         .some((contact) => contact.container_id === seat.identity);
       if (established) {
-        const outcome = await this.packet(room.room_id).removeContact(seat.identity);
+        let outcome: { status: RelayStatus | 'already_absent'; notified: boolean };
+        try {
+          outcome = await this.packet(room.room_id).removeContact(seat.identity);
+        } catch (error) {
+          if (!isExactMissingContact(error, seat.identity)) throw error;
+          outcome = { status: 'already_absent', notified: false };
+        }
         return {
           room_id: room.room_id,
           participant_id: seat.participant_id,
@@ -774,121 +737,56 @@ export class RoomService {
         key_material_retained: true,
       };
     }
-    const intent = await this.store.append(room.room_id, {
-      version: 1,
-      kind: 'membership_intent',
-      room_id: room.room_id,
-      at: this.now(),
-      action: 'remove',
-      participant_id: seat.participant_id,
-      recipient_identity: seat.identity,
-      role: seat.role,
-      // The participant-visible label: the alias in anonymous rooms, the
-      // contact display name otherwise; the anonymous relay stays pseudonymous either way.
-      alias: seat.alias ?? seat.display_name,
-      epoch: room.membership_epoch + 1,
-      notify,
-    });
-    if (intent.kind !== 'membership_intent') {
-      throw new RoomServiceError('storage returned the wrong membership intent kind');
-    }
-    const { receipt } = await this.completeRemovalUnlocked(room, intent);
-    return receipt;
-  }
-
-  /**
-   * Idempotent completion of a durable removal intent: each step re-checks the
-   * archive/state it would produce, so a crash anywhere re-drives cleanly
-   * The 0.13 sever is replay-safe by design.
-   */
-  private async completeRemovalUnlocked(
-    room: Room,
-    intent: MembershipIntentRecord,
-  ): Promise<{ room: Room; receipt: RemovalReceipt }> {
-    let current = room;
-    const index = current.seats.findIndex(
-      (candidate) => candidate.participant_id === intent.participant_id,
-    );
-    if (index < 0) {
-      throw new RoomServiceError(
-        `membership intent ${intent.record_id} references an unknown seat in room "${current.room_id}"`,
-      );
-    }
-    if (current.seats[index]!.state !== 'removed') {
-      const seats = [...current.seats];
-      seats[index] = {
-        ...seats[index]!,
-        state: 'removed',
-        removed_at: intent.at,
-        removed_epoch: intent.epoch,
-      };
-      current = await this.store.save(RoomSchema.parse({
-        ...current,
-        seats,
-        command_grants: current.command_grants.filter((grant) =>
-          grant.caller_cid !== intent.recipient_identity),
-        membership_epoch: Math.max(current.membership_epoch, intent.epoch),
-      }));
-    }
-    const [existing] = await queryStore(this.store, current.room_id, {
-      kind: 'membership_result', intentRecordId: intent.record_id, limit: 1,
-    });
-    let outcome: { status: RelayStatus; notified: boolean; key_material_retained: true };
-    if (existing !== undefined && existing.kind === 'membership_result') {
-      outcome = {
-        status: existing.status,
-        notified: existing.notified,
+    if (seat.state === 'removed') {
+      return {
+        room_id: room.room_id,
+        participant_id: seat.participant_id,
+        epoch: seat.removed_epoch ?? room.membership_epoch,
+        status: 'already_absent',
+        notified: false,
         key_material_retained: true,
       };
-    } else {
-      try {
-        outcome = await this.packet(current.room_id).removeContact(intent.recipient_identity);
-      } catch (error) {
-        // The intent and removed seat are already durable. An exact-target
-        // SDK miss is the replay signature of a prior daemon-side removal
-        // whose response/result fsync was lost. Record conservative completion
-        // without claiming that this attempt sent a peer notification.
-        if (!isExactMissingContact(error, intent.recipient_identity)) throw error;
-        outcome = { status: 'send_failed', notified: false, key_material_retained: true };
-      }
-      const result = await this.store.append(current.room_id, {
-        version: 1,
-        kind: 'membership_result',
-        room_id: current.room_id,
-        at: this.now(),
-        intent_record_id: intent.record_id,
-        participant_id: intent.participant_id,
-        status: outcome.status,
-        notified: outcome.notified,
-        key_material_retained: true,
-      });
-      if (result.kind !== 'membership_result') {
-        throw new RoomServiceError('storage returned the wrong membership result kind');
-      }
     }
-    if (intent.notify) await this.ensureMembershipNotice(current, intent);
+    let outcome: { status: RelayStatus | 'already_absent'; notified: boolean };
+    try {
+      outcome = await this.packet(room.room_id).removeContact(seat.identity);
+    } catch (error) {
+      // A missing exact target means the desired contact state already exists.
+      if (!isExactMissingContact(error, seat.identity)) throw error;
+      outcome = { status: 'already_absent', notified: false };
+    }
+    const epoch = room.membership_epoch + 1;
+    const seats = room.seats.map((candidate): Seat => candidate.participant_id === seat.participant_id
+      ? { ...candidate, state: 'removed', removed_at: this.now(), removed_epoch: epoch }
+      : candidate);
+    const current = await this.store.save(RoomSchema.parse({
+      ...room,
+      seats,
+      command_grants: room.command_grants.filter((grant) => grant.caller_cid !== seat.identity),
+      membership_epoch: epoch,
+    }));
+    if (notify) {
+      try { await this.ensureMembershipNotice(current, seat, epoch); } catch { /* non-authoritative notice */ }
+    }
     return {
-      room: current,
-      receipt: {
-        room_id: current.room_id,
-        participant_id: intent.participant_id,
-        epoch: intent.epoch,
-        status: outcome.status,
-        notified: outcome.notified,
-        key_material_retained: true,
-      },
+      room_id: current.room_id,
+      participant_id: seat.participant_id,
+      epoch,
+      status: outcome.status,
+      notified: outcome.notified,
+      key_material_retained: true,
     };
   }
 
-  private async ensureMembershipNotice(room: Room, intent: MembershipIntentRecord): Promise<void> {
+  private async ensureMembershipNotice(room: Room, seat: Seat, epoch: number): Promise<void> {
     const records = await queryStore(this.store, room.room_id, {
-      kind: 'message', category: 'membership', membershipEpoch: intent.epoch, limit: 1,
+      kind: 'message', category: 'membership', membershipEpoch: epoch, limit: 1,
     });
     const already = records.length > 0;
     if (already) return;
     const remaining = activeSeats(room);
     if (remaining.length === 0) return;
-    const label = intent.alias ?? intent.role;
+    const label = seat.alias ?? seat.display_name;
     const appended = await this.store.append(room.room_id, {
       version: 1,
       kind: 'message',
@@ -897,8 +795,8 @@ export class RoomService {
       message_id: LowerCrockfordUlidSchema.parse(this.nextMessageId()),
       author: { identity: room.identity_cid, display_name: room.identity_name, role: ROOM_ROLE },
       category: 'membership',
-      text: `${label} left the room · epoch ${intent.epoch}`,
-      membership: { action: 'remove', alias: label, role: intent.role, epoch: intent.epoch },
+      text: `${label} left the room · epoch ${epoch}`,
+      membership: { action: 'remove', alias: label, role: seat.role, epoch },
       recipient_identities: uniqueIdentities(remaining.map((seat) => seat.identity)),
     });
     if (appended.kind !== 'message') {
@@ -1492,19 +1390,6 @@ export class RoomService {
       invites,
       membership_epoch: room.membership_epoch + activatedPending.length + newSeats.length,
     });
-    // Re-drive any removal whose intent has no terminal result.
-    let membershipAfter = 0;
-    for (;;) {
-      const journal = await queryStore(this.store, next.room_id, {
-        kind: 'membership_intent', unresolvedResultKind: 'membership_result',
-        after: membershipAfter, limit: JOURNAL_WORK_BATCH_SIZE,
-      }) as MembershipIntentRecord[];
-      if (journal.length === 0) break;
-      for (const intent of journal) {
-        membershipAfter = intent.seq;
-        ({ room: next } = await this.completeRemovalUnlocked(next, intent));
-      }
-    }
     const requirementsMet = invites
       .filter((invite) => invite.state !== 'revoked')
       .every((invite) => invite.accepted_cids.length >= invite.min_accepts);

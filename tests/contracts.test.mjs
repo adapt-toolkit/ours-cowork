@@ -635,7 +635,7 @@ test('message records gain role_briefing and membership categories with pinned p
   }));
 });
 
-test('membership intent and result records ride the archive pump contracts', () => {
+test('legacy membership journals remain readable but cannot be appended', () => {
   const intent = {
     version: 1, room_id: ROOM_ID, seq: 5, record_id: `${ROOM_ID}:5`, at: AT,
     kind: 'membership_intent', action: 'remove', participant_id: PID_1,
@@ -652,5 +652,7 @@ test('membership intent and result records ride the archive pump contracts', () 
   assert.throws(() => CommunicationRecordSchema.parse({ ...result, key_material_retained: false }));
   assert.throws(() => CommunicationRecordSchema.parse({ ...intent, action: 'promote' }));
   const { seq: _s, record_id: _r, ...appendIntent } = intent;
-  assert.equal(AppendRecordSchema.parse(appendIntent).kind, 'membership_intent');
+  const { seq: _rs, record_id: _rr, ...appendResult } = result;
+  assert.throws(() => AppendRecordSchema.parse(appendIntent));
+  assert.throws(() => AppendRecordSchema.parse(appendResult));
 });

@@ -669,13 +669,12 @@ export const RemoveMemberCommandInputSchema = z.object({
   participant_id: LowerCrockfordUlidSchema,
   expected_membership_epoch: z.number().int().nonnegative().safe(),
   confirm: z.literal(true),
-  idempotency_key: CommandIdempotencyKeySchema,
 }).strict();
 
 /** Local operator input for one exact per-room, per-command caller grant. */
 export const RuntimeCommandGrantInputSchema = RuntimeCommandGrantSchema;
 
-/** Durable provenance for one authorized remote membership mutation. */
+/** Legacy provenance retained only to decode prerelease membership journals. */
 export const RuntimeCommandAuditSchema = z.object({
   sender_cid: NonEmptyStringSchema,
   sender_participant_id: LowerCrockfordUlidSchema,
@@ -802,6 +801,8 @@ const FileShape = {
   source_reply_to: ReplyReferenceSchema.optional(),
 } as const;
 
+// Legacy prerelease removal journal records remain readable as archive history,
+// but are deliberately excluded from AppendRecordSchema below.
 const MembershipIntentShape = {
   kind: z.literal('membership_intent'),
   action: z.enum(['remove']),
@@ -954,8 +955,6 @@ export const AppendRecordSchema = z.discriminatedUnion('kind', [
   z.object({ ...AppendCommonShape, ...FileShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayIntentShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayResultShape }).strict(),
-  z.object({ ...AppendCommonShape, ...MembershipIntentShape }).strict(),
-  z.object({ ...AppendCommonShape, ...MembershipResultShape }).strict(),
   z.object({ ...AppendCommonShape, ...CloseNoticeIntentShape }).strict(),
   z.object({ ...AppendCommonShape, ...CloseNoticeResultShape }).strict(),
 ]).superRefine((record, context) => {

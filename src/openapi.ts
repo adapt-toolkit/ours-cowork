@@ -180,29 +180,6 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     example: { room_id: EXAMPLE_ROOM_ID, participant: 'Reviewer-1', notify: true },
   },
   {
-    method: 'room.participant.replace',
-    summary: 'Replace a participant',
-    description: 'Removes one participant seat and mints a replacement invitation requirement in '
-      + 'the same operation.',
-    params: params({
-      room_id: roomIdProperty,
-      participant: {
-        type: 'string',
-        minLength: 1,
-        description: 'Participant id, identity, display name, or alias.',
-      },
-      notify: notifyProperty,
-      mode: inviteModeProperty,
-      min_accepts: {
-        type: 'integer',
-        minimum: 1,
-        description: 'Acceptances required for the replacement invitation requirement.',
-      },
-    }, ['room_id', 'participant']),
-    result: 'An invite receipt for the replacement, extended with the `removal` receipt.',
-    example: { room_id: EXAMPLE_ROOM_ID, participant: 'Reviewer-1', mode: 'one_time' },
-  },
-  {
     method: 'room.revoke',
     summary: 'Revoke an invitation requirement',
     description: 'Revokes one live invitation requirement so it can no longer admit a seat.',

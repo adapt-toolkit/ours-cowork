@@ -345,7 +345,7 @@ test('external acceptance refuses an already-known CID because a second SDK rede
   assert.deepEqual(packet.addCalls, [secret]);
 });
 
-test('pending external seats can be cancelled without authority or epoch gain and cannot be replaced', async () => {
+test('pending external seats can be cancelled without authority or epoch gain', async () => {
   const f = fixture();
   await create(f);
   const pending = await f.service.acceptExternalInvite(ROOM_ID, {
@@ -360,17 +360,6 @@ test('pending external seats can be cancelled without authority or epoch gain an
   assert.equal(room.seats[0].accepted_at, undefined);
   assert.equal(room.membership_epoch, 0);
   assert.equal((await f.store.read(ROOM_ID)).length, 0);
-
-  const replacePending = await f.service.acceptExternalInvite(ROOM_ID, {
-    role: 'reviewer', invite: packInvite(Buffer.from('replace me')),
-  });
-  await assert.rejects(f.service.replaceParticipant(ROOM_ID, {
-    participant: replacePending.participant_id,
-  }), /not an active participant/i);
-  room = await f.service.showRoom(ROOM_ID);
-  assert.equal(room.membership_epoch, 0);
-  assert.equal(room.seats.find((seat) => seat.participant_id === replacePending.participant_id).state, 'pending');
-  assert.equal(room.invites.length, 0, 'a never-authoritative seat cannot create replacement lineage');
 });
 
 test('late redemption after cancellation can be severed and safely re-accepted by the operator', async () => {
@@ -1783,7 +1772,7 @@ test('quiet_membership and notify:false suppress the announcement but never the 
   assert.equal(notices.length, 0);
 });
 
-test('anonymous replacement is unconditionally silent and the successor inherits the alias', async () => {
+test('anonymous participant removal and addition stay independent', async () => {
   const f = evolutionFixture();
   await f.service.createRoom({ goal: 'Ship', briefing: 'Common.', anonymous: true });
   await f.service.setRoleBriefing(ROOM_ID, { role: 'Developer', text: 'Build.' });
@@ -1793,24 +1782,21 @@ test('anonymous replacement is unconditionally silent and the successor inherits
   const before = await f.service.showRoom(ROOM_ID);
   const aliceSeat = before.seats.find((seat) => seat.identity === 'cid-alice');
   assert.equal(aliceSeat.alias, 'Developer #1');
-  const recordCountForBobBefore = (await f.store.read(ROOM_ID)).filter((record) =>
-    record.kind === 'message' && record.recipient_identities.includes('cid-bob')).length;
-
   await f.service.revokeInvite(ROOM_ID, invite.invite_id);
-  const replacement = await f.service.replaceParticipant(ROOM_ID, { participant: 'cid-alice', mode: 'one_time' });
-  assert.equal(replacement.invite.role, 'Developer');
-  assert.equal(replacement.invite.replaces_seat, aliceSeat.participant_id);
-  assert.equal(typeof replacement.blob, 'string');
+  await f.service.removeParticipant(ROOM_ID, { participant: aliceSeat.participant_id });
+  assert.equal(membershipRecords(await f.store.read(ROOM_ID)).notices.length, 1);
 
-  // the removal half was silent: no membership notice despite quiet_membership=false
-  assert.equal(membershipRecords(await f.store.read(ROOM_ID)).notices.length, 0);
-
-  await admit(f, replacement.invite, 'cid-carol', 'Carol', '2026-08-02T10:40:00.000Z');
+  const added = await f.service.createInvite(ROOM_ID, {
+    mode: 'one_time', role: 'Developer', min_accepts: 1,
+  });
+  assert.equal(added.invite.role, 'Developer');
+  assert.equal(typeof added.blob, 'string');
+  await admit(f, added.invite, 'cid-carol', 'Carol', '2026-08-02T10:40:00.000Z');
   const after = await f.service.showRoom(ROOM_ID);
   const carolSeat = after.seats.find((seat) => seat.identity === 'cid-carol');
-  assert.equal(carolSeat.alias, 'Developer #1', 'successor inherits the predecessor alias');
-  assert.equal(carolSeat.replaces_seat, aliceSeat.participant_id);
-  assert.notEqual(carolSeat.participant_id, aliceSeat.participant_id, 'internal identity still tracks the change');
+  assert.equal(carolSeat.alias, 'Developer #3', 'a separately added participant receives a new ordinal');
+  assert.equal(Object.hasOwn(carolSeat, 'replaces_seat'), false);
+  assert.notEqual(carolSeat.participant_id, aliceSeat.participant_id);
   assert.equal(after.membership_epoch > before.membership_epoch, true);
 
   // the successor got the current common + role briefings, addressed only to it
@@ -1821,11 +1807,6 @@ test('anonymous replacement is unconditionally silent and the successor inherits
   for (const briefing of carolBriefings) {
     assert.deepEqual(briefing.recipient_identities, ['cid-carol']);
   }
-
-  // the switch is unnoticeable to bob: not one new message addressed to it
-  const recordCountForBobAfter = records.filter((record) =>
-    record.kind === 'message' && record.recipient_identities.includes('cid-bob')).length;
-  assert.equal(recordCountForBobAfter, recordCountForBobBefore);
 });
 
 test('removal crash points re-drive from the intent ledger without duplicate epochs or results', async () => {

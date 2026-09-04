@@ -119,13 +119,6 @@ const RemoveParticipantInputSchema = z.object({
   notify: z.boolean().optional(),
 }).strict();
 
-const ReplaceParticipantInputSchema = z.object({
-  participant: z.string().min(1),
-  notify: z.boolean().optional(),
-  mode: InviteModeSchema.optional(),
-  min_accepts: z.number().int().positive().safe().optional(),
-}).strict();
-
 type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | 'append' | 'read' | 'delete'>
   & Pick<CoworkStore, 'discardPendingProvisioning'>
   & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'briefingDeliveryTimes'>>;
@@ -174,10 +167,6 @@ export interface RemovalReceipt {
   key_material_retained: true;
 }
 
-export interface ReplacementReceipt extends InviteReceipt {
-  removal: RemovalReceipt;
-}
-
 export interface ExternalInviteReceipt {
   room_id: string;
   participant_id: string;
@@ -189,7 +178,6 @@ export interface ExternalInviteReceipt {
   pending_name: string;
   requested_at: string;
   accepted_at?: string;
-  replaces_seat?: string;
 }
 
 export class RoomServiceError extends Error {
@@ -616,18 +604,6 @@ export class RoomService {
       const contactsBeforeRedemption = new Set(
         this.packet(id).listContacts().map((contact) => contact.container_id),
       );
-      const predecessor = request.replaces_seat === undefined
-        ? undefined
-        : room.seats.find((seat) => seat.participant_id === request.replaces_seat);
-      if (request.replaces_seat !== undefined
-        && (!predecessor || predecessor.state !== 'removed' || predecessor.role !== request.role)) {
-        throw new RoomServiceError('external replacement must reference a removed seat with the configured role');
-      }
-      if (predecessor && room.seats.some((seat) => seat.replaces_seat === predecessor.participant_id
-        && (seat.state === 'pending' || seat.state === 'active'))) {
-        throw new RoomServiceError('external replacement seat already has a pending or active successor');
-      }
-
       let added: Awaited<ReturnType<RoomPacket['addContact']>>;
       try {
         added = await this.packet(id).addContact(request.invite);
@@ -657,10 +633,7 @@ export class RoomService {
         invite_sha256: digest,
         participant_id: participantId,
         state: 'pending' as const,
-        ...(predecessor === undefined ? {} : { replaces_seat: predecessor.participant_id }),
-        ...(room.anonymous
-          ? { alias: predecessor?.alias ?? mintAlias(seated, request.role) }
-          : {}),
+        ...(room.anonymous ? { alias: mintAlias(seated, request.role) } : {}),
       };
       await this.store.save(RoomSchema.parse({ ...room, seats: [...room.seats, pending] }));
       const reconciled = await this.reconcileUnlocked(await this.store.load(id), this.packet(id));
@@ -676,7 +649,6 @@ export class RoomService {
         pending_name: added.pending_name,
         requested_at: requestedAt,
         ...(seat.accepted_at === undefined ? {} : { accepted_at: seat.accepted_at }),
-        ...(seat.replaces_seat === undefined ? {} : { replaces_seat: seat.replaces_seat }),
       };
     });
     await this.intake.resumePending(id);
@@ -685,7 +657,7 @@ export class RoomService {
 
   private async mintInviteUnlocked(
     room: Room,
-    request: { mode: InviteMode; role: string; min_accepts: number; replaces_seat?: string },
+    request: { mode: InviteMode; role: string; min_accepts: number },
   ): Promise<InviteReceipt> {
     const packet = this.packet(room.room_id);
     if (!packet.supportsInviteProvenance
@@ -703,7 +675,6 @@ export class RoomService {
       accepted_cids: [],
       state: 'live',
       created_at: this.now(),
-      ...(request.replaces_seat === undefined ? {} : { replaces_seat: request.replaces_seat }),
     });
     try {
       await this.store.save(RoomSchema.parse({ ...room, invites: [...room.invites, invite] }));
@@ -741,35 +712,6 @@ export class RoomService {
     return receipt;
   }
 
-  /**
-   * Removal plus a same-role invite stamped with the seat lineage.
-   * In an anonymous room the flow is unconditionally
-   * silent — the successor inherits the alias and other members see nothing.
-   */
-  async replaceParticipant(roomId: string, input: unknown): Promise<ReplacementReceipt> {
-    const id = LowerCrockfordUlidSchema.parse(roomId);
-    const request = ReplaceParticipantInputSchema.parse(input);
-    const receipt = await this.lock(id, async () => {
-      const room = await this.store.load(id);
-      this.assertMutable(room, 'replace a participant in');
-      const seat = this.findActiveSeat(room, request.participant);
-      const notify = room.anonymous
-        ? false
-        : (request.notify ?? true) && !room.quiet_membership;
-      const removal = await this.beginRemovalUnlocked(room, seat, notify);
-      const current = await this.store.load(id);
-      const invite = await this.mintInviteUnlocked(current, {
-        mode: request.mode ?? 'one_time',
-        role: seat.role,
-        min_accepts: request.min_accepts ?? 1,
-        replaces_seat: seat.participant_id,
-      });
-      return { ...invite, removal };
-    });
-    await this.intake.resumePending(id);
-    return receipt;
-  }
-
   private findSeatForRemoval(room: Room, participant: string): Seat {
     const matches = (candidate: Seat): boolean =>
       candidate.identity === participant || candidate.participant_id === participant;
@@ -779,15 +721,6 @@ export class RoomService {
       throw new RoomServiceError(
         `"${participant}" is not a pending, active, or recoverable cancelled participant of room "${room.room_id}"`,
       );
-    }
-    return seat;
-  }
-
-  private findActiveSeat(room: Room, participant: string): Seat {
-    const seat = room.seats.find((candidate) => candidate.state === 'active'
-      && (candidate.identity === participant || candidate.participant_id === participant));
-    if (!seat) {
-      throw new RoomServiceError(`"${participant}" is not an active participant of room "${room.room_id}"`);
     }
     return seat;
   }
@@ -1481,13 +1414,12 @@ export class RoomService {
       if (seat.state !== 'pending') continue;
       const contact = contactsByCid.get(seat.identity);
       if (contact === undefined) continue;
-      const { alias: _alias, replaces_seat: _replacesSeat, ...base } = seat;
+      const { alias: _alias, ...base } = seat;
       const activated: Seat = {
         ...base,
         state: 'active',
         display_name: contact.displayName,
         accepted_at: this.now(),
-        ...(_replacesSeat === undefined ? {} : { replaces_seat: _replacesSeat }),
         ...(room.anonymous ? { alias: _alias! } : {}),
       };
       activatedPending.push(activated);
@@ -1511,10 +1443,6 @@ export class RoomService {
       const removedAt = lastRemovedAt.get(cid);
       if (removedAt !== undefined && invite.created_at <= removedAt) continue;
       const seated = [...seatsWithActivations, ...newSeats];
-      const predecessor = invite.replaces_seat === undefined
-        ? undefined
-        : seated.find((seat) => seat.participant_id === invite.replaces_seat && seat.state === 'removed');
-      if (invite.replaces_seat !== undefined && !predecessor) continue;
       newSeats.push({
         identity: cid,
         display_name: contact.displayName,
@@ -1523,12 +1451,7 @@ export class RoomService {
         accepted_at: this.now(),
         participant_id: LowerCrockfordUlidSchema.parse(generateUlid()),
         state: 'active',
-        ...(predecessor === undefined ? {} : { replaces_seat: predecessor.participant_id }),
-        // A replacement into a role inherits the
-        // predecessor's alias — the alias binds to the seat/role lineage.
-        ...(room.anonymous
-          ? { alias: predecessor?.alias ?? mintAlias(seated, invite.role) }
-          : {}),
+        ...(room.anonymous ? { alias: mintAlias(seated, invite.role) } : {}),
       });
       existingCids.add(cid);
     }
@@ -1947,7 +1870,7 @@ function isCancelledExternalSeat(seat: Seat): boolean {
 /**
  * Room-scoped pseudonym "<role> #<n>": n is the per-role admission ordinal
  * counted over every seat ever admitted with the role (removed seats keep
- * their ordinal; replacements inherit instead of minting).
+ * their ordinal, and every independently added seat receives a new one).
  */
 function mintAlias(seated: Seat[], role: string): string {
   return `${role} #${seated.filter((seat) => seat.role === role).length + 1}`;

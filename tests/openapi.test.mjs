@@ -20,6 +20,7 @@ import {
   PostMessageInputSchema,
   RoleBriefingDeleteInputSchema,
   RoleBriefingSetInputSchema,
+  RuntimeRoleCommandGrantInputSchema,
   UpdateRoomInputSchema,
 } from '../src/contracts.ts';
 import {
@@ -279,6 +280,7 @@ test('documented examples satisfy the contract schemas the service enforces', ()
     'room.settings': UpdateRoomInputSchema,
     'room.briefing.role.set': RoleBriefingSetInputSchema,
     'room.briefing.role.delete': RoleBriefingDeleteInputSchema,
+    'room.command.role.set': RuntimeRoleCommandGrantInputSchema,
     'room.message': PostMessageInputSchema,
   };
   for (const [method, schema] of Object.entries(contracts)) {

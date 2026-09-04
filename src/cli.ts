@@ -84,6 +84,7 @@ const NATIVE_MUTATION_METHODS = new Set([
   'room.participant.remove',
   'room.command.grant',
   'room.command.revoke',
+  'room.command.role.set',
 ]);
 
 export function rpcTimeoutForMethod(method: string): number {
@@ -132,6 +133,8 @@ Room commands:
   show <room-id>
   participants <room-id>
   command-grants <room-id>
+  role-command-grants <room-id>
+  role-command-set <room-id> --role <label> --commands <list-members,remove-member|none>
   command-grant <room-id> <caller-cid> <list-members|remove-member>
   command-revoke <room-id> <caller-cid> <list-members|remove-member>
   history <room-id> [--after <seq>] [--limit <n>] [--view operator|participant]
@@ -339,6 +342,22 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
     case 'command-grants': {
       const [roomId] = exactPositionals(parseOptions(args), 1, 'room command-grants');
       return { method: 'room.command.grants', params: { room_id: roomId } };
+    }
+    case 'role-command-grants': {
+      const [roomId] = exactPositionals(parseOptions(args), 1, 'room role-command-grants');
+      return { method: 'room.command.role.grants', params: { room_id: roomId } };
+    }
+    case 'role-command-set': {
+      const parsed = parseOptions(args, ['--role', '--commands']);
+      const [roomId] = exactPositionals(parsed, 1, 'room role-command-set');
+      const role = requiredFlag(parsed, '--role', 'room role-command-set');
+      const value = requiredFlag(parsed, '--commands', 'room role-command-set');
+      const commands = value === 'none' ? [] : value.split(',');
+      if (new Set(commands).size !== commands.length || commands.some(item =>
+        item !== 'list-members' && item !== 'remove-member')) {
+        usageError('--commands must be a unique comma-separated subset of list-members,remove-member or none');
+      }
+      return { method: 'room.command.role.set', params: { room_id: roomId, role, commands } };
     }
     case 'command-grant':
     case 'command-revoke': {

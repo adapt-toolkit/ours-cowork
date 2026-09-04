@@ -45,6 +45,7 @@ function room(overrides = {}) {
     mission: { goal: 'Ship it', briefing: 'Work together.', briefing_version: 1 },
     role_briefings: {},
     rest_roles: [],
+    role_command_grants: [],
     anonymous: false,
     quiet_membership: false,
     membership_epoch: 0,
@@ -453,6 +454,7 @@ function roomV2(overrides = {}) {
     mission: { goal: 'Ship it', briefing: 'Work together.', briefing_version: 1 },
     role_briefings: {},
     rest_roles: [],
+    role_command_grants: [],
     anonymous: false,
     quiet_membership: false,
     membership_epoch: 0,
@@ -466,6 +468,7 @@ function roomV2(overrides = {}) {
 
 test('runtime-command grants default empty and bind unique commands to active CIDs', () => {
   assert.deepEqual(RoomSchema.parse(roomV2()).command_grants, []);
+  assert.deepEqual(RoomSchema.parse(roomV2()).role_command_grants, []);
   const cid = 'A'.repeat(64);
   const granted = roomV2({
     seats: [seatV2({ identity: cid })],
@@ -482,6 +485,30 @@ test('runtime-command grants default empty and bind unique commands to active CI
     ...granted,
     seats: [seatV2({ identity: cid, state: 'removed', removed_at: AT, removed_epoch: 0 })],
   }), /active room identity/i);
+});
+
+test('runtime role-command policy is exact, unique, and backwards-compatible', () => {
+  const configured = RoomSchema.parse(roomV2({
+    role_command_grants: [{ role: 'Configurable owner', commands: ['list-members', 'remove-member'] }],
+  }));
+  assert.deepEqual(configured.role_command_grants, [
+    { role: 'Configurable owner', commands: ['list-members', 'remove-member'] },
+  ]);
+  assert.throws(() => RoomSchema.parse(roomV2({
+    role_command_grants: [
+      { role: 'same', commands: ['list-members'] },
+      { role: 'same', commands: ['remove-member'] },
+    ],
+  })), /unique by role/i);
+  assert.throws(() => RoomSchema.parse(roomV2({
+    role_command_grants: [{ role: 'role', commands: ['list-members', 'list-members'] }],
+  })), /commands must be unique/i);
+  assert.throws(() => RoomSchema.parse(roomV2({
+    role_command_grants: [{ role: '', commands: ['list-members'] }],
+  })), /role/i);
+  assert.throws(() => RoomSchema.parse(roomV2({
+    role_command_grants: [{ role: 'role', commands: ['filesystem-admin'] }],
+  })), /invalid_enum_value|invalid enum/i);
 });
 
 test('room schema v2 round-trips briefing versions, anonymity, and membership fields', () => {

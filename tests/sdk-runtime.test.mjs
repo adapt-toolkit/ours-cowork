@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import { OursError } from '@ours.network/sdk';
 import {
+  ContactAlreadyAbsentError,
   LegacyCoworkStateError,
   PacketRegistry,
   RoomIdentityMismatchError,
@@ -36,6 +37,7 @@ class FakeClient {
   calls = [];
   chooseResult = { name: IDENTITY, cid: CID, switchedFrom: null };
   chooseFailure;
+  registeredCommands = [];
   createFailure;
 
   async chooseIdentity(input) {
@@ -59,6 +61,11 @@ class FakeClient {
   async listInvites() { return structuredClone(this.invites); }
   async listIncomingMessages() { return structuredClone(this.messages); }
   async listIncomingFiles() { return structuredClone(this.files); }
+
+  async registerCommands(commands) {
+    this.registeredCommands = commands;
+    this.calls.push(['registerCommands', commands.map(({ handler: _handler, ...command }) => structuredClone(command))]);
+  }
 
   async getHistoryItem(input) {
     this.calls.push(['getHistoryItem', structuredClone(input)]);
@@ -379,6 +386,137 @@ test('SDK room packet promotes an older raced message through intake before ackn
   assert.equal(client.messages.every((message) => message.status === 'read'), true);
 });
 
+test('SDK room packet publishes only the bounded membership commands and keeps handlers local', async () => {
+  const client = blankClient();
+  const registerCommands = client.registerCommands.bind(client);
+  let leaseLost = true;
+  client.registerCommands = async (commands) => {
+    if (leaseLost) {
+      leaseLost = false;
+      throw Object.assign(new Error('not bound'), { code: 'NOT_BOUND' });
+    }
+    return registerCommands(commands);
+  };
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  const handlers = {
+    listMembers: async () => ({ ok: true }),
+    removeMember: async () => ({ ok: true }),
+  };
+  await packet.registerRuntimeCommands(handlers);
+  assert.deepEqual(client.registeredCommands.map((command) => command.name), [
+    'list-members', 'remove-member',
+  ]);
+  assert.equal(client.registeredCommands.some((command) => command.name === 'add-seat'), false);
+  assert.equal(client.registeredCommands[0].handler, handlers.listMembers);
+  assert.equal(client.registeredCommands[1].handler, handlers.removeMember);
+  assert.deepEqual(client.registeredCommands[0].input_schema, {
+    type: 'object', additionalProperties: false,
+  });
+  assert.deepEqual(client.registeredCommands[1].input_schema.required, [
+    'participant_id', 'expected_membership_epoch', 'confirm',
+  ]);
+  assert.deepEqual(client.registeredCommands[1].input_schema.properties.confirm, { const: true });
+  assert.equal(client.calls.filter(([name]) => name === 'chooseIdentity').length, 1);
+});
+
+test('SDK room packet drains typed rows without exposing them as chat or losing a raced text row', async () => {
+  const client = blankClient();
+  const command = {
+    seq: 1, msg_id: 7, from: { id: CID, name: 'Peer' }, status: 'unread',
+    inbox_state: 'unread', wire_id: 'wire-command', message_kind: 'command',
+  };
+  const text = {
+    seq: 2, msg_id: 8, from: { id: CID, name: 'Peer' }, status: 'unread',
+    inbox_state: 'unread', wire_id: SECOND_MESSAGE_WIRE, message_kind: 'text',
+    date: '2026-08-15T08:00:00Z', occurred_at_ms: Date.parse('2026-08-15T08:00:00Z'),
+    reply_to: null,
+  };
+  client.messages = [command, text];
+  client.messageHistory.set(SECOND_MESSAGE_WIRE, {
+    ...text, peer: text.from, direction: 'in', text: 'raced text', body: 'raced text',
+    date: '2026-08-15T08:00:00Z', reply_to: null,
+  });
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  assert.deepEqual(await packet.listUnreadMessages(32), []);
+
+  const listIncomingMessages = client.listIncomingMessages.bind(client);
+  let leaseLost = true;
+  client.listIncomingMessages = async () => {
+    if (leaseLost) {
+      leaseLost = false;
+      throw Object.assign(new Error('binding reassigned'), { code: 'BINDING_REASSIGNED' });
+    }
+    return listIncomingMessages();
+  };
+  client.getMessages = async (input) => {
+    client.calls.push(['getMessages', structuredClone(input)]);
+    command.status = 'read';
+    command.inbox_state = 'read';
+    return { messages: [], command_results: [], commands_handled: 1, remaining: 1 };
+  };
+  const unexpected = [];
+  await packet.drainRuntimeCommands(async (item) => unexpected.push(item));
+  assert.deepEqual(unexpected, []);
+  assert.equal(client.calls.filter(([name]) => name === 'chooseIdentity').length, 1);
+  assert.deepEqual(await packet.listUnreadMessages(32), [{
+    msg_id: 8, sender_id: CID, sender_name: 'Peer', text: 'raced text',
+    date: '2026-08-15T08:00:00.000Z', wire_id: SECOND_MESSAGE_WIRE, reply_to: null,
+  }]);
+  assert.equal(text.status, 'unread');
+
+  // If the SDK snapshot races and returns an ordinary row, Cowork hands that
+  // row straight to intake instead of silently consuming it.
+  command.status = 'unread';
+  command.inbox_state = 'unread';
+  client.getMessages = async () => {
+    command.status = 'read';
+    text.status = 'read';
+    return {
+      messages: [{
+        ...structuredClone(client.messageHistory.get(SECOND_MESSAGE_WIRE)),
+        status: 'read', inbox_state: 'read',
+      }],
+      command_results: [], commands_handled: 0, remaining: 0,
+    };
+  };
+  await packet.drainRuntimeCommands(async (item) => unexpected.push(item));
+  assert.deepEqual(unexpected.map((item) => item.wire_id), [SECOND_MESSAGE_WIRE]);
+});
+
+test('SDK room packet stops a text snapshot at the first typed ordering barrier', async () => {
+  const client = blankClient();
+  const rows = [
+    { seq: 1, msg_id: 7, wire_id: MESSAGE_WIRE, message_kind: 'text', body: 'before command' },
+    { seq: 2, msg_id: 8, wire_id: 'wire-command-barrier', message_kind: 'command', body: '{}' },
+    { seq: 3, msg_id: 9, wire_id: SECOND_MESSAGE_WIRE, message_kind: 'text', body: 'after command' },
+  ].map((row) => ({
+    ...row,
+    from: { id: CID, name: 'Peer' },
+    status: 'unread', inbox_state: 'unread', encryption: 'e2e', reply_to: null,
+    date: '2026-08-15T08:00:00Z', occurred_at_ms: Date.parse('2026-08-15T08:00:00Z') + row.seq,
+  }));
+  client.messages = rows;
+  for (const row of rows.filter((candidate) => candidate.message_kind === 'text')) {
+    client.messageHistory.set(row.wire_id, {
+      ...row, peer: row.from, direction: 'in', text: row.body,
+      transport: 'double_ratchet', delivery_state: null, human_read_at_ms: null,
+    });
+  }
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  const first = await packet.listUnreadMessages(32);
+  assert.deepEqual(first.map((item) => item.text), ['before command']);
+  await packet.acknowledgeMessage(first[0], async () => assert.fail('the oldest text must be exact'));
+
+  client.getMessages = async (input) => {
+    client.calls.push(['getMessages', structuredClone(input)]);
+    rows[1].status = 'read';
+    rows[1].inbox_state = 'read';
+    return { messages: [], command_results: [], commands_handled: 1, remaining: 1 };
+  };
+  await packet.drainRuntimeCommands(async () => assert.fail('the typed row must not become chat'));
+  assert.deepEqual((await packet.listUnreadMessages(32)).map((item) => item.text), ['after command']);
+});
+
 test('SDK room packet treats an empty message acknowledgement as an already-read expected row', async () => {
   const client = blankClient();
   const packet = new SdkRoomPacket(IDENTITY, CID, client);
@@ -423,6 +561,30 @@ test('successful contact removal evicts only its target without a fallible post-
   assert.deepEqual(client.calls.find(([name]) => name === 'removeContact'), [
     'removeContact', { contact: CID },
   ]);
+});
+
+test('contact removal translates only the SDK exact-target Unknown contact outcome', async () => {
+  const client = blankClient();
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  client.removeContact = async () => {
+    throw new OursError('TX_FAILED', `remove_contact failed: Error: Unknown contact: ${CID}`);
+  };
+  await assert.rejects(packet.removeContact(CID), (error) => {
+    assert(error instanceof ContactAlreadyAbsentError);
+    assert.equal(error.contactCid, CID);
+    return true;
+  });
+
+  const wrongTarget = new OursError(
+    'TX_FAILED',
+    `remove_contact failed: Error: Unknown contact: ${'CD'.repeat(32)}`,
+  );
+  client.removeContact = async () => { throw wrongTarget; };
+  await assert.rejects(packet.removeContact(CID), (error) => error === wrongTarget);
+
+  const unrelated = new OursError('TX_FAILED', 'remove_contact failed: transport unavailable');
+  client.removeContact = async () => { throw unrelated; };
+  await assert.rejects(packet.removeContact(CID), (error) => error === unrelated);
 });
 
 test('contact-only refresh succeeds without listing invites', async () => {

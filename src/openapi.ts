@@ -164,8 +164,9 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
   {
     method: 'room.participant.remove',
     summary: 'Remove a participant',
-    description: 'Removes one participant seat, bumps the membership epoch, and severs the '
-      + 'contact. The receipt reports what actually happened, including retained key material.',
+    description: 'Directly removes the contact, then records the seat as removed and bumps the '
+      + 'membership epoch. An already-absent exact contact completes successfully without a '
+      + 'durable removal intent.',
     params: params({
       room_id: roomIdProperty,
       participant: {
@@ -176,31 +177,8 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
       notify: notifyProperty,
     }, ['room_id', 'participant']),
     result: 'A removal receipt with `participant_id`, `epoch`, `status`, `notified`, and '
-      + '`key_material_retained`.',
+      + '`key_material_retained`; `status` is `already_absent` for an idempotent no-op.',
     example: { room_id: EXAMPLE_ROOM_ID, participant: 'Reviewer-1', notify: true },
-  },
-  {
-    method: 'room.participant.replace',
-    summary: 'Replace a participant',
-    description: 'Removes one participant seat and mints a replacement invitation requirement in '
-      + 'the same operation.',
-    params: params({
-      room_id: roomIdProperty,
-      participant: {
-        type: 'string',
-        minLength: 1,
-        description: 'Participant id, identity, display name, or alias.',
-      },
-      notify: notifyProperty,
-      mode: inviteModeProperty,
-      min_accepts: {
-        type: 'integer',
-        minimum: 1,
-        description: 'Acceptances required for the replacement invitation requirement.',
-      },
-    }, ['room_id', 'participant']),
-    result: 'An invite receipt for the replacement, extended with the `removal` receipt.',
-    example: { room_id: EXAMPLE_ROOM_ID, participant: 'Reviewer-1', mode: 'one_time' },
   },
   {
     method: 'room.revoke',
@@ -266,6 +244,65 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     params: params({ room_id: roomIdProperty }, ['room_id']),
     result: 'An array of seat records.',
     example: { room_id: EXAMPLE_ROOM_ID },
+  },
+  {
+    method: 'room.command.grants',
+    summary: 'List runtime-command grants',
+    description: 'Lists the default-deny grants that bind one active participant CID to one '
+      + 'room runtime command.',
+    params: params({ room_id: roomIdProperty }, ['room_id']),
+    result: 'An array of `{caller_cid, command}` grants.',
+    example: { room_id: EXAMPLE_ROOM_ID },
+  },
+  {
+    method: 'room.command.role.grants',
+    summary: 'List role runtime-command policies',
+    description: 'Lists durable role policies. A command is authorized only while an authenticated '
+      + 'active seat has the exact configured role.',
+    params: params({ room_id: roomIdProperty }, ['room_id']),
+    result: 'An array of `{role, commands}` policies.',
+    example: { room_id: EXAMPLE_ROOM_ID },
+  },
+  {
+    method: 'room.command.role.set',
+    summary: 'Set a role runtime-command policy',
+    description: 'Atomically replaces the command policy for one exact role. An empty command '
+      + 'list removes the policy without removing independent per-CID grants.',
+    params: params({
+      room_id: roomIdProperty,
+      role: { type: 'string', minLength: 1, description: 'Exact admitted seat role.' },
+      commands: { type: 'array', uniqueItems: true, items: {
+        type: 'string', enum: ['list-members', 'remove-member'],
+      } },
+    }, ['room_id', 'role', 'commands']),
+    result: 'The complete sorted role-policy list after the idempotent update.',
+    example: { room_id: EXAMPLE_ROOM_ID, role: 'Owner', commands: ['list-members', 'remove-member'] },
+  },
+  {
+    method: 'room.command.grant',
+    summary: 'Authorize a runtime command caller',
+    description: 'Idempotently grants one command to one exact active participant CID. Display '
+      + 'names and roles are never authority.',
+    params: params({
+      room_id: roomIdProperty,
+      caller_cid: { type: 'string', pattern: '^[0-9A-Fa-f]{64}$', description: 'Authenticated caller CID.' },
+      command: { type: 'string', enum: ['list-members', 'remove-member'] },
+    }, ['room_id', 'caller_cid', 'command']),
+    result: 'The complete sorted grant list after the idempotent update.',
+    example: { room_id: EXAMPLE_ROOM_ID, caller_cid: 'A'.repeat(64), command: 'list-members' },
+  },
+  {
+    method: 'room.command.revoke',
+    summary: 'Revoke a runtime command caller',
+    description: 'Idempotently removes one exact CID/command grant. Revocation is persisted '
+      + 'before subsequent command dispatch can acquire the room mutex.',
+    params: params({
+      room_id: roomIdProperty,
+      caller_cid: { type: 'string', pattern: '^[0-9A-Fa-f]{64}$', description: 'Authenticated caller CID.' },
+      command: { type: 'string', enum: ['list-members', 'remove-member'] },
+    }, ['room_id', 'caller_cid', 'command']),
+    result: 'The complete sorted grant list after the idempotent update.',
+    example: { room_id: EXAMPLE_ROOM_ID, caller_cid: 'A'.repeat(64), command: 'remove-member' },
   },
   {
     method: 'room.history',

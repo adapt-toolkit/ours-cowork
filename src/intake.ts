@@ -181,6 +181,9 @@ export class IntakePump {
 
   private async processAndRelayUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
     for (;;) {
+      await packet.drainRuntimeCommands?.(
+        (item) => this.processInboxItem(roomId, packet, item, false),
+      );
       const messages = await packet.listUnreadMessages(INTAKE_BATCH_SIZE);
       const files = await packet.listUnreadFiles(INTAKE_BATCH_SIZE);
       if (messages.length === 0 && files.length === 0) break;

@@ -91,8 +91,10 @@ test('the exhaustive service route table marks every route auth:true', () => {
   const routes = createServiceRoutes(service);
   assert.deepEqual(Object.keys(routes).sort(), [
     'room.briefing.role.delete', 'room.briefing.role.set',
-    'room.close', 'room.create', 'room.delete', 'room.history', 'room.invite', 'room.list',
-    'room.message', 'room.participant.remove', 'room.participant.replace', 'room.participants',
+    'room.close', 'room.command.grant', 'room.command.grants', 'room.command.revoke',
+    'room.command.role.grants', 'room.command.role.set',
+    'room.create', 'room.delete', 'room.history', 'room.invite', 'room.list',
+    'room.message', 'room.participant.remove', 'room.participants',
     'room.rebind', 'room.recover', 'room.recover.confirm', 'room.revoke',
     'room.role.rest.add', 'room.role.rest.remove', 'room.say',
     'room.settings', 'room.show',
@@ -125,6 +127,9 @@ test('external invite acceptance has strict params and is excluded from the ordi
   assert.equal((await privateDispatcher.dispatch({
     ...envelope, params: { ...envelope.params, extra: true },
   })).error.code, 'invalid_params');
+  assert.equal((await privateDispatcher.dispatch({
+    ...envelope, params: { ...envelope.params, replaces_seat: 'participant' },
+  })).error.code, 'invalid_params');
 });
 
 test('room membership and briefing verbs are reachable over authenticated RPC with strict params', async () => {
@@ -147,8 +152,30 @@ test('room membership and briefing verbs are reachable over authenticated RPC wi
   await send('room.participant.remove', { room_id: 'r1', participant: 'cid-a', notify: false });
   assert.deepEqual(calls.at(-1), ['removeParticipant', 'r1', { participant: 'cid-a', notify: false }]);
 
-  await send('room.participant.replace', { room_id: 'r1', participant: 'cid-a', mode: 'public', min_accepts: 2 });
-  assert.deepEqual(calls.at(-1), ['replaceParticipant', 'r1', { participant: 'cid-a', mode: 'public', min_accepts: 2 }]);
+  const beforeRemovedMethod = calls.length;
+  assert.equal((await send('room.participant.replace', {
+    room_id: 'r1', participant: 'cid-a',
+  })).error.code, 'method_not_found');
+  assert.equal(calls.length, beforeRemovedMethod);
+
+  const cid = 'A'.repeat(64);
+  await send('room.command.grants', { room_id: 'r1' });
+  assert.deepEqual(calls.at(-1), ['runtimeCommandGrants', 'r1']);
+  await send('room.command.role.grants', { room_id: 'r1' });
+  assert.deepEqual(calls.at(-1), ['runtimeRoleCommandGrants', 'r1']);
+  await send('room.command.role.set', {
+    room_id: 'r1', role: 'Configurable owner', commands: ['list-members', 'remove-member'],
+  });
+  assert.deepEqual(calls.at(-1), ['setRuntimeRoleCommands', 'r1', {
+    role: 'Configurable owner', commands: ['list-members', 'remove-member'],
+  }]);
+  await send('room.command.grant', { room_id: 'r1', caller_cid: cid, command: 'list-members' });
+  assert.deepEqual(calls.at(-1), ['grantRuntimeCommand', 'r1', { caller_cid: cid, command: 'list-members' }]);
+  await send('room.command.revoke', { room_id: 'r1', caller_cid: cid, command: 'remove-member' });
+  assert.deepEqual(calls.at(-1), ['revokeRuntimeCommand', 'r1', { caller_cid: cid, command: 'remove-member' }]);
+  assert.equal((await send('room.command.role.set', {
+    room_id: 'r1', role: 'x', commands: ['filesystem-admin'],
+  })).error.code, 'invalid_params');
 
   // configurability rides existing verbs: create flags, settings toggle, history view
   await send('room.create', { name: 'Launch room', goal: 'g', briefing: 'b', anonymous: true, quiet_membership: true });
@@ -168,7 +195,8 @@ test('room membership and briefing verbs are reachable over authenticated RPC wi
   for (const [method, params] of [
     ['room.briefing.role.set', { room_id: 'r1', role: 'x', text: 't', extra: true }],
     ['room.participant.remove', { room_id: 'r1', participant: 'cid-a', alias: 'spoof' }],
-    ['room.participant.replace', { room_id: 'r1', participant: 'cid-a', replaces_seat: 'spoof' }],
+    ['room.command.grant', { room_id: 'r1', caller_cid: cid, command: 'unknown' }],
+    ['room.command.revoke', { room_id: 'r1', caller_cid: 'Alice', command: 'list-members' }],
   ]) {
     const before = calls.length;
     const response = await send(method, params);

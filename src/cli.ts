@@ -82,7 +82,9 @@ const NATIVE_MUTATION_METHODS = new Set([
   'room.recover.confirm',
   'room.rebind',
   'room.participant.remove',
-  'room.participant.replace',
+  'room.command.grant',
+  'room.command.revoke',
+  'room.command.role.set',
 ]);
 
 export function rpcTimeoutForMethod(method: string): number {
@@ -124,13 +126,17 @@ Room commands:
   settings <room-id> [--name <display-name>] [--goal <text>] [--briefing <text>] [--status <text>] [--quiet-membership true|false]
   role-briefing <room-id> --role <label> (--text <text> | --delete)
   invite <room-id> [--role <label>] [--mode one_time|public] [--min-accepts <n>]
-  accept <room-id> --role <label> (--invite-file <path> | --invite-stdin) [--expected-cid <64-hex>] [--replaces <participant-id>]
+  accept <room-id> --role <label> (--invite-file <path> | --invite-stdin) [--expected-cid <64-hex>]
   revoke <room-id> <invite-id>
   remove <room-id> <participant> [--silent]
-  replace <room-id> <participant> [--mode one_time|public] [--min-accepts <n>] [--silent]
   list
   show <room-id>
   participants <room-id>
+  command-grants <room-id>
+  role-command-grants <room-id>
+  role-command-set <room-id> --role <label> --commands <list-members,remove-member|none>
+  command-grant <room-id> <caller-cid> <list-members|remove-member>
+  command-revoke <room-id> <caller-cid> <list-members|remove-member>
   history <room-id> [--after <seq>] [--limit <n>] [--view operator|participant]
   message <room-id> --text <text>
   say <room-id> --role <label> --text <text>
@@ -288,7 +294,7 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
     case 'accept': {
       const parsed = parseOptions(
         args,
-        ['--role', '--invite-file', '--expected-cid', '--replaces'],
+        ['--role', '--invite-file', '--expected-cid'],
         ['--invite-stdin'],
       );
       const [roomId] = exactPositionals(parsed, 1, 'room accept');
@@ -307,9 +313,6 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
         ...(parsed.values['--expected-cid'] === undefined
           ? {}
           : { expected_cid: parsed.values['--expected-cid'] }),
-        ...(parsed.values['--replaces'] === undefined
-          ? {}
-          : { replaces_seat: parsed.values['--replaces'] }),
       } };
     }
     case 'remove': {
@@ -318,21 +321,6 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
       return { method: 'room.participant.remove', params: {
         room_id: roomId,
         participant,
-        ...(parsed.booleans.has('--silent') ? { notify: false } : {}),
-      } };
-    }
-    case 'replace': {
-      const parsed = parseOptions(args, ['--mode', '--min-accepts'], ['--silent']);
-      const [roomId, participant] = exactPositionals(parsed, 2, 'room replace');
-      const mode = parsed.values['--mode'];
-      if (mode !== undefined && mode !== 'one_time' && mode !== 'public') usageError('--mode must be one_time or public');
-      return { method: 'room.participant.replace', params: {
-        room_id: roomId,
-        participant,
-        ...(mode === undefined ? {} : { mode }),
-        ...(parsed.values['--min-accepts'] === undefined
-          ? {}
-          : { min_accepts: parseInteger(parsed.values['--min-accepts'], '--min-accepts', 1) }),
         ...(parsed.booleans.has('--silent') ? { notify: false } : {}),
       } };
     }
@@ -350,6 +338,41 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
     case 'close': {
       const [roomId] = exactPositionals(parseOptions(args), 1, `room ${command}`);
       return { method: `room.${command}`, params: { room_id: roomId } };
+    }
+    case 'command-grants': {
+      const [roomId] = exactPositionals(parseOptions(args), 1, 'room command-grants');
+      return { method: 'room.command.grants', params: { room_id: roomId } };
+    }
+    case 'role-command-grants': {
+      const [roomId] = exactPositionals(parseOptions(args), 1, 'room role-command-grants');
+      return { method: 'room.command.role.grants', params: { room_id: roomId } };
+    }
+    case 'role-command-set': {
+      const parsed = parseOptions(args, ['--role', '--commands']);
+      const [roomId] = exactPositionals(parsed, 1, 'room role-command-set');
+      const role = requiredFlag(parsed, '--role', 'room role-command-set');
+      const value = requiredFlag(parsed, '--commands', 'room role-command-set');
+      const commands = value === 'none' ? [] : value.split(',');
+      if (new Set(commands).size !== commands.length || commands.some(item =>
+        item !== 'list-members' && item !== 'remove-member')) {
+        usageError('--commands must be a unique comma-separated subset of list-members,remove-member or none');
+      }
+      return { method: 'room.command.role.set', params: { room_id: roomId, role, commands } };
+    }
+    case 'command-grant':
+    case 'command-revoke': {
+      const [roomId, callerCid, runtimeCommand] = exactPositionals(
+        parseOptions(args), 3, `room ${command}`,
+      );
+      if (runtimeCommand !== 'list-members' && runtimeCommand !== 'remove-member') {
+        usageError('runtime command must be list-members or remove-member');
+      }
+      return {
+        method: command === 'command-grant'
+          ? 'room.command.grant'
+          : 'room.command.revoke',
+        params: { room_id: roomId, caller_cid: callerCid, command: runtimeCommand },
+      };
     }
     case 'history': {
       const parsed = parseOptions(args, ['--after', '--limit', '--view']);

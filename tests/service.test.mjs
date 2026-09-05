@@ -10,9 +10,12 @@ import {
   MAX_HISTORY_PAGE_BYTES,
   sdkIdentityNameError,
 } from '../src/contracts.ts';
-import { LegacyCoworkStateError, packInvite } from '../src/packets.ts';
+import { ContactAlreadyAbsentError, LegacyCoworkStateError, packInvite } from '../src/packets.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+const ALICE_CID = 'A'.repeat(64);
+const BOB_CID = 'B'.repeat(64);
+const OUTSIDER_CID = 'C'.repeat(64);
 const MESSAGE_IDS = [
   '01jz6y7n8p9q0r1s2t3v4w5x6z',
   '01jz6y7n8p9q0r1s2t3v4w5x70',
@@ -123,6 +126,7 @@ class FakePacket {
     inviter_name: 'External inviter',
     pending_name: '',
   };
+  runtimeCommands;
 
   constructor(name, cid) { this.name = name; this.cid = cid; }
 
@@ -151,6 +155,7 @@ class FakePacket {
 
   listInvites() { return structuredClone(this.invites); }
   listContacts() { return structuredClone(this.contacts); }
+  async registerRuntimeCommands(handlers) { this.runtimeCommands = handlers; }
   listUnreadMessages() { return Promise.resolve([]); }
   listUnreadFiles() { return Promise.resolve([]); }
   acknowledgeFile() { return Promise.resolve(); }
@@ -340,7 +345,7 @@ test('external acceptance refuses an already-known CID because a second SDK rede
   assert.deepEqual(packet.addCalls, [secret]);
 });
 
-test('pending external seats can be cancelled without authority or epoch gain and cannot be replaced', async () => {
+test('pending external seats can be cancelled without authority or epoch gain', async () => {
   const f = fixture();
   await create(f);
   const pending = await f.service.acceptExternalInvite(ROOM_ID, {
@@ -355,17 +360,24 @@ test('pending external seats can be cancelled without authority or epoch gain an
   assert.equal(room.seats[0].accepted_at, undefined);
   assert.equal(room.membership_epoch, 0);
   assert.equal((await f.store.read(ROOM_ID)).length, 0);
+});
 
-  const replacePending = await f.service.acceptExternalInvite(ROOM_ID, {
-    role: 'reviewer', invite: packInvite(Buffer.from('replace me')),
+test('a failed removal of a just-established pending contact leaves the seat retryable', async () => {
+  const f = fixture();
+  await create(f);
+  const pending = await f.service.acceptExternalInvite(ROOM_ID, {
+    role: 'reviewer', invite: packInvite(Buffer.from('complete during cancellation')),
   });
-  await assert.rejects(f.service.replaceParticipant(ROOM_ID, {
-    participant: replacePending.participant_id,
-  }), /not an active participant/i);
-  room = await f.service.showRoom(ROOM_ID);
-  assert.equal(room.membership_epoch, 0);
-  assert.equal(room.seats.find((seat) => seat.participant_id === replacePending.participant_id).state, 'pending');
-  assert.equal(room.invites.length, 0, 'a never-authoritative seat cannot create replacement lineage');
+  const packet = f.registry.get(ROOM_ID);
+  packet.contacts = [{ name: 'External inviter', container_id: pending.identity }];
+  packet.removeContact = async () => { throw new Error('daemon removal unavailable'); };
+
+  await assert.rejects(
+    f.service.removeParticipant(ROOM_ID, { participant: pending.participant_id }),
+    /daemon removal unavailable/,
+  );
+  assert.equal((await f.service.showRoom(ROOM_ID)).seats[0].state, 'pending');
+  assert.equal((await f.service.showRoom(ROOM_ID)).membership_epoch, 0);
 });
 
 test('late redemption after cancellation can be severed and safely re-accepted by the operator', async () => {
@@ -1416,7 +1428,7 @@ test('a role without a briefing gets only the common briefing and no failure', a
   assert.equal(briefingsOf(records, 'role_briefing').length, 0);
 });
 
-test('late and replacement seats receive both briefings at their current versions once', async () => {
+test('late seats receive both briefings at their current versions once', async () => {
   const f = evolutionFixture();
   await f.service.createRoom({ goal: 'Ship', briefing: 'Common v1.' });
   await f.service.setRoleBriefing(ROOM_ID, { role: 'reviewer', text: 'Role v1.' });
@@ -1532,7 +1544,7 @@ test('a crash between role-briefing append and its intent re-drives without dupl
   assert.deepEqual(intentsFor(records, common[0].message_id), ['cid-alice']);
 });
 
-// ---- Participant removal and replacement -----------------------------------
+// ---- Participant removal ---------------------------------------------------
 
 function membershipRecords(records) {
   return {
@@ -1542,7 +1554,7 @@ function membershipRecords(records) {
   };
 }
 
-test('removeParticipant journals intent/result, severs the channel, bumps the epoch once, and announces', async () => {
+test('removeParticipant directly severs the channel, bumps the epoch once, and announces', async () => {
   const f = evolutionFixture();
   await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
   const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
@@ -1566,17 +1578,8 @@ test('removeParticipant journals intent/result, severs the channel, bumps the ep
 
   const records = await f.store.read(ROOM_ID);
   const { intents, results, notices } = membershipRecords(records);
-  assert.equal(intents.length, 1);
-  assert.equal(intents[0].action, 'remove');
-  assert.equal(intents[0].participant_id, seat.participant_id);
-  assert.equal(intents[0].recipient_identity, 'cid-alice');
-  assert.equal(intents[0].epoch, epochBefore + 1);
-  assert.equal(results.length, 1);
-  assert.equal(results[0].intent_record_id, intents[0].record_id);
-  assert.deepEqual(
-    { status: results[0].status, notified: results[0].notified, key_material_retained: results[0].key_material_retained },
-    { status: 'queued', notified: true, key_material_retained: true },
-  );
+  assert.equal(intents.length, 0);
+  assert.equal(results.length, 0);
 
   // announcement goes to the remaining active seats only, epoch stamped
   assert.equal(notices.length, 1);
@@ -1590,11 +1593,277 @@ test('removeParticipant journals intent/result, severs the channel, bumps the ep
     record.kind === 'message' && record.category === 'chat').at(-1);
   assert.deepEqual(chat.recipient_identities, ['cid-bob']);
 
-  // a second removal of the same participant is an explicit error
-  await assert.rejects(f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' }), /active/i);
+  // Repeating a completed removal is a successful no-op.
+  const repeated = await f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' });
+  assert.equal(repeated.status, 'already_absent');
+  assert.equal(repeated.epoch, epochBefore + 1);
+  assert.deepEqual(packet.removeContactCalls, ['cid-alice']);
+  assert.equal((await f.service.showRoom(ROOM_ID)).membership_epoch, epochBefore + 1);
 });
 
-test('quiet_membership and notify:false suppress the announcement but never the journal', async () => {
+test('runtime membership commands authorize by trusted CID, redact the roster, and retry from room state', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'builder', min_accepts: 1,
+  });
+  await admit(f, invite, ALICE_CID, 'Alice');
+  await admit(f, invite, BOB_CID, 'Bob', '2026-08-02T10:21:00.000Z');
+  const packet = f.registry.get(ROOM_ID);
+  const roomBefore = await f.service.showRoom(ROOM_ID);
+  const alice = roomBefore.seats.find((seat) => seat.identity === ALICE_CID);
+  const bob = roomBefore.seats.find((seat) => seat.identity === BOB_CID);
+  const aliceContext = Object.freeze({
+    sender_cid: ALICE_CID,
+    sender_name: 'Bob (spoofed)',
+    request_wire_id: 'wire-remove-alice-1',
+  });
+
+  assert.deepEqual(await packet.runtimeCommands.listMembers({}, aliceContext), {
+    ok: false, error: 'unauthorized',
+  }, 'active membership alone is never a command grant');
+  await assert.rejects(f.service.grantRuntimeCommand(ROOM_ID, {
+    caller_cid: OUTSIDER_CID, command: 'list-members',
+  }), /not an active room identity/);
+  await assert.rejects(f.service.grantRuntimeCommand(ROOM_ID, {
+    caller_cid: 'Alice', command: 'list-members',
+  }), /64-character hexadecimal CID/);
+  assert.deepEqual(await f.service.grantRuntimeCommand(ROOM_ID, {
+    caller_cid: ALICE_CID.toLowerCase(), command: 'list-members',
+  }), [{ caller_cid: ALICE_CID, command: 'list-members' }]);
+  assert.deepEqual(await f.service.grantRuntimeCommand(ROOM_ID, {
+    caller_cid: ALICE_CID, command: 'list-members',
+  }), [{ caller_cid: ALICE_CID, command: 'list-members' }], 'grant is idempotent');
+
+  const listed = await packet.runtimeCommands.listMembers({}, aliceContext);
+  assert.deepEqual(listed, {
+    ok: true,
+    membership_epoch: roomBefore.membership_epoch,
+    members: roomBefore.seats.map((seat) => ({
+      participant_id: seat.participant_id,
+      role: seat.role,
+      state: seat.state,
+    })),
+  });
+  const serialized = JSON.stringify(listed);
+  for (const secret of [ALICE_CID, BOB_CID, 'Alice', 'Bob', 'invite_id', 'accepted_at']) {
+    assert.equal(serialized.includes(secret), false, `list result leaked ${secret}`);
+  }
+  assert.deepEqual(await packet.runtimeCommands.listMembers({}, {
+    sender_cid: OUTSIDER_CID, sender_name: 'Alice', request_wire_id: 'wire-list-outsider',
+  }), { ok: false, error: 'unauthorized' });
+
+  const baseRequest = {
+    participant_id: alice.participant_id,
+    expected_membership_epoch: roomBefore.membership_epoch,
+    confirm: true,
+  };
+  assert.deepEqual(await packet.runtimeCommands.removeMember({ ...baseRequest, confirm: false }, aliceContext), {
+    ok: false, error: 'invalid_request',
+  });
+  assert.deepEqual(await packet.runtimeCommands.removeMember(baseRequest, {
+    sender_cid: OUTSIDER_CID, sender_name: 'Alice', request_wire_id: 'wire-remove-outsider',
+  }), { ok: false, error: 'unauthorized' });
+  assert.equal(membershipRecords(await f.store.read(ROOM_ID)).intents.length, 0);
+  assert.deepEqual(await packet.runtimeCommands.removeMember(baseRequest, aliceContext), {
+    ok: false, error: 'unauthorized',
+  }, 'list-members does not grant remove-member');
+  await f.service.grantRuntimeCommand(ROOM_ID, {
+    caller_cid: ALICE_CID, command: 'remove-member',
+  });
+  assert.deepEqual(await f.service.runtimeCommandGrants(ROOM_ID), [
+    { caller_cid: ALICE_CID, command: 'list-members' },
+    { caller_cid: ALICE_CID, command: 'remove-member' },
+  ]);
+  assert.deepEqual(await packet.runtimeCommands.removeMember({
+    ...baseRequest, expected_membership_epoch: roomBefore.membership_epoch - 1,
+  }, aliceContext), {
+    ok: false,
+    error: 'stale_membership_epoch',
+    membership_epoch: roomBefore.membership_epoch,
+  });
+  await f.service.revokeRuntimeCommand(ROOM_ID, {
+    caller_cid: ALICE_CID, command: 'remove-member',
+  });
+  assert.deepEqual(await f.service.revokeRuntimeCommand(ROOM_ID, {
+    caller_cid: ALICE_CID, command: 'remove-member',
+  }), [{ caller_cid: ALICE_CID, command: 'list-members' }], 'revoke is idempotent');
+  assert.deepEqual(await packet.runtimeCommands.removeMember(baseRequest, aliceContext), {
+    ok: false, error: 'unauthorized',
+  }, 'revoke takes effect before later handler admission');
+  await f.service.grantRuntimeCommand(ROOM_ID, {
+    caller_cid: ALICE_CID, command: 'remove-member',
+  });
+  const restartedService = new RoomService(f.store, f.registry);
+  assert.deepEqual(await restartedService.runtimeCommandGrants(ROOM_ID), [
+    { caller_cid: ALICE_CID, command: 'list-members' },
+    { caller_cid: ALICE_CID, command: 'remove-member' },
+  ], 'grants survive service restart');
+  assert.deepEqual(await packet.runtimeCommands.removeMember(baseRequest, aliceContext), {
+    ok: false, error: 'cannot_remove_self',
+  });
+  assert.equal(membershipRecords(await f.store.read(ROOM_ID)).intents.length, 0);
+  assert.deepEqual(packet.removeContactCalls ?? [], []);
+  const afterSelfRefusal = await f.service.showRoom(ROOM_ID);
+  assert.equal(afterSelfRefusal.membership_epoch, roomBefore.membership_epoch);
+  assert.equal(afterSelfRefusal.seats.find((seat) =>
+    seat.participant_id === alice.participant_id).state, 'active');
+
+  const removeRequest = {
+    ...baseRequest,
+    participant_id: bob.participant_id,
+  };
+  await f.service.grantRuntimeCommand(ROOM_ID, {
+    caller_cid: BOB_CID, command: 'list-members',
+  });
+  const removed = await packet.runtimeCommands.removeMember(removeRequest, aliceContext);
+  assert.deepEqual(removed, {
+    ok: true,
+    participant_id: bob.participant_id,
+    membership_epoch: roomBefore.membership_epoch + 1,
+    removed: true,
+  });
+  const firstRecords = await f.store.read(ROOM_ID);
+  const firstMembership = membershipRecords(firstRecords);
+  assert.equal(firstMembership.intents.length, 0);
+  assert.equal(firstMembership.results.length, 0);
+  assert.deepEqual(packet.removeContactCalls, [BOB_CID]);
+  assert.equal((await f.service.runtimeCommandGrants(ROOM_ID))
+    .some((grant) => grant.caller_cid === BOB_CID), false, 'removed callers lose every grant');
+
+  assert.deepEqual(await packet.runtimeCommands.removeMember(removeRequest, {
+    ...aliceContext, request_wire_id: 'wire-remove-alice-retry',
+  }), removed);
+  assert.deepEqual(await packet.runtimeCommands.removeMember({
+    ...removeRequest, idempotency_key: 'legacy-key',
+  }, { ...aliceContext, request_wire_id: 'wire-remove-legacy-key' }), {
+    ok: false, error: 'invalid_request',
+  });
+  await f.service.revokeRuntimeCommand(ROOM_ID, {
+    caller_cid: ALICE_CID, command: 'remove-member',
+  });
+  assert.deepEqual(await packet.runtimeCommands.removeMember(removeRequest, {
+    ...aliceContext, request_wire_id: 'wire-remove-after-revoke',
+  }), { ok: false, error: 'unauthorized' }, 'revocation blocks a state-based retry');
+  const settledMembership = membershipRecords(await f.store.read(ROOM_ID));
+  assert.equal(settledMembership.intents.length, 0);
+  assert.equal(settledMembership.results.length, 0);
+  assert.deepEqual(packet.removeContactCalls, [BOB_CID]);
+  assert.equal((await f.service.showRoom(ROOM_ID)).membership_epoch, roomBefore.membership_epoch + 1);
+});
+
+test('role command policy follows authenticated invite membership without trusting the role label or display name', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  assert.deepEqual(await f.service.setRuntimeRoleCommands(ROOM_ID, {
+    role: 'Configurable owner role', commands: ['remove-member', 'list-members'],
+  }), [{ role: 'Configurable owner role', commands: ['list-members', 'remove-member'] }]);
+  const configured = await f.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'Configurable owner role', min_accepts: 1,
+  });
+  await admit(f, configured.invite, ALICE_CID, 'Ordinary-looking display name');
+  const packet = f.registry.get(ROOM_ID);
+  const context = {
+    sender_cid: ALICE_CID,
+    sender_name: 'forged display Owner',
+    request_wire_id: 'wire-role-policy',
+  };
+  const listed = await packet.runtimeCommands.listMembers({}, context);
+  assert.equal(listed.ok, true);
+
+  assert.deepEqual(await packet.runtimeCommands.listMembers({}, {
+    sender_cid: OUTSIDER_CID, sender_name: 'Configurable owner role', request_wire_id: 'wire-forged-role',
+  }), { ok: false, error: 'unauthorized' }, 'message metadata cannot forge stored membership');
+
+  await f.service.grantRuntimeCommand(ROOM_ID, {
+    caller_cid: ALICE_CID, command: 'list-members',
+  });
+  await f.service.setRuntimeRoleCommands(ROOM_ID, {
+    role: 'Configurable owner role', commands: [],
+  });
+  assert.equal((await packet.runtimeCommands.listMembers({}, context)).ok, true,
+    'removing role policy preserves an overlapping explicit per-CID grant');
+  assert.deepEqual(await packet.runtimeCommands.removeMember({
+    participant_id: (await f.service.showRoom(ROOM_ID)).seats[0].participant_id,
+    expected_membership_epoch: (await f.service.showRoom(ROOM_ID)).membership_epoch,
+    confirm: true,
+  }, context), { ok: false, error: 'unauthorized' }, 'role policy commands are removed exactly');
+  await f.service.revokeRuntimeCommand(ROOM_ID, {
+    caller_cid: ALICE_CID, command: 'list-members',
+  });
+  assert.deepEqual(await packet.runtimeCommands.listMembers({}, context), {
+    ok: false, error: 'unauthorized',
+  });
+});
+
+test('an unconfigured Owner-looking role and display label receive no command authority', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const invite = await f.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'Owner', min_accepts: 1,
+  });
+  await admit(f, invite.invite, ALICE_CID, 'Owner');
+  assert.deepEqual(await f.registry.get(ROOM_ID).runtimeCommands.listMembers({}, {
+    sender_cid: ALICE_CID, sender_name: 'Owner', request_wire_id: 'wire-unconfigured-owner-label',
+  }), { ok: false, error: 'unauthorized' });
+});
+
+test('external admission inherits durable role commands only after the exact authenticated contact activates', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  await f.service.setRuntimeRoleCommands(ROOM_ID, {
+    role: 'Fleet configured owner', commands: ['list-members', 'remove-member'],
+  });
+  const secret = packInvite(Buffer.from('fleet owner public invite'));
+  f.registry.get(ROOM_ID).addResult.container_id = ALICE_CID;
+  const pending = await f.service.acceptExternalInvite(ROOM_ID, {
+    role: 'Fleet configured owner', invite: secret, expected_cid: ALICE_CID,
+  });
+  const packet = f.registry.get(ROOM_ID);
+  const context = { sender_cid: ALICE_CID, sender_name: 'anything', request_wire_id: 'wire-pending' };
+  assert.deepEqual(await packet.runtimeCommands.listMembers({}, context), {
+    ok: false, error: 'room_unavailable',
+  });
+  packet.contacts = [{ name: 'Authenticated owner contact', container_id: ALICE_CID }];
+  const active = await f.service.reconcileRoom(ROOM_ID);
+  assert.equal(active.seats.find((seat) => seat.participant_id === pending.participant_id).state, 'active');
+  assert.equal((await packet.runtimeCommands.listMembers({}, context)).ok, true);
+
+  const restarted = new RoomService(f.store, f.registry);
+  await restarted.recoverRoom(ROOM_ID);
+  assert.equal((await packet.runtimeCommands.listMembers({}, {
+    ...context, request_wire_id: 'wire-after-restart',
+  })).ok, true, 'role policy survives restart reconciliation');
+
+  await restarted.removeParticipant(ROOM_ID, { participant: pending.participant_id, notify: false });
+  assert.deepEqual(await packet.runtimeCommands.listMembers({}, {
+    ...context, request_wire_id: 'wire-removed-owner',
+  }), { ok: false, error: 'unauthorized' }, 'a stale former seat cannot inherit its old role policy');
+});
+
+test('role command policy persistence is atomic, actionable, and retryable', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  let fail = true;
+  f.store.beforeSave = (room) => {
+    if (fail && room.role_command_grants.length > 0) {
+      fail = false;
+      throw new Error('role command persistence unavailable');
+    }
+  };
+  await assert.rejects(f.service.setRuntimeRoleCommands(ROOM_ID, {
+    role: 'Fleet owner', commands: ['list-members', 'remove-member'],
+  }), /role command persistence unavailable/);
+  assert.deepEqual((await f.service.showRoom(ROOM_ID)).role_command_grants, []);
+  assert.deepEqual(await f.service.setRuntimeRoleCommands(ROOM_ID, {
+    role: 'Fleet owner', commands: ['list-members', 'remove-member'],
+  }), [{ role: 'Fleet owner', commands: ['list-members', 'remove-member'] }]);
+  assert.deepEqual(await f.service.setRuntimeRoleCommands(ROOM_ID, {
+    role: 'Fleet owner', commands: ['remove-member', 'list-members'],
+  }), [{ role: 'Fleet owner', commands: ['list-members', 'remove-member'] }], 'retry converges');
+});
+
+test('quiet_membership and notify:false suppress the announcement without a removal journal', async () => {
   const f = evolutionFixture();
   await f.service.createRoom({ goal: 'Ship', briefing: 'Common.', quiet_membership: true });
   const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
@@ -1602,9 +1871,8 @@ test('quiet_membership and notify:false suppress the announcement but never the 
   await admit(f, invite, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
   await f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' });
   let { intents, results, notices } = membershipRecords(await f.store.read(ROOM_ID));
-  assert.equal(intents.length, 1);
-  assert.equal(intents[0].notify, false);
-  assert.equal(results.length, 1);
+  assert.equal(intents.length, 0);
+  assert.equal(results.length, 0);
   assert.equal(notices.length, 0);
 
   const g = evolutionFixture();
@@ -1614,11 +1882,12 @@ test('quiet_membership and notify:false suppress the announcement but never the 
   await admit(g, inviteG, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
   await g.service.removeParticipant(ROOM_ID, { participant: 'cid-alice', notify: false });
   ({ intents, results, notices } = membershipRecords(await g.store.read(ROOM_ID)));
-  assert.equal(intents[0].notify, false);
+  assert.equal(intents.length, 0);
+  assert.equal(results.length, 0);
   assert.equal(notices.length, 0);
 });
 
-test('anonymous replacement is unconditionally silent and the successor inherits the alias', async () => {
+test('anonymous participant removal and addition stay independent', async () => {
   const f = evolutionFixture();
   await f.service.createRoom({ goal: 'Ship', briefing: 'Common.', anonymous: true });
   await f.service.setRoleBriefing(ROOM_ID, { role: 'Developer', text: 'Build.' });
@@ -1628,24 +1897,21 @@ test('anonymous replacement is unconditionally silent and the successor inherits
   const before = await f.service.showRoom(ROOM_ID);
   const aliceSeat = before.seats.find((seat) => seat.identity === 'cid-alice');
   assert.equal(aliceSeat.alias, 'Developer #1');
-  const recordCountForBobBefore = (await f.store.read(ROOM_ID)).filter((record) =>
-    record.kind === 'message' && record.recipient_identities.includes('cid-bob')).length;
-
   await f.service.revokeInvite(ROOM_ID, invite.invite_id);
-  const replacement = await f.service.replaceParticipant(ROOM_ID, { participant: 'cid-alice', mode: 'one_time' });
-  assert.equal(replacement.invite.role, 'Developer');
-  assert.equal(replacement.invite.replaces_seat, aliceSeat.participant_id);
-  assert.equal(typeof replacement.blob, 'string');
+  await f.service.removeParticipant(ROOM_ID, { participant: aliceSeat.participant_id });
+  assert.equal(membershipRecords(await f.store.read(ROOM_ID)).notices.length, 1);
 
-  // the removal half was silent: no membership notice despite quiet_membership=false
-  assert.equal(membershipRecords(await f.store.read(ROOM_ID)).notices.length, 0);
-
-  await admit(f, replacement.invite, 'cid-carol', 'Carol', '2026-08-02T10:40:00.000Z');
+  const added = await f.service.createInvite(ROOM_ID, {
+    mode: 'one_time', role: 'Developer', min_accepts: 1,
+  });
+  assert.equal(added.invite.role, 'Developer');
+  assert.equal(typeof added.blob, 'string');
+  await admit(f, added.invite, 'cid-carol', 'Carol', '2026-08-02T10:40:00.000Z');
   const after = await f.service.showRoom(ROOM_ID);
   const carolSeat = after.seats.find((seat) => seat.identity === 'cid-carol');
-  assert.equal(carolSeat.alias, 'Developer #1', 'successor inherits the predecessor alias');
-  assert.equal(carolSeat.replaces_seat, aliceSeat.participant_id);
-  assert.notEqual(carolSeat.participant_id, aliceSeat.participant_id, 'internal identity still tracks the change');
+  assert.equal(carolSeat.alias, 'Developer #3', 'a separately added participant receives a new ordinal');
+  assert.equal(Object.hasOwn(carolSeat, 'replaces_seat'), false);
+  assert.notEqual(carolSeat.participant_id, aliceSeat.participant_id);
   assert.equal(after.membership_epoch > before.membership_epoch, true);
 
   // the successor got the current common + role briefings, addressed only to it
@@ -1656,47 +1922,165 @@ test('anonymous replacement is unconditionally silent and the successor inherits
   for (const briefing of carolBriefings) {
     assert.deepEqual(briefing.recipient_identities, ['cid-carol']);
   }
-
-  // the switch is unnoticeable to bob: not one new message addressed to it
-  const recordCountForBobAfter = records.filter((record) =>
-    record.kind === 'message' && record.recipient_identities.includes('cid-bob')).length;
-  assert.equal(recordCountForBobAfter, recordCountForBobBefore);
 });
 
-test('removal crash points re-drive from the intent ledger without duplicate epochs or results', async () => {
+test('a membership-notice failure cannot fail removal or block later messages', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'builder', min_accepts: 1,
+  });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  await admit(f, invite, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
+  f.store.beforeAppend = (draft) => {
+    if (draft.kind === 'message' && draft.category === 'membership') {
+      throw new Error('membership notice unavailable');
+    }
+  };
+
+  const receipt = await f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' });
+  assert.equal(receipt.status, 'queued');
+  assert.equal((await f.service.showRoom(ROOM_ID)).seats.find((seat) =>
+    seat.identity === 'cid-alice').state, 'removed');
+  assert.deepEqual(membershipRecords(await f.store.read(ROOM_ID)), {
+    intents: [], results: [], notices: [],
+  });
+
+  f.store.beforeAppend = undefined;
+  await f.service.postMessage(ROOM_ID, { text: 'Room remains usable.' });
+  const chat = (await f.store.read(ROOM_ID)).find((record) =>
+    record.kind === 'message' && record.text === 'Room remains usable.');
+  assert.deepEqual(chat.recipient_identities, ['cid-bob']);
+});
+
+test('legacy unresolved membership intents are inert during reconcile and messaging', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'builder', min_accepts: 1,
+  });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  const records = f.store.records.get(ROOM_ID);
+  const seq = records.length + 1;
+  records.push({
+    version: 1,
+    room_id: ROOM_ID,
+    seq,
+    record_id: `${ROOM_ID}:${seq}`,
+    at: '2026-08-02T10:40:00.000Z',
+    kind: 'membership_intent',
+    action: 'remove',
+    participant_id: '01jz6y7n8p9q0r1s2t3v4w5x75',
+    recipient_identity: 'cid-ghost',
+    role: 'builder',
+    epoch: 999,
+    notify: true,
+  });
+
+  const reconciled = await f.service.reconcileRoom(ROOM_ID);
+  assert.equal(reconciled.state, 'active');
+  assert.equal(reconciled.membership_epoch < 999, true);
+  await f.service.postMessage(ROOM_ID, { text: 'Legacy intent cannot block me.' });
+  const history = await f.store.read(ROOM_ID);
+  assert.equal(history.filter((record) => record.kind === 'membership_intent').length, 1);
+  assert.equal(history.filter((record) => record.kind === 'membership_result').length, 0);
+  assert.equal(history.some((record) =>
+    record.kind === 'message' && record.text === 'Legacy intent cannot block me.'), true);
+});
+
+test('a lost metadata save leaves no removal intent and a retry converges from contact state', async () => {
   const f = evolutionFixture();
   await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
   const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
   await admit(f, invite, 'cid-alice', 'Alice');
   await admit(f, invite, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
   const packet = f.registry.get(ROOM_ID);
+  const originalRemove = packet.removeContact.bind(packet);
+  packet.removeContact = async (contact) => {
+    if (!packet.contacts.some((candidate) => candidate.container_id === contact)) {
+      packet.removeContactCalls = [...(packet.removeContactCalls ?? []), contact];
+      throw new ContactAlreadyAbsentError(contact, new Error('exact SDK contact miss'));
+    }
+    return originalRemove(contact);
+  };
+  const epochBefore = (await f.service.showRoom(ROOM_ID)).membership_epoch;
 
-  // crash after the intent append, before the seat-state save
+  // The daemon removes the contact, then the local metadata save is lost.
   let armed = true;
   f.store.beforeSave = (room) => {
     if (armed && room.seats.some((seat) => seat.state === 'removed')) {
       armed = false;
-      throw new Error('crash after membership intent');
+      throw new Error('lost metadata save after contact removal');
     }
   };
-  await assert.rejects(f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' }), /crash after membership intent/);
+  await assert.rejects(
+    f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' }),
+    /lost metadata save after contact removal/,
+  );
   f.store.beforeSave = undefined;
   assert.equal((await f.service.showRoom(ROOM_ID)).seats.find((seat) => seat.identity === 'cid-alice').state, 'active');
+  assert.equal(packet.contacts.some((contact) => contact.container_id === 'cid-alice'), false);
+  assert.deepEqual(membershipRecords(await f.store.read(ROOM_ID)), {
+    intents: [], results: [], notices: [],
+  });
 
-  // recovery re-drives the pending intent to completion
+  // Reconciliation remains usable and never replays historical removal work.
   await f.service.reconcileRoom(ROOM_ID);
+  assert.equal((await f.service.showRoom(ROOM_ID)).seats.find((seat) => seat.identity === 'cid-alice').state, 'active');
+
+  // The same explicit remove observes the absent contact and finishes locally.
+  const receipt = await f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' });
+  assert.equal(receipt.status, 'already_absent');
   const room = await f.service.showRoom(ROOM_ID);
   assert.equal(room.seats.find((seat) => seat.identity === 'cid-alice').state, 'removed');
-  const { intents, results } = membershipRecords(await f.store.read(ROOM_ID));
-  assert.equal(intents.length, 1);
-  assert.equal(results.length, 1);
-  assert.equal(room.membership_epoch, intents[0].epoch);
-
-  // a second reconcile is a no-op
-  await f.service.reconcileRoom(ROOM_ID);
+  assert.equal(room.membership_epoch, epochBefore + 1);
+  assert.deepEqual(packet.removeContactCalls, ['cid-alice', 'cid-alice']);
   const settled = membershipRecords(await f.store.read(ROOM_ID));
-  assert.equal(settled.intents.length, 1);
-  assert.equal(settled.results.length, 1);
+  assert.equal(settled.intents.length, 0);
+  assert.equal(settled.results.length, 0);
+});
+
+test('direct removal accepts only an exact-target SDK contact miss as completion', async () => {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'builder', min_accepts: 1,
+  });
+  await admit(f, invite, 'cid-alice', 'Alice');
+  await admit(f, invite, 'cid-bob', 'Bob', '2026-08-02T10:21:00.000Z');
+  const packet = f.registry.get(ROOM_ID);
+  packet.removeContact = async (contact) => {
+    packet.removeContactCalls = [...(packet.removeContactCalls ?? []), contact];
+    throw new ContactAlreadyAbsentError(contact, new Error('exact SDK contact miss'));
+  };
+  const receipt = await f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' });
+  assert.deepEqual({ status: receipt.status, notified: receipt.notified }, {
+    status: 'already_absent', notified: false,
+  });
+  assert.equal((await f.service.showRoom(ROOM_ID)).seats.find((seat) =>
+    seat.identity === 'cid-alice').state, 'removed');
+  assert.deepEqual(membershipRecords(await f.store.read(ROOM_ID)).intents, []);
+  assert.deepEqual(membershipRecords(await f.store.read(ROOM_ID)).results, []);
+  assert.deepEqual(packet.removeContactCalls, ['cid-alice']);
+
+  const unrelated = evolutionFixture();
+  await unrelated.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite: unrelatedInvite } = await unrelated.service.createInvite(ROOM_ID, {
+    mode: 'public', role: 'builder', min_accepts: 1,
+  });
+  await admit(unrelated, unrelatedInvite, 'cid-alice', 'Alice');
+  const unrelatedPacket = unrelated.registry.get(ROOM_ID);
+  unrelatedPacket.removeContact = async () => {
+    throw new ContactAlreadyAbsentError('cid-someone-else', new Error('different SDK contact miss'));
+  };
+  await assert.rejects(
+    unrelated.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' }),
+    /cid-someone-else/,
+  );
+  assert.equal((await unrelated.service.showRoom(ROOM_ID)).seats.find((seat) =>
+    seat.identity === 'cid-alice').state, 'active');
+  assert.deepEqual(membershipRecords(await unrelated.store.read(ROOM_ID)).intents, []);
+  assert.deepEqual(membershipRecords(await unrelated.store.read(ROOM_ID)).results, []);
 });
 
 test('a removed cid re-admits only through an invite minted after its removal', async () => {

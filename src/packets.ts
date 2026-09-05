@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import { join } from 'node:path';
 import { brotliCompressSync, brotliDecompressSync, constants as zlibConstants } from 'node:zlib';
 
-import type { OursClient } from '@ours.network/sdk';
+import type { CommandContext, JsonValue, OursClient } from '@ours.network/sdk';
 
 import {
   FileMimeSchema,
@@ -50,6 +50,17 @@ export interface FileInboxItem {
   reply_to: ReplyReference | null;
 }
 
+export interface RoomRuntimeCommandHandlers {
+  listMembers(
+    input: JsonValue,
+    context: Readonly<CommandContext>,
+  ): JsonValue | Promise<JsonValue>;
+  removeMember(
+    input: JsonValue,
+    context: Readonly<CommandContext>,
+  ): JsonValue | Promise<JsonValue>;
+}
+
 export interface RoomPacket {
   readonly name: string;
   readonly cid: string;
@@ -73,6 +84,10 @@ export interface RoomPacket {
   }>;
   /** Reconcile only contacts before retry-sensitive removal work. */
   refreshContacts(): Promise<void>;
+  /** Replace the room identity's public catalog with the bounded cowork command set. */
+  registerRuntimeCommands?(handlers: RoomRuntimeCommandHandlers): Promise<void>;
+  /** Consume leading typed rows while the caller holds the room mutex. */
+  drainRuntimeCommands?(onUnexpected: (item: InboxItem) => Promise<void>): Promise<void>;
   listUnreadMessages(limit: number): Promise<InboxItem[]>;
   acknowledgeMessage(expected: InboxItem, onUnexpected: (item: InboxItem) => Promise<void>): Promise<void>;
   listUnreadFiles(limit: number): Promise<FileInboxItem[]>;
@@ -102,6 +117,24 @@ export class LegacyCoworkStateError extends Error {
     );
     this.name = 'LegacyCoworkStateError';
   }
+}
+
+/** Exact SDK proof that the requested contact CID is already absent. */
+export class ContactAlreadyAbsentError extends Error {
+  readonly contactCid: string;
+
+  constructor(contactCid: string, cause: unknown) {
+    super(`contact already absent: ${contactCid}`, { cause });
+    this.name = 'ContactAlreadyAbsentError';
+    this.contactCid = contactCid;
+  }
+}
+
+function isExactSdkMissingContact(error: unknown, contactCid: string): boolean {
+  return error instanceof Error
+    && 'code' in error
+    && error.code === 'TX_FAILED'
+    && error.message === `remove_contact failed: Error: Unknown contact: ${contactCid}`;
 }
 
 export class RoomIdentityMismatchError extends Error {
@@ -464,11 +497,58 @@ export class SdkRoomPacket implements RoomPacket {
     return this.contacts.map((contact) => ({ ...contact }));
   }
 
+  async registerRuntimeCommands(handlers: RoomRuntimeCommandHandlers): Promise<void> {
+    await this.runBound(() => this.client.registerCommands([
+      {
+        name: 'list-members',
+        description: 'List the room roster using contact-safe member fields.',
+        input_schema: { type: 'object', additionalProperties: false },
+        handler: handlers.listMembers,
+      },
+      {
+        name: 'remove-member',
+        description: 'Remove one room member by stable participant ID with revision and consent gates.',
+        input_schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['participant_id', 'expected_membership_epoch', 'confirm'],
+          properties: {
+            participant_id: { type: 'string', pattern: '^[0-7][0-9a-hjkmnp-tv-z]{25}$' },
+            expected_membership_epoch: { type: 'integer', minimum: 0 },
+            confirm: { const: true },
+          },
+        },
+        handler: handlers.removeMember,
+      },
+    ]));
+  }
+
+  async drainRuntimeCommands(onUnexpected: (item: InboxItem) => Promise<void>): Promise<void> {
+    for (;;) {
+      const [oldest] = (await this.runBound(() => this.client.listIncomingMessages()))
+        .filter((message) => message.status === 'unread')
+        .sort((left, right) => left.seq - right.seq);
+      if (oldest === undefined || oldest.message_kind === undefined || oldest.message_kind === 'text') return;
+      const pulled = await this.runBound(() => this.client.getMessages({ limit: 1 }));
+      if (pulled.messages.length > 1) throw new Error('SDK returned more than one message for limit 1');
+      for (const history of pulled.messages) await onUnexpected(messageItem(history, 'read'));
+      if (pulled.messages.length === 0
+        && pulled.commands_handled === 0
+        && pulled.command_results.length === 0) {
+        throw new Error(`SDK did not consume leading typed message ${oldest.wire_id}`);
+      }
+    }
+  }
+
   async listUnreadMessages(limit: number): Promise<InboxItem[]> {
     validateBatchLimit(limit);
-    const metadata = (await this.runBound(() => this.client.listIncomingMessages()))
+    const unread = (await this.runBound(() => this.client.listIncomingMessages()))
       .filter((message) => message.status === 'unread')
-      .sort((left, right) => left.seq - right.seq)
+      .sort((left, right) => left.seq - right.seq);
+    const barrier = unread.findIndex((message) =>
+      message.message_kind !== undefined && message.message_kind !== 'text');
+    const metadata = (barrier < 0 ? unread : unread.slice(0, barrier))
+      .filter((message) => message.message_kind === undefined || message.message_kind === 'text')
       .slice(0, limit);
     return Promise.all(metadata.map(async (listed) => {
       const history = await this.runBound(() => this.client.getHistoryItem({ wire_id: listed.wire_id }));
@@ -541,7 +621,13 @@ export class SdkRoomPacket implements RoomPacket {
   }
 
   async removeContact(contactCid: string): Promise<{ status: RelayStatus; notified: boolean; key_material_retained: true }> {
-    const result = await this.runBound(() => this.client.removeContact({ contact: contactCid }));
+    let result: Awaited<ReturnType<OursClient['removeContact']>>;
+    try {
+      result = await this.runBound(() => this.client.removeContact({ contact: contactCid }));
+    } catch (error) {
+      if (!isExactSdkMissingContact(error, contactCid)) throw error;
+      throw new ContactAlreadyAbsentError(contactCid, error);
+    }
     const notified = result.notified === true;
     // The mutation response is authoritative for this exact target, but it is
     // not a replacement contact list. Evict only that target synchronously so

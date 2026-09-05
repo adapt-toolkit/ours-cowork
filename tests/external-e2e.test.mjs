@@ -184,7 +184,7 @@ if (process.argv.includes('--external-driver')) {
 
     try {
       assert(existsSync(CLI), 'build the daemon and CLI before running the external-mode E2E');
-      assert(existsSync(OURS_CLI), 'install @ours.network/cli 2.5.0 before running the shared-daemon E2E');
+      assert(existsSync(OURS_CLI), 'install @ours.network/cli 2.7.0 before running the shared-daemon E2E');
       const brokerPort = await unusedPort();
       broker = spawn(process.execPath, [join(ROOT, 'node_modules/.bin/adapt-broker'), '--host', '127.0.0.1', '--port', String(brokerPort), '--test_mode'], {
         cwd: ROOT,

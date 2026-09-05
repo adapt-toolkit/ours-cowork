@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { createServer, connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -76,6 +77,7 @@ if (process.argv.includes('--e2e-driver')) {
     const brokerErrors = [];
     let broker;
     let brokerExit;
+    let oursProxy;
     let oursEnv;
     let coworkEnv;
     let observer;
@@ -160,6 +162,17 @@ if (process.argv.includes('--e2e-driver')) {
       return body;
     }
 
+    async function restartCoworkAfterFullExit() {
+      await runCli(['stop']);
+      await waitFor(
+        () => !existsSync(join(stateDir, 'cowork', 'daemon.lock')),
+        'cowork worker lock release',
+      );
+      await runCli(['start']);
+      await waitFor(async () => (await runCli(['status'])).running === true,
+        'cowork readiness after full-exit restart');
+    }
+
     async function contacts(peer) {
       return (await peer.client.listContacts()).contacts;
     }
@@ -210,6 +223,12 @@ if (process.argv.includes('--e2e-driver')) {
       }
       try { await observer?.releaseLease(); }
       catch (error) { cleanupErrors.push(new Error(`release observer lease: ${error.message}`)); }
+      if (oursProxy) {
+        try {
+          await new Promise((resolveClose, reject) => oursProxy.close((error) =>
+            error ? reject(error) : resolveClose()));
+        } catch (error) { cleanupErrors.push(new Error(`close ours fault proxy: ${error.message}`)); }
+      }
       if (oursEnv) {
         try { await runOurs(['daemon', 'stop'], 20_000); }
         catch (error) { cleanupErrors.push(new Error(`stop shared ours daemon: ${error.message}`)); }
@@ -240,7 +259,7 @@ if (process.argv.includes('--e2e-driver')) {
 
     try {
       assert(existsSync(CLI), 'build the daemon and CLI before running E2E');
-      assert(existsSync(OURS_CLI), 'install @ours.network/cli 2.5.0 before running E2E');
+      assert(existsSync(OURS_CLI), 'install @ours.network/cli 2.7.0 before running E2E');
       const port = await unusedPort();
 
       broker = spawn(process.execPath, [join(ROOT, 'node_modules/.bin/adapt-broker'), '--host', '127.0.0.1', '--port', String(port), '--test_mode'], {
@@ -266,14 +285,61 @@ if (process.argv.includes('--e2e-driver')) {
       oursEnv = sharedDaemonEnvironment(oursConfigPath);
       await runOurs(['daemon', 'start']);
       await waitForPort(oursPort);
+
+      // Cowork alone talks through this transparent local proxy. One armed
+      // removeContact response can be lost after the real daemon commits it,
+      // reproducing the canonical ambiguous recovery boundary without any
+      // room-state or history rewriting.
+      let loseNextRemoveResponse = false;
+      oursProxy = createHttpServer((incoming, outgoing) => {
+        const upstream = httpRequest({
+          hostname: '127.0.0.1',
+          port: oursPort,
+          method: incoming.method,
+          path: incoming.url,
+          headers: { ...incoming.headers, host: `127.0.0.1:${oursPort}` },
+        }, (response) => {
+          const lose = loseNextRemoveResponse
+            && incoming.url === '/api/v1/removeContact';
+          if (!lose) {
+            outgoing.writeHead(response.statusCode ?? 500, response.headers);
+            response.pipe(outgoing);
+            return;
+          }
+          const chunks = [];
+          response.on('data', (chunk) => chunks.push(chunk));
+          response.on('end', () => {
+            if (response.statusCode === 200) {
+              loseNextRemoveResponse = false;
+              outgoing.writeHead(502, { 'content-type': 'text/plain' });
+              outgoing.end('simulated lost removeContact response');
+              return;
+            }
+            outgoing.writeHead(response.statusCode ?? 500, response.headers);
+            outgoing.end(Buffer.concat(chunks));
+          });
+        });
+        upstream.on('error', (error) => {
+          if (!outgoing.headersSent) outgoing.writeHead(502, { 'content-type': 'text/plain' });
+          outgoing.end(String(error));
+        });
+        incoming.pipe(upstream);
+      });
+      const oursProxyPort = await unusedPort();
+      await new Promise((resolveListen, reject) => {
+        oursProxy.once('error', reject);
+        oursProxy.listen(oursProxyPort, '127.0.0.1', resolveListen);
+      });
+
       const { attachOursClient } = await import('@ours.network/sdk');
       observer = await attachOursClient({ env: oursEnv, leaseToken: 'cowork-e2e-observer' });
-      const [alice, bob, charlie] = await Promise.all([
+      const [alice, bob, charlie, successor] = await Promise.all([
         createPeer(attachOursClient, 'Alice'),
         createPeer(attachOursClient, 'Bob'),
         createPeer(attachOursClient, 'Charlie'),
+        createPeer(attachOursClient, 'Successor'),
       ]);
-      peerClients.push(alice.client, bob.client, charlie.client);
+      peerClients.push(alice.client, bob.client, charlie.client, successor.client);
       stage('participants-ready');
 
       const configPath = join(stateDir, 'cowork-config.json');
@@ -282,7 +348,17 @@ if (process.argv.includes('--e2e-driver')) {
         stateDir: join(stateDir, 'cowork'),
         rest: { enabled: false, port: 3052 },
       }), { mode: 0o600 });
-      coworkEnv = { ...oursEnv, OURS_COWORK_CONFIG: configPath };
+      const coworkOursConfigPath = join(stateDir, 'cowork-ours-config.json');
+      writeFileSync(coworkOursConfigPath, JSON.stringify({
+        brokerUrl: `ws://127.0.0.1:${port}`,
+        port: oursProxyPort,
+        stateDir: oursStateDir,
+        apiVisibility: 'owner',
+      }), { mode: 0o600 });
+      coworkEnv = {
+        ...sharedDaemonEnvironment(coworkOursConfigPath),
+        OURS_COWORK_CONFIG: configPath,
+      };
 
       await runCli(['start']);
       await waitFor(async () => (await runCli(['status'])).running === true, 'authenticated daemon status');
@@ -374,7 +450,10 @@ if (process.argv.includes('--e2e-driver')) {
       assert.deepEqual(archivedFile.source_reply_to, { wire_id: aliceBriefing.wire_id });
       stage('files');
 
-      await runCli(['restart'], 45_000);
+      await runCli(['room', 'command-grant', roomId, alice.cid, 'list-members']);
+      await runCli(['room', 'command-grant', roomId, alice.cid, 'remove-member']);
+
+      await restartCoworkAfterFullExit();
       room = await runCli(['room', 'show', roomId]);
       assert.equal(room.identity_cid, roomCid);
       assert.equal(room.identity_name, created.identity_name);
@@ -390,12 +469,152 @@ if (process.argv.includes('--e2e-driver')) {
       assert.equal(room.seats.find((seat) => seat.identity === charlie.cid).invite_id, reviewerInvitation.invite.invite_id);
       stage('restart-and-live-invite');
 
+      room = await runCli(['room', 'show', roomId]);
+      const catalog = await waitFor(async () => {
+        const commands = await alice.client.listContactCommands({ contact: roomCid });
+        return commands.length === 2 ? commands : undefined;
+      }, 'bounded room command catalog');
+      assert.deepEqual(catalog.map((command) => command.name), ['list-members', 'remove-member']);
+      const listRequest = await alice.client.sendCommand({
+        contact: roomCid, command: 'list-members', arguments: {},
+      });
+      const listResult = await waitFor(async () => {
+        const pulled = await alice.client.getMessages();
+        return pulled.command_results.find((result) =>
+          result.reply_to?.wire_id === listRequest.wireId);
+      }, 'correlated list-members result');
+      assert.equal(listResult.reply_to.wire_id, listRequest.wireId);
+      const listedOutcome = JSON.parse(listResult.body);
+      assert.equal(listedOutcome.ok, true);
+      assert.equal(listedOutcome.result.ok, true);
+      assert.equal(listedOutcome.result.membership_epoch, room.membership_epoch);
+      assert.equal(listedOutcome.result.members.some((member) =>
+        member.participant_id === room.seats[0].participant_id), true);
+      assert.equal(JSON.stringify(listedOutcome).includes(alice.cid), false);
+
+      const aliceSeat = room.seats.find((seat) => seat.identity === alice.cid);
+      const selfRequest = await alice.client.sendCommand({
+        contact: roomCid,
+        command: 'remove-member',
+        arguments: {
+          participant_id: aliceSeat.participant_id,
+          expected_membership_epoch: room.membership_epoch,
+          confirm: true,
+        },
+      });
+      const selfResult = await waitFor(async () => {
+        const pulled = await alice.client.getMessages();
+        return pulled.command_results.find((result) =>
+          result.reply_to?.wire_id === selfRequest.wireId);
+      }, 'correlated self-removal refusal');
+      assert.equal(selfResult.reply_to.wire_id, selfRequest.wireId);
+      assert.deepEqual(JSON.parse(selfResult.body), {
+        ok: true, result: { ok: false, error: 'cannot_remove_self' },
+      });
+      const afterSelfRefusal = await runCli(['room', 'show', roomId]);
+      assert.equal(afterSelfRefusal.membership_epoch, room.membership_epoch);
+      assert.equal(afterSelfRefusal.seats.find((seat) =>
+        seat.participant_id === aliceSeat.participant_id).state, 'active');
+      assert.equal((await contacts(alice)).some((contact) =>
+        contact.container_id === roomCid), true);
+      const afterSelfHistory = await runCli([
+        'room', 'history', roomId, '--after', '0', '--limit', '1000',
+      ]);
+      assert.equal(afterSelfHistory.some((record) =>
+        record.kind === 'membership_intent' || record.kind === 'membership_result'), false);
+
+      const charlieSeat = room.seats.find((seat) => seat.identity === charlie.cid);
+      const removeArguments = {
+        participant_id: charlieSeat.participant_id,
+        expected_membership_epoch: room.membership_epoch,
+        confirm: true,
+      };
+      await runCli(['stop']);
+      await send(charlie, roomCid, 'before typed removal barrier');
+      const removeRequest = await alice.client.sendCommand({
+        contact: roomCid, command: 'remove-member', arguments: removeArguments,
+      });
+      await send(charlie, roomCid, 'after typed removal barrier');
+      await send(alice, roomCid, 'after typed barrier sentinel');
+      loseNextRemoveResponse = true;
+      await runCli(['start']);
+      await waitFor(async () => (await runCli(['status'])).running === true,
+        'cowork restart for queued typed ordering');
+      const ambiguousResult = await waitFor(async () => {
+        const pulled = await alice.client.getMessages();
+        return pulled.command_results.find((result) =>
+          result.reply_to?.wire_id === removeRequest.wireId);
+      }, 'correlated ambiguous remove-member failure');
+      assert.equal(ambiguousResult.reply_to.wire_id, removeRequest.wireId);
+      assert.deepEqual(JSON.parse(ambiguousResult.body), { ok: false, error: 'handler_failed' });
+      assert.equal((await runCli(['room', 'participants', roomId]))
+        .find((seat) => seat.participant_id === charlieSeat.participant_id)?.state, 'active');
+
+      await restartCoworkAfterFullExit();
+      const recoveredRoom = await runCli(['room', 'show', roomId]);
+      assert.equal(recoveredRoom.membership_epoch, room.membership_epoch);
+      assert.equal(recoveredRoom.seats.find((seat) =>
+        seat.participant_id === charlieSeat.participant_id).state, 'active');
+      let recoveryHistory = await runCli([
+        'room', 'history', roomId, '--after', '0', '--limit', '1000',
+      ]);
+      assert.equal(recoveryHistory.some((record) =>
+        record.kind === 'membership_intent' || record.kind === 'membership_result'), false);
+
+      const replayRequest = await alice.client.sendCommand({
+        contact: roomCid, command: 'remove-member', arguments: removeArguments,
+      });
+      const replayResult = await waitFor(async () => {
+        const pulled = await alice.client.getMessages();
+        return pulled.command_results.find((result) =>
+          result.reply_to?.wire_id === replayRequest.wireId);
+      }, 'correlated idempotent remove-member replay');
+      assert.deepEqual(JSON.parse(replayResult.body), {
+        ok: true,
+        result: {
+          ok: true,
+          participant_id: charlieSeat.participant_id,
+          membership_epoch: room.membership_epoch + 1,
+          removed: true,
+        },
+      });
+
+      await restartCoworkAfterFullExit();
+      recoveryHistory = await runCli([
+        'room', 'history', roomId, '--after', '0', '--limit', '1000',
+      ]);
+      assert.equal(recoveryHistory.some((record) =>
+        record.kind === 'membership_intent' || record.kind === 'membership_result'), false);
+      assert.equal((await runCli(['room', 'show', roomId])).membership_epoch, room.membership_epoch + 1);
+
+      await joinInvite(successor, reviewerInvitation.blob);
+      await waitFor(async () => (await runCli(['room', 'participants', roomId]))
+        .some((seat) => seat.identity === successor.cid && seat.state === 'active'),
+      'successor admission after repeated removal recovery');
+      const barrierHistory = await waitFor(async () => {
+        const history = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
+        return history.some((record) => record.kind === 'message'
+          && record.text === 'after typed barrier sentinel') ? history : undefined;
+      }, 'post-barrier sentinel archive');
+      assert.equal(barrierHistory.some((record) => record.kind === 'message'
+        && record.text === 'before typed removal barrier'), true);
+      assert.equal(barrierHistory.some((record) => record.kind === 'message'
+        && record.text === 'after typed removal barrier'), true);
+      // A removed sender receives Cowork's existing content-free bounce. Drop
+      // that peer-side warning channel before the later close-contract check.
+      if ((await contacts(charlie)).some((contact) => contact.container_id === roomCid)) {
+        await charlie.client.removeContact({ contact: roomCid });
+      }
+      stage('typed-command-removal-retry');
+
       const closed = await runCli(['room', 'close', roomId]);
       assert.equal(closed.state, 'closed');
       await waitFor(async () => !(await observer.identities())
         .some((identity) => identity.name === created.identity_name),
       'room identity deletion from the shared daemon');
-      await waitFor(() => Promise.all([contacts(alice), contacts(bob), contacts(charlie)]).then((rows) =>
+      await waitFor(() => Promise.all([
+        contacts(alice), contacts(bob), contacts(charlie), contacts(successor),
+      ]).then((rows) =>
         rows.every((contactsList) => !contactsList.some((contact) => contact.container_id === roomCid))),
       'bilateral SDK contact removal');
       const roomDir = join(stateDir, 'cowork', 'rooms', roomId);
@@ -412,7 +631,7 @@ if (process.argv.includes('--e2e-driver')) {
     }
   });
 } else {
-  test('standalone daemon completes the real standard-SDK three-participant flow', async (t) => {
+  test('standalone daemon completes the real standard-SDK removal recovery flow', async (t) => {
     const child = spawn(process.execPath, [THIS_FILE, '--e2e-driver'], {
       cwd: ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],

@@ -10,8 +10,8 @@ test('package stays an independent cowork daemon', async () => {
 
   assert.equal(pkg.name, '@ours.network/cowork');
   assert.equal(pkg.bin['ours-cowork'], 'dist/cli.js');
-  assert.equal(dependencies['@ours.network/sdk'], '3.5.0');
-  assert.equal(pkg.devDependencies['@ours.network/cli'], '2.5.0');
+  assert.equal(dependencies['@ours.network/sdk'], '3.7.0');
+  assert.equal(pkg.devDependencies['@ours.network/cli'], '2.7.0');
   assert.equal(dependencies['better-sqlite3'], '11.10.0');
   assert.equal('@adapt-toolkit/sdk' in dependencies, false);
   assert.equal('@adapt-toolkit/sdk-native' in dependencies, false);

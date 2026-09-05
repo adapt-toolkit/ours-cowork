@@ -7,6 +7,7 @@ import { basename, dirname, join } from 'node:path';
 import { z } from 'zod';
 
 import { apiDocsAsset } from './openapi.ts';
+import { ContainerIdSchema, RuntimeCommandNameSchema } from './contracts.ts';
 import { CONTENT_SECURITY_POLICY, createStaticWebHandler, safePathname, type StaticWebHandler } from './web.ts';
 
 export const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -109,10 +110,14 @@ export interface RoomServiceApi {
   confirmRecoveredInvite(roomId: string, recoveryOf: string, inviteId: string): Promise<unknown>;
   rebindIdentity(roomId: string): Promise<unknown>;
   removeParticipant(roomId: string, input: unknown): Promise<unknown>;
-  replaceParticipant(roomId: string, input: unknown): Promise<unknown>;
   listRooms(): Promise<unknown>;
   showRoom(roomId: string): Promise<unknown>;
   participants(roomId: string): Promise<unknown>;
+  runtimeCommandGrants(roomId: string): Promise<unknown>;
+  runtimeRoleCommandGrants(roomId: string): Promise<unknown>;
+  setRuntimeRoleCommands(roomId: string, input: unknown): Promise<unknown>;
+  grantRuntimeCommand(roomId: string, input: unknown): Promise<unknown>;
+  revokeRuntimeCommand(roomId: string, input: unknown): Promise<unknown>;
   history(roomId: string, options: unknown): Promise<unknown>;
   postMessage(roomId: string, input: unknown): Promise<unknown>;
   postAsRole(roomId: string, input: unknown): Promise<unknown>;
@@ -142,22 +147,20 @@ const RoleBriefingDeleteParams = z.object({
 const RestRoleParams = z.object({
   room_id: z.string(), role: z.string(),
 }).strict();
+const RuntimeCommandGrantParams = z.object({
+  room_id: z.string(), caller_cid: ContainerIdSchema, command: RuntimeCommandNameSchema,
+}).strict();
+const RuntimeRoleCommandGrantParams = z.object({
+  room_id: z.string(), role: z.string(), commands: z.array(RuntimeCommandNameSchema),
+}).strict();
 const ParticipantRemoveParams = z.object({
   room_id: z.string(), participant: z.string(), notify: z.boolean().optional(),
-}).strict();
-const ParticipantReplaceParams = z.object({
-  room_id: z.string(),
-  participant: z.string(),
-  notify: z.boolean().optional(),
-  mode: z.enum(['one_time', 'public']).optional(),
-  min_accepts: z.number().optional(),
 }).strict();
 const ExternalInviteAcceptParams = z.object({
   room_id: z.string(),
   role: z.string(),
   invite: z.string(),
   expected_cid: z.string().optional(),
-  replaces_seat: z.string().optional(),
 }).strict();
 
 export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRouteTable {
@@ -192,10 +195,6 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
       const { room_id, ...input } = ParticipantRemoveParams.parse(params);
       return service.removeParticipant(room_id, input);
     } },
-    'room.participant.replace': { auth: true, run: (params) => {
-      const { room_id, ...input } = ParticipantReplaceParams.parse(params);
-      return service.replaceParticipant(room_id, input);
-    } },
     'room.revoke': { auth: true, run: (params) => {
       const value = InviteRevokeParams.parse(params);
       return service.revokeInvite(value.room_id, value.invite_id);
@@ -212,6 +211,22 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
     } },
     'room.show': { auth: true, run: (params) => service.showRoom(RoomIdParams.parse(params).room_id) },
     'room.participants': { auth: true, run: (params) => service.participants(RoomIdParams.parse(params).room_id) },
+    'room.command.grants': { auth: true, run: (params) =>
+      service.runtimeCommandGrants(RoomIdParams.parse(params).room_id) },
+    'room.command.role.grants': { auth: true, run: (params) =>
+      service.runtimeRoleCommandGrants(RoomIdParams.parse(params).room_id) },
+    'room.command.role.set': { auth: true, run: (params) => {
+      const { room_id, ...input } = RuntimeRoleCommandGrantParams.parse(params);
+      return service.setRuntimeRoleCommands(room_id, input);
+    } },
+    'room.command.grant': { auth: true, run: (params) => {
+      const { room_id, ...input } = RuntimeCommandGrantParams.parse(params);
+      return service.grantRuntimeCommand(room_id, input);
+    } },
+    'room.command.revoke': { auth: true, run: (params) => {
+      const { room_id, ...input } = RuntimeCommandGrantParams.parse(params);
+      return service.revokeRuntimeCommand(room_id, input);
+    } },
     'room.history': { auth: true, run: (params) => {
       const { room_id, ...options } = HistoryParams.parse(params);
       return service.history(room_id, options);

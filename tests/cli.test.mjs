@@ -323,6 +323,12 @@ test('room commands send exactly one JSONL request over management.sock', async 
     { args: ['room', 'list'], method: 'room.list', params: {} },
     { args: ['room', 'show', 'room1'], method: 'room.show', params: { room_id: 'room1' } },
     { args: ['room', 'participants', 'room1'], method: 'room.participants', params: { room_id: 'room1' } },
+    { args: ['room', 'command-grants', 'room1'], method: 'room.command.grants', params: { room_id: 'room1' } },
+    { args: ['room', 'role-command-grants', 'room1'], method: 'room.command.role.grants', params: { room_id: 'room1' } },
+    { args: ['room', 'role-command-set', 'room1', '--role', 'Owner', '--commands', 'list-members,remove-member'], method: 'room.command.role.set', params: { room_id: 'room1', role: 'Owner', commands: ['list-members', 'remove-member'] } },
+    { args: ['room', 'role-command-set', 'room1', '--role', 'Owner', '--commands', 'none'], method: 'room.command.role.set', params: { room_id: 'room1', role: 'Owner', commands: [] } },
+    { args: ['room', 'command-grant', 'room1', 'A'.repeat(64), 'list-members'], method: 'room.command.grant', params: { room_id: 'room1', caller_cid: 'A'.repeat(64), command: 'list-members' } },
+    { args: ['room', 'command-revoke', 'room1', 'A'.repeat(64), 'remove-member'], method: 'room.command.revoke', params: { room_id: 'room1', caller_cid: 'A'.repeat(64), command: 'remove-member' } },
     { args: ['room', 'history', 'room1', '--after', '5', '--limit', '20'], method: 'room.history', params: { room_id: 'room1', after: 5, limit: 20 } },
     { args: ['room', 'message', 'room1', '--text', 'Hello'], method: 'room.message', params: { room_id: 'room1', text: 'Hello' } },
     { args: ['room', 'close', 'room1'], method: 'room.close', params: { room_id: 'room1' } },
@@ -338,8 +344,6 @@ test('room commands send exactly one JSONL request over management.sock', async 
     { args: ['room', 'role-briefing', 'room1', '--role', 'reviewer', '--delete'], method: 'room.briefing.role.delete', params: { room_id: 'room1', role: 'reviewer' } },
     { args: ['room', 'remove', 'room1', 'cid-participant'], method: 'room.participant.remove', params: { room_id: 'room1', participant: 'cid-participant' } },
     { args: ['room', 'remove', 'room1', 'cid-participant', '--silent'], method: 'room.participant.remove', params: { room_id: 'room1', participant: 'cid-participant', notify: false } },
-    { args: ['room', 'replace', 'room1', 'cid-participant'], method: 'room.participant.replace', params: { room_id: 'room1', participant: 'cid-participant' } },
-    { args: ['room', 'replace', 'room1', 'cid-participant', '--mode', 'public', '--min-accepts', '2'], method: 'room.participant.replace', params: { room_id: 'room1', participant: 'cid-participant', mode: 'public', min_accepts: 2 } },
     { args: ['room', 'history', 'room1', '--view', 'participant'], method: 'room.history', params: { room_id: 'room1', view: 'participant', after: 0 } },
     // REST role authorship
     { args: ['room', 'say', 'room1', '--role', 'Reviewer', '--text', 'Reviewed'], method: 'room.say', params: { room_id: 'room1', role: 'Reviewer', text: 'Reviewed' } },
@@ -370,13 +374,13 @@ test('room accept reads secrets only from secure files or bounded stdin and reda
     await writeFile(file, secret, { mode: 0o600 });
     const fromFile = await runCli([
       '--json', 'room', 'accept', 'room1', '--role', 'reviewer', '--invite-file', file,
-      '--expected-cid', 'ab'.repeat(32), '--replaces', '01jz6y7n8p9q0r1s2t3v4w5x70',
+      '--expected-cid', 'ab'.repeat(32),
     ], { env: rpc.env });
     assert.equal(fromFile.code, 0, fromFile.stderr);
     assert.equal(`${fromFile.stdout}${fromFile.stderr}`.includes(secret), false);
     assert.deepEqual(rpc.requests[0].params, {
       room_id: 'room1', role: 'reviewer', invite: secret,
-      expected_cid: 'ab'.repeat(32), replaces_seat: '01jz6y7n8p9q0r1s2t3v4w5x70',
+      expected_cid: 'ab'.repeat(32),
     });
 
     const fromStdin = await runCli([
@@ -399,6 +403,8 @@ test('room accept rejects argv secrets, source ambiguity, insecure files, and ov
       [['room', 'accept', 'room1', '--role', 'r', '--invite-file', insecure], {}],
       [['room', 'accept', 'room1', '--role', 'r', '--invite-file', insecure, '--invite-stdin'], { input: 'x' }],
       [['room', 'accept', 'room1', '--role', 'r', '--invite-stdin'], { input: 'x'.repeat((48 * 1024) + 1) }],
+      [['room', 'accept', 'room1', '--role', 'r', '--invite-stdin', '--replaces', 'participant'], { input: 'x' }],
+      [['room', 'replace', 'room1', 'participant'], {}],
     ]) {
       const result = await runCli(args, { env: rpc.env, ...options });
       assert.notEqual(result.code, 0, args.join(' '));

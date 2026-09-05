@@ -35,6 +35,16 @@ export const LowerCrockfordUlidSchema = z.string().regex(
   'must be a 26-character lowercase Crockford ULID',
 );
 
+export const ContainerIdSchema = z.string().regex(/^[0-9a-f]{64}$/i, 'must be a 64-character hexadecimal CID')
+  .transform((value) => value.toUpperCase());
+
+export const RuntimeCommandNameSchema = z.enum(['list-members', 'remove-member']);
+
+export const RuntimeCommandGrantSchema = z.object({
+  caller_cid: ContainerIdSchema,
+  command: RuntimeCommandNameSchema,
+}).strict();
+
 function isStrictRfc3339(value: string): boolean {
   const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/.exec(value);
   if (!match) return false;
@@ -133,6 +143,22 @@ export function isStandardRoomIdentityName(roomId: string, identityName: string)
 }
 export const RoleSchema = utf8Bounded('role', MAX_ROLE_BYTES);
 export const ROOM_ROLE = 'room';
+export const RuntimeRoleCommandGrantSchema = z.object({
+  role: RoleSchema,
+  commands: z.array(RuntimeCommandNameSchema).superRefine((commands, context) => {
+    const seen = new Set<string>();
+    for (const [index, command] of commands.entries()) {
+      if (seen.has(command)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index],
+          message: 'runtime role commands must be unique',
+        });
+      }
+      seen.add(command);
+    }
+  }),
+}).strict();
 export const MissionTextSchema = utf8Bounded('mission text', MAX_TEXT_BYTES);
 export const MessageTextSchema = utf8Bounded('message text', MAX_TEXT_BYTES);
 export const FileNameSchema = utf8Bounded('file name', MAX_FILE_NAME_BYTES)
@@ -180,6 +206,8 @@ export const SeatSchema = z.object({
   alias: NonEmptyStringSchema.optional(),
   removed_at: Rfc3339Schema.optional(),
   removed_epoch: z.number().int().nonnegative().safe().optional(),
+  // Read and discard prerelease successor lineage. New rooms expose only
+  // independent add/remove membership operations.
   replaces_seat: LowerCrockfordUlidSchema.optional(),
   bounced_at: Rfc3339Schema.optional(),
 }).strict().superRefine((seat, context) => {
@@ -237,7 +265,7 @@ export const SeatSchema = z.object({
       message: 'external admission metadata requires both requested_at and invite_sha256',
     });
   }
-});
+}).transform(({ replaces_seat: _legacyReplacesSeat, ...seat }) => seat);
 
 export const RoomInviteSchema = z.object({
   invite_id: NonEmptyStringSchema,
@@ -249,6 +277,8 @@ export const RoomInviteSchema = z.object({
   recovery_of: NonEmptyStringSchema.optional(),
   recovery_confirmed: z.boolean().optional(),
   created_at: Rfc3339Schema,
+  // Read and discard prerelease successor lineage. Invite recovery lineage
+  // remains separate and is represented by recovery_of.
   replaces_seat: LowerCrockfordUlidSchema.optional(),
 }).strict().superRefine((invite, context) => {
   if (invite.mode === 'one_time' && invite.min_accepts !== 1) {
@@ -302,7 +332,7 @@ export const RoomInviteSchema = z.object({
       message: 'receipt_pending invites cannot have accepted CIDs',
     });
   }
-});
+}).transform(({ replaces_seat: _legacyReplacesSeat, ...invite }) => invite);
 
 const MissionV1Schema = z.object({
   goal: MissionTextSchema,
@@ -452,6 +482,22 @@ const CurrentRoomSchema = z.object({
       seen.add(role);
     }
   }),
+  /** Operator-managed, default-deny grants for the room identity's runtime commands. */
+  command_grants: z.array(RuntimeCommandGrantSchema),
+  /** Operator-managed command policy inherited by authenticated active seats of an exact role. */
+  role_command_grants: z.array(RuntimeRoleCommandGrantSchema).superRefine((grants, context) => {
+    const seen = new Set<string>();
+    for (const [index, grant] of grants.entries()) {
+      if (seen.has(grant.role)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index, 'role'],
+          message: 'runtime role command grants must be unique by role',
+        });
+      }
+      seen.add(grant.role);
+    }
+  }),
   anonymous: z.boolean(),
   quiet_membership: z.boolean(),
   membership_epoch: z.number().int().nonnegative().safe(),
@@ -512,30 +558,22 @@ const CurrentRoomSchema = z.object({
       });
     }
   }
-  for (const [index, seat] of room.seats.entries()) {
-    if (seat.replaces_seat === undefined) continue;
-    const predecessor = byParticipant.get(seat.replaces_seat);
-    if (!predecessor || predecessor === seat || predecessor.state !== 'removed') {
+  const seenCommandGrants = new Set<string>();
+  for (const [index, grant] of room.command_grants.entries()) {
+    const key = `${grant.caller_cid}\0${grant.command}`;
+    if (seenCommandGrants.has(key)) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ['seats', index, 'replaces_seat'],
-        message: 'replaces_seat must reference a removed seat in this room',
-      });
-      continue;
-    }
-    if (predecessor.role !== seat.role) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['seats', index, 'role'],
-        message: 'a replacement seat must inherit the predecessor role',
+        path: ['command_grants', index],
+        message: 'runtime command grants must be unique by caller CID and command',
       });
     }
-    if (room.anonymous && seat.alias !== predecessor.alias) {
-      // The alias binds to the seat/role lineage.
+    seenCommandGrants.add(key);
+    if (!room.seats.some((seat) => seat.state === 'active' && seat.identity === grant.caller_cid)) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ['seats', index, 'alias'],
-        message: 'an anonymous replacement seat must inherit the predecessor alias',
+        path: ['command_grants', index, 'caller_cid'],
+        message: 'runtime command grants require an active room identity',
       });
     }
   }
@@ -547,8 +585,8 @@ export function defaultRoomName(roomId: string): string {
 }
 
 /**
- * room_name and rest_roles were added additively to metadata v2. Accept an
- * otherwise-valid room missing either one long enough for the default to apply.
+ * room_name, rest_roles, command_grants, and role_command_grants were added additively to metadata
+ * v2. Accept an otherwise-valid room missing any one long enough for defaults.
  *
  * TRAP: each default is injected independently. A single guard on the first
  * field would skip the second on every room that already carries the first —
@@ -564,6 +602,8 @@ export const RoomSchema = z.preprocess((value) => {
     }
   }
   if (!Object.hasOwn(value, 'rest_roles')) patch.rest_roles = [];
+  if (!Object.hasOwn(value, 'command_grants')) patch.command_grants = [];
+  if (!Object.hasOwn(value, 'role_command_grants')) patch.role_command_grants = [];
   if (Object.keys(patch).length === 0) return value;
   return { ...value, ...patch };
 }, CurrentRoomSchema);
@@ -579,6 +619,8 @@ export function migrateRoomV1(
     mission: { ...room.mission, briefing_version: 1 },
     role_briefings: {},
     rest_roles: [],
+    command_grants: [],
+    role_command_grants: [],
     anonymous: false,
     quiet_membership: false,
     membership_epoch: 0,
@@ -638,9 +680,6 @@ export const RestRoleInputSchema = z.object({
   role: RoleSchema,
 }).strict();
 
-export const ContainerIdSchema = z.string().regex(/^[0-9a-f]{64}$/i, 'must be a 64-character hexadecimal CID')
-  .transform((value) => value.toUpperCase());
-
 export const AcceptExternalInviteInputSchema = z.object({
   role: RoleSchema,
   invite: z.string().refine(
@@ -648,7 +687,35 @@ export const AcceptExternalInviteInputSchema = z.object({
     `invite input must be at most ${MAX_EXTERNAL_INVITE_BYTES} UTF-8 bytes`,
   ),
   expected_cid: ContainerIdSchema.optional(),
-  replaces_seat: LowerCrockfordUlidSchema.optional(),
+}).strict();
+
+/** Public runtime-command inputs are deliberately smaller than operator APIs. */
+export const ListMembersCommandInputSchema = z.object({}).strict();
+
+export const CommandIdempotencyKeySchema = z.string().regex(
+  /^[A-Za-z0-9._:-]{1,128}$/,
+  'must contain 1-128 portable idempotency-key characters',
+);
+
+export const RemoveMemberCommandInputSchema = z.object({
+  participant_id: LowerCrockfordUlidSchema,
+  expected_membership_epoch: z.number().int().nonnegative().safe(),
+  confirm: z.literal(true),
+}).strict();
+
+/** Local operator input for one exact per-room, per-command caller grant. */
+export const RuntimeCommandGrantInputSchema = RuntimeCommandGrantSchema;
+
+/** Replace the complete command-invocation policy for one exact room role. */
+export const RuntimeRoleCommandGrantInputSchema = RuntimeRoleCommandGrantSchema;
+
+/** Legacy provenance retained only to decode prerelease membership journals. */
+export const RuntimeCommandAuditSchema = z.object({
+  sender_cid: NonEmptyStringSchema,
+  sender_participant_id: LowerCrockfordUlidSchema,
+  request_wire_id: NonEmptyStringSchema,
+  idempotency_key: CommandIdempotencyKeySchema,
+  expected_membership_epoch: z.number().int().nonnegative().safe(),
 }).strict();
 
 export const AuthorSnapshotSchema = z.object({
@@ -769,6 +836,8 @@ const FileShape = {
   source_reply_to: ReplyReferenceSchema.optional(),
 } as const;
 
+// Legacy prerelease removal journal records remain readable as archive history,
+// but are deliberately excluded from AppendRecordSchema below.
 const MembershipIntentShape = {
   kind: z.literal('membership_intent'),
   action: z.enum(['remove']),
@@ -778,6 +847,7 @@ const MembershipIntentShape = {
   alias: NonEmptyStringSchema.optional(),
   epoch: PositiveSafeIntegerSchema,
   notify: z.boolean(),
+  command: RuntimeCommandAuditSchema.optional(),
 } as const;
 
 const MembershipResultShape = {
@@ -920,8 +990,6 @@ export const AppendRecordSchema = z.discriminatedUnion('kind', [
   z.object({ ...AppendCommonShape, ...FileShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayIntentShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayResultShape }).strict(),
-  z.object({ ...AppendCommonShape, ...MembershipIntentShape }).strict(),
-  z.object({ ...AppendCommonShape, ...MembershipResultShape }).strict(),
   z.object({ ...AppendCommonShape, ...CloseNoticeIntentShape }).strict(),
   z.object({ ...AppendCommonShape, ...CloseNoticeResultShape }).strict(),
 ]).superRefine((record, context) => {
@@ -934,6 +1002,9 @@ export type RoomState = z.infer<typeof RoomStateSchema>;
 export type SeatState = z.infer<typeof SeatStateSchema>;
 export type InviteMode = z.infer<typeof InviteModeSchema>;
 export type RelayStatus = z.infer<typeof RelayStatusSchema>;
+export type RuntimeCommandName = z.infer<typeof RuntimeCommandNameSchema>;
+export type RuntimeCommandGrant = z.infer<typeof RuntimeCommandGrantSchema>;
+export type RuntimeRoleCommandGrant = z.infer<typeof RuntimeRoleCommandGrantSchema>;
 export type Seat = z.infer<typeof SeatSchema>;
 export type RoomInvite = z.infer<typeof RoomInviteSchema>;
 export type Room = z.infer<typeof RoomSchema>;

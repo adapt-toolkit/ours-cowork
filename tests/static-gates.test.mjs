@@ -40,7 +40,7 @@ function normalized(path) {
 function mainTestRunnerViolations(script, devDependencies) {
   const args = script.trim().split(/\s+/);
   const violations = [];
-  if (script !== MAIN_TEST_SCRIPT) violations.push('main test command must preserve the exact Node 20 multi-file runner');
+  if (script !== MAIN_TEST_SCRIPT) violations.push('main test command must preserve the exact Node 22 multi-file runner');
   const importIndex = args.indexOf('--import');
   if (args[0] !== 'node' || importIndex < 0 || !args[importIndex + 1]) {
     violations.push('main test command must declare a Node --import loader');
@@ -290,11 +290,15 @@ test('CI repeats E2E and invokes the asserted release gate', () => {
   const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
   assert.equal(manifest.scripts.test, MAIN_TEST_SCRIPT);
   assert.equal(manifest.devDependencies.tsx, '4.23.1');
-  assert.equal(manifest.engines.node, '>=20');
+  assert.equal(manifest.engines.node, '>=22');
   assert.deepEqual(mainTestRunnerViolations(manifest.scripts.test, manifest.devDependencies), []);
   assert.equal(manifest.scripts['test:release'], 'node --test tests/static-gates.test.mjs');
   assert.equal(manifest.scripts['test:browser'], 'node --test tests/browser-smoke.test.mjs');
-  assert.match(workflow, /node-version:\s*20/);
+  assert.deepEqual(workflow.match(/node-version:\s*\d+/g), [
+    'node-version: 22',
+    'node-version: 22',
+    'node-version: 22',
+  ]);
 });
 
 test('nightly runs the release gates and publishes a prerelease without release or repository authority', () => {
@@ -345,7 +349,10 @@ test('nightly runs the release gates and publishes a prerelease without release 
   ]) {
     assert(gateJob.includes(command), `${command} missing from the nightly gate job`);
   }
-  assert.match(workflow, /node-version:\s*20/);
+  assert.deepEqual(workflow.match(/node-version:\s*\d+/g), [
+    'node-version: 22',
+    'node-version: 22',
+  ]);
 });
 
 test('main runner rejects loaderless Node and undeclared direct loaders while covering every native suite', () => {
@@ -391,7 +398,7 @@ test('declared tsx loader has one semver-required esbuild installation', () => {
   ]);
 });
 
-test('browser smoke wrapper is Node 20 JavaScript and explicitly bundles its TypeScript entry', () => {
+test('browser smoke wrapper is Node 22 JavaScript and explicitly bundles its TypeScript entry', () => {
   const wrapper = readFileSync(join(ROOT, 'tests', 'browser-smoke.test.mjs'), 'utf8');
   assert.doesNotMatch(wrapper, /(?:from\s*|import\s*\()\s*['"][^'"]+\.ts['"]/);
   assert.match(wrapper, /from ['"]esbuild['"]/);

@@ -78,6 +78,7 @@ if (process.argv.includes('--e2e-driver')) {
     let broker;
     let brokerExit;
     let oursProxy;
+    let consumerServer;
     let oursEnv;
     let coworkEnv;
     let observer;
@@ -229,6 +230,10 @@ if (process.argv.includes('--e2e-driver')) {
             error ? reject(error) : resolveClose()));
         } catch (error) { cleanupErrors.push(new Error(`close ours fault proxy: ${error.message}`)); }
       }
+      if (consumerServer) {
+        consumerServer.closeAllConnections();
+        await new Promise((done) => consumerServer.close(done));
+      }
       if (oursEnv) {
         try { await runOurs(['daemon', 'stop'], 20_000); }
         catch (error) { cleanupErrors.push(new Error(`stop shared ours daemon: ${error.message}`)); }
@@ -259,7 +264,7 @@ if (process.argv.includes('--e2e-driver')) {
 
     try {
       assert(existsSync(CLI), 'build the daemon and CLI before running E2E');
-      assert(existsSync(OURS_CLI), 'install @ours.network/cli 2.7.0 before running E2E');
+      assert(existsSync(OURS_CLI), 'install @ours.network/cli 2.7.2 before running E2E');
       const port = await unusedPort();
 
       broker = spawn(process.execPath, [join(ROOT, 'node_modules/.bin/adapt-broker'), '--host', '127.0.0.1', '--port', String(port), '--test_mode'], {
@@ -342,11 +347,39 @@ if (process.argv.includes('--e2e-driver')) {
       peerClients.push(alice.client, bob.client, charlie.client, successor.client);
       stage('participants-ready');
 
+      const restPort = await unusedPort();
+      let consumerToken = 'consumer-e2e-provisioned-token';
+      const callbackRequests = [];
+      let failCallback = false;
+      async function restRpc(method, params) {
+        const response = await fetch(`http://127.0.0.1:${restPort}/rpc`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ version: 1, id: 'consumer-test', method, params }),
+        });
+        const body = await response.json();
+        assert.equal(body.error, undefined, 'management RPC succeeds');
+        return body.result;
+      }
+      consumerServer = createHttpServer(async (req, res) => {
+        if (req.headers.authorization !== `Bearer ${consumerToken}`) { res.writeHead(401); res.end(); return; }
+        let raw = '';
+        for await (const part of req) raw += part;
+        const body = JSON.parse(raw);
+        callbackRequests.push(body);
+        if (failCallback) { res.writeHead(503); res.end(); return; }
+        try {
+          const posted = await restRpc('room.message', { room_id: body.room_id, text: body.arguments.text });
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, result: { message_id: posted.message_id } }));
+        } catch { res.writeHead(500); res.end(); }
+      });
+      await new Promise((done) => consumerServer.listen(0, '127.0.0.1', done));
       const configPath = join(stateDir, 'cowork-config.json');
       writeFileSync(configPath, JSON.stringify({
         version: 1,
         stateDir: join(stateDir, 'cowork'),
-        rest: { enabled: false, port: 3052 },
+        rest: { enabled: true, port: restPort },
+        consumer_commands: { handlers: [{ id: 'consumer', url: `http://127.0.0.1:${consumerServer.address().port}/callback`, token_file: join(stateDir, 'consumer-token') }], timeout_ms: 5000 },
       }), { mode: 0o600 });
       const coworkOursConfigPath = join(stateDir, 'cowork-ours-config.json');
       writeFileSync(coworkOursConfigPath, JSON.stringify({
@@ -520,6 +553,33 @@ if (process.argv.includes('--e2e-driver')) {
       const shown = await sharedCall('room.show', {});
       assert.equal(shown.ok, true, 'independent command after a refused command and post');
       assert.equal(shown.result.status, 'shared-command-verified');
+      stage('consumer-callback-reentry');
+      const credential = await restRpc('consumer.handler.credential.set', { handler: 'consumer', token: consumerToken });
+      assert.deepEqual(credential, { handler: 'consumer', configured: true });
+      const registered = await restRpc('room.command.definition.put', { room_id: roomId, expected_revision: 0,
+        definition: { name: 'consumer.post', description: 'Post through an external consumer', handler: 'consumer', input_schema: {
+          type: 'object', properties: { text: { type: 'string', maxLength: 100 } }, required: ['text'], additionalProperties: false,
+        } } });
+      assert.equal(registered.published, true);
+      assert.equal(JSON.stringify(registered).includes(consumerToken), false);
+      await waitFor(async () => (await alice.client.listContactCommands({ contact: roomCid })).some((entry) => entry.name === 'consumer.post'), 'consumer catalog propagation');
+      assert.deepEqual(await sharedCall('consumer.post', { text: 'No grant' }), { ok: false, error: 'unauthorized' });
+      assert.equal(callbackRequests.length, 0);
+      await runCli(['room', 'command-grant', roomId, alice.cid, 'consumer.post']);
+      failCallback = true;
+      assert.deepEqual(await sharedCall('consumer.post', { text: 'Expected failure' }), { ok: false, error: 'consumer_http_error', execution: 'unknown' });
+      failCallback = false;
+      consumerToken = 'consumer-e2e-rotated-token';
+      await restRpc('consumer.handler.credential.set', { handler: 'consumer', token: consumerToken });
+      const consumerResult = await sharedCall('consumer.post', { text: 'Consumer REST reentry post.' });
+      assert.equal(consumerResult.ok, true);
+      assert.equal(callbackRequests.length, 2);
+      assert.equal(callbackRequests[1].caller_cid, alice.cid);
+      assert.match(callbackRequests[1].request_id, /^[A-Fa-f0-9]{64}$/);
+      await waitFor(async () => (await bob.client.getMessages()).messages.some((item) => {
+        try { return JSON.parse(item.body).text === 'Consumer REST reentry post.'; } catch { return false; }
+      }), 'callback REST reentry post relayed');
+      stage('consumer-callback-reentry-complete');
       await runCli(['room', 'command-grant', roomId, alice.cid, 'room.rebind']);
       const rebound = await sharedCall('room.rebind', {});
       assert.equal(rebound.ok, true);

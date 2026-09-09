@@ -209,6 +209,7 @@ export class CoworkDaemon {
       this.service = this.options.service ?? new RoomService(
         this.store as CoworkStore,
         this.registry as PacketRegistry,
+        { consumerCommands: config.consumer_commands },
       );
       serviceRef = this.service;
 

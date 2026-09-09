@@ -46,6 +46,7 @@ import { ContactAlreadyAbsentError, unpackInvite, type RoomPacket } from './pack
 import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
 import { IntakePump } from './intake.ts';
 import { createServiceRoutes, createPrivateServiceRoutes, classifyServiceError } from './command-routes.ts';
+import { ConsumerHandlers, ConsumerDefinitionSchema, type ConsumerConfiguration, type ConsumerDefinition, type StoredConsumerDefinition } from './consumer-commands.ts';
 import { SHARED_ROOM_COMMANDS } from './command-names.ts';
 import { generateUlid } from './ulid.ts';
 
@@ -140,6 +141,7 @@ export interface RoomPacketRegistry {
 }
 
 export interface RoomServiceOptions {
+  consumerCommands?: ConsumerConfiguration;
   now?: () => string;
   roomId?: () => string;
   messageId?: () => string;
@@ -193,6 +195,8 @@ export class RoomServiceError extends Error {
 
 /** Operator lifecycle and read projections for one standalone cowork host. */
 export class RoomService {
+  private readonly consumerHandlers: ConsumerHandlers;
+  private readonly publishedConsumerRevisions = new Map<string, number>();
   private readonly commandScope = new AsyncLocalStorage<{ roomId: string; active: boolean }>();
   private readonly store: Store;
   private readonly packets: RoomPacketRegistry;
@@ -205,6 +209,7 @@ export class RoomService {
 
   constructor(store: Store, packets: RoomPacketRegistry, options: RoomServiceOptions = {}) {
     this.store = store;
+    this.consumerHandlers = new ConsumerHandlers(options.consumerCommands);
     this.packets = packets;
     this.nowValue = options.now ?? (() => new Date().toISOString());
     this.nextRoomId = options.roomId ?? generateUlid;
@@ -378,13 +383,22 @@ export class RoomService {
     return room;
   }
 
-  private async registerRuntimeCommands(roomId: string, packet: RoomPacket): Promise<void> {
+  private async registerRuntimeCommands(roomId: string, packet: RoomPacket, syncLocal = true): Promise<void> {
+    if (syncLocal) await this.syncLocalConsumerCommands(roomId);
+    const registered = await this.store.load(roomId);
+    this.publishedConsumerRevisions.delete(roomId);
     await packet.registerRuntimeCommands?.({
       shouldPause: async () => (await this.store.load(roomId)).lifecycle_request?.state === 'pending',
-      sharedCommand: (name, input, context) => this.sharedCommandUnlocked(roomId, name, input, context),
-      listMembers: (input, context) => this.listMembersCommandUnlocked(roomId, input, context),
-      removeMember: (input, context) => this.removeMemberCommandUnlocked(roomId, input, context),
+      consumerCommands: (registered.consumer_commands ?? []).map((definition) => ({
+        name: definition.name, description: definition.description,
+        input_schema: definition.input_schema as Record<string, JsonValue>,
+        handler: (input, context) => this.invokeConsumerCommand(roomId, definition.name, input, context),
+      })),
+      sharedCommand: (name, input, context) => this.lock(roomId, () => this.sharedCommandUnlocked(roomId, name, input, context)),
+      listMembers: (input, context) => this.lock(roomId, () => this.listMembersCommandUnlocked(roomId, input, context)),
+      removeMember: (input, context) => this.lock(roomId, () => this.removeMemberCommandUnlocked(roomId, input, context)),
     });
+    this.publishedConsumerRevisions.set(roomId, registered.consumer_commands_revision ?? 0);
   }
 
   /** The SDK supplies authenticated context; arguments never select another room. */
@@ -437,7 +451,7 @@ export class RoomService {
     } finally { scope.active = false; }
   }
 
-  /** Called only by the intake pump while it already owns the room mutex. */
+  /** Called by the registered adapter while it owns the room mutex. */
   private async listMembersCommandUnlocked(
     roomId: string,
     input: JsonValue,
@@ -463,7 +477,7 @@ export class RoomService {
     };
   }
 
-  /** Called only by the intake pump while it already owns the room mutex. */
+  /** Called by the registered adapter while it owns the room mutex. */
   private async removeMemberCommandUnlocked(
     roomId: string,
     input: JsonValue,
@@ -1086,6 +1100,119 @@ export class RoomService {
   }
 
   /** List the operator-managed runtime-command grants for one room. */
+  private assertRegisteredConsumerName(room: Room, name: string): void {
+    if (name.startsWith('consumer.') && !(room.consumer_commands ?? []).some((definition) => definition.name === name)) {
+      throw new RoomServiceError('consumer command is not registered');
+    }
+  }
+
+  async provisionConsumerCredential(input: unknown): Promise<unknown> {
+    try { return this.consumerHandlers.provisionCredential(input); }
+    catch { throw new RoomServiceError('consumer credential provisioning failed'); }
+  }
+
+  async consumerDefinitions(roomId: string): Promise<unknown> {
+    const room = await this.store.load(LowerCrockfordUlidSchema.parse(roomId));
+    return { revision: room.consumer_commands_revision ?? 0,
+      published: this.publishedConsumerRevisions.get(roomId) === (room.consumer_commands_revision ?? 0),
+      definitions: room.consumer_commands ?? [] };
+  }
+
+  private async saveConsumerDefinitions(room: Room, definitions: StoredConsumerDefinition[], changed: Set<string>): Promise<Room> {
+    const next = RoomSchema.parse({ ...room, consumer_commands: definitions,
+      consumer_commands_revision: (room.consumer_commands_revision ?? 0) + 1,
+      command_grants: room.command_grants.filter((grant) => !changed.has(grant.command)),
+      role_command_grants: room.role_command_grants.map((grant) => ({ ...grant,
+        commands: grant.commands.filter((command) => !changed.has(command)) })).filter((grant) => grant.commands.length > 0),
+    });
+    this.publishedConsumerRevisions.delete(room.room_id);
+    return this.store.save(next);
+  }
+
+  private async syncLocalConsumerCommands(roomId: string): Promise<void> {
+    const local = this.consumerHandlers.localDefinitions().get(roomId) ?? [];
+    const room = await this.store.load(roomId);
+    const existing = room.consumer_commands ?? [];
+    const rest = existing.filter((definition) => definition.source === 'rest');
+    if (local.some((definition) => rest.some((other) => other.name === definition.name))) throw new RoomServiceError('local/REST consumer name collision');
+    const changed = new Set<string>();
+    const definitions: StoredConsumerDefinition[] = [...rest];
+    for (const definition of local) {
+      const prior = existing.find((candidate) => candidate.name === definition.name && candidate.source === 'local');
+      const same = prior && JSON.stringify(ConsumerDefinitionSchema.parse({ name: prior.name, description: prior.description, input_schema: prior.input_schema, handler: prior.handler })) === JSON.stringify(definition);
+      if (!same) changed.add(definition.name);
+      definitions.push(same ? prior : { ...definition, source: 'local', revision: (room.consumer_commands_revision ?? 0) + 1 });
+    }
+    for (const prior of existing.filter((definition) => definition.source === 'local')) {
+      if (!local.some((definition) => definition.name === prior.name)) changed.add(prior.name);
+    }
+    if (changed.size) await this.saveConsumerDefinitions(room, definitions, changed);
+  }
+
+  async registerConsumerCommand(roomId: string, input: unknown): Promise<unknown> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = z.object({ expected_revision: z.number().int().nonnegative().safe(), definition: ConsumerDefinitionSchema }).strict().parse(input);
+    let definition: ConsumerDefinition;
+    try { definition = this.consumerHandlers.validate(request.definition); }
+    catch { throw new RoomServiceError('invalid consumer definition or unknown configured handler'); }
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'register a consumer command in');
+      if (request.expected_revision !== (room.consumer_commands_revision ?? 0)) throw new RoomServiceError('stale consumer registry revision');
+      const existing = room.consumer_commands ?? [];
+      if (existing.some((entry) => entry.name === definition.name && entry.source === 'local')) throw new RoomServiceError('cannot overwrite a local consumer definition');
+      await this.saveConsumerDefinitions(room, [...existing.filter((entry) => entry.name !== definition.name), {
+        ...definition, source: 'rest', revision: request.expected_revision + 1,
+      }], new Set([definition.name]));
+      return this.publishConsumerCommands(id);
+    });
+  }
+
+  async deleteConsumerCommand(roomId: string, input: unknown): Promise<unknown> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = z.object({ expected_revision: z.number().int().nonnegative().safe(), name: z.string() }).strict().parse(input);
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'delete a consumer command from');
+      if (request.expected_revision !== (room.consumer_commands_revision ?? 0)) throw new RoomServiceError('stale consumer registry revision');
+      const existing = room.consumer_commands ?? [];
+      const target = existing.find((entry) => entry.name === request.name);
+      if (!target) throw new RoomServiceError('consumer command is not registered');
+      if (target.source === 'local') throw new RoomServiceError('cannot delete a local consumer definition through REST');
+      await this.saveConsumerDefinitions(room, existing.filter((entry) => entry.name !== request.name), new Set([request.name]));
+      return this.publishConsumerCommands(id);
+    });
+  }
+
+  async reloadConsumerCommands(roomId: string): Promise<unknown> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    return this.lock(id, async () => {
+      this.assertMutable(await this.store.load(id), 'reload consumer commands in');
+      await this.syncLocalConsumerCommands(id);
+      return this.publishConsumerCommands(id);
+    });
+  }
+
+  private async publishConsumerCommands(roomId: string): Promise<unknown> {
+    try { await this.registerRuntimeCommands(roomId, this.packet(roomId), false); }
+    catch { /* Desired registration is committed; report publication_pending for explicit reload. */ }
+    return this.consumerDefinitions(roomId);
+  }
+
+  private async invokeConsumerCommand(roomId: string, name: string, input: JsonValue, context: Readonly<CommandContext>): Promise<JsonValue> {
+    const authorized = await this.lock(roomId, async () => {
+      const room = await this.store.load(roomId);
+      const definition = (room.consumer_commands ?? []).find((entry) => entry.name === name);
+      if ((room.state !== 'active' || room.lifecycle_request?.state === 'pending') || !definition || this.publishedConsumerRevisions.get(roomId) !== (room.consumer_commands_revision ?? 0)) return undefined;
+      if (!room.seats.some((seat) => seat.state === 'active' && seat.identity === context.sender_cid)
+        || !this.hasRuntimeCommandGrant(room, context.sender_cid, name)) return undefined;
+      return definition;
+    });
+    if (!authorized) return { ok: false, error: 'unauthorized' };
+    // Consumer may call Cowork REST: never hold the room mutex during HTTP.
+    return this.consumerHandlers.invoke(authorized, roomId, input, context);
+  }
+
   async runtimeCommandGrants(roomId: string): Promise<RuntimeCommandGrant[]> {
     return (await this.showRoom(roomId)).command_grants.map((grant) => ({ ...grant }));
   }
@@ -1103,6 +1230,7 @@ export class RoomService {
     return this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'set runtime commands for');
+      for (const command of request.commands) this.assertRegisteredConsumerName(room, command);
       const commands = [...request.commands].sort();
       const retained = room.role_command_grants.filter((grant) => grant.role !== request.role);
       const roleCommandGrants = commands.length === 0
@@ -1129,6 +1257,7 @@ export class RoomService {
     return this.lock(id, async () => {
       const room = await this.store.load(id);
       this.assertMutable(room, 'authorize runtime commands for');
+      this.assertRegisteredConsumerName(room, request.command);
       if (!room.seats.some((seat) => seat.state === 'active' && seat.identity === request.caller_cid)) {
         throw new RoomServiceError(`runtime command caller "${request.caller_cid}" is not an active room identity`);
       }
@@ -1287,7 +1416,7 @@ export class RoomService {
     // field, including spellings the service does not otherwise recognize.
     const request = PostMessageInputSchema.parse(input);
     const id = LowerCrockfordUlidSchema.parse(roomId);
-    return this.lock(id, async () => {
+    const result = await this.lock(id, async () => {
       const room = await this.store.load(id);
       return this.appendChatUnlocked(id, room, {
         identity: room.identity_cid,
@@ -1295,6 +1424,8 @@ export class RoomService {
         role: ROOM_ROLE,
       }, request.text);
     });
+    await this.intake.resumePending(id);
+    return result;
   }
 
   /**
@@ -1352,7 +1483,7 @@ export class RoomService {
     // full first, so `role` is the only authorship field a caller can supply.
     const request = PostAsRoleInputSchema.parse(input);
     const id = LowerCrockfordUlidSchema.parse(roomId);
-    return this.lock(id, async () => {
+    const result = await this.lock(id, async () => {
       const room = await this.store.load(id);
       // Room state outranks the role: a closed room refuses the post for being
       // closed, not for the name it was addressed to.
@@ -1370,6 +1501,8 @@ export class RoomService {
         role: request.role,
       }, request.text);
     });
+    await this.intake.resumePending(id);
+    return result;
   }
 
   /**
@@ -1408,7 +1541,6 @@ export class RoomService {
         recipient_identity: recipientIdentity,
       });
     }
-    await this.intake.resumePending(id);
     return appended;
   }
 

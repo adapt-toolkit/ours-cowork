@@ -187,7 +187,7 @@ test('each documented method carries a strict params schema and a conforming exa
   }
   // Every method except room.list is addressed to one room.
   for (const entry of ROOM_RPC_METHODS) {
-    if (entry.method === 'room.list' || entry.method === 'room.create') continue;
+    if (entry.method === 'room.list' || entry.method === 'room.create' || entry.method === 'consumer.handler.credential.set') continue;
     assert(Object.hasOwn(entry.params.properties, 'room_id'), `${entry.method} omits room_id`);
     assert(entry.params.required.includes('room_id'), `${entry.method} must require room_id`);
   }

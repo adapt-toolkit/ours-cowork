@@ -1364,7 +1364,7 @@ test('history returns byte-bounded short pages whose last sequence is a usable c
 
 // ---- Common and role briefing delivery -------------------------------------
 
-function evolutionFixture() {
+function evolutionFixture(options = {}) {
   const store = new MemoryStore();
   const registry = new FakeRegistry();
   let messageIndex = 0;
@@ -1373,6 +1373,7 @@ function evolutionFixture() {
     roomId: () => ROOM_ID,
     messageId: () => `01jz6y7n8p9q0r1s2t3v4w6${String(messageIndex++).padStart(3, '0')}`.slice(0, 26),
     now: () => new Date(Date.UTC(2026, 7, 2, 10, 11, 12, tick++)).toISOString(),
+    ...options,
   });
   return { store, registry, service };
 }
@@ -2286,8 +2287,8 @@ test('room.say is refused unless the room is active, and accepts a room with no 
   }
 });
 
-async function sharedCommandFixture() {
-  const f = evolutionFixture();
+async function sharedCommandFixture(options = {}) {
+  const f = evolutionFixture(options);
   await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
   const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
   await admit(f, invite, ALICE_CID, 'Alice');
@@ -2413,6 +2414,117 @@ test('shared recovery returns a receipt and confirms its exact lineage idempoten
 });
 
 
+async function consumerFixture(t, local = false) {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-consumer-'));
+  fs.chmodSync(root, 0o700);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const definition = { name: 'consumer.orders', description: 'Read an order', handler: 'orders', input_schema: {
+    type: 'object', additionalProperties: false, properties: { id: { type: 'integer' } }, required: ['id'],
+  } };
+  const definitions_file = path.join(root, 'definitions.json');
+  const writeLocal = (commands) => fs.writeFileSync(definitions_file, JSON.stringify({ version: 1, rooms: [{ room_id: ROOM_ID, commands }] }), { mode: 0o600 });
+  if (local) writeLocal([definition]);
+  const config = { handlers: [{ id: 'orders', url: 'http://127.0.0.1:1/callback', token_file: path.join(root, 'token') }], timeout_ms: 100,
+    ...(local ? { definitions_file } : {}) };
+  const f = await sharedCommandFixture({ consumerCommands: config });
+  return { ...f, definition, config, writeLocal, fs, root };
+}
+
+test('consumer registry persists definitions, denies default execution and clears grants on replacement/deletion', async (t) => {
+  const f = await consumerFixture(t);
+  const { service, definition } = f;
+  await assert.rejects(service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: definition.name }), /not registered/);
+  const registered = await service.registerConsumerCommand(ROOM_ID, { expected_revision: 0, definition });
+  assert.equal(registered.revision, 1);
+  assert.equal(registered.published, true);
+  const staleHandler = f.registry.get(ROOM_ID).runtimeCommands.consumerCommands[0].handler;
+  assert.deepEqual(await staleHandler({ id: 1 }, sharedContext), { ok: false, error: 'unauthorized' });
+  await service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: definition.name });
+  await service.setRuntimeRoleCommands(ROOM_ID, { role: 'builder', commands: [definition.name] });
+  assert.deepEqual(await staleHandler({ id: 1 }, sharedContext), { ok: false, error: 'consumer_handler_unavailable' });
+  await assert.rejects(service.registerConsumerCommand(ROOM_ID, { expected_revision: 0, definition }), /stale/);
+  await service.registerConsumerCommand(ROOM_ID, { expected_revision: 1, definition: { ...definition, description: 'Changed' } });
+  assert.deepEqual(await service.runtimeCommandGrants(ROOM_ID), []);
+  assert.deepEqual(await service.runtimeRoleCommandGrants(ROOM_ID), []);
+  assert.deepEqual(await staleHandler({ id: 1 }, sharedContext), { ok: false, error: 'unauthorized' });
+  await service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: definition.name });
+  await service.deleteConsumerCommand(ROOM_ID, { expected_revision: 2, name: definition.name });
+  assert.deepEqual(await staleHandler({ id: 1 }, sharedContext), { ok: false, error: 'unauthorized' });
+  assert.equal((await service.consumerDefinitions(ROOM_ID)).definitions.length, 0);
+});
+
+test('consumer catalog publication failure is committed but fail-closed and reload retries it', async (t) => {
+  const f = await consumerFixture(t);
+  const packet = f.registry.get(ROOM_ID);
+  const original = packet.registerRuntimeCommands.bind(packet);
+  packet.registerRuntimeCommands = async () => { throw new Error('SDK unavailable'); };
+  const result = await f.service.registerConsumerCommand(ROOM_ID, { expected_revision: 0, definition: f.definition });
+  assert.equal(result.published, false);
+  assert.equal(result.revision, 1);
+  packet.registerRuntimeCommands = original;
+  assert.equal((await f.service.reloadConsumerCommands(ROOM_ID)).published, true);
+  assert.equal(packet.runtimeCommands.consumerCommands[0].name, f.definition.name);
+});
+
+test('local consumer reload validates before change, preserves unchanged grants and rejects REST collisions', async (t) => {
+  const f = await consumerFixture(t, true);
+  const initial = await f.service.consumerDefinitions(ROOM_ID);
+  assert.equal(initial.definitions[0].source, 'local');
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: f.definition.name });
+  await f.service.reloadConsumerCommands(ROOM_ID);
+  assert.equal((await f.service.runtimeCommandGrants(ROOM_ID)).length, 1);
+  await assert.rejects(f.service.registerConsumerCommand(ROOM_ID, { expected_revision: initial.revision, definition: f.definition }), /local/);
+  f.writeLocal([{ ...f.definition, handler: 'unknown' }]);
+  await assert.rejects(f.service.reloadConsumerCommands(ROOM_ID), /unknown/);
+  assert.deepEqual(await f.service.consumerDefinitions(ROOM_ID), initial);
+  f.writeLocal([]);
+  const removed = await f.service.reloadConsumerCommands(ROOM_ID);
+  assert.equal(removed.definitions.length, 0);
+  assert.deepEqual(await f.service.runtimeCommandGrants(ROOM_ID), []);
+});
+
+test('consumer definitions and grants restore from disk and removed callers cannot execute', async (t) => {
+  const f = await consumerFixture(t);
+  const { CoworkStore } = await import('../src/storage.ts');
+  const stateDir = `${f.root}/state`;
+  const disk = new CoworkStore(stateDir);
+  await disk.create(await f.store.load(ROOM_ID));
+  const service = new RoomService(disk, f.registry, { consumerCommands: f.config });
+  await service.registerConsumerCommand(ROOM_ID, { expected_revision: 0, definition: f.definition });
+  await service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: f.definition.name });
+  const restoredDisk = new CoworkStore(stateDir);
+  const restoredRegistry = new FakeRegistry();
+  const storedRoom = await restoredDisk.load(ROOM_ID);
+  restoredRegistry.restoreResult = new FakePacket(storedRoom.identity_name, storedRoom.identity_cid);
+  const restored = new RoomService(restoredDisk, restoredRegistry, { consumerCommands: f.config });
+  await restored.recoverPacket(ROOM_ID);
+  assert.deepEqual(await restored.consumerDefinitions(ROOM_ID), await service.consumerDefinitions(ROOM_ID));
+  assert.deepEqual(await restored.runtimeCommandGrants(ROOM_ID), await service.runtimeCommandGrants(ROOM_ID));
+  const call = restoredRegistry.get(ROOM_ID).runtimeCommands.consumerCommands[0].handler;
+  assert.deepEqual(await call({ id: 1 }, sharedContext), { ok: false, error: 'consumer_handler_unavailable' });
+  const room = await restoredDisk.load(ROOM_ID);
+  await restoredDisk.save({ ...room, command_grants: [], role_command_grants: [{ role: 'builder', commands: [f.definition.name] }], seats: room.seats.map((seat) => seat.identity === ALICE_CID
+    ? { ...seat, state: 'removed', removed_at: '2026-08-02T12:00:00.000Z', removed_epoch: room.membership_epoch } : seat) });
+  assert.deepEqual(await call({ id: 1 }, sharedContext), { ok: false, error: 'unauthorized' });
+});
+
+test('a granted stale consumer handler refuses execution while a later catalog publication is pending', async (t) => {
+  const f = await consumerFixture(t);
+  await f.service.registerConsumerCommand(ROOM_ID, { expected_revision: 0, definition: f.definition });
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: f.definition.name });
+  const packet = f.registry.get(ROOM_ID);
+  const call = packet.runtimeCommands.consumerCommands[0].handler;
+  assert.deepEqual(await call({ id: 1 }, sharedContext), { ok: false, error: 'consumer_handler_unavailable' });
+  packet.registerRuntimeCommands = async () => { throw new Error('SDK down'); };
+  const update = await f.service.registerConsumerCommand(ROOM_ID, { expected_revision: 1, definition: { ...f.definition, name: 'consumer.other' } });
+  assert.equal(update.published, false);
+  assert.equal((await f.service.runtimeCommandGrants(ROOM_ID)).length, 1, 'unchanged command keeps its grant');
+  assert.deepEqual(await call({ id: 1 }, sharedContext), { ok: false, error: 'unauthorized' });
+});
+
 test('ours room.accept preserves private-route validation and does not echo invitation material', async () => {
   const f = await sharedCommandFixture();
   const packet = f.registry.get(ROOM_ID);
@@ -2446,4 +2558,15 @@ test('ours room.rebind preserves CID and handles an independent command after re
   assert.equal(rebinds, 1);
   await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'room.show' });
   assert.equal((await call('room.show', {}, sharedContext)).ok, true);
+});
+
+
+test('accepted lifecycle shutdown refuses a later consumer invocation before HTTP', async (t) => {
+  const f = await consumerFixture(t);
+  await f.service.registerConsumerCommand(ROOM_ID, { expected_revision: 0, definition: f.definition });
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: f.definition.name });
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'room.close' });
+  const handlers = f.registry.get(ROOM_ID).runtimeCommands;
+  assert.equal((await handlers.sharedCommand('room.close', {}, sharedContext)).result.status, 'accepted');
+  assert.deepEqual(await handlers.consumerCommands[0].handler({ id: 1 }, sharedContext), { ok: false, error: 'unauthorized' });
 });

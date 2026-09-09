@@ -53,6 +53,7 @@ export interface FileInboxItem {
 }
 
 export interface RoomRuntimeCommandHandlers {
+  consumerCommands?: Array<{ name: string; description: string; input_schema: Record<string, JsonValue>; handler(input: JsonValue, context: Readonly<CommandContext>): Promise<JsonValue> }>;
   shouldPause?(): Promise<boolean>;
   sharedCommand?(name: typeof SHARED_ROOM_COMMANDS[number], input: JsonValue, context: Readonly<CommandContext>): Promise<JsonValue>;
   listMembers(
@@ -90,7 +91,7 @@ export interface RoomPacket {
   refreshContacts(): Promise<void>;
   /** Replace the room identity's public catalog with the bounded cowork command set. */
   registerRuntimeCommands?(handlers: RoomRuntimeCommandHandlers): Promise<void>;
-  /** Consume leading typed rows while the caller holds the room mutex. */
+  /** Consume leading typed rows with one SDK reader; handlers acquire their own room locks. */
   drainRuntimeCommands?(onUnexpected: (item: InboxItem) => Promise<void>): Promise<void>;
   listUnreadMessages(limit: number): Promise<InboxItem[]>;
   acknowledgeMessage(expected: InboxItem, onUnexpected: (item: InboxItem) => Promise<void>): Promise<void>;
@@ -506,6 +507,7 @@ export class SdkRoomPacket implements RoomPacket {
   async registerRuntimeCommands(handlers: RoomRuntimeCommandHandlers): Promise<void> {
     this.runtimeHandlers = handlers;
     await this.runBound(() => this.client.registerCommands([
+      ...(handlers.consumerCommands ?? []),
       {
         name: 'list-members',
         description: 'List the room roster using contact-safe member fields.',

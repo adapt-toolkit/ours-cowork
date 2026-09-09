@@ -36,10 +36,10 @@ const attachSharedClient: AttachClient = async (options) => {
  * ours configuration/environment and proves endpoint/state-root coherence.
  */
 export function createOursHost(
-  _config: CoworkConfig,
+  config: CoworkConfig,
   log: (...parts: unknown[]) => void = () => {},
 ): OursRuntimeHost {
-  return new SharedOursHost(log);
+  return new SharedOursHost(log, attachSharedClient, config.consumer_commands !== undefined);
 }
 
 export class SharedOursHost implements OursRuntimeHost {
@@ -55,6 +55,7 @@ export class SharedOursHost implements OursRuntimeHost {
   constructor(
     log: (...parts: unknown[]) => void = () => {},
     attach: AttachClient = attachSharedClient,
+    private readonly requireDynamicCatalogs = false,
   ) {
     this.log = log;
     this.attach = attach;
@@ -63,7 +64,21 @@ export class SharedOursHost implements OursRuntimeHost {
   async boot(): Promise<void> {
     if (this.watchClient) return;
     if (this.closed) throw new Error('shared ours daemon host cannot restart in the same process');
-    this.watchClient = await this.attach({ leaseToken: this.watchLeaseToken });
+    const client = await this.attach({ leaseToken: this.watchLeaseToken });
+    try {
+      if (this.requireDynamicCatalogs) {
+        const { version } = await client.version();
+        const parts = /^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
+        const [major, minor, patch] = parts ? parts.slice(1).map(Number) : [0, 0, 0];
+        if (!(major! > 3 || (major === 3 && (minor! > 7 || (minor === 7 && patch! >= 2))))) {
+          throw new Error('consumer commands require shared daemon SDK 3.7.2 or newer (ours CLI 2.7.2)');
+        }
+      }
+      this.watchClient = client;
+    } catch (error) {
+      await client.releaseLease();
+      throw error;
+    }
   }
 
   async createClient(leaseToken = `cowork-${randomBytes(16).toString('hex')}`): Promise<OursClient> {

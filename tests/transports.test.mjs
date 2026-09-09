@@ -90,6 +90,8 @@ test('the exhaustive service route table marks every route auth:true', () => {
   const service = new Proxy({}, { get: () => async () => null });
   const routes = createServiceRoutes(service);
   assert.deepEqual(Object.keys(routes).sort(), [
+    'consumer.handler.credential.set',
+    'room.command.definition.list', 'room.command.definition.put', 'room.command.definition.delete', 'room.command.definition.reload',
     'room.briefing.role.delete', 'room.briefing.role.set',
     'room.close', 'room.command.grant', 'room.command.grants', 'room.command.revoke',
     'room.command.role.grants', 'room.command.role.set',
@@ -98,7 +100,7 @@ test('the exhaustive service route table marks every route auth:true', () => {
     'room.rebind', 'room.recover', 'room.recover.confirm', 'room.revoke',
     'room.role.rest.add', 'room.role.rest.remove', 'room.say',
     'room.settings', 'room.show',
-  ]);
+  ].sort());
   assert(Object.values(routes).every((route) => route.auth === true));
   const privateRoutes = createPrivateServiceRoutes(service);
   assert.deepEqual(Object.keys(privateRoutes), ['room.accept']);

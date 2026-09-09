@@ -2,9 +2,9 @@
 
 Baseline: latest fetched `origin/main` at `76753c13e009ba7ea585b3a9c8c8e27444234e5c` (2026-09-09).
 
-Status: implementation and specification have Critic technical PASS. Owner resolved the requested exclusion boundary on 2026-09-09: “nope, we don't include that. Only include the commands of the room, not coworking.” This replied to the enumerated exclusions below; those operations remain on their existing management surfaces. The specification is a reviewed proposal, not approval of its open design choices.
+Status: implementation and specification have Critic technical PASS. Owner confirmed on 2026-09-09 that only room commands belong in scope, excluding Cowork host/process/service and global create/list operations. Clarification remains pending for four room-specific management operations: accept, close, delete and rebind. The specification is a reviewed proposal, not approval of its open design choices.
 
-Scope evidence: authenticated Owner room message `01m22g1pcy8t3ydb9bcp9xwa1y` (2026-09-09 07:10:20 UTC), in response to the status and exclusion list.
+Scope evidence: authenticated Owner room message `01m22g1pcy8t3ydb9bcp9xwa1y` (2026-09-09 07:10:20 UTC): “nope, we don't include that. Only include the commands of the room, not coworking.” Critic requested clarification for the four room-specific operations in message `01m22g2n34ck8stg5nh2g2e2e0`; their omission is not yet treated as approved.
 
 ## Shared dispatch
 
@@ -23,12 +23,12 @@ All REST entries below mean a method on `POST /rpc`, not a separate REST URL. Ea
 | `role-briefing --role … --text …` | `room.briefing.role.set` | same |
 | `role-briefing --role … --delete` | `room.briefing.role.delete` | same |
 | `invite` | `room.invite` | same |
-| `accept` | `room.accept` (Unix only; absent from REST) | Excluded: private management input |
+| `accept` | `room.accept` (Unix only; absent from REST) | Pending clarification: private management input |
 | `remove` | `room.participant.remove` | same; distinct from legacy `remove-member` |
 | `revoke` | `room.revoke` | same |
 | `recover` | `room.recover` | same |
 | `recover --confirm` | `room.recover.confirm` | same |
-| `rebind` | `room.rebind` | Excluded: room runtime/lifecycle management |
+| `rebind` | `room.rebind` | Pending clarification: room runtime/lifecycle management |
 | `list` | `room.list` | Excluded: global Cowork management |
 | `show` | `room.show` | same |
 | `participants` | `room.participants` | same |
@@ -42,8 +42,8 @@ All REST entries below mean a method on `POST /rpc`, not a separate REST URL. Ea
 | `say` | `room.say` | same |
 | `rest-role add` | `room.role.rest.add` | same |
 | `rest-role remove` | `room.role.rest.remove` | same |
-| `close` | `room.close` | Excluded: room runtime/lifecycle management |
-| `delete` | `room.delete` | Excluded: room runtime/lifecycle management |
+| `close` | `room.close` | Pending clarification: room runtime/lifecycle management |
+| `delete` | `room.delete` | Pending clarification: room runtime/lifecycle management |
 | — | — | `list-members`: existing contact-safe roster and membership epoch |
 | — | — | `remove-member`: existing stable participant ID, confirm=true, epoch, idempotence and no-self-removal contract |
 
@@ -62,7 +62,7 @@ All REST entries below mean a method on `POST /rpc`, not a separate REST URL. Ea
 | REST `GET /docs`, `/docs/ui.js`, `/docs/ui.css`, `/openapi.json` | Documentation assets | Static representation, not service dispatch |
 | Other REST `GET` static web assets | Browser console | Static representation, not business operations |
 
-`room.create/list` cross room boundaries: per-room grants do not establish host-wide authority. `room.accept` reads a secret only through the existing private Unix boundary. `room.close/delete/rebind` manage the room runtime/reply channel itself. These enumerated exclusions remain management operations under the Owner's confirmed scope; no management routes were removed or changed.
+`room.create/list` cross room boundaries: per-room grants do not establish host-wide authority. `room.accept` reads a secret only through the existing private Unix boundary. `room.close/delete/rebind` manage the room runtime/reply channel itself. Host/global exclusions are confirmed. Whether the four room-specific management operations also remain excluded awaits Owner clarification; no management routes were removed or changed.
 
 ## Permission and behavior contract
 

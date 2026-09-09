@@ -54,7 +54,8 @@ export function canonicalJson(value: unknown): string {
 /**
  * THE ONLY PLACE A ROOM BODY CROSSES THE WIRE.
  *
- * Every outbound envelope is canonicalised and sent here. Standard SDK
+ * Every outbound room body is sent here; envelopes are canonicalised and plain
+ * notices are sent verbatim. Standard SDK
  * identities authenticate the transport; cowork 1.0 no longer reaches into a
  * custom actor to add a second application-level signature.
  *
@@ -79,9 +80,9 @@ export function canonicalJson(value: unknown): string {
 export async function sendRoomBody(
   packet: Pick<RoomPacket, 'send'>,
   recipientIdentity: string,
-  unsigned: Record<string, unknown>,
+  unsigned: Record<string, unknown> | string,
 ): Promise<Awaited<ReturnType<RoomPacket['send']>>> {
-  return packet.send(recipientIdentity, canonicalJson(unsigned));
+  return packet.send(recipientIdentity, typeof unsigned === 'string' ? unsigned : canonicalJson(unsigned));
 }
 
 /** Archive, consume, and relay participant messages for hosted room packets. */
@@ -480,25 +481,13 @@ export class IntakePump {
       }
 
       if (file !== undefined) {
-        const author = file.author_alias === undefined ? file.author : {
-          identity: file.author_alias.participant_id,
-          display_name: file.author_alias.alias,
-          role: file.author.role,
-        };
-        const metadata = await sendRoomBody(packet, intent.recipient_identity, {
-          version: 1 as const,
-          kind: 'room_file' as const,
-          room_id: roomId,
-          room_name: room.room_name,
-          file_id: file.file_id,
-          author,
-          filename: file.filename,
-          mime: file.mime,
-          size: file.size,
-          sha256: file.sha256,
-          at: file.at,
-        });
-        if (metadata.status === 'send_failed') {
+        const uploader = file.author_alias?.alias ?? file.author.display_name;
+        const notice = await sendRoomBody(
+          packet,
+          intent.recipient_identity,
+          `${uploader} sent a file`,
+        );
+        if (notice.status === 'send_failed') {
           const failed = await this.store.append(roomId, {
             version: 1,
             kind: 'relay_result',
@@ -528,7 +517,7 @@ export class IntakePump {
           recipient_identity: intent.recipient_identity,
           status: outcome.status,
           ...(outcome.wire_id === undefined || outcome.wire_id === '' ? {} : { wire_id: outcome.wire_id }),
-          ...(metadata.wire_id === undefined || metadata.wire_id === '' ? {} : { metadata_wire_id: metadata.wire_id }),
+          ...(notice.wire_id === undefined || notice.wire_id === '' ? {} : { metadata_wire_id: notice.wire_id }),
         });
         if (appended.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
         continue;

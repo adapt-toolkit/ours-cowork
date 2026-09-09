@@ -265,9 +265,12 @@ test('restart intake drains legacy invalid file metadata without archiving it or
   assert.equal(JSON.stringify(await f.store.read(ROOM_ID)).includes('poison.bin'), false);
 });
 
-test('participant files archive bytes before consume and relay metadata + core bytes to every other seat', async () => {
+test('participant files archive bytes before consume and relay a readable notice before bytes to every other seat', async () => {
   const f = fixture();
   f.packet.fileInbox.push(incomingFile());
+  const sends = [];
+  f.packet.beforeSend = (recipient, body) => sends.push(['notice', recipient, body]);
+  f.packet.beforeSendFile = (recipient) => sends.push(['file', recipient]);
 
   await f.pump.pump(ROOM_ID);
 
@@ -292,12 +295,24 @@ test('participant files archive bytes before consume and relay metadata + core b
     { file_id: file.file_id, status: 'queued', wire_id: 'wire-file-out', metadata_wire_id: 'wire-out' },
     { file_id: file.file_id, status: 'queued', wire_id: 'wire-file-out', metadata_wire_id: 'wire-out' },
   ]);
-  const metadata = JSON.parse(f.packet.sendCalls[0].body);
-  assert.equal(metadata.kind, 'room_file');
-  assert.equal(metadata.room_name, 'Release room');
-  assert.equal(metadata.file_id, file.file_id);
-  assert.equal(metadata.sha256, file.sha256);
-  assert.equal('data_base64' in metadata, false, 'file bytes must use the core binary path, not text JSON');
+  assert.deepEqual(sends, [
+    ['notice', 'cid-bob', 'Alice sent a file'],
+    ['file', 'cid-bob'],
+    ['notice', 'cid-cara', 'Alice sent a file'],
+    ['file', 'cid-cara'],
+  ]);
+});
+
+test('a refused file notice prevents binary sends and records terminal failures', async () => {
+  const f = fixture();
+  f.packet.fileInbox.push(incomingFile());
+  f.packet.nextSend = { status: 'send_failed' };
+  await f.pump.pump(ROOM_ID);
+  assert.equal(f.packet.sendCalls.length, 2);
+  assert.equal(f.packet.sendFileCalls.length, 0);
+  const results = byKind(await f.store.read(ROOM_ID), 'relay_result');
+  assert.equal(results.length, 2);
+  assert(results.every((result) => result.status === 'send_failed' && result.wire_id === undefined));
 });
 
 test('file crash redrive keeps archive/intents stable and retries only a result-less recipient', async () => {
@@ -381,7 +396,7 @@ test('oversized files fail loudly without archive, consume, or relay effects', a
   assert.equal(f.packet.sendFileCalls.length, 0);
 });
 
-test('anonymous file metadata uses only the alias author and never leaks real seat or claimed names', async () => {
+test('anonymous file notices use only the stored alias and never leak real seat or claimed names', async () => {
   const f = fixture({ room: anonymousRoom() });
   f.packet.fileInbox.push(incomingFile());
   await f.pump.pump(ROOM_ID);
@@ -394,11 +409,7 @@ test('anonymous file metadata uses only the alias author and never leaks real se
       assert.equal(bytes.includes(leak), false, `${leak} leaked into file metadata`);
     }
   }
-  assert.deepEqual(JSON.parse(f.packet.sendCalls[0].body).author, {
-    identity: '01jz6y7n8p9q0r1s2t3v4w5xa1',
-    display_name: 'builder #1',
-    role: 'builder',
-  });
+  assert.equal(f.packet.sendCalls[0].body, 'builder #1 sent a file');
 });
 
 test('canonical JSON recursively sorts keys and participant fan-out excludes its durable seat author', async () => {

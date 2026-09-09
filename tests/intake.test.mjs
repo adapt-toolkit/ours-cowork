@@ -269,7 +269,7 @@ test('participant files archive bytes before consume and relay a readable notice
   const f = fixture();
   f.packet.fileInbox.push(incomingFile());
   const sends = [];
-  f.packet.beforeSend = (recipient, body) => sends.push(['notice', recipient, body]);
+  f.packet.beforeSend = (recipient, body) => sends.push(['notice', recipient, JSON.parse(body).text]);
   f.packet.beforeSendFile = (recipient) => sends.push(['file', recipient]);
 
   await f.pump.pump(ROOM_ID);
@@ -301,6 +301,18 @@ test('participant files archive bytes before consume and relay a readable notice
     ['notice', 'cid-cara', 'Alice sent a file'],
     ['file', 'cid-cara'],
   ]);
+  const notice = JSON.parse(f.packet.sendCalls[0].body);
+  assert.deepEqual(notice, {
+    version: 1,
+    kind: 'room_msg',
+    room_id: ROOM_ID,
+    room_name: 'Release room',
+    message_id: file.file_id,
+    author: { identity: room().identity_cid, display_name: room().identity_name, role: 'room' },
+    text: 'Alice sent a file',
+    at: file.at,
+  });
+  assert.equal(f.packet.sendCalls[0].body, canonicalJson(notice));
 });
 
 test('a refused file notice prevents binary sends and records terminal failures', async () => {
@@ -347,7 +359,7 @@ test('file crash redrive keeps archive/intents stable and retries only a result-
   await f.pump.resumePending(ROOM_ID);
   assert.equal(f.packet.sendFileCalls.length, 2);
   assert(f.packet.sendFileCalls[0].data.equals(f.packet.sendFileCalls[1].data));
-  assert.equal(f.packet.sendCalls[0].body, f.packet.sendCalls[1].body, 'metadata retry keeps the stable file_id');
+  assert.equal(f.packet.sendCalls[0].body, f.packet.sendCalls[1].body, 'notice retry keeps the stable message_id and body');
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 1);
   await f.pump.resumePending(ROOM_ID);
   assert.equal(f.packet.sendFileCalls.length, 2, 'terminal file result suppresses later redrive');
@@ -409,7 +421,14 @@ test('anonymous file notices use only the stored alias and never leak real seat 
       assert.equal(bytes.includes(leak), false, `${leak} leaked into file metadata`);
     }
   }
-  assert.equal(f.packet.sendCalls[0].body, 'builder #1 sent a file');
+  const notice = JSON.parse(f.packet.sendCalls[0].body);
+  assert.equal(notice.kind, 'room_msg');
+  assert.equal(notice.text, 'builder #1 sent a file');
+  assert.deepEqual(notice.author, {
+    identity: anonymousRoom().identity_cid,
+    display_name: anonymousRoom().identity_name,
+    role: 'room',
+  });
 });
 
 test('canonical JSON recursively sorts keys and participant fan-out excludes its durable seat author', async () => {

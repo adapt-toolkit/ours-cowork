@@ -9,6 +9,7 @@ import {
   MAX_FILE_BYTES,
   Rfc3339Schema,
   RoomSchema,
+  ROOM_ROLE,
   type CommunicationRecord,
   type Room,
 } from './contracts.ts';
@@ -54,8 +55,7 @@ export function canonicalJson(value: unknown): string {
 /**
  * THE ONLY PLACE A ROOM BODY CROSSES THE WIRE.
  *
- * Every outbound room body is sent here; envelopes are canonicalised and plain
- * notices are sent verbatim. Standard SDK
+ * Every outbound envelope is canonicalised and sent here. Standard SDK
  * identities authenticate the transport; cowork 1.0 no longer reaches into a
  * custom actor to add a second application-level signature.
  *
@@ -80,9 +80,9 @@ export function canonicalJson(value: unknown): string {
 export async function sendRoomBody(
   packet: Pick<RoomPacket, 'send'>,
   recipientIdentity: string,
-  unsigned: Record<string, unknown> | string,
+  unsigned: Record<string, unknown>,
 ): Promise<Awaited<ReturnType<RoomPacket['send']>>> {
-  return packet.send(recipientIdentity, typeof unsigned === 'string' ? unsigned : canonicalJson(unsigned));
+  return packet.send(recipientIdentity, canonicalJson(unsigned));
 }
 
 /** Archive, consume, and relay participant messages for hosted room packets. */
@@ -482,11 +482,20 @@ export class IntakePump {
 
       if (file !== undefined) {
         const uploader = file.author_alias?.alias ?? file.author.display_name;
-        const notice = await sendRoomBody(
-          packet,
-          intent.recipient_identity,
-          `${uploader} sent a file`,
-        );
+        const notice = await sendRoomBody(packet, intent.recipient_identity, {
+          version: 1 as const,
+          kind: 'room_msg' as const,
+          room_id: roomId,
+          room_name: room.room_name,
+          message_id: file.file_id,
+          author: {
+            identity: room.identity_cid,
+            display_name: room.identity_name,
+            role: ROOM_ROLE,
+          },
+          text: `${uploader} sent a file`,
+          at: file.at,
+        });
         if (notice.status === 'send_failed') {
           const failed = await this.store.append(roomId, {
             version: 1,

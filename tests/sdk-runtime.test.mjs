@@ -852,13 +852,25 @@ test('shared host exposes attach failure and never falls back to another runtime
 });
 
 
-test('consumer configuration refuses a shared daemon without runtime catalog propagation', async () => {
-  let releases = 0;
-  const host = new SharedOursHost(() => {}, async () => ({
-    version: async () => ({ protocol: 10 }),
-    releaseLease: async () => { releases++; },
-  }), true);
-  await assert.rejects(host.boot(), /catalog protocol 11/);
-  assert.equal(releases, 1);
-  await host.shutdown();
+test('consumer configuration checks the daemon SDK release, not its control protocol', async () => {
+  for (const version of ['3.7.0', '3.7.1', '3.6.99', '3.7.2-rc.1', 'unknown']) {
+    let releases = 0;
+    const host = new SharedOursHost(() => {}, async () => ({
+      version: async () => ({ version, protocol: 2 }),
+      releaseLease: async () => { releases++; },
+    }), true);
+    await assert.rejects(host.boot(), /SDK 3.7.2/);
+    assert.equal(releases, 1);
+    await host.shutdown();
+  }
+  for (const version of ['3.7.2', '3.7.3', '3.8.0', '4.0.0']) {
+    let releases = 0;
+    const host = new SharedOursHost(() => {}, async () => ({
+      version: async () => ({ version, protocol: 2 }),
+      releaseLease: async () => { releases++; },
+    }), true);
+    await host.boot();
+    await host.shutdown();
+    assert.equal(releases, 1);
+  }
 });

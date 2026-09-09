@@ -67,9 +67,11 @@ export class SharedOursHost implements OursRuntimeHost {
     const client = await this.attach({ leaseToken: this.watchLeaseToken });
     try {
       if (this.requireDynamicCatalogs) {
-        const { protocol } = await client.version();
-        if (!Number.isInteger(protocol) || protocol < 11) {
-          throw new Error('consumer commands require catalog protocol 11: upgrade the shared ours daemon to CLI 2.7.2 / SDK 3.7.2 or newer');
+        const { version } = await client.version();
+        const parts = /^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
+        const [major, minor, patch] = parts ? parts.slice(1).map(Number) : [0, 0, 0];
+        if (!(major! > 3 || (major === 3 && (minor! > 7 || (minor === 7 && patch! >= 2))))) {
+          throw new Error('consumer commands require shared daemon SDK 3.7.2 or newer (ours CLI 2.7.2)');
         }
       }
       this.watchClient = client;

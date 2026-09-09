@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { z } from 'zod';
+import { RUNTIME_COMMAND_NAMES } from './command-names.ts';
 
 const MAX_TEXT_BYTES = 262_144;
 export const MAX_FILE_BYTES = 2 * 1024 * 1024;
@@ -38,7 +39,7 @@ export const LowerCrockfordUlidSchema = z.string().regex(
 export const ContainerIdSchema = z.string().regex(/^[0-9a-f]{64}$/i, 'must be a 64-character hexadecimal CID')
   .transform((value) => value.toUpperCase());
 
-export const RuntimeCommandNameSchema = z.enum(['list-members', 'remove-member']);
+export const RuntimeCommandNameSchema = z.enum(RUNTIME_COMMAND_NAMES);
 
 export const RuntimeCommandGrantSchema = z.object({
   caller_cid: ContainerIdSchema,

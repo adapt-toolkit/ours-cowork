@@ -2284,3 +2284,127 @@ test('room.say is refused unless the room is active, and accepts a room with no 
     await assert.rejects(f.service.postAsRole(ROOM_ID, { role: 'Reviewer', text: 'Too late.' }), /not active/i);
   }
 });
+
+async function sharedCommandFixture() {
+  const f = evolutionFixture();
+  await f.service.createRoom({ goal: 'Ship', briefing: 'Common.' });
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  await admit(f, invite, ALICE_CID, 'Alice');
+  await admit(f, invite, BOB_CID, 'Bob');
+  return f;
+}
+
+const sharedContext = Object.freeze({ sender_cid: ALICE_CID, sender_name: 'Untrusted label', request_wire_id: 'request' });
+
+test('every shared command refuses ungranted, spoofed, cross-room and removed callers', async () => {
+  const { SHARED_ROOM_COMMANDS } = await import('../src/command-names.ts');
+  const f = await sharedCommandFixture();
+  const call = f.registry.get(ROOM_ID).runtimeCommands.sharedCommand;
+  for (const name of SHARED_ROOM_COMMANDS) {
+    assert.deepEqual(await call(name, {}, sharedContext), { ok: false, error: 'unauthorized' }, name);
+    await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: name });
+    assert.deepEqual(await call(name, { room_id: ROOM_ID }, sharedContext), { ok: false, error: 'invalid_request' }, name);
+    assert.deepEqual(await call(name, {}, { ...sharedContext, sender_cid: OUTSIDER_CID }), { ok: false, error: 'unauthorized' }, name);
+  }
+  await f.service.removeParticipant(ROOM_ID, { participant: ALICE_CID });
+  for (const name of SHARED_ROOM_COMMANDS) {
+    assert.deepEqual(await call(name, {}, sharedContext), { ok: false, error: 'unauthorized' }, name);
+  }
+});
+
+test('shared ours commands and management routes produce equal results and durable effects', async () => {
+  const { SHARED_ROOM_COMMANDS } = await import('../src/command-names.ts');
+  const { createServiceRoutes, classifyServiceError } = await import('../src/command-routes.ts');
+  const f = await sharedCommandFixture();
+  const g = await sharedCommandFixture();
+  // Participant IDs use random ULIDs; align the independent fixture's stable IDs.
+  const before = await f.store.load(ROOM_ID);
+  const other = await g.store.load(ROOM_ID);
+  other.seats.forEach((seat, index) => { seat.participant_id = before.seats[index].participant_id; });
+  await g.store.save(other);
+  for (const fixture of [f, g]) {
+    for (const name of SHARED_ROOM_COMMANDS) await fixture.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: name });
+  }
+  const cases = [
+    ['room.settings', { goal: 'Revised', briefing: 'Updated common.' }],
+    ['room.briefing.role.set', { role: 'builder', text: 'Build carefully.' }],
+    ['room.briefing.role.delete', { role: 'builder' }],
+    ['room.invite', { mode: 'one_time', role: 'reviewer', min_accepts: 1 }],
+    ['room.revoke', { invite_id: 'core-invite-2' }],
+    ['room.recover', {}],
+    ['room.recover.confirm', { recovery_of: 'missing', invite_id: 'missing' }],
+    ['room.show', {}],
+    ['room.participants', {}],
+    ['room.command.grants', {}],
+    ['room.command.role.grants', {}],
+    ['room.command.role.set', { role: 'builder', commands: ['room.history'] }],
+    ['room.command.grant', { caller_cid: BOB_CID, command: 'room.show' }],
+    ['room.command.revoke', { caller_cid: BOB_CID, command: 'room.show' }],
+    ['room.history', { limit: 1, view: 'participant' }],
+    ['room.message', { text: 'A room post.' }],
+    ['room.role.rest.add', { role: 'Reporter' }],
+    ['room.say', { role: 'Reporter', text: 'A role post.' }],
+    ['room.role.rest.remove', { role: 'Reporter' }],
+    ['room.participant.remove', { participant: BOB_CID }],
+    ['room.settings', { unknown: true }],
+    ['room.say', { role: 'Reporter', text: 'Removed role refuses.' }],
+  ];
+  assert.deepEqual(new Set(cases.map(([name]) => name)), new Set(SHARED_ROOM_COMMANDS));
+  const routes = createServiceRoutes(f.service);
+  const call = g.registry.get(ROOM_ID).runtimeCommands.sharedCommand;
+  for (const [name, input] of cases) {
+    let expected;
+    try { expected = { ok: true, result: await routes[name].run({ ...input, room_id: ROOM_ID }) }; }
+    catch (error) { expected = { ok: false, error: classifyServiceError(error) }; }
+    const actual = await call(name, input, sharedContext);
+    assert.deepEqual(actual, JSON.parse(JSON.stringify(expected)), name);
+    assert.deepEqual(await g.store.load(ROOM_ID), await f.store.load(ROOM_ID), `${name} metadata`);
+    assert.deepEqual(await g.store.read(ROOM_ID), await f.store.read(ROOM_ID), `${name} archive`);
+  }
+});
+
+test('commands drained by intake enqueue posts without recursive command drain', { timeout: 3000 }, async () => {
+  const f = await sharedCommandFixture();
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'room.message' });
+  const packet = f.registry.get(ROOM_ID);
+  let inside = false;
+  let pending = true;
+  let result;
+  packet.drainRuntimeCommands = async () => {
+    assert.equal(inside, false, 'SDK command callbacks must not recursively drain SDK getMessages');
+    if (!pending) return;
+    pending = false;
+    inside = true;
+    try { result = await packet.runtimeCommands.sharedCommand('room.message', { text: 'Queued inside SDK command.' }, sharedContext); }
+    finally { inside = false; }
+  };
+  await f.service.resumePending(ROOM_ID);
+  assert.equal(result.ok, true);
+  const records = await f.store.read(ROOM_ID);
+  const post = records.find((row) => row.kind === 'message' && row.text === 'Queued inside SDK command.');
+  assert(post);
+  assert.equal(records.filter((row) => row.kind === 'relay_result' && row.message_id === post.message_id).length, 2);
+});
+
+test('shared recovery returns a receipt and confirms its exact lineage idempotently', async () => {
+  const f = await sharedCommandFixture();
+  for (const command of ['room.recover', 'room.recover.confirm']) {
+    await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command });
+  }
+  const packet = f.registry.get(ROOM_ID);
+  packet.invites = [];
+  const recovered = await packet.runtimeCommands.sharedCommand('room.recover', {}, sharedContext);
+  assert.equal(recovered.ok, true);
+  const [receipt] = recovered.result;
+  assert.equal(receipt.recovery_of, 'core-invite-1');
+  assert.equal(receipt.invite.state, 'receipt_pending');
+  const input = { recovery_of: receipt.recovery_of, invite_id: receipt.invite.invite_id };
+  const confirmed = await packet.runtimeCommands.sharedCommand('room.recover.confirm', input, sharedContext);
+  assert.equal(confirmed.ok, true);
+  assert.equal(confirmed.result.state, 'live');
+  assert.equal(confirmed.result.recovery_confirmed, true);
+  assert.deepEqual(await packet.runtimeCommands.sharedCommand('room.recover.confirm', input, sharedContext), confirmed);
+  const room = await f.service.showRoom(ROOM_ID);
+  assert.equal(room.invites.find((invite) => invite.invite_id === receipt.recovery_of).state, 'revoked');
+  assert.equal(room.invites.find((invite) => invite.invite_id === receipt.invite.invite_id).state, 'live');
+});

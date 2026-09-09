@@ -1,3 +1,5 @@
+import { RUNTIME_COMMAND_NAMES } from './command-names.ts';
+
 /**
  * OpenAPI description of the room-management REST surface.
  *
@@ -272,7 +274,7 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
       room_id: roomIdProperty,
       role: { type: 'string', minLength: 1, description: 'Exact admitted seat role.' },
       commands: { type: 'array', uniqueItems: true, items: {
-        type: 'string', enum: ['list-members', 'remove-member'],
+        type: 'string', enum: [...RUNTIME_COMMAND_NAMES],
       } },
     }, ['room_id', 'role', 'commands']),
     result: 'The complete sorted role-policy list after the idempotent update.',
@@ -286,7 +288,7 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     params: params({
       room_id: roomIdProperty,
       caller_cid: { type: 'string', pattern: '^[0-9A-Fa-f]{64}$', description: 'Authenticated caller CID.' },
-      command: { type: 'string', enum: ['list-members', 'remove-member'] },
+      command: { type: 'string', enum: [...RUNTIME_COMMAND_NAMES] },
     }, ['room_id', 'caller_cid', 'command']),
     result: 'The complete sorted grant list after the idempotent update.',
     example: { room_id: EXAMPLE_ROOM_ID, caller_cid: 'A'.repeat(64), command: 'list-members' },
@@ -299,7 +301,7 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     params: params({
       room_id: roomIdProperty,
       caller_cid: { type: 'string', pattern: '^[0-9A-Fa-f]{64}$', description: 'Authenticated caller CID.' },
-      command: { type: 'string', enum: ['list-members', 'remove-member'] },
+      command: { type: 'string', enum: [...RUNTIME_COMMAND_NAMES] },
     }, ['room_id', 'caller_cid', 'command']),
     result: 'The complete sorted grant list after the idempotent update.',
     example: { room_id: EXAMPLE_ROOM_ID, caller_cid: 'A'.repeat(64), command: 'remove-member' },

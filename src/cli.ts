@@ -9,7 +9,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { ensureRuntimeState, loadConfig, type CoworkConfig } from './config.ts';
-import { MAX_EXTERNAL_INVITE_BYTES, MAX_MANAGEMENT_RESPONSE_BYTES } from './contracts.ts';
+import { MAX_EXTERNAL_INVITE_BYTES, MAX_MANAGEMENT_RESPONSE_BYTES, RuntimeCommandNameSchema } from './contracts.ts';
 
 const EXIT = {
   success: 0,
@@ -134,9 +134,9 @@ Room commands:
   participants <room-id>
   command-grants <room-id>
   role-command-grants <room-id>
-  role-command-set <room-id> --role <label> --commands <list-members,remove-member|none>
-  command-grant <room-id> <caller-cid> <list-members|remove-member>
-  command-revoke <room-id> <caller-cid> <list-members|remove-member>
+  role-command-set <room-id> --role <label> --commands <command,...|none>
+  command-grant <room-id> <caller-cid> <command>
+  command-revoke <room-id> <caller-cid> <command>
   history <room-id> [--after <seq>] [--limit <n>] [--view operator|participant]
   message <room-id> --text <text>
   say <room-id> --role <label> --text <text>
@@ -354,8 +354,8 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
       const value = requiredFlag(parsed, '--commands', 'room role-command-set');
       const commands = value === 'none' ? [] : value.split(',');
       if (new Set(commands).size !== commands.length || commands.some(item =>
-        item !== 'list-members' && item !== 'remove-member')) {
-        usageError('--commands must be a unique comma-separated subset of list-members,remove-member or none');
+        !RuntimeCommandNameSchema.safeParse(item).success)) {
+        usageError('--commands must be a unique comma-separated list of built-in command names or none');
       }
       return { method: 'room.command.role.set', params: { room_id: roomId, role, commands } };
     }
@@ -364,8 +364,8 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
       const [roomId, callerCid, runtimeCommand] = exactPositionals(
         parseOptions(args), 3, `room ${command}`,
       );
-      if (runtimeCommand !== 'list-members' && runtimeCommand !== 'remove-member') {
-        usageError('runtime command must be list-members or remove-member');
+      if (!RuntimeCommandNameSchema.safeParse(runtimeCommand).success) {
+        usageError('runtime command must be a supported built-in command name');
       }
       return {
         method: command === 'command-grant'

@@ -13,6 +13,8 @@ import {
   MAX_FILE_BYTES,
   sdkIdentityNameError,
 } from './contracts.ts';
+import { SHARED_ROOM_COMMANDS } from './command-names.ts';
+import { ROOM_RPC_METHODS } from './openapi.ts';
 import type { OursRuntimeClientFactory } from './ours-runtime.ts';
 
 export type InviteMode = 'one_time' | 'public';
@@ -51,6 +53,7 @@ export interface FileInboxItem {
 }
 
 export interface RoomRuntimeCommandHandlers {
+  sharedCommand?(name: typeof SHARED_ROOM_COMMANDS[number], input: JsonValue, context: Readonly<CommandContext>): Promise<JsonValue>;
   listMembers(
     input: JsonValue,
     context: Readonly<CommandContext>,
@@ -520,6 +523,20 @@ export class SdkRoomPacket implements RoomPacket {
         },
         handler: handlers.removeMember,
       },
+      ...(handlers.sharedCommand === undefined ? [] : SHARED_ROOM_COMMANDS.map((name) => {
+        const doc = ROOM_RPC_METHODS.find((method) => method.method === name)!;
+        const { room_id: _roomId, ...properties } = doc.params.properties as Record<string, JsonValue>;
+        return {
+          name,
+          description: `${doc.description} Requires an explicit grant; applies only to this room.`,
+          input_schema: {
+            ...doc.params,
+            properties,
+            required: (doc.params.required as string[]).filter((field) => field !== 'room_id'),
+          } as Record<string, JsonValue>,
+          handler: (input: JsonValue, context: Readonly<CommandContext>) => handlers.sharedCommand!(name, input, context),
+        };
+      })),
     ]));
   }
 

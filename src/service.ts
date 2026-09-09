@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 
 import { z } from 'zod';
@@ -44,6 +45,8 @@ import {
 import { ContactAlreadyAbsentError, unpackInvite, type RoomPacket } from './packets.ts';
 import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
 import { IntakePump } from './intake.ts';
+import { createServiceRoutes, classifyServiceError } from './command-routes.ts';
+import { SHARED_ROOM_COMMANDS } from './command-names.ts';
 import { generateUlid } from './ulid.ts';
 
 function byteBoundedHistoryPage<T>(records: T[]): T[] {
@@ -190,6 +193,7 @@ export class RoomServiceError extends Error {
 
 /** Operator lifecycle and read projections for one standalone cowork host. */
 export class RoomService {
+  private readonly commandScope = new AsyncLocalStorage<{ roomId: string; active: boolean }>();
   private readonly store: Store;
   private readonly packets: RoomPacketRegistry;
   private readonly nowValue: () => string;
@@ -374,9 +378,40 @@ export class RoomService {
 
   private async registerRuntimeCommands(roomId: string, packet: RoomPacket): Promise<void> {
     await packet.registerRuntimeCommands?.({
+      sharedCommand: (name, input, context) => this.sharedCommandUnlocked(roomId, name, input, context),
       listMembers: (input, context) => this.listMembersCommandUnlocked(roomId, input, context),
       removeMember: (input, context) => this.removeMemberCommandUnlocked(roomId, input, context),
     });
+  }
+
+  /** The SDK supplies authenticated context; arguments never select another room. */
+  private async sharedCommandUnlocked(
+    roomId: string,
+    name: typeof SHARED_ROOM_COMMANDS[number],
+    input: JsonValue,
+    context: Readonly<CommandContext>,
+  ): Promise<JsonValue> {
+    if (!SHARED_ROOM_COMMANDS.includes(name)
+      || input === null || typeof input !== 'object' || Array.isArray(input)
+      || Object.hasOwn(input, 'room_id')) return { ok: false, error: 'invalid_request' };
+    const room = await this.store.load(roomId);
+    if (room.state !== 'active') return { ok: false, error: 'room_unavailable' };
+    if (!room.seats.some((seat) => seat.state === 'active' && seat.identity === context.sender_cid)
+      || !this.hasRuntimeCommandGrant(room, context.sender_cid, name)) {
+      return { ok: false, error: 'unauthorized' };
+    }
+    const scope = { roomId, active: true };
+    try {
+      return await this.commandScope.run(scope, async (): Promise<JsonValue> => {
+        try {
+          const result = await createServiceRoutes(this)[name]!.run({ ...input, room_id: roomId });
+          // Preserve the service value; the SDK owns transport delivery.
+          return { ok: true, result: JSON.parse(JSON.stringify(result)) as JsonValue };
+        } catch (error) {
+          return { ok: false, error: classifyServiceError(error) };
+        }
+      });
+    } finally { scope.active = false; }
   }
 
   /** Called only by the intake pump while it already owns the room mutex. */
@@ -1704,6 +1739,11 @@ export class RoomService {
   }
 
   private lock<T>(roomId: string, work: () => T | Promise<T>): Promise<T> {
+    // Intake owns this room lock throughout a typed callback. Avoid nesting a
+    // service operation whose expected validation/state error would poison the
+    // store's outer lock even after the command adapter translated that error.
+    const scope = this.commandScope.getStore();
+    if (scope?.active && scope.roomId === roomId) return Promise.resolve().then(work);
     return (this.store.mutex(roomId) as RoomMutex).runExclusive(work);
   }
 

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 
 import { z } from 'zod';
@@ -86,6 +87,7 @@ export async function sendRoomBody(
 
 /** Archive, consume, and relay participant messages for hosted room packets. */
 export class IntakePump {
+  private readonly processing = new AsyncLocalStorage<{ roomId: string; active: boolean }>();
   private readonly store: IntakeStore;
   private readonly packets: IntakePacketRegistry;
   private readonly nowValue: () => string;
@@ -125,12 +127,16 @@ export class IntakePump {
   /** Process bounded unread history batches, then service durable intents. */
   async pump(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
+    const current = this.processing.getStore();
+    if (current?.active && current.roomId === id) return;
     await this.lock(id, () => this.processAndRelayUnlocked(id, this.packet(id)));
   }
 
   /** Retry every durable relay intent which has no terminal result. */
   async resumePending(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
+    const current = this.processing.getStore();
+    if (current?.active && current.roomId === id) return;
     await this.lock(id, () => this.processAndRelayUnlocked(id, this.packet(id)));
   }
 
@@ -180,6 +186,13 @@ export class IntakePump {
   }
 
   private async processAndRelayUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
+    const scope = { roomId, active: true };
+    try {
+      await this.processing.run(scope, () => this.drainAndRelayUnlocked(roomId, packet));
+    } finally { scope.active = false; }
+  }
+
+  private async drainAndRelayUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
     for (;;) {
       await packet.drainRuntimeCommands?.(
         (item) => this.processInboxItem(roomId, packet, item, false),

@@ -472,9 +472,11 @@ if (process.argv.includes('--e2e-driver')) {
       room = await runCli(['room', 'show', roomId]);
       const catalog = await waitFor(async () => {
         const commands = await alice.client.listContactCommands({ contact: roomCid });
-        return commands.length === 2 ? commands : undefined;
+        return commands.length === 22 ? commands : undefined;
       }, 'bounded room command catalog');
-      assert.deepEqual(catalog.map((command) => command.name), ['list-members', 'remove-member']);
+      assert.equal(catalog.length, 22);
+      assert.deepEqual(catalog.slice(0, 2).map((command) => command.name), ['list-members', 'remove-member']);
+      assert(catalog.some((command) => command.name === 'room.message'));
       const listRequest = await alice.client.sendCommand({
         contact: roomCid, command: 'list-members', arguments: {},
       });
@@ -492,6 +494,32 @@ if (process.argv.includes('--e2e-driver')) {
         member.participant_id === room.seats[0].participant_id), true);
       assert.equal(JSON.stringify(listedOutcome).includes(alice.cid), false);
 
+      async function sharedCall(command, args) {
+        const request = await alice.client.sendCommand({ contact: roomCid, command, arguments: args });
+        const response = await waitFor(async () => (await alice.client.getMessages()).command_results
+          .find((result) => result.reply_to?.wire_id === request.wireId), `correlated ${command} result`);
+        const outcome = JSON.parse(response.body);
+        assert.equal(outcome.ok, true, 'SDK handler completed');
+        return outcome.result;
+      }
+      assert.deepEqual(await sharedCall('room.show', {}), { ok: false, error: 'unauthorized' });
+      for (const name of ['room.settings', 'room.message', 'room.say', 'room.show']) {
+        await runCli(['room', 'command-grant', roomId, alice.cid, name]);
+      }
+      const updated = await sharedCall('room.settings', { status: 'shared-command-verified' });
+      assert.equal(updated.ok, true);
+      assert.equal((await runCli(['room', 'show', roomId])).status, 'shared-command-verified');
+      assert.deepEqual(await sharedCall('room.say', { role: 'Unregistered role', text: 'Refused.' }),
+        { ok: false, error: 'invalid_state' });
+      const posted = await sharedCall('room.message', { text: 'Shared typed command post.' });
+      assert.equal(posted.ok, true);
+      const relayed = await waitFor(async () => (await bob.client.getMessages()).messages.find((item) => {
+        try { return JSON.parse(item.body).text === 'Shared typed command post.'; } catch { return false; }
+      }), 'shared typed command relayed post');
+      assert(relayed);
+      const shown = await sharedCall('room.show', {});
+      assert.equal(shown.ok, true, 'independent command after a refused command and post');
+      assert.equal(shown.result.status, 'shared-command-verified');
       const aliceSeat = room.seats.find((seat) => seat.identity === alice.cid);
       const selfRequest = await alice.client.sendCommand({
         contact: roomCid,

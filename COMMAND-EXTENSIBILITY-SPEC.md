@@ -1,12 +1,16 @@
-# Consumer-defined Cowork commands
+# Injecting consumer commands into the room’s ours catalog
 
-Status: proposal for Owner review; no consumer extensibility implemented. Critic review is not Owner approval.
+Status: proposal revised to the Owner’s 2026-09-09 clarification: only injection into the ours command catalog is required. No consumer extensibility implemented. Critic review is not Owner approval.
 
 Baseline: ours-cowork `76753c13e009ba7ea585b3a9c8c8e27444234e5c`, SDK 3.7.0. Part 1 extracts fixed service routes and expands the room's ours catalog. This document describes a possible later change.
 
 ## Intent and feasibility
 
-Consumers should define a room operation once and invoke it through CLI, REST or ours, without adding a built-in to Cowork. Both REST registration and local definition files are feasible. Neither a JSON definition nor registration alone supplies executable business logic: an operator must also provide a handler.
+Consumers should inject new commands into a room identity’s advertised **ours command catalog**, so authorized peers discover and invoke them through ours. This is the required execution surface. Adding invocation of these consumer commands through CLI or REST is an optional bonus, not a requirement or acceptance gate.
+
+REST registration and local definition files are the two proposed ways to supply commands to that ours catalog. A REST request that registers a command is distinct from a REST endpoint that executes it; the former remains part of the proposal, while the latter is optional. Both registration sources are feasible. Neither a JSON definition nor registration alone supplies executable business logic: an operator must also provide a handler.
+
+Scope source: authenticated Owner message `01m22gdyggk01grsd6253h1ppw` (2026-09-09 07:17:01 UTC). Part 1’s parity work for existing built-ins does not make cross-transport invocation a Part 2 requirement.
 
 The SDK already registers a catalog of `{name, description, input_schema}` with in-process handlers and authenticates command callers by CID. Cowork already persists per-room CID and role grants. However, its command-name enum is currently fixed, its management routes are static, and handlers run while intake owns the room lock. Dynamic names, persistent registrations, loading, handler invocation and catalog reconciliation all require future implementation. SDK catalog registration replaces the complete catalog; additions must preserve built-ins and all accepted consumer definitions.
 
@@ -50,7 +54,10 @@ REST uses the existing loopback management RPC transport rather than introducing
 - `command.definition.put`: `{room_id, definition, expected_revision}`; validates and creates/replaces a REST-owned definition. Initial creation requires revision 0. Return the committed definition revision and effective catalog state.
 - `command.definition.list`: room-scoped definitions, origin, revision and publication state, excluding secrets (definitions may not contain credentials).
 - `command.definition.delete`: `{room_id, name, expected_revision}`; removes only a REST-owned definition.
-- Future CLI adapters call these same methods. Invocation uses `room.command.invoke` with `{room_id, name, arguments}` over CLI/REST. Ours publishes the individual names and invokes the same registry service using its authenticated room/CID context.
+
+After either registration source is accepted, Cowork publishes the individual names in that room’s ours catalog. Each SDK handler invokes the registry service using authenticated room/CID context and the supplied arguments. This completes the required injection-to-invocation path; it needs no new CLI invocation command or REST invocation endpoint.
+
+Optional bonus, outside required scope: future CLI helpers may call the registration methods, and CLI/REST invocation could use a generic `room.command.invoke` method. Neither those helpers nor that execution method is required by this specification. If added later, they should reuse the same handler dispatch rather than introduce another business implementation.
 
 Names are illustrative and not implemented routes. Registrar access is host management authority, consistent with today's Unix socket and loopback management listener. If REST is ever exposed beyond the current host boundary, explicit authentication and authorization must precede registration support; loopback is not a multi-user access-control system.
 
@@ -60,7 +67,7 @@ Initial loading happens at daemon startup. An explicit host-management reload op
 
 ## Invocation authority
 
-Registration is not an invocation grant. New definitions start with no CID or role grants. An active room seat must have a current exact grant for the consumer name. Built-in composition additionally requires the current grant for its target built-in: a wrapper cannot turn a harmless-looking name into policy administration, room authorship or a confidential room snapshot without that underlying authority. A host management invocation retains existing management authority.
+Registration is not an invocation grant. New definitions start with no CID or role grants. An active room seat must have a current exact grant for the consumer name. Built-in composition additionally requires the current grant for its target built-in: a wrapper cannot turn a harmless-looking name into policy administration, room authorship or a confidential room snapshot without that underlying authority. The required invocation policy applies to ours callers. Any optional CLI/REST execution surface would need its own explicit caller-to-authority mapping; registration permission alone must not silently become execution permission.
 
 Do not derive permission from display names, role labels such as “Owner”, the registration author, definition contents or advertised catalog presence. Resolve roles from current seat state and configured grants. Removed seats lose invocation authority. Roles configured by a host operator may grant consumer names; arbitrary registrants cannot edit grants through definition fields.
 
@@ -82,7 +89,7 @@ A malformed local reload leaves the last valid generation effective and returns 
 
 ## Execution, errors and transport limits
 
-All transports call the registry's validation/authorization/dispatch path. Preserve built-in state validation, locking and effects. Preserve Part 1's intake-owned execution for composed built-ins, with nested drains deferred until the command finishes; registration must not recursively invoke intake. This proposal adds no execution scheduler. No command runs an unbounded consumer loop while holding the room mutex.
+Ours command handlers call the registry's validation/authorization/dispatch path. Both registration sources feed that same ours catalog; optional CLI/REST invocation is not needed for execution. Preserve built-in state validation, locking and effects. Preserve Part 1's intake-owned execution for composed built-ins, with nested drains deferred until the command finishes; registration must not recursively invoke intake. This proposal adds no execution scheduler. No command runs an unbounded consumer loop while holding the room mutex.
 
 Composition is one built-in call in version one; no transaction across a sequence of effects, automatic compensation, background jobs or retry workflow. Return correlated success/error results, with bounded public diagnostics. Registration errors identify field and reason but never credentials or filesystem contents. Handler failures must not manufacture a successful business result.
 
@@ -97,4 +104,4 @@ Verify advertised catalog, request and result size limits against the exact SDK/
 3. Approve eligible built-in targets and invocation policy; initial exclusion of policy administration and privileged authorship/data is a proposal.
 4. Approve bounds after validating SDK catalog/result capacity and workload examples.
 
-Before future implementation acceptance, test the same definition through REST and local loading; duplicate/reserved names; stale revisions; removed callers; target-grant refusal; definition replacement revocation; restart and publication failure recovery; malformed local generations; deletion with stale peer catalogs; bounded errors; and equivalent CLI/REST/ours outcomes. If installed handlers are added, independently review isolation, resource budgets and failure recovery first.
+Required future acceptance: register a definition through REST and, separately, load the equivalent local definition; in each case verify that it appears in the receiving room’s ours catalog, preserves existing built-ins, can be discovered by a peer and invokes the intended handler through an authenticated ours command. Test duplicate/reserved names; stale revisions; removed callers; target-grant refusal; definition replacement revocation; restart and publication failure recovery; malformed local generations; deletion with stale peer catalogs; and bounded errors. No CLI/REST execution of consumer commands is required. Cross-transport result parity is an additional test only if the optional execution surfaces are later implemented. If installed handlers are added, independently review isolation, resource budgets and failure recovery first.

@@ -508,7 +508,7 @@ test('runtime role-command policy is exact, unique, and backwards-compatible', (
   })), /role/i);
   assert.throws(() => RoomSchema.parse(roomV2({
     role_command_grants: [{ role: 'role', commands: ['filesystem-admin'] }],
-  })), /invalid_enum_value|invalid enum/i);
+  })), /invalid_enum_value|invalid enum|invalid_string/i);
 });
 
 test('room schema v2 round-trips briefing versions, anonymity, and membership fields', () => {

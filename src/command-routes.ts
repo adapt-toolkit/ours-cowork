@@ -3,6 +3,11 @@ import { ContainerIdSchema, RuntimeCommandNameSchema } from './contracts.ts';
 import type { AuthenticatedRouteTable } from './transports.ts';
 
 export interface RoomServiceApi {
+  provisionConsumerCredential(input: unknown): Promise<unknown>;
+  consumerDefinitions(roomId: string): Promise<unknown>;
+  registerConsumerCommand(roomId: string, input: unknown): Promise<unknown>;
+  deleteConsumerCommand(roomId: string, input: unknown): Promise<unknown>;
+  reloadConsumerCommands(roomId: string): Promise<unknown>;
   createRoom(input: unknown): Promise<unknown>;
   updateRoom(roomId: string, input: unknown): Promise<unknown>;
   setRoleBriefing(roomId: string, input: unknown): Promise<unknown>;
@@ -69,6 +74,17 @@ const ExternalInviteAcceptParams = z.object({
 
 export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRouteTable {
   return {
+    'consumer.handler.credential.set': { auth: true, run: (params) => service.provisionConsumerCredential(params) },
+    'room.command.definition.list': { auth: true, run: (params) => service.consumerDefinitions(RoomIdParams.parse(params).room_id) },
+    'room.command.definition.put': { auth: true, run: (params) => {
+      const { room_id, ...input } = z.object({ room_id: z.string(), expected_revision: z.unknown(), definition: z.unknown() }).strict().parse(params);
+      return service.registerConsumerCommand(room_id, input);
+    } },
+    'room.command.definition.delete': { auth: true, run: (params) => {
+      const { room_id, ...input } = z.object({ room_id: z.string(), expected_revision: z.unknown(), name: z.unknown() }).strict().parse(params);
+      return service.deleteConsumerCommand(room_id, input);
+    } },
+    'room.command.definition.reload': { auth: true, run: (params) => service.reloadConsumerCommands(RoomIdParams.parse(params).room_id) },
     'room.create': { auth: true, run: (params) => service.createRoom(params) },
     'room.settings': { auth: true, run: (params) => {
       const { room_id, ...input } = z.object({

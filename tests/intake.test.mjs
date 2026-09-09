@@ -1162,3 +1162,34 @@ test('there is exactly ONE packet.send call site in src/, and it is the canonica
   assert.doesNotMatch(funnelBody, /packet\.sign\s*\(/);
   assert.match(funnelBody, /canonicalJson\s*\(/);
 });
+
+
+test('concurrent pumps share one SDK reader and callback resume queues without deadlock', async () => {
+  const f = fixture();
+  let readers = 0;
+  let maximum = 0;
+  let passes = 0;
+  let release;
+  let entered;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  f.packet.drainRuntimeCommands = async () => {
+    readers++;
+    maximum = Math.max(maximum, readers);
+    try {
+      passes++;
+      if (passes === 1) {
+        entered();
+        await gate;
+        await f.pump.resumePending(ROOM_ID);
+      }
+    } finally { readers--; }
+  };
+  const first = f.pump.pump(ROOM_ID);
+  await started;
+  const second = f.pump.pump(ROOM_ID);
+  release();
+  await Promise.all([first, second, f.pump.drain()]);
+  assert.equal(maximum, 1);
+  assert.equal(passes, 2);
+});

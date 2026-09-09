@@ -83,6 +83,40 @@ function params(properties: Record<string, JsonSchema>, required: readonly strin
  */
 export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
   {
+    method: 'consumer.handler.credential.set', summary: 'Provision or rotate a consumer callback token',
+    description: 'Protected loopback management access required. Writes a consumer-provided bearer token to the private host-configured credential file. Never returns the token. Remote callers require an authenticated private tunnel or HTTPS gateway; redact request bodies in proxies. In-flight callbacks may use the previous token.',
+    params: params({ handler: { type: 'string', minLength: 1, maxLength: 128 }, token: { type: 'string', minLength: 16, maxLength: 4096, writeOnly: true } }, ['handler', 'token']),
+    result: 'Handler ID and configured: true; no credential.', example: { handler: 'orders', token: '<consumer-provided-secret>' },
+  },
+  {
+    method: 'room.command.definition.list', summary: 'List consumer command definitions',
+    description: 'Lists desired local/REST definitions, their registry revision and SDK publication status. Credentials are never included.',
+    params: params({ room_id: roomIdProperty }, ['room_id']),
+    result: 'revision, published and definitions.', example: { room_id: EXAMPLE_ROOM_ID },
+  },
+  {
+    method: 'room.command.definition.put', summary: 'Register or replace a consumer command',
+    description: 'Registers a consumer.* command for the ours catalog using an exact host-configured handler reference. Replacement clears grants for that name. Local definitions cannot be replaced here. A published:false result means desired state is committed; use reload to retry publication.',
+    params: params({ room_id: roomIdProperty, expected_revision: { type: 'integer', minimum: 0 }, definition: {
+      type: 'object', additionalProperties: false, required: ['name', 'description', 'input_schema', 'handler'],
+      properties: { name: { type: 'string', maxLength: 128, pattern: '^consumer\\.[a-z0-9][a-z0-9.-]*[a-z0-9]$' }, description: { type: 'string', minLength: 1, maxLength: 1024 }, input_schema: { type: 'object' }, handler: { type: 'string', minLength: 1, maxLength: 128 } },
+    } }, ['room_id', 'expected_revision', 'definition']),
+    result: 'Updated revision, published and definitions.', example: { room_id: EXAMPLE_ROOM_ID, expected_revision: 0, definition: { name: 'consumer.orders', description: 'Look up orders', handler: 'orders', input_schema: { type: 'object', properties: {}, additionalProperties: false } } },
+  },
+  {
+    method: 'room.command.definition.delete', summary: 'Delete a REST consumer command',
+    description: 'Deletes the desired definition and its CID/role grants. Requires the current registry revision. Local commands must be removed from their file and reloaded.',
+    params: params({ room_id: roomIdProperty, expected_revision: { type: 'integer', minimum: 0 }, name: { type: 'string' } }, ['room_id', 'expected_revision', 'name']),
+    result: 'Updated revision, published and definitions.', example: { room_id: EXAMPLE_ROOM_ID, expected_revision: 1, name: 'consumer.orders' },
+  },
+  {
+    method: 'room.command.definition.reload', summary: 'Reload local definitions and publish the catalog',
+    description: 'Validates the complete local file before changing the selected room. Invalid files and collisions leave the previous generation intact. Also retries a pending SDK publication.',
+    params: params({ room_id: roomIdProperty }, ['room_id']),
+    result: 'revision, published and definitions.', example: { room_id: EXAMPLE_ROOM_ID },
+  },
+
+  {
     method: 'room.create',
     summary: 'Create a room',
     description: 'Provisions durable room metadata and a standard identity on the shared daemon. The room stays '
@@ -274,7 +308,7 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
       room_id: roomIdProperty,
       role: { type: 'string', minLength: 1, description: 'Exact admitted seat role.' },
       commands: { type: 'array', uniqueItems: true, items: {
-        type: 'string', enum: [...RUNTIME_COMMAND_NAMES],
+        anyOf: [{ type: 'string', enum: [...RUNTIME_COMMAND_NAMES] }, { type: 'string', maxLength: 128, pattern: '^consumer\\.[a-z0-9][a-z0-9.-]*[a-z0-9]$' }],
       } },
     }, ['room_id', 'role', 'commands']),
     result: 'The complete sorted role-policy list after the idempotent update.',
@@ -288,7 +322,7 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     params: params({
       room_id: roomIdProperty,
       caller_cid: { type: 'string', pattern: '^[0-9A-Fa-f]{64}$', description: 'Authenticated caller CID.' },
-      command: { type: 'string', enum: [...RUNTIME_COMMAND_NAMES] },
+      command: { anyOf: [{ type: 'string', enum: [...RUNTIME_COMMAND_NAMES] }, { type: 'string', maxLength: 128, pattern: '^consumer\\.[a-z0-9][a-z0-9.-]*[a-z0-9]$' }] },
     }, ['room_id', 'caller_cid', 'command']),
     result: 'The complete sorted grant list after the idempotent update.',
     example: { room_id: EXAMPLE_ROOM_ID, caller_cid: 'A'.repeat(64), command: 'list-members' },
@@ -301,7 +335,7 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     params: params({
       room_id: roomIdProperty,
       caller_cid: { type: 'string', pattern: '^[0-9A-Fa-f]{64}$', description: 'Authenticated caller CID.' },
-      command: { type: 'string', enum: [...RUNTIME_COMMAND_NAMES] },
+      command: { anyOf: [{ type: 'string', enum: [...RUNTIME_COMMAND_NAMES] }, { type: 'string', maxLength: 128, pattern: '^consumer\\.[a-z0-9][a-z0-9.-]*[a-z0-9]$' }] },
     }, ['room_id', 'caller_cid', 'command']),
     result: 'The complete sorted grant list after the idempotent update.',
     example: { room_id: EXAMPLE_ROOM_ID, caller_cid: 'A'.repeat(64), command: 'remove-member' },

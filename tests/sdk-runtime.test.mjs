@@ -850,3 +850,15 @@ test('shared host exposes attach failure and never falls back to another runtime
   await assert.rejects(host.boot(), (error) => error === unavailable);
   await assert.rejects(host.createClient(), /not booted/);
 });
+
+
+test('consumer configuration refuses a shared daemon without runtime catalog propagation', async () => {
+  let releases = 0;
+  const host = new SharedOursHost(() => {}, async () => ({
+    version: async () => ({ protocol: 10 }),
+    releaseLease: async () => { releases++; },
+  }), true);
+  await assert.rejects(host.boot(), /catalog protocol 11/);
+  assert.equal(releases, 1);
+  await host.shutdown();
+});

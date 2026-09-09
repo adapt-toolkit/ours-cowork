@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 
 import { z } from 'zod';
+import { ConsumerConfigurationSchema } from './consumer-commands.ts';
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -11,6 +12,7 @@ const NO_FOLLOW = nodeFs.constants.O_NOFOLLOW ?? 0;
 export const CoworkConfigSchema = z.object({
   version: z.literal(1),
   stateDir: z.string().min(1),
+  consumer_commands: ConsumerConfigurationSchema.optional(),
   rest: z.object({
     enabled: z.boolean(),
     port: z.number().int().min(1).max(65_535),
@@ -91,6 +93,7 @@ export function loadConfig(
     return CoworkConfigSchema.parse({
       version: 1,
       stateDir: resolve(env.OURS_COWORK_STATE_DIR ?? file.stateDir),
+      ...(file.consumer_commands === undefined ? {} : { consumer_commands: file.consumer_commands }),
       rest: {
         enabled: restPort === undefined ? file.rest.enabled : true,
         port: restPort ?? file.rest.port,

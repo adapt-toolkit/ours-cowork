@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { z } from 'zod';
+import { ConsumerCommandNameSchema, StoredConsumerDefinitionSchema } from './consumer-commands.ts';
 import { RUNTIME_COMMAND_NAMES } from './command-names.ts';
 
 const MAX_TEXT_BYTES = 262_144;
@@ -39,7 +40,7 @@ export const LowerCrockfordUlidSchema = z.string().regex(
 export const ContainerIdSchema = z.string().regex(/^[0-9a-f]{64}$/i, 'must be a 64-character hexadecimal CID')
   .transform((value) => value.toUpperCase());
 
-export const RuntimeCommandNameSchema = z.enum(RUNTIME_COMMAND_NAMES);
+export const RuntimeCommandNameSchema = z.union([z.enum(RUNTIME_COMMAND_NAMES), ConsumerCommandNameSchema]);
 
 export const RuntimeCommandGrantSchema = z.object({
   caller_cid: ContainerIdSchema,
@@ -485,6 +486,8 @@ const CurrentRoomSchema = z.object({
   }),
   /** Operator-managed, default-deny grants for the room identity's runtime commands. */
   command_grants: z.array(RuntimeCommandGrantSchema),
+  consumer_commands: z.array(StoredConsumerDefinitionSchema).max(64).optional(),
+  consumer_commands_revision: z.number().int().nonnegative().safe().optional(),
   /** Operator-managed command policy inherited by authenticated active seats of an exact role. */
   role_command_grants: z.array(RuntimeRoleCommandGrantSchema).superRefine((grants, context) => {
     const seen = new Set<string>();

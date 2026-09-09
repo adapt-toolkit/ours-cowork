@@ -92,6 +92,7 @@ export class IntakePump {
   private readonly packets: IntakePacketRegistry;
   private readonly nowValue: () => string;
   private readonly nextMessageId: () => string;
+  private readonly pumps = new Map<string, NotificationState>();
   private readonly notifications = new Map<string, NotificationState>();
   private acceptingNotifications = true;
 
@@ -124,20 +125,44 @@ export class IntakePump {
     return state.work;
   }
 
-  /** Process bounded unread history batches, then service durable intents. */
+  /** One SDK reader per room; callback HTTP never runs under the room mutex. */
   async pump(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
-    const current = this.processing.getStore();
-    if (current?.active && current.roomId === id) return;
-    await this.lock(id, () => this.processAndRelayUnlocked(id, this.packet(id)));
+    const existing = this.pumps.get(id);
+    if (existing) {
+      existing.dirty = true;
+      const current = this.processing.getStore();
+      if (current?.active && current.roomId === id) return;
+      return existing.work;
+    }
+    const state: NotificationState = { dirty: true, work: Promise.resolve() };
+    this.pumps.set(id, state);
+    state.work = this.runPump(id, state);
+    return state.work;
   }
 
-  /** Retry every durable relay intent which has no terminal result. */
+  /** A callback may publish through REST: enqueue its relay without awaiting itself. */
   async resumePending(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
-    const current = this.processing.getStore();
-    if (current?.active && current.roomId === id) return;
-    await this.lock(id, () => this.processAndRelayUnlocked(id, this.packet(id)));
+    const active = this.pumps.get(id);
+    if (active) { active.dirty = true; return; }
+    await this.pump(id);
+  }
+
+  private async runPump(roomId: string, state: NotificationState): Promise<void> {
+    const scope = { roomId, active: true };
+    try {
+      await this.processing.run(scope, async () => {
+        const packet = this.packet(roomId);
+        while (state.dirty) {
+          state.dirty = false;
+          await this.drainAndRelay(roomId, packet);
+        }
+      });
+    } finally {
+      scope.active = false;
+      if (this.pumps.get(roomId) === state) this.pumps.delete(roomId);
+    }
   }
 
   beginShutdown(): void {
@@ -145,8 +170,8 @@ export class IntakePump {
   }
 
   async drain(): Promise<void> {
-    while (this.notifications.size > 0) {
-      await Promise.allSettled([...this.notifications.values()].map((state) => state.work));
+    while (this.notifications.size > 0 || this.pumps.size > 0) {
+      await Promise.allSettled([...this.notifications.values(), ...this.pumps.values()].map((state) => state.work));
     }
   }
 
@@ -185,26 +210,26 @@ export class IntakePump {
     if (failure !== undefined) throw failure;
   }
 
-  private async processAndRelayUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
-    const scope = { roomId, active: true };
-    try {
-      await this.processing.run(scope, () => this.drainAndRelayUnlocked(roomId, packet));
-    } finally { scope.active = false; }
-  }
-
-  private async drainAndRelayUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
+  private async drainAndRelay(roomId: string, packet: RoomPacket): Promise<void> {
     for (;;) {
       await packet.drainRuntimeCommands?.(
-        (item) => this.processInboxItem(roomId, packet, item, false),
+        (item) => this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false)),
       );
       const messages = await packet.listUnreadMessages(INTAKE_BATCH_SIZE);
       const files = await packet.listUnreadFiles(INTAKE_BATCH_SIZE);
       if (messages.length === 0 && files.length === 0) break;
-      for (const item of messages) await this.processInboxItem(roomId, packet, item);
-      for (const item of files) await this.processFileInboxItem(roomId, packet, item);
+      for (const item of messages) {
+        await this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false));
+        // SDK acknowledgement can dispatch a newly promoted typed command.
+        await packet.acknowledgeMessage(item,
+          (unexpected) => this.lock(roomId, () => this.processInboxItem(roomId, packet, unexpected, false)));
+      }
+      for (const item of files) await this.lock(roomId, () => this.processFileInboxItem(roomId, packet, item));
     }
-    await this.completeSnapshotIntents(roomId);
-    await this.relayPendingUnlocked(roomId, packet);
+    await this.lock(roomId, async () => {
+      await this.completeSnapshotIntents(roomId);
+      await this.relayPendingUnlocked(roomId, packet);
+    });
   }
 
   private async processFileInboxItem(

@@ -1,107 +1,127 @@
-# Injecting consumer commands into the room’s ours catalog
+# Consumer commands over ours
 
-Status: proposal revised to the Owner’s 2026-09-09 clarification: only injection into the ours command catalog is required. No consumer extensibility implemented. Critic review is not Owner approval.
+## Status and scope
 
-Baseline: ours-cowork `76753c13e009ba7ea585b3a9c8c8e27444234e5c`, SDK 3.7.0. Part 1 extracts fixed service routes and expands the room's ours catalog. This document describes a possible later change.
+The Owner authorized this implementation as a separate PR after reviewing the two-service callback workflow. This branch builds on the shared-command PR. Consumers register definitions through Cowork REST or a local file; discovery and execution are through the ours command catalog. There is no consumer command execution endpoint or new CLI execution command.
 
-## Intent and feasibility
+The consumer runs its own HTTP service. Cowork validates the incoming ours request, checks room membership and an exact command grant, sends one authenticated callback, and returns the consumer result in the correlated ours command reply. No consumer code is loaded into Cowork.
 
-Consumers should inject new commands into a room identity’s advertised **ours command catalog**, so authorized peers discover and invoke them through ours. This is the required execution surface. Adding invocation of these consumer commands through CLI or REST is an optional bonus, not a requirement or acceptance gate.
+Runtime catalog updates require the released SDK 3.7.2 and shared daemon provided by ours CLI 2.7.2 (catalog protocol 11). Older peers may need their own SDK/daemon upgrade to discover later additions. Updating the Cowork npm dependency alone does not upgrade an already-running shared daemon.
 
-REST registration and local definition files are the two proposed ways to supply commands to that ours catalog. A REST request that registers a command is distinct from a REST endpoint that executes it; the former remains part of the proposal, while the latter is optional. Both registration sources are feasible. Neither a JSON definition nor registration alone supplies executable business logic: an operator must also provide a handler.
+## Two-service setup
 
-Scope source: authenticated Owner message `01m22gdyggk01grsd6253h1ppw` (2026-09-09 07:17:01 UTC). Part 1’s parity work for existing built-ins does not make cross-transport invocation a Part 2 requirement.
-
-The SDK already registers a catalog of `{name, description, input_schema}` with in-process handlers and authenticates command callers by CID. Cowork already persists per-room CID and role grants. However, its command-name enum is currently fixed, its management routes are static, and handlers run while intake owns the room lock. Dynamic names, persistent registrations, loading, handler invocation and catalog reconciliation all require future implementation. SDK catalog registration replaces the complete catalog; additions must preserve built-ins and all accepted consumer definitions.
-
-## Proposed smallest viable design
-
-Use one versioned JSON definition format and one registry service for both sources. Initially support **composition of existing built-ins**. A handler reference identifies a Cowork built-in plus a declarative argument mapping; no shell, JavaScript upload, dynamic import, arbitrary URL or process execution. This supports consumer-specific names, defaults and constrained workflows using existing operations. It does not provide arbitrary new business logic.
-
-For genuinely new business logic, a later, separately approved option can invoke an operator-installed handler keyed by an opaque handler ID. The operator provisions and reviews that implementation outside REST. Both registration sources resolve that same ID. That option needs an isolation and timeout contract before implementation; a definition file must never double as executable code.
-
-The Owner needs to choose whether built-in composition satisfies the first version. If arbitrary custom business logic is essential immediately, the operator-installed handler option becomes required scope, not something registration can magically provide.
-
-### Example definition
+1. The consumer implements a POST endpoint and creates a random bearer token. It must verify `Authorization: Bearer <token>` before processing the request, rejecting missing or incorrect credentials. Use HTTPS for remote callbacks; HTTP is accepted only for literal loopback hosts.
+2. The Cowork host configures an exact destination and a private credential path. Consumers cannot introduce arbitrary URLs through registration. For example, extend the normal Cowork configuration with:
 
 ```json
 {
-  "version": 1,
-  "name": "consumer.acme.set-phase",
-  "description": "Set the current phase of this room.",
-  "input_schema": {
-    "type": "object",
-    "additionalProperties": false,
-    "required": ["phase"],
-    "properties": { "phase": { "type": "string", "enum": ["design", "build", "review"] } }
-  },
-  "handler": {
-    "kind": "builtin",
-    "command": "room.settings",
-    "arguments": { "status": { "input": "phase" } }
+  "consumer_commands": {
+    "handlers": [{
+      "id": "orders",
+      "url": "https://consumer.example/cowork/orders",
+      "token_file": "/home/cowork/private/orders.token"
+    }],
+    "timeout_ms": 5000,
+    "definitions_file": "/home/cowork/private/commands.json"
   }
 }
 ```
 
-Argument mapping supports only literal JSON values and references to explicitly declared top-level inputs. No expression language, template evaluation, recursion or implicit copying of arguments. The target must be an eligible room-scoped built-in. Reject unknown fields and reject caller-selected `room_id`. Resolve the room from the authenticated invocation endpoint. The service validates both the public schema and the mapped built-in input.
+`definitions_file` is optional. The credential directory must already exist, be owned by the Cowork process user and have mode 0700. An existing token file must be owner-owned, mode 0600 and at most 4096 bytes. Missing credentials allow startup but disable callback execution until provisioned. Configuration changes to destinations require restarting the application through the normal operator process.
 
-For a future installed handler, replace the handler object with an approved shape such as `{ "kind": "installed", "id": "acme.phase.v1" }`. A missing handler ID is a registration error. REST cannot install its implementation or choose a path/URL. Handlers receive immutable parsed arguments, authenticated caller context and narrow room services, never the raw daemon client or filesystem credentials. This is a proposal requiring further design, not a sandbox claim.
+3. The consumer supplies its token through management RPC `consumer.handler.credential.set`, with params `{ "handler": "orders", "token": "<consumer-generated-token>" }`. Cowork writes the secret atomically to the selected private file. The result contains only `{ "handler": "orders", "configured": true }`. The same operation rotates the credential; subsequent callbacks use the new value. A callback already in flight can use the previous credential, so coordinate a short overlap on the consumer side. Restart loads the persisted credential. Alternatively, the operator can provision the consumer's token directly into the private file before startup.
 
-## Registration surfaces
+The existing Cowork REST management surface is loopback-only with Host/Origin checks, not a new token-authenticated public API. A consumer on another host needs an operator-provided authenticated private tunnel or HTTPS gateway to this management surface. Do not expose the loopback management API directly. Gateway authentication and request-body redaction remain deployment responsibilities. The callback bearer token authenticates Cowork to the consumer; it does not grant management access to Cowork.
 
-REST uses the existing loopback management RPC transport rather than introducing a separate HTTP authentication model:
+4. Read `room.command.definition.list` with `{ "room_id": "<room>" }` to obtain `revision`, then register:
 
-- `command.definition.put`: `{room_id, definition, expected_revision}`; validates and creates/replaces a REST-owned definition. Initial creation requires revision 0. Return the committed definition revision and effective catalog state.
-- `command.definition.list`: room-scoped definitions, origin, revision and publication state, excluding secrets (definitions may not contain credentials).
-- `command.definition.delete`: `{room_id, name, expected_revision}`; removes only a REST-owned definition.
+```json
+{
+  "version": 1,
+  "id": "register-orders",
+  "method": "room.command.definition.put",
+  "params": {
+    "room_id": "<room>",
+    "expected_revision": 0,
+    "definition": {
+      "name": "consumer.orders",
+      "description": "Look up an order",
+      "handler": "orders",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "integer" } },
+        "required": ["id"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
 
-After either registration source is accepted, Cowork publishes the individual names in that room’s ours catalog. Each SDK handler invokes the registry service using authenticated room/CID context and the supplied arguments. This completes the required injection-to-invocation path; it needs no new CLI invocation command or REST invocation endpoint.
+All management calls use the existing `POST /rpc` version-1 envelope. The definition contains only public metadata and a handler ID, never a credential or destination URL. Publication adds the command beside the built-ins in that room's ours catalog. Discovery does not grant invocation permission.
 
-Optional bonus, outside required scope: future CLI helpers may call the registration methods, and CLI/REST invocation could use a generic `room.command.invoke` method. Neither those helpers nor that execution method is required by this specification. If added later, they should reuse the same handler dispatch rather than introduce another business implementation.
+5. Grant `consumer.orders` to an active authenticated CID with `room.command.grant`, or to an exact role with `room.command.role.set`. Existing CLI grant operations also accept registered consumer command names. Unknown names cannot be granted. Only active room members with a current exact CID or role grant can execute the callback.
+6. A participant invokes `consumer.orders` over ours with `{ "id": 42 }`. Cowork sends:
 
-Names are illustrative and not implemented routes. Registrar access is host management authority, consistent with today's Unix socket and loopback management listener. If REST is ever exposed beyond the current host boundary, explicit authentication and authorization must precede registration support; loopback is not a multi-user access-control system.
+```json
+{
+  "version": 1,
+  "command": "consumer.orders",
+  "registration_revision": 1,
+  "request_id": "<authenticated SDK request wire ID>",
+  "room_id": "<receiving room>",
+  "caller_cid": "<authenticated sender CID>",
+  "arguments": { "id": 42 }
+}
+```
 
-Local configuration adds an explicit directory path, for example `command_definitions_dir`, containing regular `.json` files. Each file contains `{version:1, room_id, definitions:[...]}`. Do not scan the working directory or accept uploaded paths. Validate file ownership/permissions appropriate to the daemon account, reject symlinks, bound file count and total bytes, and validate the whole candidate generation before replacing anything. Suggested initial bounds: 64 consumer definitions per room, 64 KiB per file, 1 MiB per complete generation, schema nesting depth 16. These are proposed limits to validate against SDK catalog capacity.
+The callback includes `Content-Type: application/json` and the consumer-provisioned Authorization header. Routing and context come from Cowork and the SDK, not caller arguments. The trusted consumer receives the real caller CID, including for an anonymous room; room relay aliases are not callback identities. The handler may call Cowork's protected management REST interface using its separately authorized access. Cowork holds no room mutex while awaiting HTTP; one SDK reader per room preserves command/message ordering.
 
-Initial loading happens at daemon startup. An explicit host-management reload operation is preferable to a filesystem watcher in version one. Startup/reload and REST put share exactly the same schema, handler resolution, name and collision checks. They differ only in ownership and persistence.
+7. The consumer returns HTTP 2xx with JSON `{ "ok": true, "result": { "order": 42 } }` or `{ "ok": false, "error": "order_not_found" }`. A result may be any JSON value, including null. Cowork returns that envelope as the SDK handler result. The SDK adds its normal outer result envelope and reply correlation.
 
-## Invocation authority
+## Local definitions
 
-Registration is not an invocation grant. New definitions start with no CID or role grants. An active room seat must have a current exact grant for the consumer name. Built-in composition additionally requires the current grant for its target built-in: a wrapper cannot turn a harmless-looking name into policy administration, room authorship or a confidential room snapshot without that underlying authority. The required invocation policy applies to ours callers. Any optional CLI/REST execution surface would need its own explicit caller-to-authority mapping; registration permission alone must not silently become execution permission.
+The optional owner-private JSON file supplies an entire generation:
 
-Do not derive permission from display names, role labels such as “Owner”, the registration author, definition contents or advertised catalog presence. Resolve roles from current seat state and configured grants. Removed seats lose invocation authority. Roles configured by a host operator may grant consumer names; arbitrary registrants cannot edit grants through definition fields.
+```json
+{
+  "version": 1,
+  "rooms": [{
+    "room_id": "<room>",
+    "commands": [{
+      "name": "consumer.orders",
+      "description": "Look up an order",
+      "handler": "orders",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "integer" } },
+        "required": ["id"],
+        "additionalProperties": false
+      }
+    }]
+  }]
+}
+```
 
-Built-ins that administer command policy, speak as the room or another registered role, or return operator-private data require explicit review before allowing composition. Proposal: exclude these targets from initial composition even if directly invocable as fixed built-ins. This limits the first version; Owner may choose a broader policy explicitly.
+Replace the file atomically, then call `room.command.definition.reload` for each affected hosted room. The complete file is validated before any selected-room change. Invalid JSON/schema, duplicate names/rooms, unknown handlers, and collisions with REST definitions reject the reload and preserve the previous generation. Startup also validates the complete file and fails if it is invalid. This is explicit reload, not a file watcher or an all-room transaction.
 
-A successful definition replacement changes executable meaning. Therefore invalidate its existing invocation grants atomically on replacement, or bind grants to a definition revision. Proposal: revision-bound grants; callers reauthorize the new revision. Delete also removes grants. Definitions do not mutate built-in grants.
+Local definitions own their names. REST cannot replace/delete them. Remove or change them in the file and reload. Unchanged local definitions retain grants. Changed or removed definitions clear both CID and role grants for their names. Removing the file setting makes the next startup/reload remove previously stored local definitions. REST definitions remain durable room metadata across restart.
 
-## Validation, collisions and persistence
+## Registry consistency
 
-Reserve all built-in names and `room.*`; require consumer names under `consumer.<namespace>.<name>`, bounded to 128 portable ASCII characters. Namespace is organizational, not proof of identity. Reject case-folding aliases and duplicate names; no implicit overwrite or source precedence.
+A room has a monotonically increasing `revision`. REST put/delete require `expected_revision`; stale writers fail. Every REST replacement clears the name's grants, including a same-content replacement. Use list first and grant again deliberately after a change. Delete uses `room.command.definition.delete` with room ID, current revision and name.
 
-REST registrations are persisted as versioned room state with origin and revision. Local files are the source of truth for local definitions; keep an effective validated snapshot and source revision/hash in room state for inspection and recovery. REST cannot overwrite or delete a locally owned name. Local reload refuses a collision with a REST-owned name, and a second local file defining the same name rejects the entire generation. Explicit source migration requires removing the old registration and reauthorizing the new one.
+Desired definitions and grant removal are saved together before catalog publication. Responses report `published: false` if SDK publication failed after commit. Do not repeat the mutation blindly: inspect list and retry `room.command.definition.reload`. Consumer execution fails closed while publication is pending. Startup republishes the durable generation. Old catalog entries cannot bypass current membership, definition existence, current publication status or grants. An invocation authorized before a change may complete using its captured definition and credential; deletion does not cancel an already started remote operation.
 
-Compile/validate schemas at registration with bounded complexity, no remote references and no network resolution. Registration must reject incompatible schemas, reserved field mappings, missing targets, recursive consumer targets and unsupported handler kinds before committing state. Validation is repeated at invocation; SDK sender-side validation is useful but is not the trust boundary.
+## Validation and failure behavior
 
-Commit the desired definition generation durably, then publish the complete SDK catalog. These are not one atomic transaction. If publication fails, retain desired state with `publication_pending`, fail closed for affected new/replaced names and report the concrete pending revision. Retry catalog reconciliation on bounded recovery/startup. Never claim registration is ready merely because metadata committed. Unchanged built-ins remain available. Removal disables dispatch before catalog withdrawal; stale peer catalogs cannot invoke removed definitions. On startup, do not publish consumer names until definitions and handlers validate.
+- Names use the reserved `consumer.` namespace and lowercase letters, digits, dots and hyphens, at most 128 characters. Built-in names cannot collide. Each room allows 64 consumer definitions; the configuration allows 64 handler references and the local file 256 room entries.
+- Input schemas are bounded to 16 KiB and depth 16, with a top-level object and `additionalProperties: false`. Strict Ajv validation runs before HTTP. External references, schema IDs, async schemas, regex patterns and format execution are unsupported. The current conservative schema traversal reserves those keyword names throughout the schema document, including property maps. Arguments are bounded to 64 KiB. Validator caching is bounded and compiler instances do not share an accumulating schema registry.
+- Destinations are exact host-selected URLs. URL credentials, queries, fragments, non-HTTPS remote destinations and redirects are refused. The callback token is never advertised or placed in room metadata, arguments, normal API results or generated error messages. Trusted consumers must also avoid returning their own secrets in results.
+- One HTTP attempt is made per handler invocation. A configurable 100–30000 ms timeout (default 5000) covers headers and response streaming. Responses must be JSON and at most 256 KiB. This limit applies to the new callback protocol, not shared built-in service results.
+- Timeout, HTTP refusal, network failure and malformed/oversized responses return a specific consumer error with `execution: "unknown"`. A remote side effect may already have happened. Cowork does not automatically retry HTTP. The consumer should deduplicate durable effects by `request_id`; this is not an exactly-once execution guarantee.
+- Consumer-returned `{ok:false,error}` values are delivered unchanged. Failure does not prevent a later independent command from executing. SDK delivery limits and transport failures still apply to the final correlated reply.
 
-A malformed local reload leaves the last valid generation effective and returns errors; it does not apply a partial directory. A malformed startup generation leaves consumer commands unavailable with a clear management status; built-ins may start independently. Missing files during an explicit successful reload remove their local definitions and grants. Protect in-flight execution using an immutable accepted revision: deletion/replacement prevents new calls, while an already authorized invocation finishes under its captured revision. Document the timing; revocation is not cancellation of a committed effect.
+## Review boundary
 
-## Execution, errors and transport limits
-
-Ours command handlers call the registry's validation/authorization/dispatch path. Both registration sources feed that same ours catalog; optional CLI/REST invocation is not needed for execution. Preserve built-in state validation, locking and effects. Preserve Part 1's intake-owned execution for composed built-ins, with nested drains deferred until the command finishes; registration must not recursively invoke intake. This proposal adds no execution scheduler. No command runs an unbounded consumer loop while holding the room mutex.
-
-Composition is one built-in call in version one; no transaction across a sequence of effects, automatic compensation, background jobs or retry workflow. Return correlated success/error results, with bounded public diagnostics. Registration errors identify field and reason but never credentials or filesystem contents. Handler failures must not manufacture a successful business result.
-
-A request or reply can be lost after an effect commits. Do not promise exactly-once execution based on a wire ID. Reuse a built-in's existing idempotent semantics where applicable; otherwise callers inspect current state before retrying. Installed handlers, if approved, must define their own idempotency and cancellation contracts.
-
-Verify advertised catalog, request and result size limits against the exact SDK/core release before selecting registration bounds. Large histories, files and room snapshots may need pagination or a retrieval artifact; returning a small “too large” error after a mutation is not evidence that the mutation did not happen. Dynamic handlers must declare bounded output and must not quietly truncate success values.
-
-## Owner decisions and review gates
-
-1. Is one-call built-in composition sufficient, or are operator-installed custom handlers required in the first release?
-2. Approve the proposed source ownership, explicit reload and revision-bound grant behavior.
-3. Approve eligible built-in targets and invocation policy; initial exclusion of policy administration and privileged authorship/data is a proposal.
-4. Approve bounds after validating SDK catalog/result capacity and workload examples.
-
-Required future acceptance: register a definition through REST and, separately, load the equivalent local definition; in each case verify that it appears in the receiving room’s ours catalog, preserves existing built-ins, can be discovered by a peer and invokes the intended handler through an authenticated ours command. Test duplicate/reserved names; stale revisions; removed callers; target-grant refusal; definition replacement revocation; restart and publication failure recovery; malformed local generations; deletion with stale peer catalogs; and bounded errors. No CLI/REST execution of consumer commands is required. Cross-transport result parity is an additional test only if the optional execution surfaces are later implemented. If installed handlers are added, independently review isolation, resource budgets and failure recovery first.
+This document describes the separate implementation branch. Tests exercise credential provisioning/rotation and restart loading, default-deny grants, replacement/delete/reload/publication failure, schema and response validation, single-reader intake, and a real SDK command whose HTTP callback reenters Cowork REST. Test results and Critic verdict are reported separately; this document does not claim Owner approval or production deployment.

@@ -2,7 +2,9 @@
 
 Baseline: latest fetched `origin/main` at `76753c13e009ba7ea585b3a9c8c8e27444234e5c` (2026-09-09).
 
-Status: Part 1 review pending final verification and Owner scope resolution. Part 2 specification signed off by Critic as a reviewable proposal, not Owner design approval. Proposed exclusions below await explicit Owner scope resolution; they are not approved omissions.
+Status: implementation and specification have Critic technical PASS. Owner resolved the requested exclusion boundary on 2026-09-09: “nope, we don't include that. Only include the commands of the room, not coworking.” This replied to the enumerated exclusions below; those operations remain on their existing management surfaces. The specification is a reviewed proposal, not approval of its open design choices.
+
+Scope evidence: authenticated Owner room message `01m22g1pcy8t3ydb9bcp9xwa1y` (2026-09-09 07:10:20 UTC), in response to the status and exclusion list.
 
 ## Shared dispatch
 
@@ -16,18 +18,18 @@ All REST entries below mean a method on `POST /rpc`, not a separate REST URL. Ea
 
 | CLI | RPC method | Ours command / status |
 |---|---|---|
-| `create` | `room.create` | Proposed global exclusion, pending Owner |
+| `create` | `room.create` | Excluded: global Cowork management |
 | `settings` | `room.settings` | `room.settings` |
 | `role-briefing --role … --text …` | `room.briefing.role.set` | same |
 | `role-briefing --role … --delete` | `room.briefing.role.delete` | same |
 | `invite` | `room.invite` | same |
-| `accept` | `room.accept` (Unix only; absent from REST) | Proposed secret-input exclusion, pending Owner |
+| `accept` | `room.accept` (Unix only; absent from REST) | Excluded: private management input |
 | `remove` | `room.participant.remove` | same; distinct from legacy `remove-member` |
 | `revoke` | `room.revoke` | same |
 | `recover` | `room.recover` | same |
 | `recover --confirm` | `room.recover.confirm` | same |
-| `rebind` | `room.rebind` | Deferred room operation, pending Owner |
-| `list` | `room.list` | Proposed global exclusion, pending Owner |
+| `rebind` | `room.rebind` | Excluded: room runtime/lifecycle management |
+| `list` | `room.list` | Excluded: global Cowork management |
 | `show` | `room.show` | same |
 | `participants` | `room.participants` | same |
 | `command-grants` | `room.command.grants` | same |
@@ -40,14 +42,14 @@ All REST entries below mean a method on `POST /rpc`, not a separate REST URL. Ea
 | `say` | `room.say` | same |
 | `rest-role add` | `room.role.rest.add` | same |
 | `rest-role remove` | `room.role.rest.remove` | same |
-| `close` | `room.close` | Deferred room operation, pending Owner |
-| `delete` | `room.delete` | Deferred room operation, pending Owner |
+| `close` | `room.close` | Excluded: room runtime/lifecycle management |
+| `delete` | `room.delete` | Excluded: room runtime/lifecycle management |
 | — | — | `list-members`: existing contact-safe roster and membership epoch |
 | — | — | `remove-member`: existing stable participant ID, confirm=true, epoch, idempotence and no-self-removal contract |
 
 ## Host and transport operations
 
-| CLI / endpoint | Behavior | Proposed boundary (pending Owner) |
+| CLI / endpoint | Behavior | Boundary (excluded from room command catalog) |
 |---|---|---|
 | `serve`, `start` | Start host supervisor/daemon | Cannot be invoked through an offline room; host process authority |
 | `stop`, `restart` | Stop/restart host daemon | Removes command transport; host authority and completion protocol needed |
@@ -60,7 +62,7 @@ All REST entries below mean a method on `POST /rpc`, not a separate REST URL. Ea
 | REST `GET /docs`, `/docs/ui.js`, `/docs/ui.css`, `/openapi.json` | Documentation assets | Static representation, not service dispatch |
 | Other REST `GET` static web assets | Browser console | Static representation, not business operations |
 
-`room.create/list` cross room boundaries: per-room grants do not establish host-wide authority. `room.accept` reads a secret only through the existing private Unix boundary. `room.close/delete/rebind` act on their own runtime/reply channel; exclusion is a scope proposal rather than a claim of impossibility. Supporting them may require deferred completion or an independent host endpoint. These decisions were requested in the assigned room before treating the inventory as complete.
+`room.create/list` cross room boundaries: per-room grants do not establish host-wide authority. `room.accept` reads a secret only through the existing private Unix boundary. `room.close/delete/rebind` manage the room runtime/reply channel itself. These enumerated exclusions remain management operations under the Owner's confirmed scope; no management routes were removed or changed.
 
 ## Permission and behavior contract
 
@@ -79,3 +81,7 @@ SDK command transport wraps the returned business value. Added handlers return `
 The shared service preserves validation and effects. CLI history aggregates byte-short pages up to its requested record limit; ours returns one bounded service page, as REST does. Service results are preserved without a new size adapter or omission response contract. SDK delivery limits still apply: an exact 2 MiB file exceeds the current SDK's 2 MiB envelope budget; a transport-valid 1800 KiB file produced a ~2.4 MiB base64 history result for which no correlated SDK reply arrived in the integration test. Use a smaller history page or management transport for a single large record. CLI/REST remain unchanged. This transport limitation is documented rather than changing result semantics, following Owner scope correction on 2026-09-09. Delivery is best effort and a missing reply does not prove a mutation failed. Consumer command registration, file loading and execution are not implemented.
 
 Intake owns the room mutex during SDK callbacks. A scoped shared service invocation reuses that ownership and catches expected service errors before they poison a nested service lock. The scope expires in `finally`; normal management invocations still lock normally. Intake defers nested pumping while a command executes and relays durable intents after command handling, avoiding recursive SDK drain. Storage mutation failures still propagate through the store's lock accounting.
+
+## Verification
+
+The implementation passed backend typecheck and build, 356 backend/integration tests (including real SDK command calls), web typecheck, 119 web tests and 12 release checks. Critic independently reviewed the code and ran service tests. Scope resolution only changes this matrix; it introduces no code changes. Nothing was deployed or merged.

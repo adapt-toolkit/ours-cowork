@@ -795,7 +795,8 @@ test('offline docs cover operations and exact limitations without exposing a man
   assert.match(result.stdout, /stopped/i);
   assert.match(result.stdout, /complete cowork state directory/i);
   assert.match(result.stdout, /uninstall.*retain/i);
-  assert.match(result.stdout, /closed.*--yes/i);
+  assert.match(result.stdout, /--yes.*closes the room if necessary/i);
+  assert.match(result.stdout, /Closing retains room metadata, archive and files/i);
 
   const docNames = [
     '01-prerequisites.md', '02-installation.md', '03-configuration.md',

@@ -180,4 +180,3 @@ export function classifyServiceError(error: unknown): string {
   if (name === 'RoomServiceError') return 'invalid_state';
   return 'internal';
 }
-

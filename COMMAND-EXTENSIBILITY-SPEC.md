@@ -6,7 +6,7 @@ The Owner authorized this implementation as a separate PR after reviewing the tw
 
 The consumer runs its own HTTP service. Cowork validates the incoming ours request, checks room membership and an exact command grant, sends one authenticated callback, and returns the consumer result in the correlated ours command reply. No consumer code is loaded into Cowork.
 
-Runtime catalog updates require the released SDK 3.7.2 and shared daemon provided by ours CLI 2.7.2 (catalog protocol 11). Older peers may need their own SDK/daemon upgrade to discover later additions. Updating the Cowork npm dependency alone does not upgrade an already-running shared daemon.
+Runtime catalog updates require the released SDK 3.7.2 and shared daemon provided by ours CLI 2.7.2 (catalog protocol 11). Older peers may need their own SDK/daemon upgrade to discover later additions. Updating the Cowork npm dependency alone does not upgrade an already-running shared daemon. When consumer configuration is enabled, startup checks the daemon SDK release, rejecting versions below 3.7.2, prereleases and unknown version strings. The daemon control API protocol number is unrelated to catalog support.
 
 ## Two-service setup
 

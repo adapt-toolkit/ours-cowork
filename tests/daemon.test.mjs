@@ -806,3 +806,31 @@ test('real executable fails closed when the shared daemon is absent and creates 
   assert.equal(existsSync(join(coworkState, 'daemon.pid')), false);
   assert.equal(existsSync(join(coworkState, 'management.sock')), false);
 });
+
+
+test('startup resumes accepted lifecycle work before inbox and never restores closed deletion identity', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-daemon-lifecycle-'));
+  const events = [];
+  const rooms = [
+    { room_id: '01jz6y7n8p9q0r1s2t3v4w5x6y', state: 'active' },
+    { room_id: '01jz6y7n8p9q0r1s2t3v4w5x6z', state: 'active' },
+    { room_id: '01jz6y7n8p9q0r1s2t3v4w5x70', state: 'closed' },
+  ];
+  const service = new FakeService(events, rooms);
+  service.resumeLifecycleRequest = async (id) => { events.push(`lifecycle:${id}`); return id !== rooms[0].room_id; };
+  const daemon = new CoworkDaemon({
+    config: { version: 1, stateDir: dir, rest: { enabled: false, port: 3010 } },
+    prepare: () => ({ socketPath: join(dir, 'management.sock') }),
+    lock: () => ({ release() {} }), host: new FakeHost(events),
+    store: { async list() { return rooms; } }, registry: new FakeRegistry(events), service,
+    transports: { async start() {}, async stop() {} }, writePid() {}, removePid() {},
+  });
+  try {
+    await daemon.boot();
+    assert.equal(events.includes(`restore:${rooms[2].room_id}`), false);
+    assert(events.indexOf(`lifecycle:${rooms[1].room_id}`) < events.indexOf(`pending:${rooms[0].room_id}`));
+    assert.equal(events.includes(`pending:${rooms[1].room_id}`), false);
+    assert.equal(events.includes(`reconcile:${rooms[1].room_id}`), false);
+    assert.equal(events.includes(`lifecycle:${rooms[2].room_id}`), true);
+  } finally { await daemon.shutdown(); rmSync(dir, { recursive: true, force: true }); }
+});

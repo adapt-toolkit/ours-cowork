@@ -151,8 +151,8 @@ test('documented RPC methods are exactly the REST route table, excluding the pri
   }
 
   for (const secret of Object.keys(createPrivateServiceRoutes(serviceStub()))) {
-    assert.equal(documented.includes(secret), false, `${secret} is Unix-only and must not be documented`);
-    assert.doesNotMatch(JSON.stringify(document), new RegExp(secret.replace('.', '\\.')));
+    assert.equal(documented.includes(secret), false, `${secret} must not be a public REST operation`);
+    assert.equal(Object.hasOwn(mapping.mapping, secret), false); // It may appear as a grantable ours command name.
   }
 });
 

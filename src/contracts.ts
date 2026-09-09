@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { z } from 'zod';
+import { RUNTIME_COMMAND_NAMES } from './command-names.ts';
 
 const MAX_TEXT_BYTES = 262_144;
 export const MAX_FILE_BYTES = 2 * 1024 * 1024;
@@ -38,7 +39,7 @@ export const LowerCrockfordUlidSchema = z.string().regex(
 export const ContainerIdSchema = z.string().regex(/^[0-9a-f]{64}$/i, 'must be a 64-character hexadecimal CID')
   .transform((value) => value.toUpperCase());
 
-export const RuntimeCommandNameSchema = z.enum(['list-members', 'remove-member']);
+export const RuntimeCommandNameSchema = z.enum(RUNTIME_COMMAND_NAMES);
 
 export const RuntimeCommandGrantSchema = z.object({
   caller_cid: ContainerIdSchema,
@@ -484,6 +485,14 @@ const CurrentRoomSchema = z.object({
   }),
   /** Operator-managed, default-deny grants for the room identity's runtime commands. */
   command_grants: z.array(RuntimeCommandGrantSchema),
+  lifecycle_request: z.object({
+    request_id: z.string().min(1).max(256),
+    command: z.enum(['room.close', 'room.delete']),
+    caller_cid: ContainerIdSchema,
+    accepted_at: Rfc3339Schema,
+    state: z.enum(['pending', 'failed', 'completed']),
+    error: z.literal('lifecycle_failed').optional(),
+  }).strict().optional(),
   /** Operator-managed command policy inherited by authenticated active seats of an exact role. */
   role_command_grants: z.array(RuntimeRoleCommandGrantSchema).superRefine((grants, context) => {
     const seen = new Set<string>();

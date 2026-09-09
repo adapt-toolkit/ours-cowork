@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 
 import { z } from 'zod';
@@ -30,6 +31,8 @@ export interface IntakePacketRegistry {
 export interface IntakePumpOptions {
   now?: () => string;
   messageId?: () => string;
+  shouldPause?: (roomId: string) => Promise<boolean>;
+  afterPump?: (roomId: string) => Promise<void>;
 }
 
 interface NotificationState {
@@ -87,6 +90,7 @@ export async function sendRoomBody(
 
 /** Archive, consume, and relay participant messages for hosted room packets. */
 export class IntakePump {
+  private readonly processing = new AsyncLocalStorage<{ roomId: string; active: boolean }>();
   private readonly store: IntakeStore;
   private readonly packets: IntakePacketRegistry;
   private readonly nowValue: () => string;
@@ -94,7 +98,7 @@ export class IntakePump {
   private readonly notifications = new Map<string, NotificationState>();
   private acceptingNotifications = true;
 
-  constructor(store: IntakeStore, packets: IntakePacketRegistry, options: IntakePumpOptions = {}) {
+  constructor(store: IntakeStore, packets: IntakePacketRegistry, private readonly options: IntakePumpOptions = {}) {
     this.store = store;
     this.packets = packets;
     this.nowValue = options.now ?? (() => new Date().toISOString());
@@ -126,13 +130,21 @@ export class IntakePump {
   /** Process bounded unread history batches, then service durable intents. */
   async pump(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
+    const current = this.processing.getStore();
+    if (current?.active && current.roomId === id) return;
+    if (!this.packets.get(id)) return;
     await this.lock(id, () => this.processAndRelayUnlocked(id, this.packet(id)));
+    await this.options.afterPump?.(id);
   }
 
   /** Retry every durable relay intent which has no terminal result. */
   async resumePending(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
+    const current = this.processing.getStore();
+    if (current?.active && current.roomId === id) return;
+    if (!this.packets.get(id)) return;
     await this.lock(id, () => this.processAndRelayUnlocked(id, this.packet(id)));
+    await this.options.afterPump?.(id);
   }
 
   beginShutdown(): void {
@@ -181,16 +193,32 @@ export class IntakePump {
   }
 
   private async processAndRelayUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
+    const scope = { roomId, active: true };
+    try {
+      await this.processing.run(scope, () => this.drainAndRelayUnlocked(roomId, packet));
+    } finally { scope.active = false; }
+  }
+
+  private async drainAndRelayUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
     for (;;) {
+      if (await this.options.shouldPause?.(roomId)) break;
       await packet.drainRuntimeCommands?.(
         (item) => this.processInboxItem(roomId, packet, item, false),
       );
+      if (await this.options.shouldPause?.(roomId)) break;
       const messages = await packet.listUnreadMessages(INTAKE_BATCH_SIZE);
       const files = await packet.listUnreadFiles(INTAKE_BATCH_SIZE);
       if (messages.length === 0 && files.length === 0) break;
-      for (const item of messages) await this.processInboxItem(roomId, packet, item);
-      for (const item of files) await this.processFileInboxItem(roomId, packet, item);
+      for (const item of messages) {
+        if (await this.options.shouldPause?.(roomId)) break;
+        await this.processInboxItem(roomId, packet, item);
+      }
+      for (const item of files) {
+        if (await this.options.shouldPause?.(roomId)) break;
+        await this.processFileInboxItem(roomId, packet, item);
+      }
     }
+    if (await this.options.shouldPause?.(roomId)) return;
     await this.completeSnapshotIntents(roomId);
     await this.relayPendingUnlocked(roomId, packet);
   }

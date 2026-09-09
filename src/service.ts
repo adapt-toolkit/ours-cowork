@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 
 import { z } from 'zod';
@@ -44,6 +45,8 @@ import {
 import { ContactAlreadyAbsentError, unpackInvite, type RoomPacket } from './packets.ts';
 import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
 import { IntakePump } from './intake.ts';
+import { createServiceRoutes, createPrivateServiceRoutes, classifyServiceError } from './command-routes.ts';
+import { SHARED_ROOM_COMMANDS } from './command-names.ts';
 import { generateUlid } from './ulid.ts';
 
 function byteBoundedHistoryPage<T>(records: T[]): T[] {
@@ -190,6 +193,7 @@ export class RoomServiceError extends Error {
 
 /** Operator lifecycle and read projections for one standalone cowork host. */
 export class RoomService {
+  private readonly commandScope = new AsyncLocalStorage<{ roomId: string; active: boolean }>();
   private readonly store: Store;
   private readonly packets: RoomPacketRegistry;
   private readonly nowValue: () => string;
@@ -209,6 +213,8 @@ export class RoomService {
     this.intake = new IntakePump(store, packets, {
       now: this.nowValue,
       messageId: this.nextMessageId,
+      shouldPause: async (roomId) => (await this.store.load(roomId)).lifecycle_request?.state === 'pending',
+      afterPump: async (roomId) => { await this.resumeLifecycleRequest(roomId); },
     });
   }
 
@@ -374,9 +380,61 @@ export class RoomService {
 
   private async registerRuntimeCommands(roomId: string, packet: RoomPacket): Promise<void> {
     await packet.registerRuntimeCommands?.({
+      shouldPause: async () => (await this.store.load(roomId)).lifecycle_request?.state === 'pending',
+      sharedCommand: (name, input, context) => this.sharedCommandUnlocked(roomId, name, input, context),
       listMembers: (input, context) => this.listMembersCommandUnlocked(roomId, input, context),
       removeMember: (input, context) => this.removeMemberCommandUnlocked(roomId, input, context),
     });
+  }
+
+  /** The SDK supplies authenticated context; arguments never select another room. */
+  private async sharedCommandUnlocked(
+    roomId: string,
+    name: typeof SHARED_ROOM_COMMANDS[number],
+    input: JsonValue,
+    context: Readonly<CommandContext>,
+  ): Promise<JsonValue> {
+    if (!SHARED_ROOM_COMMANDS.includes(name)
+      || input === null || typeof input !== 'object' || Array.isArray(input)
+      || Object.hasOwn(input, 'room_id')) return { ok: false, error: 'invalid_request' };
+    const room = await this.store.load(roomId);
+    if (room.state !== 'active') return { ok: false, error: 'room_unavailable' };
+    if (!room.seats.some((seat) => seat.state === 'active' && seat.identity === context.sender_cid)
+      || !this.hasRuntimeCommandGrant(room, context.sender_cid, name)) {
+      return { ok: false, error: 'unauthorized' };
+    }
+    if (name === 'room.close' || name === 'room.delete') {
+      try {
+        if (name === 'room.delete') DeleteRoomInputSchema.parse(input);
+        else z.object({}).strict().parse(input);
+        if (room.lifecycle_request && room.lifecycle_request.state !== 'completed') {
+          if (room.lifecycle_request.request_id !== context.request_wire_id || room.lifecycle_request.command !== name || room.lifecycle_request.state === 'failed') {
+            return { ok: false, error: 'invalid_state' };
+          }
+        } else {
+          await this.store.save(RoomSchema.parse({ ...room, lifecycle_request: {
+            request_id: context.request_wire_id, command: name, caller_cid: context.sender_cid,
+            accepted_at: this.now(), state: 'pending',
+          } }));
+        }
+        return { ok: true, result: { status: 'accepted', request_id: context.request_wire_id, command: name,
+          completion: name === 'room.delete' ? 'room absent from management' : 'room closed in management' } };
+      } catch (error) { return { ok: false, error: classifyServiceError(error) }; }
+    }
+    if (room.lifecycle_request?.state === 'pending') return { ok: false, error: 'room_unavailable' };
+    const scope = { roomId, active: true };
+    try {
+      return await this.commandScope.run(scope, async (): Promise<JsonValue> => {
+        try {
+          const routes = name === 'room.accept' ? createPrivateServiceRoutes(this) : createServiceRoutes(this);
+          const result = await routes[name]!.run({ ...input, room_id: roomId });
+          // Preserve the service value; the SDK owns transport delivery.
+          return { ok: true, result: JSON.parse(JSON.stringify(result)) as JsonValue };
+        } catch (error) {
+          return { ok: false, error: classifyServiceError(error) };
+        }
+      });
+    } finally { scope.active = false; }
   }
 
   /** Called only by the intake pump while it already owns the room mutex. */
@@ -388,7 +446,7 @@ export class RoomService {
     const request = ListMembersCommandInputSchema.safeParse(input);
     if (!request.success) return { ok: false, error: 'invalid_request' };
     const room = await this.store.load(roomId);
-    if (room.state !== 'active') return { ok: false, error: 'room_unavailable' };
+    if (room.state !== 'active' || room.lifecycle_request?.state === 'pending') return { ok: false, error: 'room_unavailable' };
     const caller = room.seats.find((seat) =>
       seat.state === 'active' && seat.identity === context.sender_cid);
     if (!caller || !this.hasRuntimeCommandGrant(room, context.sender_cid, 'list-members')) {
@@ -415,7 +473,7 @@ export class RoomService {
     if (!parsed.success) return { ok: false, error: 'invalid_request' };
     const request = parsed.data;
     const room = await this.store.load(roomId);
-    if (room.state !== 'active') return { ok: false, error: 'room_unavailable' };
+    if (room.state !== 'active' || room.lifecycle_request?.state === 'pending') return { ok: false, error: 'room_unavailable' };
     const caller = room.seats.find((seat) =>
       seat.state === 'active' && seat.identity === context.sender_cid);
     if (!caller || !this.hasRuntimeCommandGrant(room, context.sender_cid, 'remove-member')) {
@@ -991,6 +1049,7 @@ export class RoomService {
 
   async notifyRoom(roomId: string, _event = 'message_received'): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
+    if (!this.packets.get(id)) return;
     // Contact acceptance and message delivery are separate core callbacks.
     // Reconcile first under the room mutex for either callback so the first
     // immediately-following participant message can never be drained as an
@@ -1141,6 +1200,30 @@ export class RoomService {
    * Forward-only close. Every external contact mutation is preceded by a
    * durable intent and the packet/live-state purge precedes terminal metadata.
    */
+  /** Execute a durable accepted request after the SDK reply attempt, or on restart. */
+  async resumeLifecycleRequest(roomId: string): Promise<boolean> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const room = await this.store.load(id);
+    const request = room.lifecycle_request;
+    if (request?.state !== 'pending') return false;
+    try {
+      if (request.command === 'room.delete') await this.deleteRoom(id, { confirm: true });
+      else await this.closeRoom(id);
+    } catch {
+      // Never recreate metadata after a partially completed deletion.
+      try {
+        await this.lock(id, async () => {
+          const current = await this.store.load(id);
+          if (current.lifecycle_request?.request_id !== request.request_id) return;
+          await this.store.save(RoomSchema.parse({ ...current, lifecycle_request: {
+            ...request, state: 'failed', error: 'lifecycle_failed',
+          } }));
+        });
+      } catch { /* A final-directory deletion retry is recovered by storage listing. */ }
+    }
+    return true;
+  }
+
   async closeRoom(roomId: string): Promise<Room> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     return this.lock(id, async () => {
@@ -1149,7 +1232,11 @@ export class RoomService {
         // A previous atomic rename may have committed closed metadata while
         // its directory fsync failed. Replacing the exact snapshot repeats
         // that durability barrier before close reports success.
-        return this.store.save(room);
+        return this.store.save(RoomSchema.parse({ ...room,
+          ...(room.lifecycle_request?.command === 'room.close' ? { lifecycle_request: {
+            ...room.lifecycle_request, state: 'completed', error: undefined,
+          } } : {}),
+        }));
       }
       if (this.isPacketPending(room)) {
         throw new RoomServiceError(
@@ -1188,9 +1275,7 @@ export class RoomService {
         }
         return this.deleteReceipt(id);
       }
-      if (room.state !== 'closed') {
-        throw new RoomServiceError(`room "${id}" must be closed before it can be deleted`);
-      }
+      if (room.state !== 'closed') await this.closeRoom(id);
       await this.store.delete(id);
       return this.deleteReceipt(id);
     });
@@ -1542,7 +1627,11 @@ export class RoomService {
       }
     }
 
-    return this.store.save(RoomSchema.parse({ ...room, state: 'closed', closed_at: this.now() }));
+    return this.store.save(RoomSchema.parse({ ...room, state: 'closed', closed_at: this.now(),
+      ...(room.lifecycle_request?.command === 'room.close' ? { lifecycle_request: {
+        ...room.lifecycle_request, state: 'completed', error: undefined,
+      } } : {}),
+    }));
   }
 
   private async appendUncertainCloseResult(
@@ -1704,6 +1793,11 @@ export class RoomService {
   }
 
   private lock<T>(roomId: string, work: () => T | Promise<T>): Promise<T> {
+    // Intake owns this room lock throughout a typed callback. Avoid nesting a
+    // service operation whose expected validation/state error would poison the
+    // store's outer lock even after the command adapter translated that error.
+    const scope = this.commandScope.getStore();
+    if (scope?.active && scope.roomId === roomId) return Promise.resolve().then(work);
     return (this.store.mutex(roomId) as RoomMutex).runExclusive(work);
   }
 

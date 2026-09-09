@@ -472,9 +472,9 @@ if (process.argv.includes('--e2e-driver')) {
       room = await runCli(['room', 'show', roomId]);
       const catalog = await waitFor(async () => {
         const commands = await alice.client.listContactCommands({ contact: roomCid });
-        return commands.length === 22 ? commands : undefined;
+        return commands.length === 26 ? commands : undefined;
       }, 'bounded room command catalog');
-      assert.equal(catalog.length, 22);
+      assert.equal(catalog.length, 26);
       assert.deepEqual(catalog.slice(0, 2).map((command) => command.name), ['list-members', 'remove-member']);
       assert(catalog.some((command) => command.name === 'room.message'));
       const listRequest = await alice.client.sendCommand({
@@ -494,8 +494,8 @@ if (process.argv.includes('--e2e-driver')) {
         member.participant_id === room.seats[0].participant_id), true);
       assert.equal(JSON.stringify(listedOutcome).includes(alice.cid), false);
 
-      async function sharedCall(command, args) {
-        const request = await alice.client.sendCommand({ contact: roomCid, command, arguments: args });
+      async function sharedCall(command, args, target = roomCid) {
+        const request = await alice.client.sendCommand({ contact: target, command, arguments: args });
         const response = await waitFor(async () => (await alice.client.getMessages()).command_results
           .find((result) => result.reply_to?.wire_id === request.wireId), `correlated ${command} result`);
         const outcome = JSON.parse(response.body);
@@ -520,6 +520,23 @@ if (process.argv.includes('--e2e-driver')) {
       const shown = await sharedCall('room.show', {});
       assert.equal(shown.ok, true, 'independent command after a refused command and post');
       assert.equal(shown.result.status, 'shared-command-verified');
+      await runCli(['room', 'command-grant', roomId, alice.cid, 'room.rebind']);
+      const rebound = await sharedCall('room.rebind', {});
+      assert.equal(rebound.ok, true);
+      assert.equal(rebound.result.identity_cid, roomCid);
+      assert.equal((await sharedCall('room.show', {})).ok, true);
+      const external = await createPeer(attachOursClient, 'ExternalInviter');
+      peerClients.push(external.client);
+      const invitation = await external.client.generateInvite({ mode: 'one_time' });
+      await runCli(['room', 'command-grant', roomId, alice.cid, 'room.accept']);
+      const accepted = await sharedCall('room.accept', { role: 'external-reviewer', invite: invitation.blob, expected_cid: external.cid });
+      assert.equal(accepted.ok, true);
+      assert.equal(accepted.result.identity, external.cid);
+      room = await waitFor(async () => {
+        const value = await runCli(['room', 'show', roomId]);
+        return value.seats.some((seat) => seat.identity === external.cid && seat.state === 'active') ? value : undefined;
+      }, 'external invite admission through ours command');
+      stage('accept-and-rebind-commands');
       const aliceSeat = room.seats.find((seat) => seat.identity === alice.cid);
       const selfRequest = await alice.client.sendCommand({
         contact: roomCid,
@@ -635,8 +652,15 @@ if (process.argv.includes('--e2e-driver')) {
       }
       stage('typed-command-removal-retry');
 
-      const closed = await runCli(['room', 'close', roomId]);
-      assert.equal(closed.state, 'closed');
+      await runCli(['room', 'command-grant', roomId, alice.cid, 'room.close']);
+      const closeReceipt = await sharedCall('room.close', {});
+      assert.equal(closeReceipt.ok, true);
+      assert.equal(closeReceipt.result.status, 'accepted');
+      const closed = await waitFor(async () => {
+        const candidate = await runCli(['room', 'show', roomId]);
+        return candidate.state === 'closed' ? candidate : undefined;
+      }, 'typed close completion');
+      assert.equal(closed.lifecycle_request.state, 'completed');
       await waitFor(async () => !(await observer.identities())
         .some((identity) => identity.name === created.identity_name),
       'room identity deletion from the shared daemon');
@@ -648,6 +672,20 @@ if (process.argv.includes('--e2e-driver')) {
       const roomDir = join(stateDir, 'cowork', 'rooms', roomId);
       assert.equal(existsSync(join(roomDir, 'room.json')), true);
       assert.equal(existsSync(join(roomDir, 'archive.sqlite3')), true);
+      const retainedHistory = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
+      assert.equal(retainedHistory.some((record) => record.kind === 'file' && record.sha256 === archivedFile.sha256), true);
+      const deletionRoom = await runCli(['room', 'create', '--name', 'Typed deletion', '--goal', 'Verify close then erase', '--briefing', 'Isolated test']);
+      const deletionInvite = await runCli(['room', 'invite', deletionRoom.room_id, '--mode', 'public', '--role', 'reviewer', '--min-accepts', '1']);
+      await joinInvite(alice, deletionInvite.blob);
+      await waitFor(async () => (await runCli(['room', 'show', deletionRoom.room_id])).state === 'active', 'deletion room activation');
+      await runCli(['room', 'command-grant', deletionRoom.room_id, alice.cid, 'room.delete']);
+      const deleteReceipt = await sharedCall('room.delete', { confirm: true }, deletionRoom.identity_cid);
+      assert.equal(deleteReceipt.ok, true);
+      assert.equal(deleteReceipt.result.status, 'accepted');
+      await waitFor(() => !existsSync(join(stateDir, 'cowork', 'rooms', deletionRoom.room_id)), 'typed deletion removes all room state');
+      assert.equal(existsSync(join(roomDir, 'archive.sqlite3')), true, 'unrelated closed archive retained');
+      assert.equal((await runCli(['room', 'show', roomId])).state, 'closed');
+      stage('typed-close-and-delete');
       const deleted = await runCli(['room', 'delete', roomId, '--yes']);
       assert.deepEqual(deleted, { version: 1, room_id: roomId, deleted: true, scope: 'this_host' });
       assert.equal(existsSync(roomDir), false);

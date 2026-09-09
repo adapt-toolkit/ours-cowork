@@ -81,6 +81,19 @@ function params(properties: Record<string, JsonSchema>, required: readonly strin
  * Every method the REST dispatcher serves, in route-table order. Kept in step
  * with `createServiceRoutes` by an asserted test rather than by convention.
  */
+/** Shared metadata for private management operations also callable over authenticated ours. */
+export const PRIVATE_ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [{
+  method: 'room.accept',
+  summary: 'Accept an external participant invitation',
+  description: 'Redeem an external ours invitation as this room and admit its inviter with the selected role. Preserve expected-CID and invitation provenance checks.',
+  params: params({ room_id: roomIdProperty, role: roleProperty,
+    invite: { type: 'string', description: 'External ours invitation; at most 49152 UTF-8 bytes.' },
+    expected_cid: { type: 'string', pattern: '^[0-9a-fA-F]{64}$' },
+  }, ['room_id', 'role', 'invite']),
+  result: 'The pending or active participant admission receipt.',
+  example: { room_id: EXAMPLE_ROOM_ID, role: 'Reviewer', invite: '<external invitation>' },
+}];
+
 export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
   {
     method: 'room.create',
@@ -386,7 +399,7 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
   {
     method: 'room.delete',
     summary: 'Delete a room',
-    description: 'Removes this host\'s local room state after the room is closed. The scope is '
+    description: 'Closes the room if necessary, then removes this host\'s local room state. The scope is '
       + 'this host only.',
     params: params({
       room_id: roomIdProperty,

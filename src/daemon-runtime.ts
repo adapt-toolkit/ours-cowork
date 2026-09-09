@@ -60,6 +60,7 @@ export interface DaemonRegistry {
 
 export interface DaemonService {
   recoverPacket(roomId: string): Promise<unknown>;
+  resumeLifecycleRequest?(roomId: string): Promise<boolean>;
   reconcileRoom(roomId: string): Promise<unknown>;
   closeRoom(roomId: string): Promise<unknown>;
   resumePending(roomId: string): Promise<void>;
@@ -250,6 +251,12 @@ export class CoworkDaemon {
       // completed) before any metadata reconciliation can create intents.
       for (const room of recoverable) {
         await recoverPhase(room.room_id, 'restore', () => this.service!.recoverPacket(room.room_id));
+      }
+      // Pending close/delete requests survive a crash after acknowledgement.
+      // Closed rooms need no identity restoration to finish deleting their data.
+      for (const room of rooms) {
+        if (room.state !== 'closed' && !healthy.has(room.room_id)) continue;
+        if (await this.service!.resumeLifecycleRequest?.(room.room_id)) healthy.delete(room.room_id);
       }
       for (const room of recoverable.filter((candidate) => candidate.state !== 'closing')) {
         await recoverPhase(room.room_id, 'reconcile', () => this.service!.reconcileRoom(room.room_id));

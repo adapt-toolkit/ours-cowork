@@ -156,6 +156,7 @@ class FakePacket {
   listInvites() { return structuredClone(this.invites); }
   listContacts() { return structuredClone(this.contacts); }
   async registerRuntimeCommands(handlers) { this.runtimeCommands = handlers; }
+  async rebind() { return { name: this.name, cid: this.cid, status: 'rebound' }; }
   listUnreadMessages() { return Promise.resolve([]); }
   listUnreadFiles() { return Promise.resolve([]); }
   acknowledgeFile() { return Promise.resolve(); }
@@ -2314,7 +2315,7 @@ test('every shared command refuses ungranted, spoofed, cross-room and removed ca
 
 test('shared ours commands and management routes produce equal results and durable effects', async () => {
   const { SHARED_ROOM_COMMANDS } = await import('../src/command-names.ts');
-  const { createServiceRoutes, classifyServiceError } = await import('../src/command-routes.ts');
+  const { createServiceRoutes, createPrivateServiceRoutes, classifyServiceError } = await import('../src/command-routes.ts');
   const f = await sharedCommandFixture();
   const g = await sharedCommandFixture();
   // Participant IDs use random ULIDs; align the independent fixture's stable IDs.
@@ -2332,6 +2333,8 @@ test('shared ours commands and management routes produce equal results and durab
     ['room.invite', { mode: 'one_time', role: 'reviewer', min_accepts: 1 }],
     ['room.revoke', { invite_id: 'core-invite-2' }],
     ['room.recover', {}],
+    ['room.accept', { role: 'reviewer', invite: 'invalid-invite' }],
+    ['room.rebind', {}],
     ['room.recover.confirm', { recovery_of: 'missing', invite_id: 'missing' }],
     ['room.show', {}],
     ['room.participants', {}],
@@ -2349,8 +2352,8 @@ test('shared ours commands and management routes produce equal results and durab
     ['room.settings', { unknown: true }],
     ['room.say', { role: 'Reporter', text: 'Removed role refuses.' }],
   ];
-  assert.deepEqual(new Set(cases.map(([name]) => name)), new Set(SHARED_ROOM_COMMANDS));
-  const routes = createServiceRoutes(f.service);
+  assert.deepEqual(new Set(cases.map(([name]) => name)), new Set(SHARED_ROOM_COMMANDS.filter((name) => name !== 'room.close' && name !== 'room.delete')));
+  const routes = { ...createServiceRoutes(f.service), ...createPrivateServiceRoutes(f.service) };
   const call = g.registry.get(ROOM_ID).runtimeCommands.sharedCommand;
   for (const [name, input] of cases) {
     let expected;
@@ -2407,4 +2410,40 @@ test('shared recovery returns a receipt and confirms its exact lineage idempoten
   const room = await f.service.showRoom(ROOM_ID);
   assert.equal(room.invites.find((invite) => invite.invite_id === receipt.recovery_of).state, 'revoked');
   assert.equal(room.invites.find((invite) => invite.invite_id === receipt.invite.invite_id).state, 'live');
+});
+
+
+test('ours room.accept preserves private-route validation and does not echo invitation material', async () => {
+  const f = await sharedCommandFixture();
+  const packet = f.registry.get(ROOM_ID);
+  const call = packet.runtimeCommands.sharedCommand;
+  const secret = packInvite(Buffer.from('isolated external invite payload'));
+  const input = { role: 'reviewer', invite: secret, expected_cid: packet.addResult.container_id };
+  assert.deepEqual(await call('room.accept', input, sharedContext), { ok: false, error: 'unauthorized' });
+  assert.equal(packet.addCalls.length, 0);
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'room.accept' });
+  assert.deepEqual(await call('room.accept', { ...input, expected_cid: 'CD'.repeat(32) }, sharedContext), { ok: false, error: 'invalid_state' });
+  assert.equal((await f.store.load(ROOM_ID)).seats.length, 2, 'mismatched CID produces no seat');
+  const result = await call('room.accept', input, sharedContext);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.state, 'pending');
+  assert.equal(result.result.identity, packet.addResult.container_id);
+  assert.equal(JSON.stringify(result).includes(secret), false);
+  assert.equal(JSON.stringify(await f.store.load(ROOM_ID)).includes(secret), false);
+});
+
+test('ours room.rebind preserves CID and handles an independent command after rebind', async () => {
+  const f = await sharedCommandFixture();
+  const packet = f.registry.get(ROOM_ID);
+  const before = await f.service.showRoom(ROOM_ID);
+  let rebinds = 0;
+  packet.rebind = async () => { rebinds++; return { name: packet.name, cid: packet.cid, status: 'rebound' }; };
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'room.rebind' });
+  const call = packet.runtimeCommands.sharedCommand;
+  const result = await call('room.rebind', {}, sharedContext);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.identity_cid, before.identity_cid);
+  assert.equal(rebinds, 1);
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'room.show' });
+  assert.equal((await call('room.show', {}, sharedContext)).ok, true);
 });

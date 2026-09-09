@@ -30,6 +30,8 @@ export interface IntakePacketRegistry {
 export interface IntakePumpOptions {
   now?: () => string;
   messageId?: () => string;
+  shouldPause?: (roomId: string) => Promise<boolean>;
+  afterPump?: (roomId: string) => Promise<void>;
 }
 
 interface NotificationState {
@@ -95,7 +97,7 @@ export class IntakePump {
   private readonly notifications = new Map<string, NotificationState>();
   private acceptingNotifications = true;
 
-  constructor(store: IntakeStore, packets: IntakePacketRegistry, options: IntakePumpOptions = {}) {
+  constructor(store: IntakeStore, packets: IntakePacketRegistry, private readonly options: IntakePumpOptions = {}) {
     this.store = store;
     this.packets = packets;
     this.nowValue = options.now ?? (() => new Date().toISOString());
@@ -129,7 +131,9 @@ export class IntakePump {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const current = this.processing.getStore();
     if (current?.active && current.roomId === id) return;
+    if (!this.packets.get(id)) return;
     await this.lock(id, () => this.processAndRelayUnlocked(id, this.packet(id)));
+    await this.options.afterPump?.(id);
   }
 
   /** Retry every durable relay intent which has no terminal result. */
@@ -137,7 +141,9 @@ export class IntakePump {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const current = this.processing.getStore();
     if (current?.active && current.roomId === id) return;
+    if (!this.packets.get(id)) return;
     await this.lock(id, () => this.processAndRelayUnlocked(id, this.packet(id)));
+    await this.options.afterPump?.(id);
   }
 
   beginShutdown(): void {
@@ -194,15 +200,24 @@ export class IntakePump {
 
   private async drainAndRelayUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
     for (;;) {
+      if (await this.options.shouldPause?.(roomId)) break;
       await packet.drainRuntimeCommands?.(
         (item) => this.processInboxItem(roomId, packet, item, false),
       );
+      if (await this.options.shouldPause?.(roomId)) break;
       const messages = await packet.listUnreadMessages(INTAKE_BATCH_SIZE);
       const files = await packet.listUnreadFiles(INTAKE_BATCH_SIZE);
       if (messages.length === 0 && files.length === 0) break;
-      for (const item of messages) await this.processInboxItem(roomId, packet, item);
-      for (const item of files) await this.processFileInboxItem(roomId, packet, item);
+      for (const item of messages) {
+        if (await this.options.shouldPause?.(roomId)) break;
+        await this.processInboxItem(roomId, packet, item);
+      }
+      for (const item of files) {
+        if (await this.options.shouldPause?.(roomId)) break;
+        await this.processFileInboxItem(roomId, packet, item);
+      }
     }
+    if (await this.options.shouldPause?.(roomId)) return;
     await this.completeSnapshotIntents(roomId);
     await this.relayPendingUnlocked(roomId, packet);
   }

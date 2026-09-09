@@ -531,18 +531,13 @@ test('close serializes duplicate close and rejects lifecycle work queued behind 
   assert.deepEqual(f.registry.destroyCalls, [ROOM_ID]);
 });
 
-test('delete requires exact confirmation and a closed room, then returns only a host-scoped receipt', async () => {
+test('delete requires exact confirmation, closes first and returns only a host-scoped receipt', async () => {
   const f = fixture();
   for (const input of [{}, { confirm: false }, { confirm: true, remote: true }]) {
     await assert.rejects(f.service.deleteRoom(ROOM_ID, input));
   }
   assert.equal(f.store.deleteCalls.length, 0);
-  await assert.rejects(f.service.deleteRoom(ROOM_ID, { confirm: true }), /only.*closed|must be closed/i);
-  assert.equal(f.store.deleteCalls.length, 0);
-
-  await f.service.closeRoom(ROOM_ID);
-  const archiveBefore = await f.service.history(ROOM_ID);
-  assert(archiveBefore.length > 0, 'archive stays readable after close');
+  assert.equal((await f.service.showRoom(ROOM_ID)).state, 'active');
   const receipt = await f.service.deleteRoom(ROOM_ID, { confirm: true });
   assert.deepEqual(receipt, {
     version: 1,
@@ -553,4 +548,127 @@ test('delete requires exact confirmation and a closed room, then returns only a 
   assert.deepEqual(Object.keys(receipt).sort(), ['deleted', 'room_id', 'scope', 'version']);
   assert.equal(JSON.stringify(receipt).match(/backup|remote|secure|erase/gi), null);
   assert.deepEqual(f.store.deleteCalls, [ROOM_ID]);
+  assert.deepEqual(f.registry.destroyCalls, [ROOM_ID]);
+});
+
+async function commandFixture(command) {
+  const cid = 'A'.repeat(64);
+  const f = fixture({
+    seats: [{ identity: cid, display_name: 'Alice', role: 'builder', invite_id: 'invite-a', accepted_at: AT,
+      participant_id: '01jz6y7n8p9q0r1s2t3v4w5xb1', state: 'active' }],
+    command_grants: [{ caller_cid: cid, command }], role_command_grants: [],
+  });
+  f.packet.contacts = [{ name: 'Alice', container_id: cid }];
+  f.packet.registerRuntimeCommands = async (handlers) => { f.packet.runtimeCommands = handlers; };
+  await f.service.recoverPacket(ROOM_ID);
+  return { ...f, context: { sender_cid: cid, sender_name: 'Alice', request_wire_id: 'B'.repeat(64) } };
+}
+
+test('lifecycle command acceptance is durable before reply and execution follows SDK completion', async () => {
+  for (const command of ['room.close', 'room.delete']) {
+    const f = await commandFixture(command);
+    let sdkHandling = false;
+    let replied = false;
+    let receipt;
+    f.packet.beforeRemove = async () => {
+      assert.equal(sdkHandling, false, 'cannot destroy the reply channel during SDK handling');
+      assert.equal(replied, true);
+    };
+    f.packet.drainRuntimeCommands = async () => {
+      sdkHandling = true;
+      receipt = await f.packet.runtimeCommands.sharedCommand(command, command === 'room.delete' ? { confirm: true } : {}, f.context);
+      assert.equal(receipt.result.status, 'accepted');
+      assert.equal((await f.store.load(ROOM_ID)).lifecycle_request.state, 'pending');
+      assert.equal((await f.store.load(ROOM_ID)).state, 'active');
+      replied = true;
+      sdkHandling = false;
+    };
+    await f.service.resumePending(ROOM_ID);
+    if (command === 'room.close') {
+      const closed = await f.store.load(ROOM_ID);
+      assert.equal(closed.state, 'closed');
+      assert.equal(closed.lifecycle_request.state, 'completed');
+      assert((await f.service.history(ROOM_ID)).length > 0);
+    } else assert.equal(f.store.rooms.has(ROOM_ID), false);
+    assert.equal(receipt.result.command, command);
+  }
+});
+
+test('competing lifecycle requests cannot overwrite an accepted delete and missing acknowledgement can resume', async () => {
+  const f = await commandFixture('room.delete');
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: f.context.sender_cid, command: 'room.close' });
+  const call = f.packet.runtimeCommands.sharedCommand;
+  assert.equal((await call('room.delete', { confirm: true }, f.context)).result.status, 'accepted');
+  assert.equal((await call('room.delete', { confirm: true }, f.context)).result.status, 'accepted', 'same request is idempotent');
+  assert.deepEqual(await call('room.close', {}, { ...f.context, request_wire_id: 'C'.repeat(64) }), { ok: false, error: 'invalid_state' });
+  const restored = new RoomService(f.store, f.registry, { now: () => LATER });
+  assert.equal(await restored.resumeLifecycleRequest(ROOM_ID), true, 'restart need not have observed reply delivery');
+  assert.equal(f.store.rooms.has(ROOM_ID), false);
+});
+
+test('failed lifecycle work remains inspectable and explicit management retry completes it', async () => {
+  const f = await commandFixture('room.close');
+  await f.packet.runtimeCommands.sharedCommand('room.close', {}, f.context);
+  f.packet.beforeRemove = async () => { throw new Error('temporary SDK refusal'); };
+  assert.equal(await f.service.resumeLifecycleRequest(ROOM_ID), true);
+  const failed = await f.service.showRoom(ROOM_ID);
+  assert.equal(failed.lifecycle_request.state, 'failed');
+  assert.equal(failed.lifecycle_request.error, 'lifecycle_failed');
+  f.packet.beforeRemove = undefined;
+  await f.service.closeRoom(ROOM_ID);
+  assert.equal((await f.service.showRoom(ROOM_ID)).lifecycle_request.state, 'completed');
+});
+
+test('interrupted deletion keeps its pending intent through archive removal and startup listing finishes final cleanup', async (t) => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'cowork-lifecycle-disk-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const request = { request_id: 'B'.repeat(64), caller_cid: 'A'.repeat(64), command: 'room.delete', state: 'pending', accepted_at: AT };
+  const initial = new CoworkStore(stateDir);
+  await initial.create(room({ state: 'closed', closed_at: LATER, lifecycle_request: request }));
+  const otherId = '01jz6y7n8p9q0r1s2t3v4w5x6z';
+  await initial.create(room({ room_id: otherId, identity_name: `cowork-room-${otherId}`, state: 'closed', closed_at: LATER }));
+  let inject = true;
+  const failingFs = new Proxy(fs, { get(target, property) {
+    if (property === 'unlinkSync') return (path) => {
+      target.unlinkSync(path);
+      if (inject && String(path).endsWith('/archive.sqlite3')) { inject = false; throw new Error('simulated interruption after archive removal'); }
+    };
+    return target[property];
+  } });
+  await assert.rejects(new CoworkStore(stateDir, { fs: failingFs }).delete(ROOM_ID), /interruption/);
+  const restarted = new CoworkStore(stateDir);
+  assert.equal((await restarted.load(ROOM_ID)).lifecycle_request.state, 'pending');
+  const service = new RoomService(restarted, { get: () => undefined }, { now: () => LATER });
+  assert.equal(await service.resumeLifecycleRequest(ROOM_ID), true);
+  assert.equal(fs.existsSync(join(stateDir, 'rooms', ROOM_ID)), false);
+  assert.equal((await restarted.load(otherId)).room_id, otherId);
+
+  // A crash after removing the last metadata file leaves only an empty
+  // directory; listing can finish that stage without recreating the room.
+  fs.mkdirSync(join(stateDir, 'rooms', ROOM_ID), { mode: 0o700 });
+  assert.deepEqual((await new CoworkStore(stateDir).list()).map((entry) => entry.room_id), [otherId]);
+  assert.equal(fs.existsSync(join(stateDir, 'rooms', ROOM_ID)), false);
+});
+
+
+test('text acknowledgement promoting close stops later snapshot work and shared commands', async () => {
+  const f = await commandFixture('room.close');
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: f.context.sender_cid, command: 'room.settings' });
+  const rows = [1, 2].map((n) => ({ msg_id: n, wire_id: String(n).repeat(64), sender_id: f.context.sender_cid,
+    sender_name: 'Alice', text: `text ${n}`, date: AT }));
+  let acknowledgements = 0;
+  f.packet.listUnreadMessages = async () => rows;
+  f.packet.acknowledgeMessage = async () => {
+    acknowledgements++;
+    const receipt = await f.packet.runtimeCommands.sharedCommand('room.close', {}, f.context);
+    assert.equal(receipt.result.status, 'accepted');
+    assert.deepEqual(await f.packet.runtimeCommands.sharedCommand('room.settings', { status: 'too late' }, f.context),
+      { ok: false, error: 'room_unavailable' });
+  };
+  await f.service.resumePending(ROOM_ID);
+  assert.equal(acknowledgements, 1);
+  const history = await f.service.history(ROOM_ID);
+  assert.equal(history.some((record) => record.kind === 'message' && record.text === 'text 1'), true);
+  assert.equal(history.some((record) => record.kind === 'message' && record.text === 'text 2'), false);
+  assert.equal((await f.service.showRoom(ROOM_ID)).state, 'closed');
 });

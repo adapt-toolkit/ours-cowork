@@ -2,7 +2,7 @@
 
 Baseline: latest fetched `origin/main` at `76753c13e009ba7ea585b3a9c8c8e27444234e5c` (2026-09-09).
 
-Status: implementation and specification have Critic technical PASS. Owner confirmed on 2026-09-09 that only room commands belong in scope, excluding Cowork host/process/service and global create/list operations. Clarification remains pending for four room-specific management operations: accept, close, delete and rebind. The specification is a proposal, not approval of its open design choices; its revision now targets consumer injection into ours only, per Owner clarification. CLI/REST consumer invocation is optional.
+Status: implementation has Critic technical PASS. Owner confirmed on 2026-09-09 that only room commands belong in scope, excluding Cowork host/process/service and global create/list operations. Clarification remains pending for four room-specific management operations: accept, close, delete and rebind. The specification is a proposal, not approval of its open design choices; its revision now targets consumer injection into ours only, per Owner clarification. CLI/REST consumer invocation is optional.
 
 Scope evidence: authenticated Owner room message `01m22g1pcy8t3ydb9bcp9xwa1y` (2026-09-09 07:10:20 UTC): “nope, we don't include that. Only include the commands of the room, not coworking.” Critic requested clarification for the four room-specific operations in message `01m22g2n34ck8stg5nh2g2e2e0`; their omission is not yet treated as approved.
 

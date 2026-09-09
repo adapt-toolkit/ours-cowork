@@ -14,7 +14,7 @@ import {
   sdkIdentityNameError,
 } from './contracts.ts';
 import { SHARED_ROOM_COMMANDS } from './command-names.ts';
-import { ROOM_RPC_METHODS } from './openapi.ts';
+import { ROOM_RPC_METHODS, PRIVATE_ROOM_RPC_METHODS } from './openapi.ts';
 import type { OursRuntimeClientFactory } from './ours-runtime.ts';
 
 export type InviteMode = 'one_time' | 'public';
@@ -54,6 +54,7 @@ export interface FileInboxItem {
 
 export interface RoomRuntimeCommandHandlers {
   consumerCommands?: Array<{ name: string; description: string; input_schema: Record<string, JsonValue>; handler(input: JsonValue, context: Readonly<CommandContext>): Promise<JsonValue> }>;
+  shouldPause?(): Promise<boolean>;
   sharedCommand?(name: typeof SHARED_ROOM_COMMANDS[number], input: JsonValue, context: Readonly<CommandContext>): Promise<JsonValue>;
   listMembers(
     input: JsonValue,
@@ -501,7 +502,10 @@ export class SdkRoomPacket implements RoomPacket {
     return this.contacts.map((contact) => ({ ...contact }));
   }
 
+  private runtimeHandlers?: RoomRuntimeCommandHandlers;
+
   async registerRuntimeCommands(handlers: RoomRuntimeCommandHandlers): Promise<void> {
+    this.runtimeHandlers = handlers;
     await this.runBound(() => this.client.registerCommands([
       ...(handlers.consumerCommands ?? []),
       {
@@ -526,7 +530,7 @@ export class SdkRoomPacket implements RoomPacket {
         handler: handlers.removeMember,
       },
       ...(handlers.sharedCommand === undefined ? [] : SHARED_ROOM_COMMANDS.map((name) => {
-        const doc = ROOM_RPC_METHODS.find((method) => method.method === name)!;
+        const doc = [...ROOM_RPC_METHODS, ...PRIVATE_ROOM_RPC_METHODS].find((method) => method.method === name)!;
         const { room_id: _roomId, ...properties } = doc.params.properties as Record<string, JsonValue>;
         return {
           name,
@@ -544,6 +548,7 @@ export class SdkRoomPacket implements RoomPacket {
 
   async drainRuntimeCommands(onUnexpected: (item: InboxItem) => Promise<void>): Promise<void> {
     for (;;) {
+      if (await this.runtimeHandlers?.shouldPause?.()) return;
       const [oldest] = (await this.runBound(() => this.client.listIncomingMessages()))
         .filter((message) => message.status === 'unread')
         .sort((left, right) => left.seq - right.seq);
@@ -582,6 +587,7 @@ export class SdkRoomPacket implements RoomPacket {
     onUnexpected: (item: InboxItem) => Promise<void>,
   ): Promise<void> {
     for (;;) {
+      if (await this.runtimeHandlers?.shouldPause?.()) return;
       const pulled = await this.runBound(() => this.client.getMessages({ limit: 1 }));
       if (pulled.messages.length > 1) throw new Error('SDK returned more than one message for limit 1');
       const [history] = pulled.messages;

@@ -45,7 +45,7 @@ import {
 import { ContactAlreadyAbsentError, unpackInvite, type RoomPacket } from './packets.ts';
 import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
 import { IntakePump } from './intake.ts';
-import { createServiceRoutes, classifyServiceError } from './command-routes.ts';
+import { createServiceRoutes, createPrivateServiceRoutes, classifyServiceError } from './command-routes.ts';
 import { ConsumerHandlers, ConsumerDefinitionSchema, type ConsumerConfiguration, type ConsumerDefinition, type StoredConsumerDefinition } from './consumer-commands.ts';
 import { SHARED_ROOM_COMMANDS } from './command-names.ts';
 import { generateUlid } from './ulid.ts';
@@ -218,6 +218,8 @@ export class RoomService {
     this.intake = new IntakePump(store, packets, {
       now: this.nowValue,
       messageId: this.nextMessageId,
+      shouldPause: async (roomId) => (await this.store.load(roomId)).lifecycle_request?.state === 'pending',
+      afterPump: async (roomId) => { await this.resumeLifecycleRequest(roomId); },
     });
   }
 
@@ -386,6 +388,7 @@ export class RoomService {
     const registered = await this.store.load(roomId);
     this.publishedConsumerRevisions.delete(roomId);
     await packet.registerRuntimeCommands?.({
+      shouldPause: async () => (await this.store.load(roomId)).lifecycle_request?.state === 'pending',
       consumerCommands: (registered.consumer_commands ?? []).map((definition) => ({
         name: definition.name, description: definition.description,
         input_schema: definition.input_schema as Record<string, JsonValue>,
@@ -414,11 +417,31 @@ export class RoomService {
       || !this.hasRuntimeCommandGrant(room, context.sender_cid, name)) {
       return { ok: false, error: 'unauthorized' };
     }
+    if (name === 'room.close' || name === 'room.delete') {
+      try {
+        if (name === 'room.delete') DeleteRoomInputSchema.parse(input);
+        else z.object({}).strict().parse(input);
+        if (room.lifecycle_request && room.lifecycle_request.state !== 'completed') {
+          if (room.lifecycle_request.request_id !== context.request_wire_id || room.lifecycle_request.command !== name || room.lifecycle_request.state === 'failed') {
+            return { ok: false, error: 'invalid_state' };
+          }
+        } else {
+          await this.store.save(RoomSchema.parse({ ...room, lifecycle_request: {
+            request_id: context.request_wire_id, command: name, caller_cid: context.sender_cid,
+            accepted_at: this.now(), state: 'pending',
+          } }));
+        }
+        return { ok: true, result: { status: 'accepted', request_id: context.request_wire_id, command: name,
+          completion: name === 'room.delete' ? 'room absent from management' : 'room closed in management' } };
+      } catch (error) { return { ok: false, error: classifyServiceError(error) }; }
+    }
+    if (room.lifecycle_request?.state === 'pending') return { ok: false, error: 'room_unavailable' };
     const scope = { roomId, active: true };
     try {
       return await this.commandScope.run(scope, async (): Promise<JsonValue> => {
         try {
-          const result = await createServiceRoutes(this)[name]!.run({ ...input, room_id: roomId });
+          const routes = name === 'room.accept' ? createPrivateServiceRoutes(this) : createServiceRoutes(this);
+          const result = await routes[name]!.run({ ...input, room_id: roomId });
           // Preserve the service value; the SDK owns transport delivery.
           return { ok: true, result: JSON.parse(JSON.stringify(result)) as JsonValue };
         } catch (error) {
@@ -437,7 +460,7 @@ export class RoomService {
     const request = ListMembersCommandInputSchema.safeParse(input);
     if (!request.success) return { ok: false, error: 'invalid_request' };
     const room = await this.store.load(roomId);
-    if (room.state !== 'active') return { ok: false, error: 'room_unavailable' };
+    if (room.state !== 'active' || room.lifecycle_request?.state === 'pending') return { ok: false, error: 'room_unavailable' };
     const caller = room.seats.find((seat) =>
       seat.state === 'active' && seat.identity === context.sender_cid);
     if (!caller || !this.hasRuntimeCommandGrant(room, context.sender_cid, 'list-members')) {
@@ -464,7 +487,7 @@ export class RoomService {
     if (!parsed.success) return { ok: false, error: 'invalid_request' };
     const request = parsed.data;
     const room = await this.store.load(roomId);
-    if (room.state !== 'active') return { ok: false, error: 'room_unavailable' };
+    if (room.state !== 'active' || room.lifecycle_request?.state === 'pending') return { ok: false, error: 'room_unavailable' };
     const caller = room.seats.find((seat) =>
       seat.state === 'active' && seat.identity === context.sender_cid);
     if (!caller || !this.hasRuntimeCommandGrant(room, context.sender_cid, 'remove-member')) {
@@ -1040,6 +1063,7 @@ export class RoomService {
 
   async notifyRoom(roomId: string, _event = 'message_received'): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
+    if (!this.packets.get(id)) return;
     // Contact acceptance and message delivery are separate core callbacks.
     // Reconcile first under the room mutex for either callback so the first
     // immediately-following participant message can never be drained as an
@@ -1179,7 +1203,7 @@ export class RoomService {
     const authorized = await this.lock(roomId, async () => {
       const room = await this.store.load(roomId);
       const definition = (room.consumer_commands ?? []).find((entry) => entry.name === name);
-      if (room.state !== 'active' || !definition || this.publishedConsumerRevisions.get(roomId) !== (room.consumer_commands_revision ?? 0)) return undefined;
+      if ((room.state !== 'active' || room.lifecycle_request?.state === 'pending') || !definition || this.publishedConsumerRevisions.get(roomId) !== (room.consumer_commands_revision ?? 0)) return undefined;
       if (!room.seats.some((seat) => seat.state === 'active' && seat.identity === context.sender_cid)
         || !this.hasRuntimeCommandGrant(room, context.sender_cid, name)) return undefined;
       return definition;
@@ -1305,6 +1329,30 @@ export class RoomService {
    * Forward-only close. Every external contact mutation is preceded by a
    * durable intent and the packet/live-state purge precedes terminal metadata.
    */
+  /** Execute a durable accepted request after the SDK reply attempt, or on restart. */
+  async resumeLifecycleRequest(roomId: string): Promise<boolean> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const room = await this.store.load(id);
+    const request = room.lifecycle_request;
+    if (request?.state !== 'pending') return false;
+    try {
+      if (request.command === 'room.delete') await this.deleteRoom(id, { confirm: true });
+      else await this.closeRoom(id);
+    } catch {
+      // Never recreate metadata after a partially completed deletion.
+      try {
+        await this.lock(id, async () => {
+          const current = await this.store.load(id);
+          if (current.lifecycle_request?.request_id !== request.request_id) return;
+          await this.store.save(RoomSchema.parse({ ...current, lifecycle_request: {
+            ...request, state: 'failed', error: 'lifecycle_failed',
+          } }));
+        });
+      } catch { /* A final-directory deletion retry is recovered by storage listing. */ }
+    }
+    return true;
+  }
+
   async closeRoom(roomId: string): Promise<Room> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     return this.lock(id, async () => {
@@ -1313,7 +1361,11 @@ export class RoomService {
         // A previous atomic rename may have committed closed metadata while
         // its directory fsync failed. Replacing the exact snapshot repeats
         // that durability barrier before close reports success.
-        return this.store.save(room);
+        return this.store.save(RoomSchema.parse({ ...room,
+          ...(room.lifecycle_request?.command === 'room.close' ? { lifecycle_request: {
+            ...room.lifecycle_request, state: 'completed', error: undefined,
+          } } : {}),
+        }));
       }
       if (this.isPacketPending(room)) {
         throw new RoomServiceError(
@@ -1352,9 +1404,7 @@ export class RoomService {
         }
         return this.deleteReceipt(id);
       }
-      if (room.state !== 'closed') {
-        throw new RoomServiceError(`room "${id}" must be closed before it can be deleted`);
-      }
+      if (room.state !== 'closed') await this.closeRoom(id);
       await this.store.delete(id);
       return this.deleteReceipt(id);
     });
@@ -1709,7 +1759,11 @@ export class RoomService {
       }
     }
 
-    return this.store.save(RoomSchema.parse({ ...room, state: 'closed', closed_at: this.now() }));
+    return this.store.save(RoomSchema.parse({ ...room, state: 'closed', closed_at: this.now(),
+      ...(room.lifecycle_request?.command === 'room.close' ? { lifecycle_request: {
+        ...room.lifecycle_request, state: 'completed', error: undefined,
+      } } : {}),
+    }));
   }
 
   private async appendUncertainCloseResult(

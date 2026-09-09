@@ -10,7 +10,7 @@
 - The shared daemon's history database and cowork's room archive are separate durable stores with no cross-store transaction. Cowork orders archive and recipient-intent durability before advancing SDK unread state, but a crash can still leave an already-archived SDK row unread; source IDs make that replay idempotent.
 - Backups require a stopped cowork daemon. Back up and restore the complete cowork state directory as one unit, preserving ownership and modes; protect shared identity state separately through the shared daemon's operator procedure.
 - Service uninstall retains data. It removes the cowork systemd or launchd definition, not configuration, archives, room metadata, or identities in the shared daemon.
-- Closing and deleting are separate. First close the room explicitly with `ours-cowork room close <room-id>`. Only a closed room can then be deleted with `ours-cowork room delete <room-id> --yes`.
+- Closing retains room metadata, archive and files. `ours-cowork room delete <room-id> --yes` closes the room if necessary, then erases all local room data. Ours close/delete replies acknowledge durable acceptance; management state determines completion.
 - Confirmed deletion removes the retained archive and metadata from this host only. It does not claim remote purge, backup erasure, key wipe, or secure erase.
 - The web console and HTTP room RPC have no authentication. They bind only to `127.0.0.1` and must not be forwarded, proxied, or exposed remotely.
 - Web updates use periodic polling rather than push. A view can lag daemon state until its next refresh; confirmed mutations trigger an immediate refresh.

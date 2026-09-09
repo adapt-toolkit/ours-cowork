@@ -186,7 +186,12 @@ export class CoworkStore {
       .filter((entry) => entry.isDirectory() && LowerCrockfordUlidSchema.safeParse(entry.name).success)
       .map((entry) => entry.name).sort();
     const rooms: Room[] = [];
-    for (const id of ids) rooms.push(await this.load(id));
+    for (const id of ids) {
+      // Metadata is removed last during deletion. A remaining empty directory
+      // is a resumable final stage, never a reason to recreate an identity.
+      if (!this.lstatIfPresent(this.metadataPath(id))) { await this.delete(id); continue; }
+      rooms.push(await this.load(id));
+    }
     return rooms;
   }
 
@@ -433,11 +438,15 @@ export class CoworkStore {
       const expected = new Set(['archive.sqlite3','archive.sqlite3-wal','archive.sqlite3-shm','blobs','room.json','room.json.v1.bak']);
       const unexpected = this.fs.readdirSync(roomDir).filter((name) => !expected.has(name));
       if (unexpected.length) throw new CoworkStorageError(`room "${id}" contains live or unexpected residue: ${unexpected.join(', ')}`);
-      for (const name of ['archive.sqlite3-wal','archive.sqlite3-shm','archive.sqlite3','room.json.v1.bak','room.json']) {
+      for (const name of ['archive.sqlite3-wal','archive.sqlite3-shm','archive.sqlite3','room.json.v1.bak']) {
         const path = join(roomDir, name); if (this.lstatIfPresent(path)) { this.assertRegularFile(path, name); this.fs.unlinkSync(path); }
       }
       const blobs = this.blobsDirectory(id);
       if (this.lstatIfPresent(blobs)) this.fs.rmSync(blobs, { recursive: true, force: true });
+      // Persist payload removal while the closed-room/lifecycle metadata still
+      // proves what a restart must finish, then remove that metadata last.
+      this.fsyncDirectory(roomDir);
+      if (this.lstatIfPresent(metadata)) { this.assertRegularFile(metadata, 'room metadata'); this.fs.unlinkSync(metadata); }
       this.fsyncDirectory(roomDir); this.fs.rmdirSync(roomDir); this.fsyncDirectory(this.roomsDirectory());
     });
   }

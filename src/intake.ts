@@ -30,6 +30,8 @@ export interface IntakePacketRegistry {
 export interface IntakePumpOptions {
   now?: () => string;
   messageId?: () => string;
+  shouldPause?: (roomId: string) => Promise<boolean>;
+  afterPump?: (roomId: string) => Promise<void>;
 }
 
 interface NotificationState {
@@ -96,7 +98,7 @@ export class IntakePump {
   private readonly notifications = new Map<string, NotificationState>();
   private acceptingNotifications = true;
 
-  constructor(store: IntakeStore, packets: IntakePacketRegistry, options: IntakePumpOptions = {}) {
+  constructor(store: IntakeStore, packets: IntakePacketRegistry, private readonly options: IntakePumpOptions = {}) {
     this.store = store;
     this.packets = packets;
     this.nowValue = options.now ?? (() => new Date().toISOString());
@@ -128,6 +130,7 @@ export class IntakePump {
   /** One SDK reader per room; callback HTTP never runs under the room mutex. */
   async pump(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
+    if (!this.packets.get(id)) return;
     const existing = this.pumps.get(id);
     if (existing) {
       existing.dirty = true;
@@ -157,6 +160,8 @@ export class IntakePump {
         while (state.dirty) {
           state.dirty = false;
           await this.drainAndRelay(roomId, packet);
+          await this.options.afterPump?.(roomId);
+          if (!this.packets.get(roomId)) break;
         }
       });
     } finally {
@@ -212,20 +217,27 @@ export class IntakePump {
 
   private async drainAndRelay(roomId: string, packet: RoomPacket): Promise<void> {
     for (;;) {
+      if (await this.options.shouldPause?.(roomId)) break;
       await packet.drainRuntimeCommands?.(
         (item) => this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false)),
       );
+      if (await this.options.shouldPause?.(roomId)) break;
       const messages = await packet.listUnreadMessages(INTAKE_BATCH_SIZE);
       const files = await packet.listUnreadFiles(INTAKE_BATCH_SIZE);
       if (messages.length === 0 && files.length === 0) break;
       for (const item of messages) {
+        if (await this.options.shouldPause?.(roomId)) break;
         await this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false));
         // SDK acknowledgement can dispatch a newly promoted typed command.
         await packet.acknowledgeMessage(item,
           (unexpected) => this.lock(roomId, () => this.processInboxItem(roomId, packet, unexpected, false)));
       }
-      for (const item of files) await this.lock(roomId, () => this.processFileInboxItem(roomId, packet, item));
+      for (const item of files) {
+        if (await this.options.shouldPause?.(roomId)) break;
+        await this.lock(roomId, () => this.processFileInboxItem(roomId, packet, item));
+      }
     }
+    if (await this.options.shouldPause?.(roomId)) return;
     await this.lock(roomId, async () => {
       await this.completeSnapshotIntents(roomId);
       await this.relayPendingUnlocked(roomId, packet);

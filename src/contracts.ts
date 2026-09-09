@@ -488,6 +488,14 @@ const CurrentRoomSchema = z.object({
   command_grants: z.array(RuntimeCommandGrantSchema),
   consumer_commands: z.array(StoredConsumerDefinitionSchema).max(64).optional(),
   consumer_commands_revision: z.number().int().nonnegative().safe().optional(),
+  lifecycle_request: z.object({
+    request_id: z.string().min(1).max(256),
+    command: z.enum(['room.close', 'room.delete']),
+    caller_cid: ContainerIdSchema,
+    accepted_at: Rfc3339Schema,
+    state: z.enum(['pending', 'failed', 'completed']),
+    error: z.literal('lifecycle_failed').optional(),
+  }).strict().optional(),
   /** Operator-managed command policy inherited by authenticated active seats of an exact role. */
   role_command_grants: z.array(RuntimeRoleCommandGrantSchema).superRefine((grants, context) => {
     const seen = new Set<string>();

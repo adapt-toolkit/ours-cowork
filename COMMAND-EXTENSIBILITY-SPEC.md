@@ -125,3 +125,10 @@ Desired definitions and grant removal are saved together before catalog publicat
 ## Review boundary
 
 This document describes the separate implementation branch. Tests exercise credential provisioning/rotation and restart loading, default-deny grants, replacement/delete/reload/publication failure, schema and response validation, single-reader intake, and a real SDK command whose HTTP callback reenters Cowork REST. Test results and Critic verdict are reported separately; this document does not claim Owner approval or production deployment.
+
+
+## Room lifecycle interaction
+
+The base command surface includes accept, rebind, close and delete. Accepted lifecycle shutdown prevents new consumer invocations. HTTP work already authorized may complete with its captured definition and credential. The single SDK reader executes durable close/delete work after its reply attempt and outside the room mutex; callbacks can still call management REST without waiting on their own reader.
+
+Room deletion erases persisted room definitions and grants together with the room archive, files and metadata. Shared host configuration, the source definitions file and handler credentials are host-managed resources and are not removed by a room deletion. A stale local file entry cannot recreate the deleted room or its identity.

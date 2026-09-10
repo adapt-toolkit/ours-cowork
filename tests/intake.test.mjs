@@ -655,6 +655,19 @@ test('binary and notice replies resolve one file and use the earliest recipient 
   records = await f.store.read(ROOM_ID);
   assert.deepEqual(byKind(records, 'message').map(message => message.source_reply_to.wire_id),
     [bResult.wire_id, bResult.metadata_wire_id]);
+
+  f.packet.sendCalls.length = 0;
+  f.packet.inbox.push(incoming({
+    msg_id: 12, sender_id: 'cid-cara', text: 'C replies to its notice', wire_id: 'wire-C-answer',
+    reply_to: { wire_id: cResult.metadata_wire_id },
+  }));
+  await f.pump.pump(ROOM_ID);
+  const cReply = f.packet.sendCalls.filter(call => JSON.parse(call.body).text === 'C replies to its notice');
+  assert.deepEqual(cReply.map(call => call.recipient), ['cid-alice', 'cid-bob']);
+  assert.deepEqual(cReply.find(call => call.recipient === 'cid-alice').replyTo,
+    { wire_id: 'wire-A-file-original' });
+  assert.deepEqual(cReply.find(call => call.recipient === 'cid-bob').replyTo,
+    { wire_id: bResult.wire_id });
 });
 
 test('a refused file notice prevents binary sends and records terminal failures', async () => {

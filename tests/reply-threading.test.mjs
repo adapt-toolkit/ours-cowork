@@ -172,6 +172,8 @@ test('earliest eligible file result selects metadata fallback while every file w
   const evidence = [file, ...early, ...later, ...bCopy];
   const fromB = item('L_b', 20, 'B', 'w_b', [], 'binary-B');
   assert.deepEqual(selectReply(evidence, 'R', fromB, 'C').replyTo, { wire_id: 'notice-C' });
+  const fromC = item('L_c', 21, 'C', 'w_c', [], 'notice-C');
+  assert.deepEqual(selectReply(evidence, 'R', fromC, 'B').replyTo, { wire_id: 'binary-B' });
   for (const alias of ['notice-C', 'binary-C', 'later-notice-C']) {
     assert.equal(selectReply(evidence, 'R', item('L_c', 21, 'C', 'w_c', [], alias), 'A').parentKey,
       'file:F_a');

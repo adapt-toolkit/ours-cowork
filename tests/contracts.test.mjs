@@ -30,6 +30,7 @@ import {
   roomIdentityName,
   sdkIdentityNameError,
 } from '../src/contracts.ts';
+import { StartThreadInputSchema, ThreadRootSchema } from '../src/thread-contracts.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const MESSAGE_ID = '01jz6y7n8p9q0r1s2t3v4w5x6z';
@@ -392,6 +393,88 @@ test('communication records form a strict discriminated version-1 union', () => 
 
   const { seq: _seq, record_id: _recordId, ...appendMessage } = message;
   assert.equal(AppendRecordSchema.parse(appendMessage).kind, 'message');
+});
+
+test('intake rejections record one source disposition without rejected content', () => {
+  const common = {
+    version: 1,
+    kind: 'intake_rejection',
+    room_id: ROOM_ID,
+    seq: 1,
+    record_id: `${ROOM_ID}:1`,
+    at: AT,
+    source_kind: 'message',
+    source_msg_id: 41,
+    source_wire_id: 'wire-in-41',
+    sender_identity: 'cid-alice',
+    sender_participant_id: '01jz6y7n8p9q0r1s2t3v4w5x70',
+    fingerprint: 'a'.repeat(64),
+    error: 'reply_target_unavailable',
+    notification_attempt_claimed: true,
+  };
+  assert.deepEqual(CommunicationRecordSchema.parse(common), common);
+  const { seq: _seq, record_id: _recordId, ...appendMessageRejection } = common;
+  assert.deepEqual(AppendRecordSchema.parse(appendMessageRejection), appendMessageRejection);
+
+  const fileRejection = {
+    ...appendMessageRejection,
+    source_kind: 'file',
+    source_msg_id: undefined,
+    source_file_id: 42,
+    error: 'thread_files_unsupported',
+  };
+  assert.deepEqual(AppendRecordSchema.parse(fileRejection), fileRejection);
+
+  for (const malformed of [
+    { ...appendMessageRejection, source_file_id: 42 },
+    { ...appendMessageRejection, source_msg_id: undefined },
+    { ...appendMessageRejection, source_kind: 'file' },
+    { ...appendMessageRejection, notification_attempt_claimed: false },
+    { ...appendMessageRejection, fingerprint: 'A'.repeat(64) },
+    { ...appendMessageRejection, text: 'private rejected text' },
+    { ...appendMessageRejection, target_wire_id: 'private-target' },
+    { ...appendMessageRejection, thread_id: MESSAGE_ID },
+  ]) assert.throws(() => AppendRecordSchema.parse(malformed));
+});
+
+test('thread command topics trim at input while stored root topics must already be canonical', () => {
+  assert.equal(StartThreadInputSchema.parse({
+    topic: ' Review ',
+    participant_ids: ['01jz6y7n8p9q0r1s2t3v4w5x70'],
+    idempotency_key: 'request-1',
+  }).topic, 'Review');
+  const root = {
+    schema_version: 1,
+    thread_id: MESSAGE_ID,
+    topic: 'Review',
+    creator_participant_id: '01jz6y7n8p9q0r1s2t3v4w5x70',
+    members: [{
+      participant_id: '01jz6y7n8p9q0r1s2t3v4w5x70',
+      identity: 'A'.repeat(64),
+    }],
+    idempotency_key: 'request-1',
+    fingerprint: 'a'.repeat(64),
+  };
+  assert.deepEqual(ThreadRootSchema.parse(root), root);
+  assert.throws(() => ThreadRootSchema.parse({ ...root, topic: ' Review ' }), /topic/i);
+});
+
+test('reply-unavailable relay results are terminal archive records', () => {
+  const result = {
+    version: 1,
+    kind: 'relay_result',
+    room_id: ROOM_ID,
+    seq: 1,
+    record_id: `${ROOM_ID}:1`,
+    at: AT,
+    intent_record_id: `${ROOM_ID}:9`,
+    message_id: MESSAGE_ID,
+    recipient_identity: 'cid-bob',
+    status: 'skipped_reply_unavailable',
+  };
+  assert.deepEqual(CommunicationRecordSchema.parse(result), result);
+  const { seq: _seq, record_id: _recordId, ...appendResult } = result;
+  assert.deepEqual(AppendRecordSchema.parse(appendResult), appendResult);
 });
 
 test('message thread contracts distinguish immutable roots, descendants, and ordinary rows', () => {

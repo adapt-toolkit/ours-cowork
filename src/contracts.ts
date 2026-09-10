@@ -809,8 +809,13 @@ const RelayIntentShape = {
   recipient_identity: NonEmptyStringSchema,
 } as const;
 
-/** A relay intent may terminate without a send when its seat was removed. */
-export const RelayResultStatusSchema = z.enum(['queued', 'send_failed', 'skipped_removed']);
+/** A relay intent may terminate without a send when delivery is unavailable. */
+export const RelayResultStatusSchema = z.enum([
+  'queued',
+  'send_failed',
+  'skipped_removed',
+  'skipped_reply_unavailable',
+]);
 
 const RelayResultShape = {
   kind: z.literal('relay_result'),
@@ -849,6 +854,19 @@ const FileShape = {
   source_file_id: z.number().int().nonnegative().safe(),
   source_wire_id: NonEmptyStringSchema.optional(),
   source_reply_to: ReplyReferenceSchema.optional(),
+} as const;
+
+const IntakeRejectionShape = {
+  kind: z.literal('intake_rejection'),
+  source_kind: z.enum(['message', 'file']),
+  source_msg_id: z.number().int().nonnegative().safe().optional(),
+  source_file_id: z.number().int().nonnegative().safe().optional(),
+  source_wire_id: NonEmptyStringSchema,
+  sender_identity: NonEmptyStringSchema,
+  sender_participant_id: LowerCrockfordUlidSchema,
+  fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+  error: z.enum(['reply_target_unavailable', 'thread_files_unsupported']),
+  notification_attempt_claimed: z.literal(true),
 } as const;
 
 // Legacy prerelease removal journal records remain readable as archive history,
@@ -894,6 +912,7 @@ export const MessageRecordSchema = z.object({ ...RecordCommonShape, ...MessageSh
 export const FileRecordSchema = z.object({ ...RecordCommonShape, ...FileShape }).strict();
 export const RelayIntentRecordSchema = z.object({ ...RecordCommonShape, ...RelayIntentShape }).strict();
 export const RelayResultRecordSchema = z.object({ ...RecordCommonShape, ...RelayResultShape }).strict();
+export const IntakeRejectionRecordSchema = z.object({ ...RecordCommonShape, ...IntakeRejectionShape }).strict();
 export const MembershipIntentRecordSchema = z.object({ ...RecordCommonShape, ...MembershipIntentShape }).strict();
 export const MembershipResultRecordSchema = z.object({ ...RecordCommonShape, ...MembershipResultShape }).strict();
 export const CloseNoticeIntentRecordSchema = z.object({ ...RecordCommonShape, ...CloseNoticeIntentShape }).strict();
@@ -904,6 +923,7 @@ const RawCommunicationRecordSchema = z.discriminatedUnion('kind', [
   FileRecordSchema,
   RelayIntentRecordSchema,
   RelayResultRecordSchema,
+  IntakeRejectionRecordSchema,
   MembershipIntentRecordSchema,
   MembershipResultRecordSchema,
   CloseNoticeIntentRecordSchema,
@@ -940,6 +960,23 @@ function refineRelaySubject(
       code: z.ZodIssueCode.custom,
       path: ['message_id'],
       message: 'relay records require exactly one of message_id or file_id',
+    });
+  }
+}
+
+function refineIntakeRejection(
+  record: { kind: string; source_kind?: 'message' | 'file'; source_msg_id?: number; source_file_id?: number },
+  context: z.RefinementCtx,
+): void {
+  if (record.kind !== 'intake_rejection') return;
+  const hasMessage = record.source_msg_id !== undefined;
+  const hasFile = record.source_file_id !== undefined;
+  if (hasMessage === hasFile
+    || (record.source_kind === 'message' ? !hasMessage : !hasFile)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['source_kind'],
+      message: 'intake rejections require exactly one numeric source field matching source_kind',
     });
   }
 }
@@ -1113,6 +1150,7 @@ export const CommunicationRecordSchema = RawCommunicationRecordSchema.superRefin
     refineMessageThread(record, context);
   }
   refineRelaySubject(record, context);
+  refineIntakeRejection(record, context);
   refineFileRecord(record, context);
 });
 
@@ -1121,6 +1159,7 @@ export const AppendRecordSchema = z.discriminatedUnion('kind', [
   z.object({ ...AppendCommonShape, ...FileShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayIntentShape }).strict(),
   z.object({ ...AppendCommonShape, ...RelayResultShape }).strict(),
+  z.object({ ...AppendCommonShape, ...IntakeRejectionShape }).strict(),
   z.object({ ...AppendCommonShape, ...CloseNoticeIntentShape }).strict(),
   z.object({ ...AppendCommonShape, ...CloseNoticeResultShape }).strict(),
 ]).superRefine((record, context) => {
@@ -1129,6 +1168,7 @@ export const AppendRecordSchema = z.discriminatedUnion('kind', [
     refineMessageThread(record, context);
   }
   refineRelaySubject(record, context);
+  refineIntakeRejection(record, context);
   refineFileRecord(record, context);
 });
 
@@ -1148,4 +1188,5 @@ export type MembershipNotice = z.infer<typeof MembershipNoticeSchema>;
 export type AuthorSnapshot = z.infer<typeof AuthorSnapshotSchema>;
 export type CommunicationRecord = z.infer<typeof CommunicationRecordSchema>;
 export type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
+export type IntakeRejection = Extract<CommunicationRecord, { kind: 'intake_rejection' }>;
 export type AppendRecord = z.infer<typeof AppendRecordSchema>;

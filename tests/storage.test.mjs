@@ -47,6 +47,37 @@ function temporaryStore() {
   return { stateDir, store: new CoworkStore(stateDir), cleanup: () => rmSync(stateDir, { recursive: true, force: true }) };
 }
 
+function downgradeArchiveToV1(databasePath) {
+  const db = new Database(databasePath);
+  db.transaction(() => {
+    db.exec(`DROP INDEX IF EXISTS records_thread_creation_key;
+      DROP INDEX IF EXISTS records_thread_id;
+      DROP INDEX IF EXISTS records_source_message;
+      DROP INDEX IF EXISTS records_source_file;
+      CREATE UNIQUE INDEX records_source_message ON records(source_msg_id)
+        WHERE kind='message' AND source_msg_id IS NOT NULL;
+      CREATE UNIQUE INDEX records_source_file ON records(source_file_id)
+        WHERE kind='file' AND source_file_id IS NOT NULL;`);
+    db.pragma('user_version = 1');
+  }).immediate();
+  db.close();
+}
+
+function intakeRejection(sourceKind, sourceId, overrides = {}) {
+  return {
+    version: 1, kind: 'intake_rejection', room_id: ROOM_ID, at: AT,
+    source_kind: sourceKind,
+    [sourceKind === 'message' ? 'source_msg_id' : 'source_file_id']: sourceId,
+    source_wire_id: `wire-${sourceKind}-${sourceId}`,
+    sender_identity: 'cid-alice',
+    sender_participant_id: '01jz6y7n8p9q0r1s2t3v4w5xa1',
+    fingerprint: '0'.repeat(64),
+    error: sourceKind === 'message' ? 'reply_target_unavailable' : 'thread_files_unsupported',
+    notification_attempt_claimed: true,
+    ...overrides,
+  };
+}
+
 function roomV1(overrides = {}) {
   return {
     version: 1, room_id: ROOM_ID, identity_name: `cowork-room-${ROOM_ID}`,
@@ -64,6 +95,9 @@ test('room creation provisions only private SQLite storage and metadata', async 
     assert.equal(statSync(path).mode & 0o777, 0o700);
   }
   assert.equal(statSync(join(roomDir, 'archive.sqlite3')).mode & 0o777, 0o600);
+  const db = new Database(join(roomDir, 'archive.sqlite3'), { readonly: true });
+  assert.equal(db.pragma('user_version', { simple: true }), 2);
+  db.close();
   assert.deepEqual(await store.load(ROOM_ID), room());
   assert.deepEqual((await store.list()).map((value) => value.room_id), [ROOM_ID]);
 });
@@ -77,6 +111,118 @@ test('concurrent appends assign durable monotonic sequence and record ids across
   const last = await restarted.append(ROOM_ID, message(24));
   assert.equal(last.seq, 25);
   assert.equal(last.record_id, `${ROOM_ID}:25`);
+});
+
+test('root key and selected pending work commit together', async (t) => {
+  const { store, stateDir, cleanup } = temporaryStore(); t.after(cleanup);
+  await store.create(room());
+  const threadId = message(1).message_id;
+  const secondId = message(2).message_id;
+  const participantId = '01jz6y7n8p9q0r1s2t3v4w5xa1';
+  const identity = 'A'.repeat(64);
+  const root = message(1, {
+    author: { identity, display_name: 'A', role: 'builder' },
+    text: 'Thread: Review',
+    recipient_identities: [identity],
+    scope: { thread_id: threadId },
+    thread_root: {
+      schema_version: 1,
+      thread_id: threadId,
+      topic: 'Review',
+      creator_participant_id: participantId,
+      members: [{ participant_id: participantId, identity }],
+      idempotency_key: 'request-1',
+      fingerprint: '0'.repeat(64),
+    },
+  });
+  const saved = await store.append(ROOM_ID, root);
+  assert.deepEqual((await store.recordsNeedingRelayIntents(ROOM_ID)).map((row) => row.message_id), [threadId]);
+  assert.deepEqual(await store.relayRecipientsNeedingIntent(ROOM_ID, saved.seq), [identity]);
+  const restarted = new CoworkStore(stateDir);
+  assert.deepEqual((await restarted.read(ROOM_ID))[0].thread_root, saved.thread_root);
+  await assert.rejects(store.append(ROOM_ID, {
+    ...root,
+    message_id: secondId,
+    scope: { thread_id: secondId },
+    thread_root: { ...root.thread_root, thread_id: secondId },
+  }), /unique|constraint/i);
+});
+
+test('pre-commit failure rolls back a root, recipients, and pending work', async (t) => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'ours-cowork-sqlite-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const store = new CoworkStore(stateDir, { beforeRecordCommit: () => { throw new Error('injected pre-commit failure'); } });
+  await store.create(room());
+  const threadId = message(3).message_id;
+  const participantId = '01jz6y7n8p9q0r1s2t3v4w5xa1';
+  const identity = 'A'.repeat(64);
+  await assert.rejects(store.append(ROOM_ID, message(3, {
+    author: { identity, display_name: 'A', role: 'builder' },
+    text: 'Thread: Atomic',
+    recipient_identities: [identity],
+    scope: { thread_id: threadId },
+    thread_root: {
+      schema_version: 1, thread_id: threadId, topic: 'Atomic',
+      creator_participant_id: participantId,
+      members: [{ participant_id: participantId, identity }],
+      idempotency_key: 'request-atomic', fingerprint: '1'.repeat(64),
+    },
+  })), /injected pre-commit failure/);
+  assert.deepEqual(await new CoworkStore(stateDir).read(ROOM_ID), []);
+  assert.deepEqual(await new CoworkStore(stateDir).recordsNeedingRelayIntents(ROOM_ID), []);
+  const db = new Database(join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3'), { readonly: true });
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM record_recipients').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM relay_intent_work').get().count, 0);
+  db.close();
+});
+
+test('accepted and rejected intake share source uniqueness while rejections create no work', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
+  await store.create(room());
+  const rejected = await store.append(ROOM_ID, intakeRejection('message', 51));
+  assert.equal((await store.query(ROOM_ID, { sourceMsgId: 51, limit: 1 }))[0].record_id, rejected.record_id);
+  assert.deepEqual(await store.recipients(ROOM_ID, rejected.seq), []);
+  assert.deepEqual(await store.recordsNeedingRelayIntents(ROOM_ID), []);
+  assert.deepEqual(await store.relayRecipientsNeedingIntent(ROOM_ID, rejected.seq), []);
+  await assert.rejects(store.append(ROOM_ID, message(51, { source_msg_id: 51 })), /unique|constraint/i);
+
+  const bytes = Buffer.from('accepted file');
+  const { createHash } = await import('node:crypto');
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  await store.append(ROOM_ID, {
+    version: 1, kind: 'file', room_id: ROOM_ID, at: AT,
+    file_id: message(52).message_id,
+    author: { identity: 'cid-alice', display_name: 'Alice', role: 'researcher' },
+    filename: 'accepted.txt', mime: 'text/plain', size: bytes.length, sha256: digest,
+    data_base64: bytes.toString('base64'), recipient_identities: [], source_file_id: 52,
+  });
+  const blobNames = readdirSync(join(stateDir, 'rooms', ROOM_ID, 'blobs'));
+  const rejectedFile = await store.append(ROOM_ID, intakeRejection('file', 53));
+  assert.equal(rejectedFile.kind, 'intake_rejection');
+  assert.deepEqual(await store.recipients(ROOM_ID, rejectedFile.seq), []);
+  assert.deepEqual(await store.relayRecipientsNeedingIntent(ROOM_ID, rejectedFile.seq), []);
+  assert.deepEqual(readdirSync(join(stateDir, 'rooms', ROOM_ID, 'blobs')), blobNames);
+  await assert.rejects(store.append(ROOM_ID, intakeRejection('file', 52)), /unique|constraint/i);
+  assert.deepEqual(readdirSync(join(stateDir, 'rooms', ROOM_ID, 'blobs')), blobNames);
+  assert.equal((await new CoworkStore(stateDir).query(ROOM_ID, { sourceMsgId: 51, limit: 1 }))[0].kind, 'intake_rejection');
+});
+
+test('reply-unavailable relay results settle retry selection', async (t) => {
+  const { store, cleanup } = temporaryStore(); t.after(cleanup);
+  await store.create(room());
+  const source = await store.append(ROOM_ID, message(61));
+  const intent = await store.append(ROOM_ID, {
+    version: 1, kind: 'relay_intent', room_id: ROOM_ID, at: AT,
+    message_id: source.message_id, recipient_identity: 'cid-bob',
+  });
+  await store.append(ROOM_ID, {
+    version: 1, kind: 'relay_result', room_id: ROOM_ID, at: AT,
+    intent_record_id: intent.record_id, message_id: source.message_id,
+    recipient_identity: 'cid-bob', status: 'skipped_reply_unavailable',
+  });
+  assert.deepEqual(await store.query(ROOM_ID, {
+    kind: 'relay_intent', unresolvedResultKind: 'relay_result',
+  }), []);
 });
 
 test('append validates caller payload once and does not rehash validated file bytes', () => {
@@ -94,11 +240,15 @@ test('bounded reads decode only selected rows, never earlier archive payloads', 
   for (let index = 0; index < 100; index += 1) await store.append(ROOM_ID, message(index));
   const databasePath = join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3');
   const db = new Database(databasePath);
-  db.prepare("UPDATE records SET payload_json = '{broken' WHERE seq = 1").run();
+  // The v2 JSON expression indexes reject malformed JSON during the corrupting
+  // write itself, so use valid JSON with an invalid record shape to verify that
+  // bounded reads still decode only the rows they selected.
+  assert.throws(() => db.prepare("UPDATE records SET payload_json = '{broken' WHERE seq = 1").run(), /malformed JSON/i);
+  db.prepare("UPDATE records SET payload_json = '{}' WHERE seq = 1").run();
   db.close();
   const page = await store.read(ROOM_ID, { after: 95, limit: 3 });
   assert.deepEqual(page.map((record) => record.seq), [96, 97, 98]);
-  await assert.rejects(store.read(ROOM_ID, { limit: 1 }), /malformed JSON.*sequence 1/);
+  await assert.rejects(store.read(ROOM_ID, { limit: 1 }), /invalid record.*sequence 1/);
 });
 
 test('indexed unresolved and source queries avoid archive-wide validation', async (t) => {
@@ -569,10 +719,113 @@ test('restart removes only recognized crash-left blob temporaries and rejects ar
   await assert.rejects(new CoworkStore(stateDir).read(ROOM_ID, { limit: 1 }), /unexpected room blob residue/);
 });
 
+test('v1 archive migration preserves records and blobs and is idempotent across restarts', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
+  await store.create(room());
+  const ordinary = await store.append(ROOM_ID, message(71, { source_msg_id: 71 }));
+  const bytes = Buffer.from('legacy v1 blob bytes');
+  const { createHash } = await import('node:crypto');
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  const file = await store.append(ROOM_ID, {
+    version: 1, kind: 'file', room_id: ROOM_ID, at: AT,
+    file_id: message(72).message_id,
+    author: { identity: 'cid-alice', display_name: 'Alice', role: 'researcher' },
+    filename: 'legacy.bin', mime: 'application/octet-stream', size: bytes.length,
+    sha256: digest, data_base64: bytes.toString('base64'), recipient_identities: [], source_file_id: 72,
+  });
+  const databasePath = join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3');
+  downgradeArchiveToV1(databasePath);
+
+  const first = await new CoworkStore(stateDir).read(ROOM_ID);
+  assert.deepEqual(first.map((row) => row.record_id), [ordinary.record_id, file.record_id]);
+  assert.equal(first[1].data_base64, bytes.toString('base64'));
+  const afterFirst = new Database(databasePath, { readonly: true });
+  assert.equal(afterFirst.pragma('user_version', { simple: true }), 2);
+  assert.equal(afterFirst.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='index' AND name IN ('records_thread_creation_key','records_thread_id')").get().count, 2);
+  afterFirst.close();
+
+  assert.deepEqual((await new CoworkStore(stateDir).read(ROOM_ID)).map((row) => row.record_id), [ordinary.record_id, file.record_id]);
+  const afterSecond = new Database(databasePath, { readonly: true });
+  assert.equal(afterSecond.pragma('user_version', { simple: true }), 2);
+  afterSecond.close();
+
+  assert.throws(() => {
+    const oldWriter = new Database(databasePath, { readonly: true });
+    try {
+      const version = oldWriter.pragma('user_version', { simple: true });
+      if (version !== 1) throw new Error(`unsupported room archive schema version ${version}`);
+    } finally {
+      oldWriter.close();
+    }
+  }, /unsupported room archive schema version 2/);
+});
+
+test('failed v1 migration rolls back DDL and schema version together', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
+  await store.create(room());
+  const accepted = await store.append(ROOM_ID, message(81, { source_msg_id: 81 }));
+  const databasePath = join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3');
+  downgradeArchiveToV1(databasePath);
+  const db = new Database(databasePath);
+  const rejected = {
+    ...intakeRejection('message', 81),
+    seq: 2,
+    record_id: `${ROOM_ID}:2`,
+  };
+  db.prepare(`INSERT INTO records
+    (seq,record_id,kind,at,payload_json,source_msg_id)
+    VALUES (?,?,?,?,?,?)`).run(2, rejected.record_id, rejected.kind, rejected.at, JSON.stringify(rejected), rejected.source_msg_id);
+  db.close();
+
+  await assert.rejects(new CoworkStore(stateDir).read(ROOM_ID), /unique|constraint/i);
+  const inspected = new Database(databasePath, { readonly: true });
+  assert.equal(inspected.pragma('user_version', { simple: true }), 1);
+  assert.equal(inspected.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='index' AND name IN ('records_thread_creation_key','records_thread_id')").get().count, 0);
+  const sourceIndex = inspected.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='records_source_message'").get().sql;
+  assert.match(sourceIndex, /kind='message'/);
+  assert.equal(inspected.prepare('SELECT COUNT(*) AS count FROM records').get().count, 2);
+  inspected.close();
+  assert.equal(accepted.seq, 1);
+});
+
+test('corrupt persisted thread fields fail strict archive decode', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
+  await store.create(room());
+  const threadId = message(91).message_id;
+  const participantId = '01jz6y7n8p9q0r1s2t3v4w5xa1';
+  const identity = 'A'.repeat(64);
+  const root = await store.append(ROOM_ID, message(91, {
+    author: { identity, display_name: 'A', role: 'builder' },
+    text: 'Thread: Decode', recipient_identities: [identity],
+    scope: { thread_id: threadId },
+    thread_root: {
+      schema_version: 1, thread_id: threadId, topic: 'Decode',
+      creator_participant_id: participantId,
+      members: [{ participant_id: participantId, identity }],
+      idempotency_key: 'decode-1', fingerprint: '2'.repeat(64),
+    },
+  }));
+  const databasePath = join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3');
+  const db = new Database(databasePath);
+  const payload = JSON.parse(db.prepare('SELECT payload_json FROM records WHERE seq = ?').get(root.seq).payload_json);
+  payload.thread_root.topic = ' Decode ';
+  db.prepare('UPDATE records SET payload_json = ? WHERE seq = ?').run(JSON.stringify(payload), root.seq);
+  db.close();
+  await assert.rejects(new CoworkStore(stateDir).read(ROOM_ID), /invalid record.*sequence 1/i);
+});
+
 test('later opens reject unknown schema versions without executing repair DDL', async (t) => {
   const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup); await store.create(room());
-  const path = join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3'); const db = new Database(path); db.pragma('user_version = 99'); db.close();
+  const path = join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3'); const db = new Database(path);
+  const indexes = db.prepare("SELECT name,sql FROM sqlite_master WHERE type='index' ORDER BY name").all();
+  db.pragma('user_version = 99'); db.close();
+  const archiveBytes = readFileSync(path);
   await assert.rejects(store.read(ROOM_ID), /unsupported room archive schema version 99/);
+  const inspected = new Database(path, { readonly: true });
+  assert.equal(inspected.pragma('user_version', { simple: true }), 99);
+  assert.deepEqual(inspected.prepare("SELECT name,sql FROM sqlite_master WHERE type='index' ORDER BY name").all(), indexes);
+  inspected.close();
+  assert.deepEqual(readFileSync(path), archiveBytes);
 });
 
 test('SQLite main, WAL, SHM, metadata, and blob files are forced private', async (t) => {

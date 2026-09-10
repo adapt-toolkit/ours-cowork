@@ -7,15 +7,19 @@ const ParticipantIdSchema = z.string().regex(
 const ContainerIdSchema = z.string()
   .regex(/^[0-9a-f]{64}$/i, 'must be a 64-character hexadecimal CID')
   .transform((value) => value.toUpperCase());
-const TopicSchema = z.string()
+const TopicTextSchema = z.string()
   .refine(
     (value) => Array.from(value).length >= 1
       && Array.from(value).length <= 120
       && value.trim().length > 0
       && !/[\p{Cc}\p{Cf}]/u.test(value),
     'topic must contain 1-120 Unicode characters without control or format characters',
-  )
-  .transform((value) => value.trim());
+  );
+const InputTopicSchema = TopicTextSchema.transform((value) => value.trim());
+const StoredTopicSchema = TopicTextSchema.refine(
+  (value) => value === value.trim(),
+  'stored topic must already be trimmed',
+);
 const IdempotencyKeySchema = z.string().regex(
   /^[A-Za-z0-9._:-]{1,128}$/,
   'must contain 1-128 portable idempotency-key characters',
@@ -29,7 +33,7 @@ export const ThreadMemberSchema = z.object({
 export const ThreadRootSchema = z.object({
   schema_version: z.literal(1),
   thread_id: ParticipantIdSchema,
-  topic: TopicSchema,
+  topic: StoredTopicSchema,
   creator_participant_id: ParticipantIdSchema,
   members: z.array(ThreadMemberSchema).min(1),
   idempotency_key: IdempotencyKeySchema,
@@ -73,7 +77,7 @@ export const ThreadScopeSchema = z.object({
 }).strict();
 
 export const StartThreadInputSchema = z.object({
-  topic: TopicSchema,
+  topic: InputTopicSchema,
   participant_ids: z.array(ParticipantIdSchema).min(1),
   idempotency_key: IdempotencyKeySchema,
 }).strict();

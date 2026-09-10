@@ -20,9 +20,24 @@ import { generateUlid } from './ulid.ts';
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
 const NO_FOLLOW = nodeFs.constants.O_NOFOLLOW ?? 0;
-const SQLITE_SCHEMA_VERSION = 1;
+const SQLITE_SCHEMA_VERSION = 2;
 const DEFAULT_WORK_BATCH_SIZE = 64;
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
+const SQLITE_V2_EXTENSION_DDL = `
+  CREATE UNIQUE INDEX IF NOT EXISTS records_thread_creation_key
+  ON records(json_extract(payload_json,'$.author.identity'),
+             json_extract(payload_json,'$.thread_root.idempotency_key'))
+  WHERE kind='message' AND json_type(payload_json,'$.thread_root')='object';
+  CREATE INDEX IF NOT EXISTS records_thread_id
+  ON records(json_extract(payload_json,'$.scope.thread_id'))
+  WHERE kind='message' AND json_type(payload_json,'$.scope')='object';
+  DROP INDEX IF EXISTS records_source_message;
+  DROP INDEX IF EXISTS records_source_file;
+  CREATE UNIQUE INDEX records_source_message ON records(source_msg_id)
+  WHERE source_msg_id IS NOT NULL;
+  CREATE UNIQUE INDEX records_source_file ON records(source_file_id)
+  WHERE source_file_id IS NOT NULL;
+`;
 
 export type CoworkFs = typeof nodeFs;
 
@@ -463,55 +478,67 @@ export class CoworkStore {
     try {
       this.secureSqliteFiles(path);
       db = new Database(path, { fileMustExist: !create });
+      const activeDb = db;
       if (guardFd !== undefined) this.validateOpenPath(guardFd, path, 'room archive database', 'file', true);
       this.fs.chmodSync(path, FILE_MODE);
-      db.pragma('journal_mode = WAL');
-      db.pragma('synchronous = FULL');
-      db.pragma('foreign_keys = ON');
-      db.pragma('busy_timeout = 5000');
+      const existingVersion = create
+        ? undefined
+        : activeDb.pragma('user_version', { simple: true }) as number;
+      if (existingVersion !== undefined && existingVersion !== 1 && existingVersion !== SQLITE_SCHEMA_VERSION) {
+        throw new CoworkStorageError(`unsupported room archive schema version ${existingVersion}`);
+      }
+      activeDb.pragma('journal_mode = WAL');
+      activeDb.pragma('synchronous = FULL');
+      activeDb.pragma('foreign_keys = ON');
+      activeDb.pragma('busy_timeout = 5000');
       if (create) {
-        db.exec(`CREATE TABLE records (
-        seq INTEGER PRIMARY KEY, record_id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, at TEXT NOT NULL,
-        payload_json TEXT NOT NULL, blob_path TEXT, message_id TEXT, file_id TEXT, intent_record_id TEXT,
-        recipient_identity TEXT, source_msg_id INTEGER, source_file_id INTEGER, category TEXT,
-        briefing_role TEXT, briefing_version INTEGER, membership_epoch INTEGER
-      );
-      CREATE TABLE record_recipients (
-        record_seq INTEGER NOT NULL REFERENCES records(seq) ON DELETE CASCADE,
-        recipient_identity TEXT NOT NULL, category TEXT, briefing_role TEXT,
-        briefing_version INTEGER, PRIMARY KEY(record_seq, recipient_identity)
-      );
-      CREATE TABLE relay_intent_work (
-        record_seq INTEGER NOT NULL REFERENCES records(seq) ON DELETE CASCADE,
-        recipient_identity TEXT NOT NULL, PRIMARY KEY(record_seq, recipient_identity)
-      );
-      CREATE INDEX relay_work_source ON relay_intent_work(record_seq, recipient_identity);
-      CREATE INDEX records_kind_seq ON records(kind, seq);
-      CREATE INDEX records_message ON records(message_id, kind, seq);
-      CREATE INDEX records_file ON records(file_id, kind, seq);
-      CREATE INDEX records_intent_result ON records(intent_record_id, kind);
-      CREATE INDEX records_relay_recipient ON records(kind, recipient_identity, seq);
-      CREATE UNIQUE INDEX records_source_message ON records(source_msg_id) WHERE kind='message' AND source_msg_id IS NOT NULL;
-      CREATE UNIQUE INDEX records_source_file ON records(source_file_id) WHERE kind='file' AND source_file_id IS NOT NULL;
-      CREATE INDEX records_briefing ON records(category, briefing_role, briefing_version, seq);
-      CREATE INDEX records_membership_epoch ON records(category, membership_epoch);
-      CREATE INDEX recipients_identity ON record_recipients(recipient_identity, record_seq);
-      CREATE INDEX recipients_briefing_delivery ON record_recipients
-        (recipient_identity, category, briefing_role, briefing_version, record_seq);`);
-        db.pragma(`user_version = ${SQLITE_SCHEMA_VERSION}`);
+        activeDb.transaction(() => {
+          activeDb.exec(`CREATE TABLE records (
+          seq INTEGER PRIMARY KEY, record_id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, at TEXT NOT NULL,
+          payload_json TEXT NOT NULL, blob_path TEXT, message_id TEXT, file_id TEXT, intent_record_id TEXT,
+          recipient_identity TEXT, source_msg_id INTEGER, source_file_id INTEGER, category TEXT,
+          briefing_role TEXT, briefing_version INTEGER, membership_epoch INTEGER
+        );
+        CREATE TABLE record_recipients (
+          record_seq INTEGER NOT NULL REFERENCES records(seq) ON DELETE CASCADE,
+          recipient_identity TEXT NOT NULL, category TEXT, briefing_role TEXT,
+          briefing_version INTEGER, PRIMARY KEY(record_seq, recipient_identity)
+        );
+        CREATE TABLE relay_intent_work (
+          record_seq INTEGER NOT NULL REFERENCES records(seq) ON DELETE CASCADE,
+          recipient_identity TEXT NOT NULL, PRIMARY KEY(record_seq, recipient_identity)
+        );
+        CREATE INDEX relay_work_source ON relay_intent_work(record_seq, recipient_identity);
+        CREATE INDEX records_kind_seq ON records(kind, seq);
+        CREATE INDEX records_message ON records(message_id, kind, seq);
+        CREATE INDEX records_file ON records(file_id, kind, seq);
+        CREATE INDEX records_intent_result ON records(intent_record_id, kind);
+        CREATE INDEX records_relay_recipient ON records(kind, recipient_identity, seq);
+        CREATE UNIQUE INDEX records_source_message ON records(source_msg_id) WHERE kind='message' AND source_msg_id IS NOT NULL;
+        CREATE UNIQUE INDEX records_source_file ON records(source_file_id) WHERE kind='file' AND source_file_id IS NOT NULL;
+        CREATE INDEX records_briefing ON records(category, briefing_role, briefing_version, seq);
+        CREATE INDEX records_membership_epoch ON records(category, membership_epoch);
+        CREATE INDEX recipients_identity ON record_recipients(recipient_identity, record_seq);
+        CREATE INDEX recipients_briefing_delivery ON record_recipients
+          (recipient_identity, category, briefing_role, briefing_version, record_seq);`);
+          activeDb.exec(SQLITE_V2_EXTENSION_DDL);
+          activeDb.pragma(`user_version = ${SQLITE_SCHEMA_VERSION}`);
+        }).immediate();
         this.reconciledBlobRooms.add(roomId);
       } else {
-        const version = db.pragma('user_version', { simple: true }) as number;
-        if (version !== SQLITE_SCHEMA_VERSION) {
-          throw new CoworkStorageError(`unsupported room archive schema version ${version}`);
+        if (existingVersion === 1) {
+          activeDb.transaction(() => {
+            activeDb.exec(SQLITE_V2_EXTENSION_DDL);
+            activeDb.pragma(`user_version = ${SQLITE_SCHEMA_VERSION}`);
+          }).immediate();
         }
         if (!this.reconciledBlobRooms.has(roomId)) {
-          this.reconcileBlobDirectory(roomId, db);
+          this.reconcileBlobDirectory(roomId, activeDb);
           this.reconciledBlobRooms.add(roomId);
         }
       }
       this.secureSqliteFiles(path);
-      const result = work(db);
+      const result = work(activeDb);
       this.secureSqliteFiles(path);
       return result;
     } catch (error) { throw this.wrap(`failed to access room "${roomId}" SQLite archive`, error); }

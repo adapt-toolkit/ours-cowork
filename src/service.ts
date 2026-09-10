@@ -49,6 +49,19 @@ import { createServiceRoutes, createPrivateServiceRoutes, classifyServiceError }
 import { ConsumerHandlers, ConsumerDefinitionSchema, type ConsumerConfiguration, type ConsumerDefinition, type StoredConsumerDefinition } from './consumer-commands.ts';
 import { SHARED_ROOM_COMMANDS } from './command-names.ts';
 import { generateUlid } from './ulid.ts';
+import { readReplyRows } from './reply-threading.ts';
+import {
+  StartThreadInputSchema,
+  ThreadFailure,
+  type ThreadError,
+  type ThreadRoot,
+} from './thread-contracts.ts';
+import { publicThreadMetadata, selectThreadMembers, threadFingerprint } from './threads.ts';
+
+const MAX_ROOM_MESSAGE_BYTES = 262_144;
+type StartThreadCommandResult =
+  | { ok: true; thread_id: string; status: 'accepted' }
+  | { ok: false; error: ThreadError | 'room_unavailable' };
 
 function byteBoundedHistoryPage<T>(records: T[]): T[] {
   const page: T[] = [];
@@ -395,10 +408,117 @@ export class RoomService {
         handler: (input, context) => this.invokeConsumerCommand(roomId, definition.name, input, context),
       })),
       sharedCommand: (name, input, context) => this.lock(roomId, () => this.sharedCommandUnlocked(roomId, name, input, context)),
+      startThread: async (input, context) => {
+        const result = await this.lock(roomId, () => this.startThreadCommandUnlocked(roomId, input, context));
+        if (result.ok === true) await this.intake.resumePending(roomId);
+        return result;
+      },
       listMembers: (input, context) => this.lock(roomId, () => this.listMembersCommandUnlocked(roomId, input, context)),
       removeMember: (input, context) => this.lock(roomId, () => this.removeMemberCommandUnlocked(roomId, input, context)),
     });
     this.publishedConsumerRevisions.set(roomId, registered.consumer_commands_revision ?? 0);
+  }
+
+  /** Called by the registered adapter while it owns the room mutex. */
+  private async startThreadCommandUnlocked(
+    roomId: string,
+    input: JsonValue,
+    context: Readonly<CommandContext>,
+  ): Promise<StartThreadCommandResult> {
+    const room = await this.store.load(roomId);
+    if (room.state !== 'active' || room.lifecycle_request?.state === 'pending') {
+      return { ok: false, error: 'room_unavailable' };
+    }
+    const creator = room.seats.find((seat) =>
+      seat.state === 'active' && seat.identity === context.sender_cid);
+    if (creator === undefined
+      || !this.hasRuntimeCommandGrant(room, context.sender_cid, 'start_thread')) {
+      return { ok: false, error: 'unauthorized' };
+    }
+    const parsed = StartThreadInputSchema.safeParse(input);
+    if (!parsed.success) return { ok: false, error: 'invalid_request' };
+    const request = parsed.data;
+    const rows = await readReplyRows(this.store, roomId);
+    const prior = rows.filter((row): row is MessageRecord =>
+      row.kind === 'message'
+      && row.thread_root !== undefined
+      && row.author.identity === context.sender_cid
+      && row.thread_root.idempotency_key === request.idempotency_key);
+    if (prior.length > 1) throw new Error('duplicate thread roots for creator idempotency key');
+    if (prior.length === 1) {
+      const root = prior[0]!;
+      if (root.thread_root!.creator_participant_id !== creator.participant_id) {
+        return { ok: false, error: 'unauthorized' };
+      }
+      if (root.thread_root!.fingerprint !== threadFingerprint(request)) {
+        return { ok: false, error: 'idempotency_conflict' };
+      }
+      return { ok: true, thread_id: root.message_id, status: 'accepted' };
+    }
+
+    let members;
+    try {
+      members = selectThreadMembers(room, context.sender_cid, request);
+    } catch (error) {
+      if (error instanceof ThreadFailure) return { ok: false, error: error.code };
+      throw error;
+    }
+    const threadId = LowerCrockfordUlidSchema.parse(this.nextMessageId());
+    const at = this.now();
+    const threadRoot: ThreadRoot = {
+      schema_version: 1,
+      thread_id: threadId,
+      topic: request.topic,
+      creator_participant_id: creator.participant_id,
+      members,
+      idempotency_key: request.idempotency_key,
+      fingerprint: threadFingerprint(request),
+    };
+    if (room.anonymous && creator.alias === undefined) {
+      throw new Error('anonymous thread creator is missing its room alias');
+    }
+    const root = {
+      version: 1 as const,
+      kind: 'message' as const,
+      room_id: roomId,
+      at,
+      message_id: threadId,
+      author: {
+        identity: creator.identity,
+        display_name: creator.display_name,
+        role: creator.role,
+      },
+      ...(room.anonymous ? {
+        author_alias: { participant_id: creator.participant_id, alias: creator.alias! },
+      } : {}),
+      category: 'chat' as const,
+      text: `Thread: ${request.topic}`,
+      recipient_identities: members.map((member) => member.identity),
+      scope: { thread_id: threadId },
+      thread_root: threadRoot,
+    };
+    const projected = {
+      version: 1 as const,
+      kind: 'room_msg' as const,
+      room_id: roomId,
+      room_name: room.room_name,
+      message_id: threadId,
+      author: room.anonymous ? {
+        identity: creator.participant_id,
+        display_name: creator.alias!,
+        role: creator.role,
+      } : root.author,
+      text: root.text,
+      at,
+      thread: { schema_version: 1 as const, thread_id: threadId },
+      thread_root: publicThreadMetadata(root, room),
+    };
+    if (Buffer.byteLength(JSON.stringify(projected), 'utf8') > MAX_ROOM_MESSAGE_BYTES) {
+      return { ok: false, error: 'invalid_request' };
+    }
+    const appended = await this.store.append(roomId, root);
+    if (appended.kind !== 'message') throw new Error('storage returned the wrong thread root kind');
+    return { ok: true, thread_id: appended.message_id, status: 'accepted' };
   }
 
   /** The SDK supplies authenticated context; arguments never select another room. */

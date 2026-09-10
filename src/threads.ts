@@ -12,6 +12,39 @@ import {
 
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 
+export interface PublicThreadMetadata {
+  schema_version: 1;
+  thread_id: string;
+  topic: string;
+  creator: { identity: string; display_name: string; role: string };
+  participant_ids: string[];
+  created_at: string;
+}
+
+export function publicThreadMetadata(
+  root: Pick<MessageRecord, 'at' | 'author' | 'author_alias' | 'message_id' | 'scope'>
+    & { thread_root: ThreadRoot },
+  room: Pick<Room, 'anonymous'>,
+): PublicThreadMetadata {
+  const creator = room.anonymous && root.author_alias !== undefined ? {
+    identity: root.author_alias.participant_id,
+    display_name: root.author_alias.alias,
+    role: root.author.role,
+  } : {
+    identity: root.author.identity,
+    display_name: root.author.display_name,
+    role: root.author.role,
+  };
+  return {
+    schema_version: 1,
+    thread_id: root.thread_root.thread_id,
+    topic: root.thread_root.topic,
+    creator,
+    participant_ids: root.thread_root.members.map((member) => member.participant_id),
+    created_at: root.at,
+  };
+}
+
 export function selectThreadMembers(
   room: Room,
   cid: string,

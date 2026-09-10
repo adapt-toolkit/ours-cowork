@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import Ajv from 'ajv';
 import { OursError } from '@ours.network/sdk';
 import {
   ContactAlreadyAbsentError,
@@ -13,6 +14,7 @@ import {
   SdkRoomPacket,
 } from '../src/packets.ts';
 import { SharedOursHost } from '../src/ours-runtime.ts';
+import { StartThreadInputSchema } from '../src/thread-contracts.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const IDENTITY = 'ours-cowork:Room 01jz6y7n';
@@ -399,24 +401,71 @@ test('SDK room packet publishes only the bounded membership commands and keeps h
   };
   const packet = new SdkRoomPacket(IDENTITY, CID, client);
   const handlers = {
+    startThread: async () => ({ ok: true }),
     listMembers: async () => ({ ok: true }),
     removeMember: async () => ({ ok: true }),
   };
   await packet.registerRuntimeCommands(handlers);
   assert.deepEqual(client.registeredCommands.map((command) => command.name), [
-    'list-members', 'remove-member',
+    'start_thread', 'list-members', 'remove-member',
   ]);
   assert.equal(client.registeredCommands.some((command) => command.name === 'add-seat'), false);
-  assert.equal(client.registeredCommands[0].handler, handlers.listMembers);
-  assert.equal(client.registeredCommands[1].handler, handlers.removeMember);
-  assert.deepEqual(client.registeredCommands[0].input_schema, {
+  assert.equal(client.registeredCommands[0].handler, handlers.startThread);
+  assert.equal(client.registeredCommands[1].handler, handlers.listMembers);
+  assert.equal(client.registeredCommands[2].handler, handlers.removeMember);
+  assert.deepEqual(client.registeredCommands[1].input_schema, {
     type: 'object', additionalProperties: false,
   });
-  assert.deepEqual(client.registeredCommands[1].input_schema.required, [
+  assert.deepEqual(client.registeredCommands[2].input_schema.required, [
     'participant_id', 'expected_membership_epoch', 'confirm',
   ]);
-  assert.deepEqual(client.registeredCommands[1].input_schema.properties.confirm, { const: true });
+  assert.deepEqual(client.registeredCommands[2].input_schema.properties.confirm, { const: true });
   assert.equal(client.calls.filter(([name]) => name === 'chooseIdentity').length, 1);
+});
+
+test('start_thread catalog and server schema accept the same Unicode topic boundaries', async () => {
+  const client = blankClient();
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  const contexts = [];
+  const handlers = {
+    startThread: async (input, context) => {
+      contexts.push(context);
+      return { ok: true, normalized_topic: StartThreadInputSchema.parse(input).topic };
+    },
+    listMembers: async () => ({ ok: true }),
+    removeMember: async () => ({ ok: true }),
+  };
+  await packet.registerRuntimeCommands(handlers);
+  const command = client.registeredCommands.find(({ name }) => name === 'start_thread');
+  assert(command);
+  assert.deepEqual(command.input_schema.required, ['topic', 'participant_ids', 'idempotency_key']);
+  assert.deepEqual(Object.keys(command.input_schema.properties).sort(), [
+    'idempotency_key', 'participant_ids', 'topic',
+  ]);
+  assert.equal(command.input_schema.additionalProperties, false);
+  const validate = new Ajv({ strict: true, validateFormats: false, unicodeRegExp: true }).compile(command.input_schema);
+  const base = { participant_ids: [ROOM_ID], idempotency_key: 'request-1' };
+  const cases = [
+    ['61 emoji', '😀'.repeat(61), true],
+    ['120 emoji', '😀'.repeat(120), true],
+    ['121 emoji', '😀'.repeat(121), false],
+    ['whitespace', ' \t ', false],
+    ['NUL', 'bad\u0000topic', false],
+    ['format', 'bad\u200btopic', false],
+    ['padded', ' Review ', true],
+    ['padded raw limit', ` ${'x'.repeat(118)} `, true],
+    ['padded above raw limit', ` ${'x'.repeat(119)} `, false],
+  ];
+  for (const [label, topic, expected] of cases) {
+    const input = { ...base, topic };
+    assert.equal(validate(input), expected, `${label}: catalog`);
+    assert.equal(StartThreadInputSchema.safeParse(input).success, expected, `${label}: server`);
+  }
+  const context = Object.freeze({ sender_cid: CID, sender_name: 'Peer', request_wire_id: 'wire-command' });
+  assert.deepEqual(await command.handler({ ...base, topic: ' Review ' }, context), {
+    ok: true, normalized_topic: 'Review',
+  });
+  assert.equal(contexts[0], context);
 });
 
 test('SDK room packet drains typed rows without exposing them as chat or losing a raced text row', async () => {

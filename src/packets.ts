@@ -56,6 +56,7 @@ export interface RoomRuntimeCommandHandlers {
   consumerCommands?: Array<{ name: string; description: string; input_schema: Record<string, JsonValue>; handler(input: JsonValue, context: Readonly<CommandContext>): Promise<JsonValue> }>;
   shouldPause?(): Promise<boolean>;
   sharedCommand?(name: typeof SHARED_ROOM_COMMANDS[number], input: JsonValue, context: Readonly<CommandContext>): Promise<JsonValue>;
+  startThread?(input: JsonValue, context: Readonly<CommandContext>): Promise<JsonValue>;
   listMembers(
     input: JsonValue,
     context: Readonly<CommandContext>,
@@ -508,6 +509,34 @@ export class SdkRoomPacket implements RoomPacket {
     this.runtimeHandlers = handlers;
     await this.runBound(() => this.client.registerCommands([
       ...(handlers.consumerCommands ?? []),
+      ...(handlers.startThread === undefined ? [] : [{
+        name: 'start_thread',
+        description: 'Create a scoped reply thread for an explicit set of room participant IDs.',
+        input_schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['topic', 'participant_ids', 'idempotency_key'],
+          properties: {
+            topic: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 120,
+              pattern: '^(?![\\s\\S]*[\\p{Cc}\\p{Cf}])[\\s\\S]*\\S[\\s\\S]*$',
+            },
+            participant_ids: {
+              type: 'array',
+              minItems: 1,
+              uniqueItems: true,
+              items: { type: 'string', pattern: '^[0-7][0-9a-hjkmnp-tv-z]{25}$' },
+            },
+            idempotency_key: {
+              type: 'string',
+              pattern: '^[A-Za-z0-9._:-]{1,128}$',
+            },
+          },
+        },
+        handler: handlers.startThread,
+      }]),
       {
         name: 'list-members',
         description: 'List the room roster using contact-safe member fields.',

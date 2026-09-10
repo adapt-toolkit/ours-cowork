@@ -99,3 +99,81 @@ test('source author without source wire falls back to eligible own relay', () =>
   const evidence = [p, ...rows.slice(1), ...pair(8, 'A', 'w_aA')];
   assert.deepEqual(selectReply(evidence, 'R', item('L_b', 12, 'B', 'w_b', [], 'w_aB1'), 'A').replyTo, { wire_id: 'w_aA' });
 });
+
+test('invalid intent tuples, subject kinds, and record order never establish aliases', () => {
+  const child = item('L_b', 20, 'B', 'w_b', [], 'bad');
+  const invalid = [
+    [parent,
+      { ...pair(2, 'B', 'bad')[0], recipient_identity: 'C' },
+      pair(2, 'B', 'bad')[1]],
+    [parent,
+      pair(2, 'B', 'bad')[0],
+      { ...pair(2, 'B', 'bad')[1], message_id: 'L_other' }],
+    [parent,
+      { ...pair(2, 'B', 'bad')[0], message_id: undefined, file_id: 'L_a' },
+      pair(2, 'B', 'bad')[1]],
+    [parent,
+      { ...pair(2, 'B', 'bad')[0], seq: 9 },
+      { ...pair(2, 'B', 'bad')[1], seq: 8 }],
+    [{ ...parent, seq: 2 }, ...pair(2, 'B', 'bad')],
+    [{ ...parent, recipient_identities: ['C'] }, ...pair(2, 'B', 'bad')],
+    [parent,
+      pair(2, 'B', 'bad')[0],
+      { ...pair(2, 'B', 'bad')[0], seq: 3 },
+      { ...pair(2, 'B', 'bad')[1], seq: 4 }],
+  ];
+  for (const evidence of invalid) {
+    assert.equal(selectReply(evidence, 'R', child, 'A').state, 'unknown_parent');
+  }
+});
+
+test('source aliases are scoped to their authenticated author and room', () => {
+  const sameWireOtherRoom = { ...parent, room_id: 'OTHER' };
+  assert.equal(selectReply([parent], 'R', item('L_b', 10, 'B', 'w_b', [], 'w_a'), 'C').state,
+    'unknown_parent');
+  assert.equal(selectReply([sameWireOtherRoom], 'R', item('L_b', 10, 'A', 'w_b', [], 'w_a'), 'C').state,
+    'unknown_parent');
+});
+
+test('one participant-scoped relay wire claimed by distinct originals is ambiguous', () => {
+  const other = item('L_other', 8, 'X', 'w_x', ['B', 'C']);
+  const otherCopy = pair(9, 'B', 'w_aB1').map(row => ({ ...row, message_id: 'L_other' }));
+  const child = item('L_b', 20, 'B', 'w_b', [], 'w_aB1');
+  assert.equal(selectReply([...rows, other, ...otherCopy], 'R', child, 'A').state,
+    'ambiguous_parent');
+});
+
+test('forward and self references are unavailable evidence', () => {
+  const future = item('L_future', 12, 'B', 'future-wire', ['A']);
+  const forwardChild = item('L_child', 10, 'B', 'child-wire', ['A'], 'future-wire');
+  const self = item('L_self', 10, 'B', 'self-wire', ['A'], 'self-wire');
+  assert.equal(selectReply([future], 'R', forwardChild, 'A').state, 'unknown_parent');
+  assert.equal(selectReply([self], 'R', self, 'A').state, 'unknown_parent');
+});
+
+test('earliest eligible file result selects metadata fallback while every file wire remains an inbound alias', () => {
+  const file = { ...parent, kind: 'file', file_id: 'F_a', source_wire_id: 'f_a' };
+  delete file.message_id;
+  const early = pair(2, 'C', undefined).map(r => {
+    const out = { ...r, file_id: 'F_a' }; delete out.message_id;
+    if (out.kind === 'relay_result') out.metadata_wire_id = 'notice-C';
+    return out;
+  });
+  const later = pair(4, 'C', 'binary-C').map(r => {
+    const out = { ...r, file_id: 'F_a' }; delete out.message_id;
+    if (out.kind === 'relay_result') out.metadata_wire_id = 'later-notice-C';
+    return out;
+  });
+  const bCopy = pair(6, 'B', 'binary-B').map(r => {
+    const out = { ...r, file_id: 'F_a' }; delete out.message_id;
+    if (out.kind === 'relay_result') out.metadata_wire_id = 'notice-B';
+    return out;
+  });
+  const evidence = [file, ...early, ...later, ...bCopy];
+  const fromB = item('L_b', 20, 'B', 'w_b', [], 'binary-B');
+  assert.deepEqual(selectReply(evidence, 'R', fromB, 'C').replyTo, { wire_id: 'notice-C' });
+  for (const alias of ['notice-C', 'binary-C', 'later-notice-C']) {
+    assert.equal(selectReply(evidence, 'R', item('L_c', 21, 'C', 'w_c', [], alias), 'A').parentKey,
+      'file:F_a');
+  }
+});

@@ -893,3 +893,71 @@ test('legacy v2 metadata canonicalizes names and defaults persisted fields', asy
   const loaded = await store.load(ROOM_ID); assert.equal(loaded.room_name, 'Café launch'); assert.deepEqual(loaded.rest_roles, []);
   const persisted = JSON.parse(readFileSync(join(roomDir, 'room.json'), 'utf8')); assert.equal(persisted.room_name, 'Café launch'); assert.deepEqual(persisted.rest_roles, []);
 });
+
+test('thread file refusal survives SQLite restart with no blob, fanout, or repeated notice', async (t) => {
+  const { IntakePump } = await import('../src/intake.ts');
+  const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
+  const seats = ['A', 'B', 'C'].map((letter, i) => ({
+    identity: letter.repeat(64), display_name: letter, role: 'builder', invite_id: `invite-${letter}`,
+    accepted_at: AT, participant_id: `01jz6y7n8p9q0r1s2t3v4w5xa${i + 1}`, state: 'active',
+  }));
+  await store.create(room({ state: 'active', activated_at: AT, seats }));
+  const rootId = message(80).message_id;
+  const members = seats.slice(0, 2).map(({ identity, participant_id }) => ({ identity, participant_id }));
+  await store.append(ROOM_ID, message(80, {
+    text: 'Thread: Private review',
+    author: { identity: seats[0].identity, display_name: 'A', role: 'builder' },
+    recipient_identities: members.map(m => m.identity), scope: { thread_id: rootId },
+    thread_root: { schema_version: 1, thread_id: rootId, topic: 'Private review',
+      creator_participant_id: seats[0].participant_id, members, idempotency_key: 'root-key', fingerprint: '0'.repeat(64) },
+  }));
+  for (const member of members) {
+    const intent = await store.append(ROOM_ID, { version: 1, kind: 'relay_intent', room_id: ROOM_ID, at: AT,
+      message_id: rootId, recipient_identity: member.identity });
+    await store.append(ROOM_ID, { version: 1, kind: 'relay_result', room_id: ROOM_ID, at: AT,
+      message_id: rootId, recipient_identity: member.identity, intent_record_id: intent.record_id,
+      status: 'queued', wire_id: `root-${member.identity[0]}` });
+  }
+  // The newest archive record is deliberately outside readReplyRows' filtered kinds.
+  await store.append(ROOM_ID, intakeRejection('message', 81));
+  const item = { file_id: 82, sender_id: seats[1].identity, sender_name: 'Untrusted',
+    filename: 'secret-file.txt', mime: 'text/plain', data: Buffer.from('secret bytes'), date: AT,
+    wire_id: 'source-file-82', reply_to: { wire_id: 'root-B' } };
+  const files = [item], sends = [], fileSends = [];
+  let crashAtAck = true;
+  const packet = {
+    listUnreadMessages: async () => [], listUnreadFiles: async () => files,
+    acknowledgeFile: async () => { if (crashAtAck) throw new Error('crash before ACK'); files.length = 0; },
+    send: async (recipient, body) => { sends.push({ recipient, body }); return { status: 'queued', wire_id: 'private-error' }; },
+    sendFile: async (...args) => { fileSends.push(args); throw new Error('must not send private file'); },
+  };
+  const query = store.query.bind(store), queries = [];
+  store.query = async (id, options) => { queries.push(options); return query(id, options); };
+  const registry = { get: () => packet };
+  const pump = new IntakePump(store, registry, { now: () => AT, messageId: () => message(83).message_id });
+  await assert.rejects(pump.pump(ROOM_ID), /crash before ACK/);
+  assert.equal(files.length, 1);
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].recipient, seats[1].identity);
+  assert.equal(JSON.parse(sends[0].body).text, 'thread_files_unsupported');
+  assert.deepEqual(fileSends, []);
+  assert(queries.some(q => q.descending === true && q.limit === 1 && q.kind === undefined));
+  assert.deepEqual(readdirSync(join(stateDir, 'rooms', ROOM_ID, 'blobs')), []);
+  const reopened = new CoworkStore(stateDir);
+  const [refusal] = await reopened.query(ROOM_ID, { sourceFileId: 82, limit: 1 });
+  assert.equal(refusal.kind, 'intake_rejection');
+  assert.equal(refusal.notification_attempt_claimed, true);
+  assert.equal(refusal.sender_participant_id, seats[1].participant_id);
+  assert.deepEqual(await reopened.recordsNeedingRelayIntents(ROOM_ID), []);
+  assert.deepEqual(await reopened.recipients(ROOM_ID, refusal.seq), []);
+  for (const secret of [rootId, 'root-B', 'secret-file', 'secret bytes', seats[0].identity, seats[2].identity]) {
+    assert.equal(JSON.stringify(refusal).includes(secret), false);
+    assert.equal(sends[0].body.includes(secret), false);
+  }
+  crashAtAck = false;
+  await new IntakePump(reopened, registry, { now: () => AT }).pump(ROOM_ID);
+  assert.equal(files.length, 0);
+  assert.equal(sends.length, 1);
+  assert.equal((await reopened.query(ROOM_ID, { sourceFileId: 82 })).length, 1);
+  assert.deepEqual(readdirSync(join(stateDir, 'rooms', ROOM_ID, 'blobs')), []);
+});

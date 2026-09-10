@@ -56,6 +56,14 @@ In an anonymous room, the notice text names only the room-scoped alias; it inclu
 
 Cowork history records include messages, files, and the durable relay intent/result trail used for restart recovery. This application archive is distinct from the shared daemon's per-identity `history.sqlite3` and immutable blob store; neither is a substitute backup for the other.
 
+## Reply threading
+
+A reply is broadcast to the other active room participants, with no sender echo. The parent author receives a reference to their original source message or file; other participants receive a reference to their own recorded room copy. Multiple recorded copies remain aliases of one logical original. For files, both the metadata notice and binary copy can identify that original.
+
+Cowork derives these relationships from its existing archive. If a parent or a recipient's copy cannot be resolved, it delivers the answer without a transport parent and retains the incoming source reference. It does not replay history or scan SDK history to repair links. Queued records do not guarantee that a recipient still has the parent, and a wire lost before result persistence can remain unresolved. Existing retry behavior can create distinct transport copies.
+
+Reply translation changes transport metadata only. Room JSON bodies and version-one archive formats remain unchanged; incoming sentence references are retained but translated outgoing references use only the selected wire ID. Existing history views retain their logical-record/audit separation; reading history does not send messages. Ordinary clients can use their existing native reply handling without implementing Cowork mapping logic.
+
 The web console projects participant and room-authored messages plus the briefing into Communication. Relay, file, recovery, close, and failure records are excluded from chat and shown in Events; Archive retains the complete ordered record stream, including archived file bytes. Messages appear only after the authoritative history refresh observes them.
 
 Version one polls rather than receiving pushed updates: the room list refreshes every five seconds, while the selected room, participants, and history refresh every two seconds. Polling pauses in a hidden tab, coalesces overlap, and refreshes after confirmed mutations. CLI history remains the fallback when a browser is unavailable.

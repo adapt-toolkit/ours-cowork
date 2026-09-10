@@ -179,3 +179,31 @@ test('earliest eligible file result selects metadata fallback while every file w
       'file:F_a');
   }
 });
+
+test('a newer original owning the inbound alias still makes parent lookup ambiguous', () => {
+  const newer = item('L_newer', 12, 'X', 'w_x', ['B']);
+  const newerCopy = pair(13, 'B', 'w_aB1').map(row => ({ ...row, message_id: 'L_newer' }));
+  const child = item('L_b', 10, 'B', 'w_b', [], 'w_aB1');
+  assert.equal(selectReply([...rows, newer, ...newerCopy], 'R', child, 'A').state,
+    'ambiguous_parent');
+});
+
+test('a newer original owning the selected outgoing source wire rejects that wire', () => {
+  const p = item('L_a', 1, 'X', 'w_x', ['A', 'B']);
+  const ownCopy = pair(4, 'A', 'w_aA');
+  const newer = item('L_newer', 12, 'A', 'w_aA', ['B']);
+  const child = item('L_b', 10, 'B', 'w_b', [], 'w_xB1');
+  const parentCopy = pair(2, 'B', 'w_xB1');
+  assert.equal(selectReply([p, ...parentCopy, ...ownCopy, newer], 'R', child, 'A').state,
+    'ambiguous_parent');
+});
+
+test('conflicting source wire falls back to the parent author eligible relay copy', () => {
+  const p = item('L_a', 1, 'A', 'w_a', ['A', 'B']);
+  const evidence = [p, ...pair(2, 'B', 'w_aB1'), ...pair(4, 'A', 'w_aA'),
+    item('L_other', 8, 'A', 'w_a', [])];
+  const child = item('L_b', 10, 'B', 'w_b', [], 'w_aB1');
+  assert.deepEqual(selectReply(evidence, 'R', child, 'A'), {
+    state: 'linked', parentKey: 'message:L_a', replyTo: { wire_id: 'w_aA' },
+  });
+});

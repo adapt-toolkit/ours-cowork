@@ -58,27 +58,32 @@ export function selectReply(
   }).sort((a, b) => a.seq - b.seq);
   const wires = (r: Result, parent: Item): string[] =>
     [r.wire_id, ...(parent.kind === 'file' ? [r.metadata_wire_id] : [])].filter(nonempty);
-  const candidates = items.filter(parent => parent.seq < child.seq && (
+  const ownersFor = (wireId: string, cid: string): Item[] => items.filter(item => (
+    (item.author.identity === cid && item.source_wire_id === wireId)
+    || copies(item, cid).some(result => wires(result, item).includes(wireId))
+  ));
+  const candidates = items.filter(parent => (
     (parent.author.identity === child.author.identity && parent.source_wire_id === incoming)
     || copies(parent, child.author.identity).some(result => wires(result, parent).includes(incoming))
   ));
   if (candidates.length === 0) return { state: 'unknown_parent' };
   if (candidates.length !== 1) return { state: 'ambiguous_parent' };
   const parent = candidates[0]!;
+  if (parent.seq >= child.seq) return { state: 'unknown_parent' };
   const parentKey = key(parent)!;
   // Duplicate logical source rows are corruption, even if only one matched this wire.
   if (items.filter(item => key(item) === parentKey).length !== 1) {
     return { state: 'ambiguous_parent' };
   }
   const recipientCopies = copies(parent, recipientCid);
-  const wireId = parent.author.identity === recipientCid && nonempty(parent.source_wire_id)
-    ? parent.source_wire_id
+  const sourceWire = parent.author.identity === recipientCid && nonempty(parent.source_wire_id)
+    ? parent.source_wire_id : undefined;
+  const sourceOwners = sourceWire === undefined ? [] : ownersFor(sourceWire, recipientCid);
+  const wireId = sourceOwners.length === 1 && key(sourceOwners[0]!) === parentKey
+    ? sourceWire
     : recipientCopies.map(copy => wires(copy, parent)[0]).find(nonempty);
   if (!nonempty(wireId)) return { state: 'missing_copy', parentKey };
-  const owners = items.filter(item => item.seq < child.seq && (
-    (item.author.identity === recipientCid && item.source_wire_id === wireId)
-    || copies(item, recipientCid).some(result => wires(result, item).includes(wireId))
-  ));
+  const owners = ownersFor(wireId, recipientCid);
   if (owners.length !== 1 || key(owners[0]!) !== parentKey) {
     return { state: 'ambiguous_parent', parentKey };
   }

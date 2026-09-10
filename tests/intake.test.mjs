@@ -1483,16 +1483,21 @@ test('role-authored messages in anonymous rooms inherit the room-voice exemption
 
 test('history views: participant redacts to alias form and drops identities; operator keeps both', async () => {
   const f = fixture({ room: anonymousRoom() });
-  f.packet.inbox.push(incoming());
+  const sourceReply = { wire_id: 'private-parent-wire', sentence: 3 };
+  f.packet.inbox.push(incoming({ reply_to: sourceReply }));
   await f.pump.pump(ROOM_ID);
+  f.packet.sendCalls.length = 0;
 
   const operatorView = await f.service.history(ROOM_ID, {});
+  assert.equal(f.packet.sendCalls.length, 0);
   assert.equal(operatorView.some((record) => record.kind === 'relay_intent'), true);
   const operatorMessage = operatorView.find((record) => record.kind === 'message');
   assert.equal(operatorMessage.author.identity, 'cid-alice');
   assert.equal(operatorMessage.author_alias.alias, 'builder #1');
+  assert.deepEqual(operatorMessage.source_reply_to, sourceReply);
 
   const participantView = await f.service.history(ROOM_ID, { view: 'participant' });
+  assert.equal(f.packet.sendCalls.length, 0);
   assert.equal(participantView.length, 1);
   const [redacted] = participantView;
   assert.equal(redacted.kind, 'message');
@@ -1505,18 +1510,23 @@ test('history views: participant redacts to alias form and drops identities; ope
   assert.equal('recipient_identities' in redacted, false);
   assert.equal('source_msg_id' in redacted, false);
   assert.equal('source_wire_id' in redacted, false);
+  assert.equal('source_reply_to' in redacted, false);
   const rendered = Buffer.from(JSON.stringify(participantView), 'utf8');
-  for (const leak of ['cid-alice', 'cid-bob', 'cid-cara', 'Alice', 'Untrusted current name']) {
+  for (const leak of ['cid-alice', 'cid-bob', 'cid-cara', 'Alice', 'Untrusted current name',
+    sourceReply.wire_id]) {
     assert.equal(rendered.includes(leak), false, `${leak} leaked into the participant history view`);
   }
 
   // non-anonymous participant view keeps real authors but still drops routing identities
   const plain = fixture();
-  plain.packet.inbox.push(incoming());
+  plain.packet.inbox.push(incoming({ reply_to: sourceReply }));
   await plain.pump.pump(ROOM_ID);
+  plain.packet.sendCalls.length = 0;
   const plainView = await plain.service.history(ROOM_ID, { view: 'participant' });
+  assert.equal(plain.packet.sendCalls.length, 0);
   assert.equal(plainView[0].author.identity, 'cid-alice');
   assert.equal('recipient_identities' in plainView[0], false);
+  assert.equal('source_reply_to' in plainView[0], false);
 });
 
 // ---- Removed members at intake ---------------------------------------------

@@ -373,6 +373,11 @@ test('communication records form a strict discriminated version-1 union', () => 
   }));
   for (const record of records) assert.equal(CommunicationRecordSchema.parse(record).kind, record.kind);
 
+  const { source_wire_id: _sourceWire, source_reply_to: _sourceReply, ...legacyMessage } = message;
+  assert.deepEqual(CommunicationRecordSchema.parse(legacyMessage), legacyMessage);
+  const { wire_id: _resultWire, metadata_wire_id: _metadataWire, ...legacyResult } = records[1];
+  assert.deepEqual(CommunicationRecordSchema.parse(legacyResult), legacyResult);
+
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, version: 2 }));
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, kind: 'delivery_result' }));
   assert.throws(() => CommunicationRecordSchema.parse({ ...message, record_id: `${ROOM_ID}:2` }));
@@ -411,6 +416,8 @@ test('file archive records bind canonical bytes, size, digest, and one relay sub
     source_reply_to: { wire_id: 'wire-parent-file' },
   };
   assert.equal(CommunicationRecordSchema.parse(file).kind, 'file');
+  const { source_wire_id: _sourceWire, source_reply_to: _sourceReply, ...legacyFile } = file;
+  assert.deepEqual(CommunicationRecordSchema.parse(legacyFile), legacyFile);
   assert.throws(() => CommunicationRecordSchema.parse({ ...file, size: bytes.length + 1 }), /size/i);
   assert.throws(() => CommunicationRecordSchema.parse({ ...file, sha256: '0'.repeat(64) }), /sha256/i);
   assert.throws(() => CommunicationRecordSchema.parse({ ...file, data_base64: `${file.data_base64}=` }), /base64/i);

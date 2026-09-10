@@ -7,6 +7,7 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 
 import { CoworkStore } from '../src/storage.ts';
+import { readReplyRows, selectReply } from '../src/reply-threading.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const AT = '2026-08-02T10:11:12.345Z';
@@ -200,6 +201,136 @@ test('file bytes live in immutable external blobs while selected projections ret
   const db = new Database(join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3'), { readonly: true });
   assert.equal(db.prepare('SELECT payload_json FROM records WHERE seq=?').get(file.seq).payload_json.includes('data_base64'), false);
   db.close();
+});
+
+test('reply associations survive complete paginated SQLite reads and store reinstantiation', async (t) => {
+  const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
+  await store.create(room());
+
+  const appendPair = async (activeStore, subject, recipient, wires) => {
+    const subjectKey = subject.kind === 'file'
+      ? { file_id: subject.file_id } : { message_id: subject.message_id };
+    const intent = await activeStore.append(ROOM_ID, {
+      version: 1, kind: 'relay_intent', room_id: ROOM_ID, at: AT,
+      ...subjectKey, recipient_identity: recipient,
+    });
+    return activeStore.append(ROOM_ID, {
+      version: 1, kind: 'relay_result', room_id: ROOM_ID, at: AT,
+      intent_record_id: intent.record_id, ...subjectKey, recipient_identity: recipient,
+      status: 'queued', ...wires,
+    });
+  };
+  const parent = await store.append(ROOM_ID, message(700, {
+    text: 'canonical parent', source_msg_id: 700, source_wire_id: 'source-parent-alice',
+    recipient_identities: ['cid-bob', 'cid-cara'],
+  }));
+  for (let index = 0; index < 66; index += 1) {
+    await store.append(ROOM_ID, message(1000 + index, { recipient_identities: [] }));
+  }
+  await appendPair(store, parent, 'cid-bob', { wire_id: 'parent-bob-1' });
+  await appendPair(store, parent, 'cid-bob', { wire_id: 'parent-bob-2' });
+  await appendPair(store, parent, 'cid-cara', { wire_id: 'parent-cara-1' });
+
+  const fileBytes = Buffer.from('durable file payload '.repeat(4096));
+  const { createHash } = await import('node:crypto');
+  const file = await store.append(ROOM_ID, {
+    version: 1, kind: 'file', room_id: ROOM_ID, at: AT,
+    file_id: '01jz6y7n8p9q0r1s2t3v4w5800',
+    author: { identity: 'cid-alice', display_name: 'Alice', role: 'researcher' },
+    filename: 'archive-evidence.txt', mime: 'text/plain', size: fileBytes.length,
+    sha256: createHash('sha256').update(fileBytes).digest('hex'),
+    data_base64: fileBytes.toString('base64'), recipient_identities: ['cid-bob', 'cid-cara'],
+    source_file_id: 800, source_wire_id: 'source-file-alice',
+  });
+  for (let index = 0; index < 66; index += 1) {
+    await store.append(ROOM_ID, message(1100 + index, { recipient_identities: [] }));
+  }
+  await appendPair(store, file, 'cid-bob', {
+    wire_id: 'file-bob-binary', metadata_wire_id: 'file-bob-notice',
+  });
+  await appendPair(store, file, 'cid-cara', { metadata_wire_id: 'file-cara-notice-1' });
+  await appendPair(store, file, 'cid-cara', {
+    wire_id: 'file-cara-binary-2', metadata_wire_id: 'file-cara-notice-2',
+  });
+  const child = await store.append(ROOM_ID, message(701, {
+    author: { identity: 'cid-bob', display_name: 'Bob', role: 'reviewer' },
+    text: 'canonical reply', source_msg_id: 701, source_wire_id: 'source-child-bob',
+    source_reply_to: { wire_id: 'parent-bob-2', sentence: 4 },
+    recipient_identities: ['cid-alice', 'cid-cara'],
+  }));
+
+  const requestedPages = [];
+  const fullRows = await readReplyRows({
+    read(roomId, options) {
+      requestedPages.push({ ...options });
+      return store.read(roomId, options);
+    },
+  }, ROOM_ID);
+  assert(fullRows.length > 64);
+  assert(requestedPages.every((page) => page.limit === 64));
+  assert.deepEqual(requestedPages.map((page) => page.after), [0, 64, 128, child.seq]);
+  assert.deepEqual(fullRows.map((record) => record.seq),
+    Array.from({ length: child.seq }, (_, index) => index + 1));
+  assert.equal(fullRows.find((record) => record.record_id === file.record_id).data_base64, '');
+  assert.equal((await store.read(ROOM_ID)).find((record) => record.record_id === file.record_id).data_base64,
+    fileBytes.toString('base64'));
+
+  const choices = (rows) => ({
+    firstBobAliasToAlice: selectReply(rows, ROOM_ID,
+      { ...child, source_reply_to: { wire_id: 'parent-bob-1' } }, 'cid-alice'),
+    secondBobAliasToAlice: selectReply(rows, ROOM_ID, child, 'cid-alice'),
+    firstBobAliasToCara: selectReply(rows, ROOM_ID,
+      { ...child, source_reply_to: { wire_id: 'parent-bob-1' } }, 'cid-cara'),
+    secondBobAliasToCara: selectReply(rows, ROOM_ID, child, 'cid-cara'),
+    sourceAliasToCara: selectReply(rows, ROOM_ID, {
+      ...child, author: parent.author, source_reply_to: { wire_id: 'source-parent-alice' },
+    }, 'cid-cara'),
+    fileBinaryToAlice: selectReply(rows, ROOM_ID,
+      { ...child, source_reply_to: { wire_id: 'file-bob-binary' } }, 'cid-alice'),
+    fileNoticeToCara: selectReply(rows, ROOM_ID,
+      { ...child, source_reply_to: { wire_id: 'file-bob-notice' } }, 'cid-cara'),
+  });
+  const beforeRestart = choices(fullRows);
+  assert.deepEqual(beforeRestart.firstBobAliasToAlice.replyTo, { wire_id: 'source-parent-alice' });
+  assert.deepEqual(beforeRestart.secondBobAliasToAlice, beforeRestart.firstBobAliasToAlice);
+  assert.deepEqual(beforeRestart.firstBobAliasToCara.replyTo, { wire_id: 'parent-cara-1' });
+  assert.deepEqual(beforeRestart.secondBobAliasToCara.replyTo, { wire_id: 'parent-cara-1' });
+  assert.deepEqual(beforeRestart.sourceAliasToCara.replyTo, { wire_id: 'parent-cara-1' });
+  assert.deepEqual(beforeRestart.fileBinaryToAlice.replyTo, { wire_id: 'source-file-alice' });
+  assert.deepEqual(beforeRestart.fileNoticeToCara.replyTo, { wire_id: 'file-cara-notice-1' });
+  const unknownChild = { ...child, source_reply_to: { wire_id: 'never-recorded' } };
+  assert.deepEqual(selectReply(fullRows, ROOM_ID, unknownChild, 'cid-alice'),
+    { state: 'unknown_parent' });
+
+  const restarted = new CoworkStore(stateDir);
+  const shortPages = [];
+  const restartedRows = await readReplyRows({
+    async read(roomId, options) {
+      const page = await restarted.read(roomId, {
+        ...options, limit: shortPages.length % 3 === 0 ? 3 : 7,
+      });
+      shortPages.push(page.map((record) => record.seq));
+      return page;
+    },
+  }, ROOM_ID);
+  assert.deepEqual(shortPages[0], [1, 2, 3]);
+  assert.equal(shortPages[1][0], 4, 'a short nonfinal page must not stop pagination');
+  assert(shortPages.at(-1).length === 0);
+  assert.deepEqual(restartedRows.map((record) => record.seq), fullRows.map((record) => record.seq));
+  assert.equal(new Set(restartedRows.map((record) => record.seq)).size, restartedRows.length);
+  assert(restartedRows.some((record) => record.seq > 128 && record.kind === 'relay_result'));
+  assert.deepEqual(choices(restartedRows), beforeRestart);
+  assert.deepEqual(selectReply(restartedRows, ROOM_ID, unknownChild, 'cid-alice'),
+    { state: 'unknown_parent' });
+  assert.equal((await restarted.read(ROOM_ID)).find((record) => record.record_id === file.record_id).data_base64,
+    fileBytes.toString('base64'));
+
+  const durable = await restarted.read(ROOM_ID);
+  assert.equal(durable.filter((record) => record.record_id === parent.record_id).length, 1);
+  assert.equal(durable.filter((record) => record.record_id === file.record_id).length, 1);
+  assert.equal(durable.filter((record) => record.record_id === child.record_id).length, 1);
+  assert.equal(durable.filter((record) => record.kind === 'relay_intent').length, 6);
+  assert.equal(durable.filter((record) => record.kind === 'relay_result').length, 6);
 });
 
 test('blob references are canonical and digest-bound before any filesystem read', async (t) => {

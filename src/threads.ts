@@ -88,6 +88,27 @@ export function activeThreadSeat(room: Room, root: ThreadRoot, cid: string): Sea
       && member.participant_id === seat.participant_id));
 }
 
+/** Match the selected participant incarnation, even when its CID has rejoined. */
+export function threadRelayEligible(room: Room, root: ThreadRoot, cid: string): boolean {
+  return activeThreadSeat(room, root, cid) !== undefined;
+}
+
+/** Project a saved scoped author without falling back to a real anonymous identity. */
+export function publicThreadAuthor(
+  message: Pick<MessageRecord, 'author' | 'author_alias'>,
+  root: ThreadRoot,
+  room: Pick<Room, 'anonymous'>,
+): MessageRecord['author'] {
+  const member = root.members.find(member => member.identity === message.author.identity);
+  if (!member) throw new ThreadFailure('reply_target_unavailable');
+  if (!room.anonymous) return message.author;
+  const alias = AuthorAliasSchema.safeParse(message.author_alias);
+  if (!alias.success || alias.data.participant_id !== member.participant_id) {
+    throw new ThreadFailure('reply_target_unavailable');
+  }
+  return { identity: alias.data.participant_id, display_name: alias.data.alias, role: message.author.role };
+}
+
 export function threadFingerprint(input: StartThreadInput): string {
   return createHash('sha256').update(JSON.stringify({
     topic: input.topic,
@@ -109,6 +130,7 @@ export function findThreadRoot(
   const root = candidates[0]!;
   const parsedRoot = ThreadRootSchema.safeParse(root.thread_root);
   const parsedScope = ThreadScopeSchema.safeParse(root.scope);
+  const parsedAlias = AuthorAliasSchema.safeParse(root.author_alias);
   const creator = parsedRoot.success
     ? parsedRoot.data.members.find((member) => member.participant_id === parsedRoot.data.creator_participant_id)
     : undefined;
@@ -121,7 +143,7 @@ export function findThreadRoot(
     || root.category !== 'chat'
     || creator?.identity !== root.author.identity
     || (root.author_alias !== undefined
-      && root.author_alias.participant_id !== parsedRoot.data.creator_participant_id)
+      && (!parsedAlias.success || parsedAlias.data.participant_id !== parsedRoot.data.creator_participant_id))
     || root.source_msg_id !== undefined
     || root.source_wire_id !== undefined
     || root.source_reply_to !== undefined) {

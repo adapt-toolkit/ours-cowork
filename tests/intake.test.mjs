@@ -1734,9 +1734,10 @@ test('concurrent pumps share one SDK reader and callback resume queues without d
 });
 
 // Scoped intake must select its audience before a durable source or intent exists.
-async function threadFixture({ solo = false } = {}) {
-  const seats = room().seats.map((seat, i) => ({ ...seat, identity: ['A', 'B', 'C'][i].repeat(64) }));
-  const f = fixture({ room: { seats, command_grants: [], role_command_grants: [] } });
+async function threadFixture({ solo = false, anonymous = false, deferRelay = false } = {}) {
+  const seats = room().seats.map((seat, i) => ({ ...seat, identity: ['A', 'B', 'C'][i].repeat(64),
+    ...(anonymous ? { alias: ['Otter', 'Finch', 'Lynx'][i] } : {}) }));
+  const f = fixture({ room: { seats, anonymous, command_grants: [], role_command_grants: [] } });
   const [a, b, c] = seats;
   const tid = '01jz6y7n8p9q0r1s2t3v4w5xt0';
   const members = (solo ? [b] : [a, b]).map(({ participant_id, identity }) => ({ participant_id, identity }));
@@ -1744,16 +1745,20 @@ async function threadFixture({ solo = false } = {}) {
   const root = await f.store.append(ROOM_ID, {
     version: 1, kind: 'message', room_id: ROOM_ID, at: AT, message_id: tid,
     author: { identity: creator.identity, display_name: creator.display_name, role: creator.role },
+    ...(anonymous ? { author_alias: { participant_id: creator.participant_id, alias: creator.alias } } : {}),
     category: 'chat', text: 'Thread: Review', recipient_identities: members.map(m => m.identity),
     scope: { thread_id: tid }, thread_root: { schema_version: 1, thread_id: tid, topic: 'Review',
       creator_participant_id: creator.participant_id, members, idempotency_key: 'request-1', fingerprint: '0'.repeat(64) },
   });
-  f.packet.nextSend = cid => ({ status: 'queued', wire_id: `copy-${cid[0]}-${f.packet.sendCalls.length}` });
+  let serial = 0;
+  f.packet.nextSend = cid => ({ status: 'queued', wire_id: `copy-${cid[0]}-${++serial}` });
+  if (deferRelay) return { ...f, a, b, c, root };
   await f.pump.resumePending(ROOM_ID);
   const result = (await f.store.read(ROOM_ID)).find(r => r.kind === 'relay_result' && r.recipient_identity === b.identity);
   assert(result);
+  const rootCalls = structuredClone(f.packet.sendCalls);
   f.packet.sendCalls.length = 0;
-  return { ...f, a, b, c, root, bWire: result.wire_id };
+  return { ...f, a, b, c, root, rootCalls, bWire: result.wire_id };
 }
 
 async function assertBroadcastAfter(f) {
@@ -2035,4 +2040,238 @@ test('archive intake cutoff includes rejection-only tail and checks cursor progr
   f.store.query = undefined;
   f.store.read = () => read(ROOM_ID, { after: 0, limit: 1 });
   await assert.rejects(f.pump.nextRecordSeq(ROOM_ID), /cursor did not advance/);
+});
+
+// These exercise the real pump: omitting scoped validation leaks bodies or identities,
+// and projecting a root by spreading archive fields leaks routing metadata.
+for (const anonymous of [false, true]) {
+  test(`scoped ${anonymous ? 'anonymous' : 'named'} roots and nested replies expose only public metadata`, async () => {
+    const f = await threadFixture({ anonymous });
+    assert.deepEqual(f.rootCalls.map(c => c.recipient), [f.a.identity, f.b.identity]);
+    const rootResults = byKind(await f.store.read(ROOM_ID), 'relay_result');
+    const aWire = rootResults.find(r => r.recipient_identity === f.a.identity).wire_id;
+    assert.notEqual(aWire, f.bWire);
+    for (const call of f.rootCalls) {
+      const body = JSON.parse(call.body);
+      assert.equal(call.replyTo, undefined);
+      assert.deepEqual(body.thread, { schema_version: 1, thread_id: f.root.message_id });
+      assert.deepEqual(body.thread_root, { schema_version: 1, thread_id: f.root.message_id,
+        topic: 'Review', creator: { identity: anonymous ? f.a.participant_id : f.a.identity,
+          display_name: anonymous ? 'Otter' : 'Alice', role: 'builder' },
+        participant_ids: [f.a.participant_id, f.b.participant_id], created_at: AT });
+    }
+    const allCalls = [...f.rootCalls];
+    for (const [msg, sender, wire, target, recipient, expectedParent] of [
+      [7, f.b, 'b-source', f.bWire, f.a, aWire],
+      [8, f.a, 'a-source', 'copy-A-3', f.b, 'b-source'],
+      [9, f.b, 'b-source-2', 'copy-B-4', f.a, 'a-source'],
+    ]) {
+      f.packet.sendCalls.length = 0;
+      f.packet.inbox.push(incoming({ msg_id: msg, sender_id: sender.identity, wire_id: wire,
+        reply_to: { wire_id: target, sentence: 2 } }));
+      await f.pump.pump(ROOM_ID);
+      assert.equal(f.packet.sendCalls.length, 1);
+      const [call] = f.packet.sendCalls;
+      assert.equal(call.recipient, recipient.identity);
+      assert.deepEqual(call.replyTo, { wire_id: expectedParent });
+      const body = JSON.parse(call.body);
+      assert.deepEqual(body.thread, { schema_version: 1, thread_id: f.root.message_id });
+      assert.equal(body.thread_root, undefined);
+      assert.deepEqual(body.author, { identity: anonymous ? sender.participant_id : sender.identity,
+        display_name: anonymous ? sender.alias : sender.display_name, role: sender.role });
+      allCalls.push(call);
+    }
+    for (const call of allCalls) {
+      assert.equal(call.recipient === f.c.identity, false);
+      const body = JSON.parse(call.body);
+      assert.equal(body.version, 1); assert.equal(body.kind, 'room_msg');
+      for (const internal of ['parent_key', 'recipient_identities', 'source_wire_id', 'source_reply_to',
+        'members', 'idempotency_key', 'fingerprint', 'seq', 'record_id', 'intent_record_id']) {
+        assert.equal(call.body.includes(`"${internal}"`), false, internal);
+      }
+      if (anonymous) for (const secret of [f.a.identity, f.b.identity, f.c.identity, 'Alice', 'Bob', 'Cara']) {
+        assert.equal(call.body.includes(secret), false, secret);
+      }
+    }
+  });
+}
+
+test('missing scoped copy is terminal across restart and never sends unlinked content', async () => {
+  const f = await threadFixture();
+  f.store.records.set(ROOM_ID, f.store.records.get(ROOM_ID).map(r => r.kind === 'relay_result'
+    && r.recipient_identity === f.a.identity ? { ...r, status: 'send_failed', wire_id: undefined } : r));
+  f.packet.inbox.push(incoming({ sender_id: f.b.identity, reply_to: { wire_id: f.bWire } }));
+  await f.pump.pump(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls, []);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').filter(r => r.status === 'skipped_reply_unavailable').length, 1);
+  await new IntakePump(f.store, f.registry).resumePending(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls, []);
+});
+
+for (const replacement of ['removed', 'same-cid-new-participant', 'same-participant-new-cid']) {
+  test(`scoped recipient ${replacement} after intake is terminal skipped_removed`, async () => {
+    const f = await threadFixture();
+    f.packet.afterConsume = () => {
+      const seats = f.store.rooms.get(ROOM_ID).seats;
+      seats.find(s => s.identity === f.a.identity).state = 'removed';
+      if (replacement !== 'removed') seats.push({ ...f.a, state: 'active',
+        ...(replacement === 'same-cid-new-participant' ? { participant_id: '01jz6y7n8p9q0r1s2t3v4w5xa4' } : { identity: 'D'.repeat(64) }) });
+    };
+    f.packet.inbox.push(incoming({ sender_id: f.b.identity, reply_to: { wire_id: f.bWire } }));
+    await f.pump.pump(ROOM_ID);
+    assert.deepEqual(f.packet.sendCalls, []);
+    assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').at(-1).status, 'skipped_removed');
+    await new IntakePump(f.store, f.registry).resumePending(ROOM_ID);
+    assert.deepEqual(f.packet.sendCalls, []);
+  });
+}
+
+// A crash after ACK leaves only durable state, so restart must independently validate it.
+async function pendingScopedReply(options = {}) {
+  const f = await threadFixture(options);
+  f.packet.inbox.push(incoming({ sender_id: f.b.identity, text: 'PRIVATE descendant', reply_to: { wire_id: f.bWire } }));
+  f.packet.afterConsume = () => { throw new Error('crash after ACK'); };
+  await assert.rejects(f.pump.pump(ROOM_ID), /crash after ACK/);
+  f.packet.afterConsume = undefined;
+  return f;
+}
+
+for (const corruption of ['missing-root', 'missing-scope', 'malformed-scope', 'wrong-thread', 'missing-parent',
+  'wrong-parent', 'parent-thread', 'duplicate-root', 'duplicate-child', 'unsaved-recipient', 'unselected-recipient']) {
+  test(`scoped restart rejects ${corruption} association without sending private body`, async () => {
+    const f = await pendingScopedReply();
+    const records = f.store.records.get(ROOM_ID);
+    const root = records.find(r => r.kind === 'message' && r.thread_root);
+    const child = records.find(r => r.kind === 'message' && r.source_msg_id === 7);
+    if (corruption === 'missing-root') { delete root.thread_root; }
+    if (corruption === 'missing-scope') delete child.scope;
+    if (corruption === 'malformed-scope') child.scope = {};
+    if (corruption === 'wrong-thread') child.scope.thread_id = MESSAGE_IDS[3];
+    if (corruption === 'missing-parent') child.scope.parent_key = `message:${MESSAGE_IDS[3]}`;
+    if (corruption === 'wrong-parent') child.scope.parent_key = `message:${child.message_id}`;
+    if (corruption === 'parent-thread') root.scope.thread_id = MESSAGE_IDS[3];
+    if (corruption === 'duplicate-root' || corruption === 'duplicate-child') {
+      const duplicate = { ...(corruption === 'duplicate-root' ? root : child) };
+      delete duplicate.seq; delete duplicate.record_id;
+      await f.store.append(ROOM_ID, duplicate);
+    }
+    if (corruption === 'unsaved-recipient') child.recipient_identities = [];
+    if (corruption === 'unselected-recipient') {
+      child.recipient_identities.push(f.c.identity);
+      await f.store.append(ROOM_ID, { version: 1, kind: 'relay_intent', room_id: ROOM_ID, at: AT,
+        message_id: child.message_id, recipient_identity: f.c.identity });
+    }
+    await new IntakePump(f.store, f.registry).resumePending(ROOM_ID);
+    const calls = f.packet.sendCalls.filter(c => corruption !== 'unselected-recipient' || c.recipient === f.c.identity);
+    assert.deepEqual(calls, []);
+    const results = byKind(await f.store.read(ROOM_ID), 'relay_result').filter(r => r.message_id === child.message_id);
+    assert.ok(results.some(r => r.status === 'skipped_reply_unavailable'));
+    const count = f.packet.sendCalls.length;
+    await new IntakePump(f.store, f.registry).resumePending(ROOM_ID);
+    assert.equal(f.packet.sendCalls.length, count);
+  });
+}
+
+for (const subject of ['root', 'descendant']) for (const alias of ['missing', 'malformed', 'null', 'mismatched']) {
+  test(`anonymous scoped ${subject} ${alias} alias fails closed on restart`, async () => {
+    const f = subject === 'root' ? await threadFixture({ anonymous: true, deferRelay: true })
+      : await pendingScopedReply({ anonymous: true });
+    const target = f.store.records.get(ROOM_ID).find(r => r.kind === 'message'
+      && (subject === 'root' ? r.thread_root : r.source_msg_id === 7));
+    if (alias === 'missing') delete target.author_alias;
+    if (alias === 'null') target.author_alias = null;
+    if (alias === 'malformed') target.author_alias.alias = '';
+    if (alias === 'mismatched') target.author_alias.participant_id = f.c.participant_id;
+    await new IntakePump(f.store, f.registry).resumePending(ROOM_ID);
+    assert.deepEqual(f.packet.sendCalls, []);
+    assert.deepEqual(f.packet.sendFileCalls, []);
+    const results = byKind(await f.store.read(ROOM_ID), 'relay_result').filter(r => r.message_id === target.message_id);
+    assert.equal(results.length, subject === 'root' ? 2 : 1);
+    assert.ok(results.every(r => r.status === 'skipped_reply_unavailable'));
+    await new IntakePump(f.store, f.registry).resumePending(ROOM_ID);
+    assert.deepEqual(f.packet.sendCalls, []);
+  });
+}
+
+test('restart before scoped root fanout sends stable roots once to original seats', async () => {
+  const f = await threadFixture({ deferRelay: true });
+  await new IntakePump(f.store, f.registry).resumePending(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls.map(c => c.recipient), [f.a.identity, f.b.identity]);
+  assert.ok(f.packet.sendCalls.every(c => JSON.parse(c.body).thread_root.thread_id === f.root.message_id));
+  await new IntakePump(f.store, f.registry).resumePending(ROOM_ID);
+  assert.equal(f.packet.sendCalls.length, 2);
+});
+
+test('relay fallback advances past unresolved dangling intents without looping archive reads', async () => {
+  const f = fixture();
+  await f.store.append(ROOM_ID, { version: 1, kind: 'relay_intent', room_id: ROOM_ID, at: AT,
+    message_id: MESSAGE_IDS[0], recipient_identity: 'cid-alice' });
+  const read = f.store.read.bind(f.store);
+  let reads = 0;
+  f.store.read = (...args) => {
+    if (++reads > 20) throw new Error('relay archive pagination repeated');
+    return read(...args);
+  };
+  await f.pump.resumePending(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls, []);
+});
+
+test('scoped relay rejects a descendant parent whose saved parent association was erased', async () => {
+  const f = await threadFixture();
+  f.packet.inbox.push(incoming({ sender_id: f.b.identity, wire_id: 'b-descendant', reply_to: { wire_id: f.bWire } }));
+  await f.pump.pump(ROOM_ID);
+  f.packet.sendCalls.length = 0;
+  f.packet.inbox.push(incoming({ msg_id: 8, sender_id: f.a.identity, wire_id: 'a-descendant', reply_to: { wire_id: 'copy-A-3' } }));
+  f.packet.afterConsume = () => { delete f.store.records.get(ROOM_ID).find(r => r.source_msg_id === 7).scope.parent_key; };
+  await f.pump.pump(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls, []);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').at(-1).status, 'skipped_reply_unavailable');
+});
+
+test('uncertain scoped root send retries stable metadata and retains every observed reply alias', async () => {
+  const f = await threadFixture({ anonymous: true, deferRelay: true });
+  f.packet.beforeSend = () => { throw new Error('acceptance unknown'); };
+  await assert.rejects(f.pump.resumePending(ROOM_ID), /acceptance unknown/);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 0);
+  const attempted = f.packet.sendCalls[0].body;
+  f.packet.beforeSend = undefined;
+  await new IntakePump(f.store, f.registry).resumePending(ROOM_ID);
+  assert.equal(f.packet.sendCalls[1].body, attempted);
+  const results = byKind(await f.store.read(ROOM_ID), 'relay_result');
+  const bResult = results.find(r => r.recipient_identity === f.b.identity);
+  // A second observed successful alias for the same durable intent remains valid.
+  const duplicate = { ...bResult, wire_id: 'b-other-observed-copy' };
+  delete duplicate.seq; delete duplicate.record_id;
+  await f.store.append(ROOM_ID, duplicate);
+  f.store.records.set(ROOM_ID, JSON.parse(JSON.stringify(f.store.records.get(ROOM_ID))));
+  for (const [index, alias] of [bResult.wire_id, 'b-other-observed-copy'].entries()) {
+    f.packet.sendCalls.length = 0;
+    f.packet.inbox.push(incoming({ msg_id: 7 + index, sender_id: f.b.identity,
+      wire_id: `b-reply-${index}`, reply_to: { wire_id: alias } }));
+    await f.pump.pump(ROOM_ID);
+    assert.equal(f.packet.sendCalls.length, 1);
+    assert.equal(f.packet.sendCalls[0].recipient, f.a.identity);
+    assert.deepEqual(f.packet.sendCalls[0].replyTo, { wire_id: 'copy-A-1' });
+    assert.equal(JSON.parse(f.packet.sendCalls[0].body).thread.thread_id, f.root.message_id);
+  }
+});
+
+test('corrupt anonymous root metadata blocks an already accepted descendant on restart', async () => {
+  const f = await pendingScopedReply({ anonymous: true });
+  delete f.store.records.get(ROOM_ID).find(r => r.kind === 'message' && r.thread_root).author_alias;
+  await new IntakePump(f.store, f.registry).resumePending(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls, []);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').at(-1).status, 'skipped_reply_unavailable');
+});
+
+test('saved file reply to a scoped root never emits a file notice or binary', async () => {
+  const f = await threadFixture();
+  await f.store.append(ROOM_ID, { version: 1, kind: 'file', room_id: ROOM_ID, at: AT,
+    file_id: MESSAGE_IDS[3], author: { identity: f.b.identity, display_name: 'Bob', role: 'reviewer' },
+    filename: 'PRIVATE.bin', mime: 'application/octet-stream', size: 7, data_base64: Buffer.from('PRIVATE').toString('base64'),
+    source_file_id: 9, source_wire_id: 'file-source', source_reply_to: { wire_id: f.bWire },
+    recipient_identities: [f.a.identity] });
+  await new IntakePump(f.store, f.registry).resumePending(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls, []); assert.deepEqual(f.packet.sendFileCalls, []);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').at(-1).status, 'skipped_reply_unavailable');
 });

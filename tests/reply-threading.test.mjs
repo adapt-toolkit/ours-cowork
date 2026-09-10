@@ -135,6 +135,7 @@ test('wrong room, dangling intent and skipped result are not aliases', () => {
     [parent, ...pair(2, 'B', 'bad').map(r => ({ ...r, room_id: 'OTHER' }))],
     [parent, pair(2, 'B', 'bad')[1]],
     [parent, ...pair(2, 'B', 'bad', 'skipped_removed')],
+    [parent, ...pair(2, 'B', 'bad', 'skipped_reply_unavailable')],
   ];
   for (const fixture of fixtures) assert.equal(selectReply(fixture, 'R', b, 'A').state, 'unknown_parent');
 });

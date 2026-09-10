@@ -17,9 +17,9 @@ import {
 import type { FileInboxItem, InboxItem, RoomPacket } from './packets.ts';
 import type { CoworkStore, RoomMutex } from './storage.ts';
 import { generateUlid } from './ulid.ts';
-import { readReplyRows, selectReply } from './reply-threading.ts';
-import { resolveIntakeScope } from './threads.ts';
-import { ThreadFailure } from './thread-contracts.ts';
+import { readReplyRows, resolveReplyParent, selectReply } from './reply-threading.ts';
+import { findThreadRoot, publicThreadAuthor, publicThreadMetadata, resolveIntakeScope, threadRelayEligible } from './threads.ts';
+import { ThreadFailure, ThreadScopeSchema } from './thread-contracts.ts';
 
 type IntakeStore = Pick<CoworkStore, 'mutex' | 'load' | 'save' | 'append' | 'read'>
   & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'relayRecipientsNeedingIntent'>>;
@@ -591,29 +591,63 @@ export class IntakePump {
       // A dangling intent is invalid cross-record state. Do not compound it
       // with a network effect or a result that would claim a send was tried.
       if ((message === undefined) === (file === undefined)) continue;
-      const recipients = message?.recipient_identities ?? file!.recipient_identities;
-      if (!recipients.includes(intent.recipient_identity)) continue;
-      if (!activeCids.has(intent.recipient_identity) && removedCids.has(intent.recipient_identity)) {
-        // The seat was removed after fan-out: terminal result, never a send.
-        const skipped = await this.store.append(roomId, {
-          version: 1,
-          kind: 'relay_result',
-          room_id: roomId,
-          at: this.now(),
-          intent_record_id: intent.record_id,
-          ...(intent.message_id === undefined ? {} : { message_id: intent.message_id }),
-          ...(intent.file_id === undefined ? {} : { file_id: intent.file_id }),
-          recipient_identity: intent.recipient_identity,
-          status: 'skipped_removed',
-        });
-        if (skipped.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
-        continue;
-      }
-
       const source = message ?? file!;
-      const replyRows = source.source_reply_to === undefined
-        ? [] : await readReplyRows(this.store, roomId);
+      const replyRows = source.source_reply_to === undefined && message?.scope === undefined
+        && message?.thread_root === undefined ? [] : await readReplyRows(this.store, roomId);
+      const resolved = resolveReplyParent(replyRows, roomId, source.author.identity,
+        source.source_reply_to?.wire_id, source.seq);
+      // A missing child scope must not turn a known private parent into a broadcast.
+      const parent = resolved.state === 'resolved' ? resolved.parent.item : undefined;
+      const scoped = message?.scope !== undefined || message?.thread_root !== undefined
+        || (parent?.kind === 'message' && (parent.scope !== undefined || parent.thread_root !== undefined));
       const decision = selectReply(replyRows, roomId, source, intent.recipient_identity);
+      let publicThread: Record<string, unknown> = {};
+      let scopedAuthor: MessageRecord['author'] | undefined;
+      if (scoped) {
+        try {
+          const scope = ThreadScopeSchema.safeParse(message?.scope);
+          if (!message || !scope.success || message.category !== 'chat'
+            || !message.recipient_identities.includes(intent.recipient_identity)
+            || message.seq >= intent.seq
+            || replyRows.filter(r => r.kind === 'message' && r.message_id === message.message_id).length !== 1) {
+            throw new ThreadFailure('reply_target_unavailable');
+          }
+          const root = findThreadRoot(replyRows, scope.data.thread_id);
+          if (!root?.thread_root
+            || !root.thread_root.members.some(member => member.identity === intent.recipient_identity)) {
+            throw new ThreadFailure('reply_target_unavailable');
+          }
+          if (!threadRelayEligible(room, root.thread_root, intent.recipient_identity)) {
+            await this.skipRelay(roomId, intent, 'skipped_removed');
+            continue;
+          }
+          const metadata = publicThreadMetadata({ ...root, thread_root: root.thread_root }, room);
+          scopedAuthor = publicThreadAuthor(message, root.thread_root, room);
+          if (message.message_id === root.message_id) {
+            publicThread = { thread: { schema_version: 1, thread_id: root.message_id }, thread_root: metadata };
+          } else {
+            const parentScope = ThreadScopeSchema.safeParse(parent?.kind === 'message' ? parent.scope : undefined);
+            if (message.thread_root !== undefined || root.seq >= message.seq
+              || scope.data.parent_key === undefined || resolved.state !== 'resolved'
+              || resolved.parent.key !== scope.data.parent_key || !parentScope.success
+              || parentScope.data.thread_id !== root.message_id || decision.state !== 'linked'
+              || decision.parentKey !== scope.data.parent_key) {
+              throw new ThreadFailure('reply_target_unavailable');
+            }
+            publicThread = { thread: { schema_version: 1, thread_id: root.message_id } };
+          }
+        } catch (error) {
+          if (!(error instanceof ThreadFailure)) throw error;
+          await this.skipRelay(roomId, intent, 'skipped_reply_unavailable');
+          continue;
+        }
+      } else {
+        if (!source.recipient_identities.includes(intent.recipient_identity)) continue;
+        if (!activeCids.has(intent.recipient_identity) && removedCids.has(intent.recipient_identity)) {
+          await this.skipRelay(roomId, intent, 'skipped_removed');
+          continue;
+        }
+      }
       const replyTo = decision.replyTo;
 
       if (file !== undefined) {
@@ -676,11 +710,12 @@ export class IntakePump {
         room_name: room.room_name,
         message_id: message!.message_id,
         // An anonymous author leaves the archive only in alias form.
-        author: message!.author_alias === undefined ? message!.author : {
+        author: scopedAuthor ?? (message!.author_alias === undefined ? message!.author : {
           identity: message!.author_alias.participant_id,
           display_name: message!.author_alias.alias,
           role: message!.author.role,
-        },
+        }),
+        ...publicThread,
         text: message!.text,
         at: message!.at,
         ...(message!.briefing_role === undefined ? {} : { briefing_role: message!.briefing_role }),
@@ -705,6 +740,20 @@ export class IntakePump {
       if (appended.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
       }
     }
+  }
+
+  private async skipRelay(
+    roomId: string, intent: RelayIntentRecord,
+    status: 'skipped_removed' | 'skipped_reply_unavailable',
+  ): Promise<void> {
+    const result = await this.store.append(roomId, {
+      version: 1, kind: 'relay_result', room_id: roomId, at: this.now(),
+      intent_record_id: intent.record_id,
+      ...(intent.message_id === undefined ? {} : { message_id: intent.message_id }),
+      ...(intent.file_id === undefined ? {} : { file_id: intent.file_id }),
+      recipient_identity: intent.recipient_identity, status,
+    });
+    if (result.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
   }
 
   private findSourceMessage(records: CommunicationRecord[], item: InboxItem): MessageRecord | undefined {
@@ -785,7 +834,8 @@ async function queryStore(
   }
   let records = archive.filter((record) => {
     const value = record as CommunicationRecord & Record<string, unknown>;
-    return (options.kind === undefined || record.kind === options.kind)
+    return (options.after === undefined || record.seq > options.after)
+      && (options.kind === undefined || record.kind === options.kind)
       && (options.messageId === undefined || value.message_id === options.messageId)
       && (options.fileId === undefined || value.file_id === options.fileId)
       && (options.sourceMsgId === undefined || value.source_msg_id === options.sourceMsgId)

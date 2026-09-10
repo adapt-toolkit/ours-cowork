@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { ConsumerCommandNameSchema, StoredConsumerDefinitionSchema } from './consumer-commands.ts';
 import { RUNTIME_COMMAND_NAMES } from './command-names.ts';
+import { ThreadRootSchema, ThreadScopeSchema } from './thread-contracts.ts';
 
 const MAX_TEXT_BYTES = 262_144;
 export const MAX_FILE_BYTES = 2 * 1024 * 1024;
@@ -797,6 +798,8 @@ const MessageShape = {
   source_msg_id: z.number().int().nonnegative().safe().optional(),
   source_wire_id: NonEmptyStringSchema.optional(),
   source_reply_to: ReplyReferenceSchema.optional(),
+  scope: ThreadScopeSchema.optional(),
+  thread_root: ThreadRootSchema.optional(),
 } as const;
 
 const RelayIntentShape = {
@@ -914,6 +917,19 @@ interface MessageCategoryView {
   membership?: z.infer<typeof MembershipNoticeSchema>;
 }
 
+interface MessageThreadView {
+  message_id: string;
+  author: { identity: string };
+  author_alias?: z.infer<typeof AuthorAliasSchema>;
+  category: 'briefing' | 'role_briefing' | 'chat' | 'membership';
+  text: string;
+  source_msg_id?: number;
+  source_wire_id?: string;
+  source_reply_to?: z.infer<typeof ReplyReferenceSchema>;
+  scope?: z.infer<typeof ThreadScopeSchema>;
+  thread_root?: z.infer<typeof ThreadRootSchema>;
+}
+
 function refineRelaySubject(
   record: { kind: string; message_id?: string; file_id?: string },
   context: z.RefinementCtx,
@@ -984,6 +1000,106 @@ function refineMessageCategory(message: MessageCategoryView, context: z.Refineme
   }
 }
 
+function refineMessageThread(message: MessageThreadView, context: z.RefinementCtx): void {
+  if (message.thread_root !== undefined) {
+    if (message.scope === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['scope'],
+        message: 'thread root messages require scope',
+      });
+      return;
+    }
+    if (message.scope.thread_id !== message.message_id
+      || message.thread_root.thread_id !== message.message_id) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['thread_root', 'thread_id'],
+        message: 'thread root thread_id and scope thread_id must equal message_id',
+      });
+    }
+    if (message.scope.parent_key !== undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['scope', 'parent_key'],
+        message: 'parent_key is forbidden on thread root messages',
+      });
+    }
+    if (message.category !== 'chat') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['category'],
+        message: 'thread root messages must be chat messages',
+      });
+    }
+    if (message.text !== `Thread: ${message.thread_root.topic}`) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['text'],
+        message: 'thread root message text must identify its topic',
+      });
+    }
+    const creator = message.thread_root.members.find(
+      (member) => member.participant_id === message.thread_root?.creator_participant_id,
+    );
+    if (creator?.identity !== message.author.identity) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['thread_root', 'creator_participant_id'],
+        message: 'thread root creator must match the message author',
+      });
+    }
+    if (message.author_alias !== undefined
+      && message.author_alias.participant_id !== message.thread_root.creator_participant_id) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['author_alias', 'participant_id'],
+        message: 'thread root author alias must identify the creator',
+      });
+    }
+    for (const field of ['source_msg_id', 'source_wire_id', 'source_reply_to'] as const) {
+      if (message[field] !== undefined) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [field],
+          message: `${field} is forbidden on thread root messages`,
+        });
+      }
+    }
+    return;
+  }
+
+  if (message.scope === undefined) return;
+  if (message.scope.parent_key === undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['scope', 'parent_key'],
+      message: 'thread descendants require an immediate parent_key',
+    });
+  }
+  if (message.scope.thread_id === message.message_id) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['scope', 'thread_id'],
+      message: 'thread descendant thread_id must identify a distinct root message',
+    });
+  }
+  if (message.source_reply_to === undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['source_reply_to'],
+      message: 'thread descendants require source_reply_to',
+    });
+  }
+  if (message.category !== 'chat') {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['category'],
+      message: 'thread descendants must be chat messages',
+    });
+  }
+}
+
 export const CommunicationRecordSchema = RawCommunicationRecordSchema.superRefine((record, context) => {
   if (record.record_id !== `${record.room_id}:${record.seq}`) {
     context.addIssue({
@@ -992,7 +1108,10 @@ export const CommunicationRecordSchema = RawCommunicationRecordSchema.superRefin
       message: 'record_id must equal room_id + ":" + seq',
     });
   }
-  if (record.kind === 'message') refineMessageCategory(record, context);
+  if (record.kind === 'message') {
+    refineMessageCategory(record, context);
+    refineMessageThread(record, context);
+  }
   refineRelaySubject(record, context);
   refineFileRecord(record, context);
 });
@@ -1005,7 +1124,10 @@ export const AppendRecordSchema = z.discriminatedUnion('kind', [
   z.object({ ...AppendCommonShape, ...CloseNoticeIntentShape }).strict(),
   z.object({ ...AppendCommonShape, ...CloseNoticeResultShape }).strict(),
 ]).superRefine((record, context) => {
-  if (record.kind === 'message') refineMessageCategory(record, context);
+  if (record.kind === 'message') {
+    refineMessageCategory(record, context);
+    refineMessageThread(record, context);
+  }
   refineRelaySubject(record, context);
   refineFileRecord(record, context);
 });
@@ -1025,4 +1147,5 @@ export type RoleBriefing = z.infer<typeof RoleBriefingSchema>;
 export type MembershipNotice = z.infer<typeof MembershipNoticeSchema>;
 export type AuthorSnapshot = z.infer<typeof AuthorSnapshotSchema>;
 export type CommunicationRecord = z.infer<typeof CommunicationRecordSchema>;
+export type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 export type AppendRecord = z.infer<typeof AppendRecordSchema>;

@@ -394,6 +394,193 @@ test('communication records form a strict discriminated version-1 union', () => 
   assert.equal(AppendRecordSchema.parse(appendMessage).kind, 'message');
 });
 
+test('message thread contracts distinguish immutable roots, descendants, and ordinary rows', () => {
+  const creatorParticipantId = '01jz6y7n8p9q0r1s2t3v4w5x70';
+  const otherParticipantId = '01jz6y7n8p9q0r1s2t3v4w5x71';
+  const creatorIdentity = 'A'.repeat(64);
+  const otherIdentity = 'B'.repeat(64);
+  const common = {
+    version: 1,
+    kind: 'message',
+    room_id: ROOM_ID,
+    seq: 1,
+    record_id: `${ROOM_ID}:1`,
+    at: AT,
+    message_id: MESSAGE_ID,
+    author: { identity: creatorIdentity, display_name: 'Alice', role: 'reviewer' },
+    category: 'chat',
+    text: 'Thread: Review',
+    recipient_identities: [creatorIdentity, otherIdentity],
+  };
+  const threadRoot = {
+    schema_version: 1,
+    thread_id: MESSAGE_ID,
+    topic: 'Review',
+    creator_participant_id: creatorParticipantId,
+    members: [
+      { participant_id: creatorParticipantId, identity: creatorIdentity },
+      { participant_id: otherParticipantId, identity: otherIdentity },
+    ],
+    idempotency_key: 'request-1',
+    fingerprint: 'a'.repeat(64),
+  };
+  const root = {
+    ...common,
+    author_alias: { participant_id: creatorParticipantId, alias: 'reviewer #1' },
+    scope: { thread_id: MESSAGE_ID },
+    thread_root: threadRoot,
+  };
+  assert.deepEqual(CommunicationRecordSchema.parse(root), root);
+  const { seq: _rootSeq, record_id: _rootRecordId, ...appendRoot } = root;
+  assert.deepEqual(AppendRecordSchema.parse(appendRoot), appendRoot);
+
+  const descendantId = '01jz6y7n8p9q0r1s2t3v4w5x72';
+  const descendant = {
+    ...common,
+    seq: 2,
+    record_id: `${ROOM_ID}:2`,
+    message_id: descendantId,
+    text: 'A scoped reply',
+    scope: { thread_id: MESSAGE_ID, parent_key: `message:${MESSAGE_ID}` },
+    source_reply_to: { wire_id: 'wire-parent' },
+  };
+  assert.deepEqual(CommunicationRecordSchema.parse(descendant), descendant);
+
+  const ordinary = { ...common, text: 'An ordinary message' };
+  assert.deepEqual(CommunicationRecordSchema.parse(ordinary), ordinary);
+});
+
+test('message thread contracts reject malformed or ambiguous scope state', () => {
+  const creatorParticipantId = '01jz6y7n8p9q0r1s2t3v4w5x70';
+  const otherParticipantId = '01jz6y7n8p9q0r1s2t3v4w5x71';
+  const creatorIdentity = 'A'.repeat(64);
+  const otherIdentity = 'B'.repeat(64);
+  const common = {
+    version: 1,
+    kind: 'message',
+    room_id: ROOM_ID,
+    seq: 1,
+    record_id: `${ROOM_ID}:1`,
+    at: AT,
+    message_id: MESSAGE_ID,
+    author: { identity: creatorIdentity, display_name: 'Alice', role: 'reviewer' },
+    category: 'chat',
+    text: 'Thread: Review',
+    recipient_identities: [creatorIdentity, otherIdentity],
+  };
+  const threadRoot = {
+    schema_version: 1,
+    thread_id: MESSAGE_ID,
+    topic: 'Review',
+    creator_participant_id: creatorParticipantId,
+    members: [
+      { participant_id: creatorParticipantId, identity: creatorIdentity },
+      { participant_id: otherParticipantId, identity: otherIdentity },
+    ],
+    idempotency_key: 'request-1',
+    fingerprint: 'a'.repeat(64),
+  };
+  const root = {
+    ...common,
+    author_alias: { participant_id: creatorParticipantId, alias: 'reviewer #1' },
+    scope: { thread_id: MESSAGE_ID },
+    thread_root: threadRoot,
+  };
+
+  assert.throws(() => CommunicationRecordSchema.parse({
+    ...root,
+    thread_root: {
+      ...threadRoot,
+      members: [threadRoot.members[0], { ...threadRoot.members[1], participant_id: creatorParticipantId }],
+    },
+  }), /unique/i);
+  assert.throws(() => CommunicationRecordSchema.parse({
+    ...root,
+    thread_root: {
+      ...threadRoot,
+      members: [threadRoot.members[0], { ...threadRoot.members[1], identity: creatorIdentity }],
+    },
+  }), /unique/i);
+  assert.throws(() => CommunicationRecordSchema.parse({
+    ...root,
+    thread_root: { ...threadRoot, creator_participant_id: '01jz6y7n8p9q0r1s2t3v4w5xff' },
+  }), /creator/i);
+  assert.throws(() => CommunicationRecordSchema.parse({
+    ...root,
+    thread_root: { ...threadRoot, thread_id: otherParticipantId },
+  }), /thread_id/i);
+  assert.throws(() => CommunicationRecordSchema.parse({ ...root, text: 'Review' }), /text/i);
+  assert.throws(() => CommunicationRecordSchema.parse({ ...root, category: 'briefing' }), /chat/i);
+  assert.throws(() => CommunicationRecordSchema.parse({
+    ...root,
+    author: { ...root.author, identity: otherIdentity },
+  }), /creator/i);
+  assert.throws(() => CommunicationRecordSchema.parse({
+    ...root,
+    author_alias: { ...root.author_alias, participant_id: otherParticipantId },
+  }), /creator/i);
+  for (const provenance of [
+    { source_msg_id: 7 },
+    { source_wire_id: 'wire-command' },
+    { source_reply_to: { wire_id: 'wire-parent' } },
+  ]) assert.throws(() => CommunicationRecordSchema.parse({ ...root, ...provenance }), /forbidden/i);
+
+  const scoped = {
+    ...common,
+    message_id: '01jz6y7n8p9q0r1s2t3v4w5x72',
+    text: 'A scoped reply',
+    scope: { thread_id: MESSAGE_ID, parent_key: `message:${MESSAGE_ID}` },
+    source_reply_to: { wire_id: 'wire-parent' },
+  };
+  assert.throws(() => CommunicationRecordSchema.parse({ ...scoped, scope: { thread_id: MESSAGE_ID } }), /parent/i);
+  assert.throws(() => CommunicationRecordSchema.parse({ ...scoped, source_reply_to: undefined }), /source_reply_to/i);
+  assert.throws(() => CommunicationRecordSchema.parse({
+    ...scoped,
+    scope: { ...scoped.scope, thread_id: scoped.message_id },
+  }), /thread_id/i);
+  assert.throws(() => CommunicationRecordSchema.parse({
+    ...scoped,
+    scope: { ...scoped.scope, parent_key: MESSAGE_ID },
+  }), /parent/i);
+  assert.throws(() => CommunicationRecordSchema.parse({ ...scoped, thread_root: threadRoot }), /thread_root/i);
+  assert.throws(() => CommunicationRecordSchema.parse({ ...common, thread_root: threadRoot }), /scope/i);
+  assert.throws(() => CommunicationRecordSchema.parse({ ...common, scope: { thread_id: MESSAGE_ID } }), /thread_root|parent/i);
+  assert.throws(() => CommunicationRecordSchema.parse({
+    ...root,
+    scope: { thread_id: MESSAGE_ID, unknown: true },
+  }));
+  assert.throws(() => CommunicationRecordSchema.parse({
+    ...root,
+    thread_root: { ...threadRoot, unknown: true },
+  }));
+});
+
+test('files cannot carry thread scope in version 1', () => {
+  const bytes = Buffer.from('thread attachment');
+  const file = {
+    version: 1,
+    kind: 'file',
+    room_id: ROOM_ID,
+    seq: 1,
+    record_id: `${ROOM_ID}:1`,
+    at: AT,
+    file_id: MESSAGE_ID,
+    author: { identity: 'A'.repeat(64), display_name: 'Alice', role: 'reviewer' },
+    filename: 'evidence.txt',
+    mime: 'text/plain',
+    size: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    data_base64: bytes.toString('base64'),
+    recipient_identities: ['B'.repeat(64)],
+    source_file_id: 7,
+  };
+  assert.deepEqual(CommunicationRecordSchema.parse(file), file);
+  assert.throws(() => CommunicationRecordSchema.parse({
+    ...file,
+    scope: { thread_id: MESSAGE_ID, parent_key: `message:${MESSAGE_ID}` },
+  }));
+});
+
 test('file archive records bind canonical bytes, size, digest, and one relay subject', () => {
   const bytes = Buffer.from([0, 1, 2, 255]);
   const file = {

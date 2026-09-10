@@ -2275,3 +2275,32 @@ test('saved file reply to a scoped root never emits a file notice or binary', as
   assert.deepEqual(f.packet.sendCalls, []); assert.deepEqual(f.packet.sendFileCalls, []);
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').at(-1).status, 'skipped_reply_unavailable');
 });
+
+test('authenticated history hides scoped intake activity while host legacy history retains global cursors',async()=>{
+ for(const anonymous of [false,true]) {
+  const f=await threadFixture({anonymous});
+  await assertBroadcastAfter(f);
+  const baseline=JSON.stringify(await f.service.participantHistory(ROOM_ID,f.c.identity,{}));
+  f.packet.inbox.push(incoming({msg_id:21,sender_id:f.b.identity,wire_id:'private-child',text:'Private answer',reply_to:{wire_id:f.bWire}}));
+  await f.pump.pump(ROOM_ID);
+  f.packet.inbox.push(incoming({msg_id:22,sender_id:f.c.identity,wire_id:'rejected-child',reply_to:{wire_id:f.bWire}}));
+  await f.pump.pump(ROOM_ID);
+  assert.equal(JSON.stringify(await f.service.participantHistory(ROOM_ID,f.c.identity,{})),baseline);
+  const rows=await f.service.participantHistory(ROOM_ID,f.a.identity,{});
+  assert.deepEqual(rows.map(r=>r.text),['Thread: Review','Participant update','Private answer']);
+  const raw=await f.service.history(ROOM_ID);
+  assert.equal(raw.some(r=>r.kind==='intake_rejection'),true);
+  const legacy=await f.service.history(ROOM_ID,{view:'participant'});
+  assert.deepEqual(legacy.map(r=>r.seq),raw.filter(r=>r.kind==='message').map(r=>r.seq));
+  legacy.forEach(r=>{assert.equal(r.record_id,`${ROOM_ID}:${r.seq}`);assert.equal(r.scope,undefined);assert.equal(r.thread_root,undefined);});
+  const store=new MemoryStore();
+  store.rooms.set(ROOM_ID,JSON.parse(JSON.stringify(await f.store.load(ROOM_ID))));
+  store.records.set(ROOM_ID,JSON.parse(JSON.stringify(raw)));
+  const restarted=new RoomService(store,f.registry);
+  assert.equal(JSON.stringify(await restarted.participantHistory(ROOM_ID,f.c.identity,{})),baseline);
+  const first=await restarted.participantHistory(ROOM_ID,f.a.identity,{limit:1});
+  assert.deepEqual((await restarted.participantHistory(ROOM_ID,f.a.identity,{after:first[0].seq,limit:1})).map(r=>r.text),['Participant update']);
+  store.rooms.get(ROOM_ID).seats.find(s=>s.identity===f.a.identity).participant_id='01jz6y7n8p9q0r1s2t3v4w5xff';
+  assert.deepEqual((await restarted.participantHistory(ROOM_ID,f.a.identity,{})).map(r=>r.text),['Participant update']);
+ }
+});

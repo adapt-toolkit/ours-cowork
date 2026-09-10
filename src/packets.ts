@@ -561,9 +561,10 @@ export class SdkRoomPacket implements RoomPacket {
       ...(handlers.sharedCommand === undefined ? [] : SHARED_ROOM_COMMANDS.map((name) => {
         const doc = [...ROOM_RPC_METHODS, ...PRIVATE_ROOM_RPC_METHODS].find((method) => method.method === name)!;
         const { room_id: _roomId, ...properties } = doc.params.properties as Record<string, JsonValue>;
+        if (name === 'room.history') properties.view = { const: 'participant' };
         return {
           name,
-          description: `${doc.description} Requires an explicit grant; applies only to this room.`,
+          description: `${name === 'room.history' ? 'Read your visible messages using viewer-local after cursors.' : doc.description} Requires an explicit grant; applies only to this room.`,
           input_schema: {
             ...doc.params,
             properties,

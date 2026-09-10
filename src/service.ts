@@ -56,6 +56,7 @@ import {
   type ThreadError,
   type ThreadRoot,
 } from './thread-contracts.ts';
+import { ParticipantHistoryPageSchema, projectParticipantHistory, publicHistoryMessage, type HostParticipantHistoryRecord, type ParticipantHistoryRecord } from './thread-history.ts';
 import { publicThreadMetadata, selectThreadMembers, threadFingerprint } from './threads.ts';
 
 const MAX_ROOM_MESSAGE_BYTES = 262_144;
@@ -106,28 +107,6 @@ const HistoryOptionsSchema = z.object({
 }).strict();
 
 const JOURNAL_WORK_BATCH_SIZE = 64;
-
-/**
- * The participant-facing history projection: message records
- * only, authors redacted to alias form in anonymous rooms, and no routing
- * identities, so no other participant's cid or contact name ever leaves the
- * operator boundary through this view.
- */
-export interface ParticipantHistoryRecord {
-  version: 1;
-  room_id: string;
-  seq: number;
-  record_id: string;
-  at: string;
-  kind: 'message';
-  message_id: string;
-  author: { identity: string; display_name: string; role: string };
-  category: 'briefing' | 'role_briefing' | 'chat' | 'membership';
-  briefing_role?: string;
-  briefing_version?: number;
-  membership?: unknown;
-  text: string;
-}
 
 const DeleteRoomInputSchema = z.object({
   confirm: z.literal(true),
@@ -560,9 +539,27 @@ export class RoomService {
     try {
       return await this.commandScope.run(scope, async (): Promise<JsonValue> => {
         try {
+          if (name === 'room.history') {
+            const request = ParticipantHistoryPageSchema.extend({ view: z.literal('participant').optional() }).safeParse(input);
+            if (!request.success) return { ok: false, error: 'invalid_request' };
+            const { view: _view, ...page } = request.data;
+            return { ok: true, result: JSON.parse(JSON.stringify(await this.participantHistory(roomId, context.sender_cid, page))) as JsonValue };
+          }
+          if (name === 'room.show' || name === 'room.participants') {
+            z.object({}).strict().parse(input);
+            const result = name === 'room.show' ? {
+              room_id: room.room_id, room_name: room.room_name, state: room.state,
+              mission: { goal: room.mission.goal, briefing: room.mission.briefing, briefing_version: room.mission.briefing_version },
+              anonymous: room.anonymous, quiet_membership: room.quiet_membership, membership_epoch: room.membership_epoch,
+            } : room.seats.map(({ participant_id, role, state }) => ({ participant_id, role, state }));
+            return { ok: true, result: JSON.parse(JSON.stringify(result)) as JsonValue };
+          }
           const routes = name === 'room.accept' ? createPrivateServiceRoutes(this) : createServiceRoutes(this);
           const result = await routes[name]!.run({ ...input, room_id: roomId });
-          // Preserve the service value; the SDK owns transport delivery.
+          if (name === 'room.message' || name === 'room.say') {
+            return { ok: true, result: { message_id: (result as MessageRecord).message_id, accepted: true } };
+          }
+          // The SDK owns transport delivery.
           return { ok: true, result: JSON.parse(JSON.stringify(result)) as JsonValue };
         } catch (error) {
           return { ok: false, error: classifyServiceError(error) };
@@ -1413,10 +1410,32 @@ export class RoomService {
     });
   }
 
+  /** Internal authenticated API; numeric cursors count only this viewer's visible messages. */
+  async participantHistory(roomId: string, viewerCid: string, page: { after?: number; limit?: number } = {}): Promise<ParticipantHistoryRecord[]> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = ParticipantHistoryPageSchema.parse(page);
+    return this.lock(id, async () => {
+      const room = await this.store.load(id);
+      if (room.state !== 'active' || !room.seats.some(seat => seat.state === 'active' && seat.identity === viewerCid)) {
+        throw new ThreadFailure('unauthorized');
+      }
+      const records: CommunicationRecord[] = [];
+      let after = 0;
+      for (;;) {
+        const batch = await this.store.read(id, { after, limit: JOURNAL_WORK_BATCH_SIZE });
+        if (batch.length === 0) break;
+        const last = batch[batch.length - 1]!;
+        if (last.seq <= after || batch.some(row => row.room_id !== id)) throw new Error('invalid participant history archive page');
+        records.push(...batch); after = last.seq;
+      }
+      return projectParticipantHistory(room, records, viewerCid, request);
+    });
+  }
+
   async history(
     roomId: string,
     options: unknown = {},
-  ): Promise<CommunicationRecord[] | ParticipantHistoryRecord[]> {
+  ): Promise<CommunicationRecord[] | HostParticipantHistoryRecord[]> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const { view, ...page } = HistoryOptionsSchema.parse(options);
     const records = view === 'participant'
@@ -1425,24 +1444,9 @@ export class RoomService {
     if (view !== 'participant') return byteBoundedHistoryPage(records);
     const projected = records
       .filter((record): record is MessageRecord => record.kind === 'message')
-      .map((record): ParticipantHistoryRecord => {
-        const {
-          author_alias,
-          recipient_identities: _recipients,
-          source_msg_id: _sourceMsg,
-          source_wire_id: _sourceWire,
-          source_reply_to: _sourceReplyTo,
-          ...rest
-        } = record;
-        return {
-          ...rest,
-          author: author_alias === undefined ? record.author : {
-            identity: author_alias.participant_id,
-            display_name: author_alias.alias,
-            role: record.author.role,
-          },
-        };
-      });
+      .map((record) => publicHistoryMessage(record, record.author_alias === undefined ? record.author : {
+        identity: record.author_alias.participant_id, display_name: record.author_alias.alias, role: record.author.role,
+      }));
     return byteBoundedHistoryPage(projected.slice(0, page.limit ?? Number.MAX_SAFE_INTEGER));
   }
 

@@ -122,6 +122,43 @@ describe('CoworkApp room orchestration', () => {
     expect(call.mock.calls.filter(([method]) => method === 'room.list')).toHaveLength(before + 1);
   });
 
+  it('loads a host history page with scoped messages and keeps rejection and relay rows in the archive', async () => {
+    const release = room(ROOM_ONE, 'Thread archive room', 'active');
+    const caller = 'A'.repeat(64), participant = '01jz6y7n8p9q0r1s2t3v4w5xa1';
+    const threadId = '01jz6y7n8p9q0r1s2t3v4w5xt1';
+    const common = { version: 1, room_id: ROOM_ONE, at: AT };
+    const message = { ...common, kind: 'message', author: { identity: caller, display_name: 'Alice', role: 'builder' }, category: 'chat', recipient_identities: [caller] };
+    const rows = [
+      { ...message, seq: 1, record_id: `${ROOM_ONE}:1`, message_id: '01jz6y7n8p9q0r1s2t3v4w5xt0', text: 'Ordinary host message' },
+      { ...message, seq: 2, record_id: `${ROOM_ONE}:2`, message_id: threadId, text: 'Thread: Review', scope: { thread_id: threadId }, thread_root: { schema_version: 1, thread_id: threadId, topic: 'Review', creator_participant_id: participant, members: [{ identity: caller, participant_id: participant }], idempotency_key: 'host-retry-key', fingerprint: '0'.repeat(64) } },
+      { ...message, seq: 3, record_id: `${ROOM_ONE}:3`, message_id: '01jz6y7n8p9q0r1s2t3v4w5xt2', text: 'Scoped host reply', scope: { thread_id: threadId, parent_key: `message:${threadId}` }, source_reply_to: { wire_id: 'root-copy' } },
+      { ...common, seq: 4, record_id: `${ROOM_ONE}:4`, kind: 'intake_rejection', source_kind: 'message', source_msg_id: 9, source_wire_id: 'rejected-wire', sender_identity: caller, sender_participant_id: participant, fingerprint: '0'.repeat(64), error: 'reply_target_unavailable', notification_attempt_claimed: true },
+      { ...common, seq: 5, record_id: `${ROOM_ONE}:5`, kind: 'relay_result', message_id: threadId, intent_record_id: `${ROOM_ONE}:4`, recipient_identity: caller, status: 'skipped_reply_unavailable' },
+    ];
+    const { isHistoryDto } = await import('../web/src/api/types');
+    const call = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      if (method === 'room.list') return [release];
+      if (method === 'room.show') return release;
+      if (method === 'room.participants') return release.seats;
+      if (method === 'room.history') {
+        expect(params.view).not.toBe('participant');
+        expect(isHistoryDto(rows)).toBe(true);
+        return rows.filter(row => row.seq > Number(params.after ?? 0));
+      }
+      throw new Error(`unexpected ${method}`);
+    });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    await user.click(await screen.findByText('Thread archive room'));
+    expect(await screen.findByText('Ordinary host message')).toBeVisible();
+    expect(screen.getByText('Thread: Review')).toBeVisible();
+    expect(screen.getByText('Scoped host reply')).toBeVisible();
+    await user.click(screen.getByRole('tab', { name: 'Archive' }));
+    expect(await screen.findByText(/host-retry-key/)).toBeVisible();
+    expect(screen.getByText(/rejected-wire/)).toBeVisible();
+    expect(screen.getAllByText(/skipped_reply_unavailable/).some(element => element.closest('[role="tabpanel"]'))).toBe(true);
+  });
+
   it('preserves loaded room data and disables mutations when list polling disconnects', async () => {
     const release = room(ROOM_ONE, 'Release coordination', 'active');
     let listCalls = 0;

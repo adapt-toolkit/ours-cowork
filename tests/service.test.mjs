@@ -2578,7 +2578,7 @@ test('every shared command refuses ungranted, spoofed, cross-room and removed ca
   }
 });
 
-test('shared ours commands and management routes produce equal results and durable effects', async () => {
+test('shared commands preserve management effects with deliberate participant result projections', async () => {
   const { SHARED_ROOM_COMMANDS } = await import('../src/command-names.ts');
   const { createServiceRoutes, createPrivateServiceRoutes, classifyServiceError } = await import('../src/command-routes.ts');
   const f = await sharedCommandFixture();
@@ -2624,6 +2624,17 @@ test('shared ours commands and management routes produce equal results and durab
     let expected;
     try { expected = { ok: true, result: await routes[name].run({ ...input, room_id: ROOM_ID }) }; }
     catch (error) { expected = { ok: false, error: classifyServiceError(error) }; }
+    if (expected.ok && name === 'room.show') {
+      const { room_id, room_name, state, mission, anonymous, quiet_membership, membership_epoch } = expected.result;
+      expected.result = { room_id, room_name, state, mission, anonymous, quiet_membership, membership_epoch };
+    } else if (expected.ok && name === 'room.participants') {
+      expected.result = expected.result.map(({ participant_id, role, state }) => ({ participant_id, role, state }));
+    } else if (expected.ok && name === 'room.history') {
+      expected.result = expected.result.map((row, index) => ({ ...row, seq: index + 1,
+        record_id: `${ROOM_ID}:participant:${before.seats.find(seat => seat.identity === ALICE_CID).participant_id}:${index + 1}` }));
+    } else if (expected.ok && (name === 'room.message' || name === 'room.say')) {
+      expected.result = { message_id: expected.result.message_id, accepted: true };
+    }
     const actual = await call(name, input, sharedContext);
     assert.deepEqual(actual, JSON.parse(JSON.stringify(expected)), name);
     assert.deepEqual(await g.store.load(ROOM_ID), await f.store.load(ROOM_ID), `${name} metadata`);
@@ -2833,4 +2844,35 @@ test('accepted lifecycle shutdown refuses a later consumer invocation before HTT
   const handlers = f.registry.get(ROOM_ID).runtimeCommands;
   assert.equal((await handlers.sharedCommand('room.close', {}, sharedContext)).result.status, 'accepted');
   assert.deepEqual(await handlers.consumerCommands[0].handler({ id: 1 }, sharedContext), { ok: false, error: 'unauthorized' });
+});
+
+test('runtime history cannot escalate or select another viewer, and commands expose safe results', async () => {
+ const f=await sharedCommandFixture();
+ const call=f.registry.get(ROOM_ID).runtimeCommands.sharedCommand;
+ for(const command of ['room.history','room.show','room.participants','room.message','room.say']) await f.service.grantRuntimeCommand(ROOM_ID,{caller_cid:ALICE_CID,command});
+ for(const input of [{view:'operator'},{view:'host'},{view:'Participant'},{view:null},{viewerCid:BOB_CID},{viewer_cid:BOB_CID},{sender_cid:BOB_CID},{after:-1}]) assert.deepEqual(await call('room.history',input,sharedContext),{ok:false,error:'invalid_request'});
+ for(const input of [{},{view:'participant'}]) {
+  const out=await call('room.history',input,sharedContext); assert.equal(out.ok,true);
+  for(const row of out.result) { assert.equal(row.kind,'message'); assert.equal(row.recipient_identities,undefined); assert.equal(row.source_wire_id,undefined); assert.match(row.record_id,/:participant:/); }
+ }
+ const show=await call('room.show',{},sharedContext);
+ assert.deepEqual(Object.keys(show.result).sort(),['anonymous','membership_epoch','mission','quiet_membership','room_id','room_name','state']);
+ const roster=await call('room.participants',{},sharedContext);
+ roster.result.forEach(seat=>assert.deepEqual(Object.keys(seat).sort(),['participant_id','role','state']));
+ await f.service.addRestRole(ROOM_ID,{role:'Reporter'});
+ for(const [name,input] of [['room.message',{text:'Public post'}],['room.say',{role:'Reporter',text:'Role post'}]]) {
+  const out=await call(name,input,sharedContext); assert.equal(out.ok,true);
+  assert.deepEqual(Object.keys(out.result).sort(),['accepted','message_id']); assert.equal(out.result.accepted,true);
+ }
+});
+
+test('participant history scans bounded raw pages before applying the visible cursor',async()=>{
+ const f=await sharedCommandFixture();
+ const original=await f.service.participantHistory(ROOM_ID,ALICE_CID,{});
+ for(let i=0;i<70;i++) await f.store.append(ROOM_ID,{version:1,kind:'relay_result',room_id:ROOM_ID,at:TIMES[0],intent_record_id:`${ROOM_ID}:1`,message_id:MESSAGE_IDS[0],recipient_identity:BOB_CID,status:'send_failed'});
+ await f.service.postMessage(ROOM_ID,{text:'After hidden activity'});
+ const read=f.store.read.bind(f.store);
+ f.store.read=async(id,page)=>{assert(page.limit<=64);return read(id,{...page,limit:Math.min(page.limit,7)});};
+ const after=await f.service.participantHistory(ROOM_ID,ALICE_CID,{after:original.length,limit:1});
+ assert.deepEqual(after.map(x=>({text:x.text,seq:x.seq})),[{text:'After hidden activity',seq:original.length+1}]);
 });

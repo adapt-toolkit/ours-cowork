@@ -14,7 +14,41 @@ Update the display name with `ours-cowork room settings <room-id> --name "New na
 
 Runtime commands are default-deny. Per-CID grants use `command-grant` and `command-revoke`. An operator may instead register a durable role policy with `role-command-set <room-id> --role <label> --commands <comma-list>` and inspect it with `role-command-grants`; use `--commands none` to remove it. A role policy authorizes only an authenticated, active seat whose durable admission role exactly matches the policy. Display names, message labels, pending seats, removed seats, and caller-supplied role text never confer authority. Removing a role policy does not remove an independently configured per-CID grant.
 
-The dedicated `start_thread` runtime command creates a scoped reply thread after an operator grants that exact command name. Its input is `{"topic":"Review","participant_ids":["<participant-id>"],"idempotency_key":"request-1"}`. The authenticated caller must be an active selected participant; every selected participant ID must identify a distinct active seat. Topics contain 1–120 Unicode code points, reject control and format characters, and are trimmed only after the raw input passes those bounds. A successful call returns `{"ok":true,"thread_id":"<thread-id>","status":"accepted"}`. Acceptance records the immutable participant set and resumes pending delivery; it does not claim that delivery completed. Repeating the same key with the same normalized topic and participant set returns the original receipt, while reusing it for different content returns `idempotency_conflict`.
+## Scoped reply threads
+
+The dedicated `start_thread` runtime command creates a scoped reply thread after an operator grants that exact command name. Discover and invoke it through the SDK's generic command APIs, then use the SDK's native reply field:
+
+```ts
+const definitions = await client.listContactCommands({ contact: roomCid });
+const start = definitions.find(c => c.name === 'start_thread');
+if (!start) throw new Error('This room does not advertise start_thread');
+await client.sendCommand({ contact: roomCid, command: start.name,
+  arguments: { topic: 'Review', participant_ids: selectedParticipantIds,
+    idempotency_key: stableKeyForThisCreation } });
+// Receive the room's root normally; reply using YOUR received root wire ID.
+await client.sendMessage({ contact: roomCid, text: 'My reply',
+  reply_to_wire_id: receivedRoot.wire_id });
+// Omitting reply_to_wire_id creates an ordinary whole-room message.
+```
+
+Here, `client` is an existing bound Ours client and `roomCid` is its room contact CID. Obtain `selectedParticipantIds` from the room's separately permitted `list-members` roster command; they are the chosen stable participant IDs and must include the creator. `stableKeyForThisCreation` is an opaque client-generated key reused only for identical retries. `receivedRoot` is this member's incoming copy of the root message, not another member's copy.
+
+The input object has exactly `topic`, `participant_ids`, and `idempotency_key`. A topic contains 1–120 Unicode code points, contains at least one non-whitespace character, excludes Unicode control and format characters, and is trimmed after the raw value passes those bounds. An idempotency key contains 1–128 ASCII characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, and `-`. The participant list contains one or more distinct, active roster IDs. A one-member thread is valid; its replies are archived and acknowledged with no other recipient.
+
+The authenticated creator must be active, selected, and granted `start_thread`. Creation records the selected seats as immutable pairs of participant ID and CID. Later admissions are not backfilled, and removing then re-admitting a CID does not restore access under its new participant ID. Roots and replies go only to selected original seats that are still active. A member does not need a `start_thread` grant to reply after receiving a root. Each recipient replies to its own received wire ID; Cowork translates each relayed reply to that recipient's copy of the immediate parent.
+
+A successful command result is `{"ok":true,"thread_id":"<thread-id>","status":"accepted"}`. Acceptance means the root and its immutable recipient work were stored; delivery to each selected member proceeds independently and may be partial. Repeating the same creator key with the same normalized topic and participant set, in any participant order, returns the original receipt. Use these public errors without relying on diagnostic details:
+
+| Error | Meaning |
+| --- | --- |
+| `unauthorized` | The caller is not an active granted creator, or the same creator/key belongs to an earlier seat incarnation. |
+| `invalid_request` | The command object or one of its bounded fields does not match the advertised schema. |
+| `invalid_members` | A selected ID is duplicate, unknown, inactive, or does not include the creator. |
+| `idempotency_conflict` | The creator reused a key with a different normalized topic or participant set. |
+| `reply_target_unavailable` | A reply target is missing, invalid, expired, ambiguous, foreign to the sender, or no longer authorized. The content is rejected and is never broadcast. |
+| `thread_files_unsupported` | A file targets a scoped root or descendant; version one scoped threads carry messages only. |
+
+Invalid scoped replies and scoped file attempts are durably rejected before their inbox item is acknowledged. Cowork makes one best-effort attempt to send the submitting member a private, fixed error-code notice; that notice can be lost, and a restart does not repeat it. The rejected content, target, and routing details are not included in the notice. If Cowork cannot prove a selected recipient's local parent copy during relay or restart, that recipient's delivery ends with a terminal unavailable result; private content is not sent without its reply link.
 
 Membership changes are deliberately independent operator actions. Add a participant by issuing an invite for the intended role and admitting that identity; remove a participant with `ours-cowork room remove <room-id> <participant>`. To preserve coverage, add and confirm the new participant before removing the old one. To remove a dead participant first, remove it and issue a new invite afterward. Cowork does not combine these actions into a replacement operation or infer successor lineage.
 

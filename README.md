@@ -23,6 +23,8 @@ The package keeps room metadata and a per-room indexed `archive.sqlite3` in its 
 
 Ordinary ours-mcp identities can join only as remote participants over the ours protocol.
 
+Granted room members can create message-only scoped reply threads for an explicit subset of stable room participant IDs through the generic Ours command catalog's `start_thread` command. Selected members receive separate root copies and reply with the SDK's native `reply_to_wire_id`; Cowork maps each descendant to the recipient's local immediate-parent copy. The selected participant-ID/CID pairs are immutable, later members are not backfilled, and excluded members receive no scoped message, file notice, notification, participant-history row, command result, or routing metadata. A message without `reply_to_wire_id` remains an ordinary whole-room message. See [Room workflow](./docs/05-room-workflow.md#scoped-reply-threads) for command discovery, schema, errors, and retry behavior, and [Messaging and history](./docs/07-messaging-history.md#reply-threading) for reply and history semantics.
+
 Active participants can also send files through the room identity. Cowork treats
 them as opaque bytes, archives them before consuming SDK inbox state, and relays an
 SDK-authenticated metadata envelope plus the binary file to every other active seat.
@@ -42,3 +44,4 @@ ours-cowork docs web
 
 Before production use, read the limitations topic. In particular, backups require a stopped daemon and restore uses the complete state directory.
 Lost room identity leases are recovered automatically with a non-force bind and exact persisted-CID proof. Operators can invoke the same safe path explicitly with `ours-cowork room rebind <room-id>`; it never recreates an established identity or steals a live lease.
+The localhost host-management CLI/API and web Archive retain full scoped-thread visibility for administrators, including excluded-member traffic that participant APIs hide. Runtime `room.history` is an authenticated, grant-gated participant view with viewer-local cursors; host cursors and participant cursors are not interchangeable. The shared SDK history remains local to each identity and does not define Cowork routing or host archive retention.

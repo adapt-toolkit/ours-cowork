@@ -11,6 +11,7 @@ import {
   sdkIdentityNameError,
 } from '../src/contracts.ts';
 import { ContactAlreadyAbsentError, LegacyCoworkStateError, packInvite } from '../src/packets.ts';
+import { ThreadFailure } from '../src/thread-contracts.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const ALICE_CID = 'A'.repeat(64);
@@ -2302,14 +2303,13 @@ function threadRoots(records) {
   return records.filter((record) => record.kind === 'message' && record.thread_root !== undefined);
 }
 
-test('publicThreadMetadata exposes participant IDs and the room-safe creator snapshot', async () => {
-  const { publicThreadMetadata } = await import('../src/threads.ts');
-  assert.equal(typeof publicThreadMetadata, 'function');
+function publicThreadRoot() {
   const thread_id = '01jz6y7n8p9q0r1s2t3v4w5xaa';
-  const root = {
+  return {
     at: '2026-09-10T10:11:12.000Z', message_id: thread_id,
     author: { identity: ALICE_CID, display_name: 'Alice', role: 'builder' },
     author_alias: { participant_id: '01jz6y7n8p9q0r1s2t3v4w5xab', alias: 'builder #1' },
+    scope: { thread_id },
     thread_root: {
       schema_version: 1, thread_id, topic: 'Review',
       creator_participant_id: '01jz6y7n8p9q0r1s2t3v4w5xab',
@@ -2320,13 +2320,21 @@ test('publicThreadMetadata exposes participant IDs and the room-safe creator sna
       idempotency_key: 'private-key', fingerprint: 'a'.repeat(64),
     },
   };
+}
+
+test('publicThreadMetadata exposes participant IDs and the room-safe creator snapshot', async () => {
+  const { publicThreadMetadata } = await import('../src/threads.ts');
+  assert.equal(typeof publicThreadMetadata, 'function');
+  const root = publicThreadRoot();
+  const { message_id: thread_id } = root;
   const expected = {
     schema_version: 1, thread_id, topic: 'Review',
     creator: { identity: ALICE_CID, display_name: 'Alice', role: 'builder' },
     participant_ids: ['01jz6y7n8p9q0r1s2t3v4w5xab', '01jz6y7n8p9q0r1s2t3v4w5xac'],
     created_at: root.at,
   };
-  assert.deepEqual(publicThreadMetadata(root, { anonymous: false }), expected);
+  const { author_alias: _anonymousAlias, ...namedRoot } = root;
+  assert.deepEqual(publicThreadMetadata(namedRoot, { anonymous: false }), expected);
   assert.deepEqual(publicThreadMetadata(root, { anonymous: true }), {
     ...expected,
     creator: { identity: '01jz6y7n8p9q0r1s2t3v4w5xab', display_name: 'builder #1', role: 'builder' },
@@ -2334,6 +2342,24 @@ test('publicThreadMetadata exposes participant IDs and the room-safe creator sna
   assert.equal(JSON.stringify(publicThreadMetadata(root, { anonymous: false })).includes(ALICE_CID), true);
   assert.equal(JSON.stringify(publicThreadMetadata(root, { anonymous: false })).includes(BOB_CID), false);
   assert.equal(JSON.stringify(publicThreadMetadata(root, { anonymous: false })).includes('private-key'), false);
+});
+
+test('publicThreadMetadata fails closed on absent, malformed, or mismatched anonymous aliases', async () => {
+  const { publicThreadMetadata } = await import('../src/threads.ts');
+  const root = publicThreadRoot();
+  const corrupt = [
+    { ...root, author_alias: undefined },
+    { ...root, author_alias: { ...root.author_alias, participant_id: 'not-a-participant-id' } },
+    { ...root, author_alias: { ...root.author_alias, participant_id: root.thread_root.members[1].participant_id } },
+  ];
+  for (const candidate of corrupt) {
+    assert.throws(
+      () => publicThreadMetadata(candidate, { anonymous: true }),
+      (error) => error instanceof ThreadFailure
+        && error.code === 'reply_target_unavailable'
+        && error.message === 'reply_target_unavailable',
+    );
+  }
 });
 
 test('start_thread needs a grant and deduplicates normalized retries', async () => {

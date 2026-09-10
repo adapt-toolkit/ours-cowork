@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-import type { CommunicationRecord, Room, Seat } from './contracts.ts';
+import { AuthorAliasSchema, type CommunicationRecord, type Room, type Seat } from './contracts.ts';
 import {
   ThreadFailure,
   ThreadRootSchema,
@@ -26,15 +26,25 @@ export function publicThreadMetadata(
     & { thread_root: ThreadRoot },
   room: Pick<Room, 'anonymous'>,
 ): PublicThreadMetadata {
-  const creator = room.anonymous && root.author_alias !== undefined ? {
-    identity: root.author_alias.participant_id,
-    display_name: root.author_alias.alias,
-    role: root.author.role,
-  } : {
-    identity: root.author.identity,
-    display_name: root.author.display_name,
-    role: root.author.role,
-  };
+  let creator: PublicThreadMetadata['creator'];
+  if (room.anonymous) {
+    const alias = AuthorAliasSchema.safeParse(root.author_alias);
+    if (!alias.success
+      || alias.data.participant_id !== root.thread_root.creator_participant_id) {
+      throw new ThreadFailure('reply_target_unavailable');
+    }
+    creator = {
+      identity: alias.data.participant_id,
+      display_name: alias.data.alias,
+      role: root.author.role,
+    };
+  } else {
+    creator = {
+      identity: root.author.identity,
+      display_name: root.author.display_name,
+      role: root.author.role,
+    };
+  }
   return {
     schema_version: 1,
     thread_id: root.thread_root.thread_id,

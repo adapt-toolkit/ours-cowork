@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { selectReply, readReplyRows } from '../src/reply-threading.ts';
+import {
+  mapReplyParent,
+  readReplyRows,
+  resolveReplyParent,
+  selectReply,
+} from '../src/reply-threading.ts';
 const item = (id, seq, author, wire, recipients, reply) => ({
   room_id: 'R', record_id: `r${seq}`, kind: 'message', message_id: id, seq,
   author: { identity: author }, source_wire_id: wire, recipient_identities: recipients,
@@ -12,6 +17,66 @@ const pair = (seq, cid, wire, status = 'queued') => [
   { room_id: 'R', seq: seq + 1, record_id: `r${seq + 1}`, kind: 'relay_result', message_id: 'L_a', recipient_identity: cid, intent_record_id: `r${seq}`, status, wire_id: wire },
 ];
 const rows = [parent, ...pair(2, 'B', 'w_aB1'), ...pair(4, 'B', 'w_aB2'), ...pair(6, 'C', 'w_aC')];
+test('scope can be resolved before a child or recipient exists', () => {
+  const p = resolveReplyParent(rows, 'R', 'B', 'w_aB1', 10);
+  assert.equal(p.state, 'resolved');
+  assert.equal(p.parent.key, 'message:L_a');
+  assert.equal(mapReplyParent(rows, 'R', p.parent, 'C').replyTo.wire_id, 'w_aC');
+  assert.equal(mapReplyParent(rows, 'R', p.parent, 'D').state, 'missing_copy');
+  assert.equal(resolveReplyParent(rows, 'R', 'B', 'w_aC', 10).state, 'unknown_parent');
+  assert.equal(resolveReplyParent(rows, 'R', 'B', 'w_aB1', 1).state, 'unknown_parent');
+});
+
+test('absent and supplied empty parent wires remain distinct', () => {
+  assert.equal(resolveReplyParent(rows, 'R', 'B', undefined, 10).state, 'none');
+  assert.equal(resolveReplyParent(rows, 'R', 'B', '', 10).state, 'unknown_parent');
+});
+
+test('new resolver keeps duplicate delivery aliases and source-less roots usable', () => {
+  for (const wire of ['w_aB1', 'w_aB2']) {
+    assert.equal(resolveReplyParent(rows, 'R', 'B', wire, 10).state, 'resolved');
+  }
+  const p = { ...parent, source_wire_id: undefined, recipient_identities: ['A', 'B', 'C'] };
+  const evidence = [p, ...rows.slice(1), ...pair(8, 'A', 'w_aA')];
+  const resolved = resolveReplyParent(evidence, 'R', 'B', 'w_aB1', 12);
+  assert.equal(resolved.state, 'resolved');
+  assert.deepEqual(mapReplyParent(evidence, 'R', resolved.parent, 'A'), {
+    state: 'linked', parentKey: 'message:L_a', replyTo: { wire_id: 'w_aA' },
+  });
+});
+
+test('new resolver rejects malformed intent tuples and survives archive reload', () => {
+  const invalid = [
+    [parent,
+      { ...pair(2, 'B', 'bad')[0], recipient_identity: 'C' },
+      pair(2, 'B', 'bad')[1]],
+    [parent,
+      pair(2, 'B', 'bad')[0],
+      { ...pair(2, 'B', 'bad')[1], message_id: 'L_other' }],
+    [parent,
+      { ...pair(2, 'B', 'bad')[0], message_id: undefined, file_id: 'L_a' },
+      pair(2, 'B', 'bad')[1]],
+    [parent,
+      { ...pair(2, 'B', 'bad')[0], seq: 9 },
+      { ...pair(2, 'B', 'bad')[1], seq: 8 }],
+    [{ ...parent, seq: 2 }, ...pair(2, 'B', 'bad')],
+    [{ ...parent, recipient_identities: ['C'] }, ...pair(2, 'B', 'bad')],
+    [parent,
+      pair(2, 'B', 'bad')[0],
+      { ...pair(2, 'B', 'bad')[0], seq: 3 },
+      { ...pair(2, 'B', 'bad')[1], seq: 4 }],
+  ];
+  for (const evidence of invalid) {
+    assert.equal(resolveReplyParent(evidence, 'R', 'B', 'bad', 20).state, 'unknown_parent');
+  }
+
+  const restored = JSON.parse(JSON.stringify(rows));
+  const resolved = resolveReplyParent(restored, 'R', 'B', 'w_aB2', 10);
+  assert.equal(resolved.state, 'resolved');
+  assert.deepEqual(mapReplyParent(restored, 'R', resolved.parent, 'C'), {
+    state: 'linked', parentKey: 'message:L_a', replyTo: { wire_id: 'w_aC' },
+  });
+});
 test('both duplicate aliases route to A original and C own copy', () => {
   for (const wire of ['w_aB1', 'w_aB2']) {
     const child = item('L_b', 10, 'B', 'w_b', ['A', 'C'], wire);

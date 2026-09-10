@@ -131,14 +131,16 @@ class FakePacket {
     if (this.afterConsumeFile) await this.afterConsumeFile({ consumed, deferred: [] });
   }
 
-  async send(recipient, body) {
-    this.sendCalls.push({ recipient, body });
+  async send(recipient, body, replyTo) {
+    this.sendCalls.push({ recipient, body, ...(replyTo ? { replyTo } : {}) });
     if (this.beforeSend) await this.beforeSend(recipient, body);
-    return structuredClone(this.nextSend);
+    return structuredClone(typeof this.nextSend === 'function'
+      ? this.nextSend(recipient, body) : this.nextSend);
   }
 
-  async sendFile(recipient, filename, mime, data) {
-    this.sendFileCalls.push({ recipient, filename, mime, data: Buffer.from(data) });
+  async sendFile(recipient, filename, mime, data, replyTo) {
+    this.sendFileCalls.push({ recipient, filename, mime, data: Buffer.from(data),
+      ...(replyTo ? { replyTo } : {}) });
     if (this.beforeSendFile) await this.beforeSendFile(recipient, filename, mime, data);
     return { status: 'queued', wire_id: 'wire-file-out' };
   }
@@ -247,6 +249,29 @@ test('intake preserves standard SDK reply references on archived messages and fi
   assert.deepEqual(byKind(records, 'file')[0].source_reply_to, { wire_id: 'wire-parent-file' });
 });
 
+test('broadcast reply references original for A, recipient copy for C, no B echo', async () => {
+  const f = fixture();
+  let serial = 0;
+  f.packet.nextSend = () => ({ status: 'queued', wire_id: `wire-relay-${++serial}` });
+  f.packet.inbox.push(incoming({ wire_id: 'wire-A-original' }));
+  await f.pump.pump(ROOM_ID);
+  const archive = await f.store.read(ROOM_ID);
+  const parent = byKind(archive, 'message')[0];
+  const copies = byKind(archive, 'relay_result').filter(r => r.message_id === parent.message_id);
+  const parentB = copies.find(r => r.recipient_identity === 'cid-bob').wire_id;
+  const parentC = copies.find(r => r.recipient_identity === 'cid-cara').wire_id;
+  f.packet.sendCalls.length = 0;
+  f.packet.inbox.push(incoming({ msg_id: 8, sender_id: 'cid-bob',
+    text: 'B answer', wire_id: 'wire-B-answer', reply_to: { wire_id: parentB } }));
+  await f.pump.pump(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls.map(c => c.recipient).sort(), ['cid-alice', 'cid-cara']);
+  assert.deepEqual(f.packet.sendCalls.find(c => c.recipient === 'cid-alice').replyTo,
+    { wire_id: 'wire-A-original' });
+  assert.deepEqual(f.packet.sendCalls.find(c => c.recipient === 'cid-cara').replyTo,
+    { wire_id: parentC });
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'message').length, 2);
+});
+
 test('restart intake drains legacy invalid file metadata without archiving it or blocking later files', async () => {
   const f = fixture();
   f.packet.fileInbox.push(
@@ -313,6 +338,35 @@ test('participant files archive bytes before consume and relay a readable notice
     at: file.at,
   });
   assert.equal(f.packet.sendCalls[0].body, canonicalJson(notice));
+});
+
+test('file reply sends notice and bytes with each recipient parent reference', async () => {
+  const f = fixture();
+  let serial = 0;
+  f.packet.nextSend = () => ({ status: 'queued', wire_id: `wire-relay-${++serial}` });
+  f.packet.inbox.push(incoming({ wire_id: 'wire-A-original' }));
+  await f.pump.pump(ROOM_ID);
+
+  const archive = await f.store.read(ROOM_ID);
+  const parent = byKind(archive, 'message')[0];
+  const copies = byKind(archive, 'relay_result').filter(r => r.message_id === parent.message_id);
+  const parentB = copies.find(r => r.recipient_identity === 'cid-bob').wire_id;
+  const parentC = copies.find(r => r.recipient_identity === 'cid-cara').wire_id;
+  f.packet.sendCalls.length = 0;
+  f.packet.sendFileCalls.length = 0;
+
+  f.packet.fileInbox.push(incomingFile({ sender_id: 'cid-bob', wire_id: 'wire-B-file-answer',
+    reply_to: { wire_id: parentB } }));
+  await f.pump.pump(ROOM_ID);
+
+  assert.deepEqual(f.packet.sendCalls.map(c => c.recipient), ['cid-alice', 'cid-cara']);
+  assert.deepEqual(f.packet.sendFileCalls.map(c => c.recipient), ['cid-alice', 'cid-cara']);
+  for (const calls of [f.packet.sendCalls, f.packet.sendFileCalls]) {
+    assert.deepEqual(calls.find(c => c.recipient === 'cid-alice').replyTo,
+      { wire_id: 'wire-A-original' });
+    assert.deepEqual(calls.find(c => c.recipient === 'cid-cara').replyTo,
+      { wire_id: parentC });
+  }
 });
 
 test('a refused file notice prevents binary sends and records terminal failures', async () => {

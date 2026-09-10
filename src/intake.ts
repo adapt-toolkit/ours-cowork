@@ -17,6 +17,7 @@ import {
 import type { FileInboxItem, InboxItem, RoomPacket } from './packets.ts';
 import type { CoworkStore, RoomMutex } from './storage.ts';
 import { generateUlid } from './ulid.ts';
+import { readReplyRows, selectReply } from './reply-threading.ts';
 
 type IntakeStore = Pick<CoworkStore, 'mutex' | 'load' | 'save' | 'append' | 'read'>
   & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'relayRecipientsNeedingIntent'>>;
@@ -84,8 +85,9 @@ export async function sendRoomBody(
   packet: Pick<RoomPacket, 'send'>,
   recipientIdentity: string,
   unsigned: Record<string, unknown>,
+  replyTo?: Parameters<RoomPacket['send']>[2],
 ): Promise<Awaited<ReturnType<RoomPacket['send']>>> {
-  return packet.send(recipientIdentity, canonicalJson(unsigned));
+  return packet.send(recipientIdentity, canonicalJson(unsigned), replyTo);
 }
 
 /** Archive, consume, and relay participant messages for hosted room packets. */
@@ -530,6 +532,12 @@ export class IntakePump {
         continue;
       }
 
+      const source = message ?? file!;
+      const replyRows = source.source_reply_to === undefined
+        ? [] : await readReplyRows(this.store, roomId);
+      const decision = selectReply(replyRows, roomId, source, intent.recipient_identity);
+      const replyTo = decision.replyTo;
+
       if (file !== undefined) {
         const uploader = file.author_alias?.alias ?? file.author.display_name;
         const notice = await sendRoomBody(packet, intent.recipient_identity, {
@@ -545,7 +553,7 @@ export class IntakePump {
           },
           text: `${uploader} sent a file`,
           at: file.at,
-        });
+        }, replyTo);
         if (notice.status === 'send_failed') {
           const failed = await this.store.append(roomId, {
             version: 1,
@@ -565,6 +573,7 @@ export class IntakePump {
           file.filename,
           file.mime,
           Buffer.from(file.data_base64, 'base64'),
+          replyTo,
         );
         const appended = await this.store.append(roomId, {
           version: 1,
@@ -603,7 +612,7 @@ export class IntakePump {
       // RoomPacket.send returns only an observed queued/refused outcome. A
       // thrown call remains result-less because its acceptance is unknown and
       // will deliberately be retried on restart with the stable message ID.
-      const outcome = await sendRoomBody(packet, intent.recipient_identity, unsigned);
+      const outcome = await sendRoomBody(packet, intent.recipient_identity, unsigned, replyTo);
       const appended = await this.store.append(roomId, {
         version: 1,
         kind: 'relay_result',

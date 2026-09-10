@@ -1311,6 +1311,7 @@ export class RoomService {
           recipient_identities: _recipients,
           source_msg_id: _sourceMsg,
           source_wire_id: _sourceWire,
+          source_reply_to: _sourceReplyTo,
           ...rest
         } = record;
         return {

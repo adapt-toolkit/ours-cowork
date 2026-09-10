@@ -78,6 +78,7 @@ class FakePacket {
   listCalls = [];
   acknowledgeOrder = [];
   nextSend = { status: 'queued', wire_id: 'wire-out' };
+  nextSendFile = { status: 'queued', wire_id: 'wire-file-out' };
   beforeConsume;
   afterConsume;
   beforeSend;
@@ -131,16 +132,19 @@ class FakePacket {
     if (this.afterConsumeFile) await this.afterConsumeFile({ consumed, deferred: [] });
   }
 
-  async send(recipient, body) {
-    this.sendCalls.push({ recipient, body });
+  async send(recipient, body, replyTo) {
+    this.sendCalls.push({ recipient, body, ...(replyTo ? { replyTo } : {}) });
     if (this.beforeSend) await this.beforeSend(recipient, body);
-    return structuredClone(this.nextSend);
+    return structuredClone(typeof this.nextSend === 'function'
+      ? this.nextSend(recipient, body) : this.nextSend);
   }
 
-  async sendFile(recipient, filename, mime, data) {
-    this.sendFileCalls.push({ recipient, filename, mime, data: Buffer.from(data) });
+  async sendFile(recipient, filename, mime, data, replyTo) {
+    this.sendFileCalls.push({ recipient, filename, mime, data: Buffer.from(data),
+      ...(replyTo ? { replyTo } : {}) });
     if (this.beforeSendFile) await this.beforeSendFile(recipient, filename, mime, data);
-    return { status: 'queued', wire_id: 'wire-file-out' };
+    return structuredClone(typeof this.nextSendFile === 'function'
+      ? this.nextSendFile(recipient, filename, mime, data) : this.nextSendFile);
   }
 
   mintInvite() { throw new Error('not used'); }
@@ -231,6 +235,13 @@ function fixture(options = {}) {
 
 function byKind(records, kind) { return records.filter((record) => record.kind === kind); }
 
+function activeSeat(identity, displayName, role, suffix) {
+  return {
+    identity, display_name: displayName, role, invite_id: `invite-${suffix}`,
+    accepted_at: AT, participant_id: `01jz6y7n8p9q0r1s2t3v4w5x${suffix}`, state: 'active',
+  };
+}
+
 // ---- Durable file broadcast -------------------------------------------------
 
 test('intake preserves standard SDK reply references on archived messages and files', async () => {
@@ -245,6 +256,250 @@ test('intake preserves standard SDK reply references on archived messages and fi
     wire_id: 'wire-parent-message', sentence: 2,
   });
   assert.deepEqual(byKind(records, 'file')[0].source_reply_to, { wire_id: 'wire-parent-file' });
+});
+
+test('broadcast reply references original for A, recipient copy for C, no B echo', async () => {
+  const f = fixture();
+  let serial = 0;
+  f.packet.nextSend = () => ({ status: 'queued', wire_id: `wire-relay-${++serial}` });
+  f.packet.inbox.push(incoming({ wire_id: 'wire-A-original' }));
+  await f.pump.pump(ROOM_ID);
+  const archive = await f.store.read(ROOM_ID);
+  const parent = byKind(archive, 'message')[0];
+  const copies = byKind(archive, 'relay_result').filter(r => r.message_id === parent.message_id);
+  const parentB = copies.find(r => r.recipient_identity === 'cid-bob').wire_id;
+  const parentC = copies.find(r => r.recipient_identity === 'cid-cara').wire_id;
+  f.packet.sendCalls.length = 0;
+  f.packet.inbox.push(incoming({ msg_id: 8, sender_id: 'cid-bob',
+    text: 'B answer', wire_id: 'wire-B-answer', reply_to: { wire_id: parentB } }));
+  await f.pump.pump(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls.map(c => c.recipient).sort(), ['cid-alice', 'cid-cara']);
+  assert.deepEqual(f.packet.sendCalls.find(c => c.recipient === 'cid-alice').replyTo,
+    { wire_id: 'wire-A-original' });
+  assert.deepEqual(f.packet.sendCalls.find(c => c.recipient === 'cid-cara').replyTo,
+    { wire_id: parentC });
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'message').length, 2);
+});
+
+test('nested intake replies use the immediate parent copies for every destination', async () => {
+  const f = fixture();
+  let serial = 0;
+  f.packet.nextSend = (recipient) => ({ status: 'queued', wire_id: `${recipient}-${++serial}` });
+  f.packet.inbox.push(incoming({ wire_id: 'wire-A-root' }));
+  await f.pump.pump(ROOM_ID);
+
+  let records = await f.store.read(ROOM_ID);
+  const root = byKind(records, 'message')[0];
+  const rootResults = byKind(records, 'relay_result').filter(r => r.message_id === root.message_id);
+  const rootB = rootResults.find(r => r.recipient_identity === 'cid-bob').wire_id;
+  f.packet.sendCalls.length = 0;
+  f.packet.inbox.push(incoming({
+    msg_id: 8, sender_id: 'cid-bob', text: 'B answers A', wire_id: 'wire-B-original',
+    reply_to: { wire_id: rootB, sentence: 4 },
+  }));
+  await f.pump.pump(ROOM_ID);
+
+  records = await f.store.read(ROOM_ID);
+  const answer = byKind(records, 'message').find(message => message.text === 'B answers A');
+  const answerResults = byKind(records, 'relay_result').filter(r => r.message_id === answer.message_id);
+  const answerA = answerResults.find(r => r.recipient_identity === 'cid-alice').wire_id;
+  const answerC = answerResults.find(r => r.recipient_identity === 'cid-cara').wire_id;
+  assert.deepEqual(answer.source_reply_to, { wire_id: rootB, sentence: 4 });
+  f.packet.sendCalls.length = 0;
+  f.packet.inbox.push(incoming({
+    msg_id: 9, sender_id: 'cid-alice', text: 'A follows up to B', wire_id: 'wire-A-followup',
+    reply_to: { wire_id: answerA },
+  }));
+  await f.pump.pump(ROOM_ID);
+
+  assert.deepEqual(f.packet.sendCalls.map(call => call.recipient), ['cid-bob', 'cid-cara']);
+  assert.deepEqual(f.packet.sendCalls.find(call => call.recipient === 'cid-bob').replyTo,
+    { wire_id: 'wire-B-original' });
+  assert.deepEqual(f.packet.sendCalls.find(call => call.recipient === 'cid-cara').replyTo,
+    { wire_id: answerC });
+  assert(f.packet.sendCalls.every(call => call.replyTo.sentence === undefined));
+});
+
+test('two participant answers remain distinct broadcasts against their own parent copies', async () => {
+  const f = fixture();
+  let serial = 0;
+  f.packet.nextSend = (recipient) => ({ status: 'queued', wire_id: `${recipient}-${++serial}` });
+  f.packet.inbox.push(incoming({ wire_id: 'wire-A-root' }));
+  await f.pump.pump(ROOM_ID);
+  const rootRecords = await f.store.read(ROOM_ID);
+  const root = byKind(rootRecords, 'message')[0];
+  const rootResults = byKind(rootRecords, 'relay_result').filter(r => r.message_id === root.message_id);
+  const rootB = rootResults.find(r => r.recipient_identity === 'cid-bob').wire_id;
+  const rootC = rootResults.find(r => r.recipient_identity === 'cid-cara').wire_id;
+
+  f.packet.sendCalls.length = 0;
+  f.packet.inbox.push(
+    incoming({ msg_id: 8, sender_id: 'cid-bob', text: 'B answer', wire_id: 'wire-B-answer', reply_to: { wire_id: rootB } }),
+    incoming({ msg_id: 9, sender_id: 'cid-cara', text: 'C answer', wire_id: 'wire-C-answer', reply_to: { wire_id: rootC } }),
+  );
+  await f.pump.pump(ROOM_ID);
+
+  const answers = byKind(await f.store.read(ROOM_ID), 'message')
+    .filter(message => message.message_id !== root.message_id);
+  assert.equal(new Set(answers.map(message => message.message_id)).size, 2);
+  assert.deepEqual(answers.map(message => message.source_reply_to.wire_id), [rootB, rootC]);
+  const bCalls = f.packet.sendCalls.filter(call => JSON.parse(call.body).text === 'B answer');
+  const cCalls = f.packet.sendCalls.filter(call => JSON.parse(call.body).text === 'C answer');
+  assert.deepEqual(bCalls.map(call => call.recipient), ['cid-alice', 'cid-cara']);
+  assert.deepEqual(cCalls.map(call => call.recipient), ['cid-alice', 'cid-bob']);
+  assert.deepEqual(bCalls.map(call => call.replyTo.wire_id), ['wire-A-root', rootC]);
+  assert.deepEqual(cCalls.map(call => call.replyTo.wire_id), ['wire-A-root', rootB]);
+});
+
+test('late participants get an unthreaded body and a removed parent author gets no send', async () => {
+  const f = fixture();
+  let serial = 0;
+  f.packet.nextSend = (recipient) => ({ status: 'queued', wire_id: `${recipient}-${++serial}` });
+  f.packet.inbox.push(incoming({ wire_id: 'wire-A-root' }));
+  await f.pump.pump(ROOM_ID);
+  const parentRows = await f.store.read(ROOM_ID);
+  const parent = byKind(parentRows, 'message')[0];
+  const results = byKind(parentRows, 'relay_result').filter(r => r.message_id === parent.message_id);
+  const rootB = results.find(r => r.recipient_identity === 'cid-bob').wire_id;
+  const rootC = results.find(r => r.recipient_identity === 'cid-cara').wire_id;
+  f.store.rooms.get(ROOM_ID).seats.push(activeSeat('cid-dana', 'Dana', 'tester', 'd1'));
+
+  f.packet.sendCalls.length = 0;
+  f.packet.afterConsume = async ({ consumed }) => {
+    if (!consumed.includes(8)) return;
+    const current = f.store.rooms.get(ROOM_ID);
+    current.membership_epoch += 1;
+    current.seats = current.seats.map(seat => seat.identity === 'cid-alice'
+      ? { ...seat, state: 'removed', removed_at: AT, removed_epoch: current.membership_epoch }
+      : seat);
+  };
+  f.packet.inbox.push(incoming({
+    msg_id: 8, sender_id: 'cid-bob', text: 'Answer after membership change',
+    wire_id: 'wire-B-answer', reply_to: { wire_id: rootB },
+  }));
+  await f.pump.pump(ROOM_ID);
+
+  assert.deepEqual(f.packet.sendCalls.map(call => call.recipient), ['cid-cara', 'cid-dana']);
+  assert.deepEqual(f.packet.sendCalls[0].replyTo, { wire_id: rootC });
+  assert.equal('replyTo' in f.packet.sendCalls[1], false);
+  const answer = byKind(await f.store.read(ROOM_ID), 'message').find(message => message.text === 'Answer after membership change');
+  const answerResults = byKind(await f.store.read(ROOM_ID), 'relay_result')
+    .filter(result => result.message_id === answer.message_id);
+  assert.deepEqual(answer.recipient_identities, ['cid-alice', 'cid-cara', 'cid-dana']);
+  assert.equal(answerResults.find(result => result.recipient_identity === 'cid-alice').status,
+    'skipped_removed');
+});
+
+test('failed parent fanout and unknown references preserve broadcast with per-destination fallback', async () => {
+  const f = fixture();
+  f.store.rooms.get(ROOM_ID).seats.push(activeSeat('cid-dana', 'Dana', 'tester', 'd1'));
+  f.packet.nextSend = (recipient, body) => {
+    const text = JSON.parse(body).text;
+    if (text === 'Participant update' && recipient === 'cid-dana') return { status: 'send_failed' };
+    return { status: 'queued', wire_id: `${text}:${recipient}` };
+  };
+  f.packet.inbox.push(incoming({ wire_id: 'wire-A-root' }));
+  await f.pump.pump(ROOM_ID);
+  const parentRows = await f.store.read(ROOM_ID);
+  const parent = byKind(parentRows, 'message')[0];
+  const parentResults = byKind(parentRows, 'relay_result').filter(r => r.message_id === parent.message_id);
+  const rootB = parentResults.find(r => r.recipient_identity === 'cid-bob').wire_id;
+
+  f.packet.sendCalls.length = 0;
+  f.packet.inbox.push(
+    incoming({ msg_id: 8, sender_id: 'cid-bob', text: 'Known parent', wire_id: 'wire-B-known', reply_to: { wire_id: rootB } }),
+    incoming({ msg_id: 9, sender_id: 'cid-bob', text: 'Unknown parent', wire_id: 'wire-B-unknown', reply_to: { wire_id: 'unrecorded-wire' } }),
+  );
+  await f.pump.pump(ROOM_ID);
+
+  const known = f.packet.sendCalls.filter(call => JSON.parse(call.body).text === 'Known parent');
+  const unknown = f.packet.sendCalls.filter(call => JSON.parse(call.body).text === 'Unknown parent');
+  assert.deepEqual(known.map(call => call.recipient), ['cid-alice', 'cid-cara', 'cid-dana']);
+  assert.deepEqual(known.find(call => call.recipient === 'cid-alice').replyTo, { wire_id: 'wire-A-root' });
+  assert.equal('replyTo' in known.find(call => call.recipient === 'cid-dana'), false);
+  assert(unknown.every(call => !('replyTo' in call)));
+  const archivedUnknown = byKind(await f.store.read(ROOM_ID), 'message')
+    .find(message => message.text === 'Unknown parent');
+  assert.deepEqual(archivedUnknown.source_reply_to, { wire_id: 'unrecorded-wire' });
+});
+
+test('a conflicting destination wire is omitted while another destination keeps its valid parent', async () => {
+  const firstId = MESSAGE_IDS[2];
+  const otherId = MESSAGE_IDS[3];
+  const records = [
+    {
+      version: 1, kind: 'message', room_id: ROOM_ID, seq: 1, record_id: `${ROOM_ID}:1`, at: AT,
+      message_id: firstId, author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' },
+      category: 'chat', text: 'First parent', source_wire_id: 'wire-A-first',
+      recipient_identities: ['cid-bob', 'cid-cara'],
+    },
+    { version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: 2, record_id: `${ROOM_ID}:2`, at: AT,
+      message_id: firstId, recipient_identity: 'cid-bob' },
+    { version: 1, kind: 'relay_result', room_id: ROOM_ID, seq: 3, record_id: `${ROOM_ID}:3`, at: AT,
+      intent_record_id: `${ROOM_ID}:2`, message_id: firstId, recipient_identity: 'cid-bob',
+      status: 'queued', wire_id: 'wire-first-bob' },
+    { version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: 4, record_id: `${ROOM_ID}:4`, at: AT,
+      message_id: firstId, recipient_identity: 'cid-cara' },
+    { version: 1, kind: 'relay_result', room_id: ROOM_ID, seq: 5, record_id: `${ROOM_ID}:5`, at: AT,
+      intent_record_id: `${ROOM_ID}:4`, message_id: firstId, recipient_identity: 'cid-cara',
+      status: 'queued', wire_id: 'wire-shared-cara' },
+    {
+      version: 1, kind: 'message', room_id: ROOM_ID, seq: 6, record_id: `${ROOM_ID}:6`, at: AT,
+      message_id: otherId, author: { identity: 'cid-bob', display_name: 'Bob', role: 'reviewer' },
+      category: 'chat', text: 'Other parent', source_wire_id: 'wire-B-other',
+      recipient_identities: ['cid-cara'],
+    },
+    { version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: 7, record_id: `${ROOM_ID}:7`, at: AT,
+      message_id: otherId, recipient_identity: 'cid-cara' },
+    { version: 1, kind: 'relay_result', room_id: ROOM_ID, seq: 8, record_id: `${ROOM_ID}:8`, at: AT,
+      intent_record_id: `${ROOM_ID}:7`, message_id: otherId, recipient_identity: 'cid-cara',
+      status: 'queued', wire_id: 'wire-shared-cara' },
+  ];
+  const f = fixture({ records });
+  f.packet.inbox.push(incoming({
+    sender_id: 'cid-bob', wire_id: 'wire-B-child', text: 'Child of first parent',
+    reply_to: { wire_id: 'wire-first-bob' },
+  }));
+  await f.pump.pump(ROOM_ID);
+
+  const calls = f.packet.sendCalls.filter(call => JSON.parse(call.body).text === 'Child of first parent');
+  assert.deepEqual(calls.map(call => call.recipient), ['cid-alice', 'cid-cara']);
+  assert.deepEqual(calls[0].replyTo, { wire_id: 'wire-A-first' });
+  assert.equal('replyTo' in calls[1], false);
+
+  f.packet.sendCalls.length = 0;
+  f.packet.inbox.push(incoming({
+    msg_id: 8, sender_id: 'cid-cara', wire_id: 'wire-C-child', text: 'Ambiguous child',
+    reply_to: { wire_id: 'wire-shared-cara' },
+  }));
+  await f.pump.pump(ROOM_ID);
+  const ambiguous = f.packet.sendCalls.filter(call => JSON.parse(call.body).text === 'Ambiguous child');
+  assert.deepEqual(ambiguous.map(call => call.recipient), ['cid-alice', 'cid-bob']);
+  assert(ambiguous.every(call => !('replyTo' in call)));
+  const archived = byKind(await f.store.read(ROOM_ID), 'message')
+    .find(message => message.text === 'Ambiguous child');
+  assert.deepEqual(archived.source_reply_to, { wire_id: 'wire-shared-cara' });
+});
+
+test('answers to a room-authored parent use participant copies and never self-send', async () => {
+  const f = fixture();
+  let serial = 0;
+  f.packet.nextSend = (recipient) => ({ status: 'queued', wire_id: `${recipient}-${++serial}` });
+  const parent = await f.service.postMessage(ROOM_ID, { text: 'Room direction' });
+  const records = await f.store.read(ROOM_ID);
+  const results = byKind(records, 'relay_result').filter(result => result.message_id === parent.message_id);
+  const parentB = results.find(result => result.recipient_identity === 'cid-bob').wire_id;
+  const parentA = results.find(result => result.recipient_identity === 'cid-alice').wire_id;
+  const parentC = results.find(result => result.recipient_identity === 'cid-cara').wire_id;
+
+  f.packet.sendCalls.length = 0;
+  f.packet.inbox.push(incoming({
+    sender_id: 'cid-bob', wire_id: 'wire-B-answer', text: 'Reply to room', reply_to: { wire_id: parentB },
+  }));
+  await f.pump.pump(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls.map(call => call.recipient), ['cid-alice', 'cid-cara']);
+  assert.deepEqual(f.packet.sendCalls.map(call => call.replyTo.wire_id), [parentA, parentC]);
+  assert(f.packet.sendCalls.every(call => call.recipient !== 'cid-room'));
 });
 
 test('restart intake drains legacy invalid file metadata without archiving it or blocking later files', async () => {
@@ -313,6 +568,106 @@ test('participant files archive bytes before consume and relay a readable notice
     at: file.at,
   });
   assert.equal(f.packet.sendCalls[0].body, canonicalJson(notice));
+});
+
+test('file reply sends notice and bytes with each recipient parent reference', async () => {
+  const f = fixture();
+  let serial = 0;
+  f.packet.nextSend = () => ({ status: 'queued', wire_id: `wire-relay-${++serial}` });
+  f.packet.inbox.push(incoming({ wire_id: 'wire-A-original' }));
+  await f.pump.pump(ROOM_ID);
+
+  const archive = await f.store.read(ROOM_ID);
+  const parent = byKind(archive, 'message')[0];
+  const copies = byKind(archive, 'relay_result').filter(r => r.message_id === parent.message_id);
+  const parentB = copies.find(r => r.recipient_identity === 'cid-bob').wire_id;
+  const parentC = copies.find(r => r.recipient_identity === 'cid-cara').wire_id;
+  f.packet.sendCalls.length = 0;
+  f.packet.sendFileCalls.length = 0;
+
+  f.packet.fileInbox.push(incomingFile({ sender_id: 'cid-bob', wire_id: 'wire-B-file-answer',
+    reply_to: { wire_id: parentB, sentence: 3 } }));
+  await f.pump.pump(ROOM_ID);
+
+  const storedReplyFile = byKind(await f.store.read(ROOM_ID), 'file')
+    .find(file => file.source_wire_id === 'wire-B-file-answer');
+  assert.deepEqual(storedReplyFile.source_reply_to, { wire_id: parentB, sentence: 3 });
+  assert.deepEqual(f.packet.sendCalls.map(c => c.recipient), ['cid-alice', 'cid-cara']);
+  assert.deepEqual(f.packet.sendFileCalls.map(c => c.recipient), ['cid-alice', 'cid-cara']);
+  for (const calls of [f.packet.sendCalls, f.packet.sendFileCalls]) {
+    assert.deepEqual(calls.find(c => c.recipient === 'cid-alice').replyTo,
+      { wire_id: 'wire-A-original' });
+    assert.deepEqual(calls.find(c => c.recipient === 'cid-cara').replyTo,
+      { wire_id: parentC });
+    assert(calls.every(call => call.replyTo.sentence === undefined));
+  }
+});
+
+test('binary and notice replies resolve one file and use the earliest recipient result fallback', async () => {
+  const f = fixture();
+  f.packet.nextSend = (recipient) => ({ status: 'queued', wire_id: `notice-${recipient}` });
+  f.packet.nextSendFile = (recipient) => recipient === 'cid-cara'
+    ? { status: 'queued' }
+    : { status: 'queued', wire_id: `binary-${recipient}` };
+  f.packet.fileInbox.push(incomingFile({ wire_id: 'wire-A-file-original' }));
+  await f.pump.pump(ROOM_ID);
+
+  let records = await f.store.read(ROOM_ID);
+  const file = byKind(records, 'file')[0];
+  const initial = byKind(records, 'relay_result').filter(result => result.file_id === file.file_id);
+  const bResult = initial.find(result => result.recipient_identity === 'cid-bob');
+  const cResult = initial.find(result => result.recipient_identity === 'cid-cara');
+  assert.equal(cResult.wire_id, undefined);
+  assert.equal(cResult.metadata_wire_id, 'notice-cid-cara');
+
+  const laterIntent = await f.store.append(ROOM_ID, {
+    version: 1, kind: 'relay_intent', room_id: ROOM_ID, at: AT,
+    file_id: file.file_id, recipient_identity: 'cid-cara',
+  });
+  await f.store.append(ROOM_ID, {
+    version: 1, kind: 'relay_result', room_id: ROOM_ID, at: AT,
+    intent_record_id: laterIntent.record_id, file_id: file.file_id,
+    recipient_identity: 'cid-cara', status: 'queued', wire_id: 'later-binary-cara',
+    metadata_wire_id: 'later-notice-cara',
+  });
+
+  f.packet.sendCalls.length = 0;
+  f.packet.sendFileCalls.length = 0;
+  f.packet.nextSend = (recipient, body) => ({
+    status: 'queued', wire_id: `${JSON.parse(body).text}:${recipient}`,
+  });
+  f.packet.inbox.push(
+    incoming({ msg_id: 10, sender_id: 'cid-bob', text: 'Reply to binary', wire_id: 'wire-B-binary-answer',
+      reply_to: { wire_id: bResult.wire_id } }),
+    incoming({ msg_id: 11, sender_id: 'cid-bob', text: 'Reply to notice', wire_id: 'wire-B-notice-answer',
+      reply_to: { wire_id: bResult.metadata_wire_id } }),
+  );
+  await f.pump.pump(ROOM_ID);
+
+  for (const text of ['Reply to binary', 'Reply to notice']) {
+    const calls = f.packet.sendCalls.filter(call => JSON.parse(call.body).text === text);
+    assert.deepEqual(calls.map(call => call.recipient), ['cid-alice', 'cid-cara']);
+    assert.deepEqual(calls.find(call => call.recipient === 'cid-alice').replyTo,
+      { wire_id: 'wire-A-file-original' });
+    assert.deepEqual(calls.find(call => call.recipient === 'cid-cara').replyTo,
+      { wire_id: 'notice-cid-cara' });
+  }
+  records = await f.store.read(ROOM_ID);
+  assert.deepEqual(byKind(records, 'message').map(message => message.source_reply_to.wire_id),
+    [bResult.wire_id, bResult.metadata_wire_id]);
+
+  f.packet.sendCalls.length = 0;
+  f.packet.inbox.push(incoming({
+    msg_id: 12, sender_id: 'cid-cara', text: 'C replies to its notice', wire_id: 'wire-C-answer',
+    reply_to: { wire_id: cResult.metadata_wire_id },
+  }));
+  await f.pump.pump(ROOM_ID);
+  const cReply = f.packet.sendCalls.filter(call => JSON.parse(call.body).text === 'C replies to its notice');
+  assert.deepEqual(cReply.map(call => call.recipient), ['cid-alice', 'cid-bob']);
+  assert.deepEqual(cReply.find(call => call.recipient === 'cid-alice').replyTo,
+    { wire_id: 'wire-A-file-original' });
+  assert.deepEqual(cReply.find(call => call.recipient === 'cid-bob').replyTo,
+    { wire_id: bResult.wire_id });
 });
 
 test('a refused file notice prevents binary sends and records terminal failures', async () => {
@@ -561,6 +916,8 @@ test('crash after consume leaves durable intents which resume without the inbox 
 test('crash after transport acceptance and before result fsync resends one stable envelope then writes one result', async () => {
   const f = fixture();
   f.store.rooms.set(ROOM_ID, room({ seats: room().seats.slice(0, 2) }));
+  let attempt = 0;
+  f.packet.nextSend = () => ({ status: 'queued', wire_id: `wire-attempt-${++attempt}` });
   f.packet.inbox.push(incoming());
   let fail = true;
   f.store.beforeAppend = (draft) => {
@@ -574,17 +931,39 @@ test('crash after transport acceptance and before result fsync resends one stabl
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 0);
 
   f.store.beforeAppend = undefined;
-  await f.pump.resumePending(ROOM_ID);
+  let restartedMessage = 1;
+  const restarted = new IntakePump(f.store, f.registry, {
+    now: () => AT, messageId: () => MESSAGE_IDS[restartedMessage++],
+  });
+  await restarted.resumePending(ROOM_ID);
   assert.equal(f.packet.sendCalls.length, 2, 'the result-less durable intent is deliberately retried');
   assert.equal(f.packet.sendCalls[0].body, f.packet.sendCalls[1].body, 'retry keeps the canonical envelope byte-stable');
   assert.equal(JSON.parse(f.packet.sendCalls[0].body).message_id, MESSAGE_IDS[0]);
   const results = byKind(await f.store.read(ROOM_ID), 'relay_result');
   assert.equal(results.length, 1, 'one eventual terminal result belongs to the durable intent');
   assert.equal(results[0].intent_record_id, `${ROOM_ID}:2`);
+  assert.equal(results[0].wire_id, 'wire-attempt-2');
 
-  await f.pump.resumePending(ROOM_ID);
+  const secondRestart = new IntakePump(f.store, f.registry, { now: () => AT, messageId: () => MESSAGE_IDS[3] });
+  await secondRestart.resumePending(ROOM_ID);
   assert.equal(f.packet.sendCalls.length, 2);
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 1);
+
+  f.packet.sendCalls.length = 0;
+  f.packet.inbox.push(
+    incoming({ msg_id: 8, sender_id: 'cid-bob', text: 'Reply to unrecorded attempt',
+      wire_id: 'wire-B-unknown', reply_to: { wire_id: 'wire-attempt-1' } }),
+    incoming({ msg_id: 9, sender_id: 'cid-bob', text: 'Reply to durable attempt',
+      wire_id: 'wire-B-known', reply_to: { wire_id: 'wire-attempt-2' } }),
+  );
+  await restarted.pump(ROOM_ID);
+  const unknown = f.packet.sendCalls.find(call => JSON.parse(call.body).text === 'Reply to unrecorded attempt');
+  const known = f.packet.sendCalls.find(call => JSON.parse(call.body).text === 'Reply to durable attempt');
+  assert.equal('replyTo' in unknown, false, 'an unrecorded accepted wire never gains recovery authority');
+  assert.deepEqual(known.replyTo, { wire_id: 'wire-in-7' });
+  const children = byKind(await f.store.read(ROOM_ID), 'message').filter(message => message.source_msg_id !== 7);
+  assert.equal(new Set(children.map(message => message.message_id)).size, 2,
+    'new source wires remain distinct logical messages');
 });
 
 test('thrown send failures leave intents result-less and create no ghost results', async () => {
@@ -603,6 +982,73 @@ test('thrown send failures leave intents result-less and create no ghost results
 
   await f.pump.resumePending(ROOM_ID);
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 1);
+});
+
+test('late parent evidence affects only a pending attempt and never replays delivered copies', async () => {
+  const parentId = MESSAGE_IDS[3];
+  const records = [
+    {
+      version: 1, kind: 'message', room_id: ROOM_ID, seq: 1, record_id: `${ROOM_ID}:1`, at: AT,
+      message_id: parentId,
+      author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' },
+      category: 'chat', text: 'Earlier parent', source_msg_id: 6, source_wire_id: 'wire-A-parent',
+      recipient_identities: ['cid-bob', 'cid-cara', 'cid-dana'],
+    },
+    { version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: 2, record_id: `${ROOM_ID}:2`, at: AT,
+      message_id: parentId, recipient_identity: 'cid-bob' },
+    { version: 1, kind: 'relay_result', room_id: ROOM_ID, seq: 3, record_id: `${ROOM_ID}:3`, at: AT,
+      intent_record_id: `${ROOM_ID}:2`, message_id: parentId, recipient_identity: 'cid-bob',
+      status: 'queued', wire_id: 'wire-parent-bob' },
+    { version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: 4, record_id: `${ROOM_ID}:4`, at: AT,
+      message_id: parentId, recipient_identity: 'cid-cara' },
+    { version: 1, kind: 'relay_result', room_id: ROOM_ID, seq: 5, record_id: `${ROOM_ID}:5`, at: AT,
+      intent_record_id: `${ROOM_ID}:4`, message_id: parentId, recipient_identity: 'cid-cara',
+      status: 'send_failed' },
+    { version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: 6, record_id: `${ROOM_ID}:6`, at: AT,
+      message_id: parentId, recipient_identity: 'cid-dana' },
+    { version: 1, kind: 'relay_result', room_id: ROOM_ID, seq: 7, record_id: `${ROOM_ID}:7`, at: AT,
+      intent_record_id: `${ROOM_ID}:6`, message_id: parentId, recipient_identity: 'cid-dana',
+      status: 'send_failed' },
+  ];
+  const f = fixture({
+    records,
+    room: { seats: [...room().seats, activeSeat('cid-dana', 'Dana', 'tester', 'd1')] },
+  });
+  f.packet.nextSend = (recipient) => ({ status: 'queued', wire_id: `wire-child-${recipient}` });
+  let crashDana = true;
+  f.packet.beforeSend = (recipient, body) => {
+    if (crashDana && recipient === 'cid-dana' && JSON.parse(body).text === 'Child with late evidence') {
+      crashDana = false;
+      throw new Error('crash before Dana outcome');
+    }
+  };
+  f.packet.inbox.push(incoming({
+    sender_id: 'cid-bob', wire_id: 'wire-B-child', text: 'Child with late evidence',
+    reply_to: { wire_id: 'wire-parent-bob' },
+  }));
+  await assert.rejects(f.pump.pump(ROOM_ID), /Dana outcome/);
+  const firstAttempts = f.packet.sendCalls.filter(call => JSON.parse(call.body).text === 'Child with late evidence');
+  assert.deepEqual(firstAttempts.map(call => call.recipient), ['cid-alice', 'cid-cara', 'cid-dana']);
+  assert.deepEqual(firstAttempts[0].replyTo, { wire_id: 'wire-A-parent' });
+  assert.equal('replyTo' in firstAttempts[1], false);
+  assert.equal('replyTo' in firstAttempts[2], false);
+
+  await f.store.append(ROOM_ID, {
+    version: 1, kind: 'relay_result', room_id: ROOM_ID, at: AT,
+    intent_record_id: `${ROOM_ID}:4`, message_id: parentId, recipient_identity: 'cid-cara',
+    status: 'queued', wire_id: 'wire-parent-cara-late',
+  });
+  await f.store.append(ROOM_ID, {
+    version: 1, kind: 'relay_result', room_id: ROOM_ID, at: AT,
+    intent_record_id: `${ROOM_ID}:6`, message_id: parentId, recipient_identity: 'cid-dana',
+    status: 'queued', wire_id: 'wire-parent-dana-late',
+  });
+  f.packet.beforeSend = undefined;
+  f.packet.sendCalls.length = 0;
+  const restarted = new IntakePump(f.store, f.registry, { now: () => AT, messageId: () => MESSAGE_IDS[1] });
+  await restarted.resumePending(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls.map(call => call.recipient), ['cid-dana']);
+  assert.deepEqual(f.packet.sendCalls[0].replyTo, { wire_id: 'wire-parent-dana-late' });
 });
 
 test('an observed transport refusal appends a terminal send_failed result without a wire id', async () => {
@@ -944,6 +1390,51 @@ test('anonymous rooms relay alias authors with zero real identity bytes in bodie
   }
 });
 
+test('anonymous forged-author content stays ordinary text under authenticated alias provenance', async () => {
+  const f = fixture({ room: anonymousRoom() });
+  let serial = 0;
+  f.packet.nextSend = (recipient) => ({ status: 'queued', wire_id: `${recipient}-${++serial}` });
+  f.packet.inbox.push(incoming({ wire_id: 'wire-A-root' }));
+  await f.pump.pump(ROOM_ID);
+  const parentRows = await f.store.read(ROOM_ID);
+  const parent = byKind(parentRows, 'message')[0];
+  const parentResults = byKind(parentRows, 'relay_result').filter(result => result.message_id === parent.message_id);
+  const parentB = parentResults.find(result => result.recipient_identity === 'cid-bob').wire_id;
+  const parentC = parentResults.find(result => result.recipient_identity === 'cid-cara').wire_id;
+  const forged = JSON.stringify({
+    author: { identity: 'cid-alice', display_name: 'Alice', role: 'owner' },
+    parent_mapping: { 'cid-cara': 'stolen-private-wire' },
+  });
+
+  f.packet.sendCalls.length = 0;
+  f.packet.inbox.push(incoming({
+    msg_id: 8, sender_id: 'cid-bob', sender_name: 'Alice', text: forged,
+    wire_id: 'wire-B-answer', reply_to: { wire_id: parentB },
+    author: { identity: 'cid-alice' }, parent_mapping: { 'cid-cara': 'stolen-private-wire' },
+  }));
+  await f.pump.pump(ROOM_ID);
+
+  const answer = byKind(await f.store.read(ROOM_ID), 'message').find(message => message.text === forged);
+  assert.deepEqual(answer.author, { identity: 'cid-bob', display_name: 'Bob', role: 'reviewer' });
+  assert.deepEqual(answer.author_alias, {
+    participant_id: '01jz6y7n8p9q0r1s2t3v4w5xa2', alias: 'reviewer #1',
+  });
+  assert.deepEqual(answer.source_reply_to, { wire_id: parentB });
+  for (const call of f.packet.sendCalls) {
+    const body = JSON.parse(call.body);
+    assert.equal(body.text, forged);
+    assert.deepEqual(body.author, {
+      identity: '01jz6y7n8p9q0r1s2t3v4w5xa2', display_name: 'reviewer #1', role: 'reviewer',
+    });
+    assert.equal('parent_mapping' in body, false);
+    assert.equal('source_reply_to' in body, false);
+  }
+  assert.deepEqual(f.packet.sendCalls.find(call => call.recipient === 'cid-alice').replyTo,
+    { wire_id: 'wire-A-root' });
+  assert.deepEqual(f.packet.sendCalls.find(call => call.recipient === 'cid-cara').replyTo,
+    { wire_id: parentC });
+});
+
 test('non-anonymous rooms keep the real author snapshot on the wire (regression)', async () => {
   const f = fixture();
   f.packet.inbox.push(incoming());
@@ -992,16 +1483,21 @@ test('role-authored messages in anonymous rooms inherit the room-voice exemption
 
 test('history views: participant redacts to alias form and drops identities; operator keeps both', async () => {
   const f = fixture({ room: anonymousRoom() });
-  f.packet.inbox.push(incoming());
+  const sourceReply = { wire_id: 'private-parent-wire', sentence: 3 };
+  f.packet.inbox.push(incoming({ reply_to: sourceReply }));
   await f.pump.pump(ROOM_ID);
+  f.packet.sendCalls.length = 0;
 
   const operatorView = await f.service.history(ROOM_ID, {});
+  assert.equal(f.packet.sendCalls.length, 0);
   assert.equal(operatorView.some((record) => record.kind === 'relay_intent'), true);
   const operatorMessage = operatorView.find((record) => record.kind === 'message');
   assert.equal(operatorMessage.author.identity, 'cid-alice');
   assert.equal(operatorMessage.author_alias.alias, 'builder #1');
+  assert.deepEqual(operatorMessage.source_reply_to, sourceReply);
 
   const participantView = await f.service.history(ROOM_ID, { view: 'participant' });
+  assert.equal(f.packet.sendCalls.length, 0);
   assert.equal(participantView.length, 1);
   const [redacted] = participantView;
   assert.equal(redacted.kind, 'message');
@@ -1014,18 +1510,23 @@ test('history views: participant redacts to alias form and drops identities; ope
   assert.equal('recipient_identities' in redacted, false);
   assert.equal('source_msg_id' in redacted, false);
   assert.equal('source_wire_id' in redacted, false);
+  assert.equal('source_reply_to' in redacted, false);
   const rendered = Buffer.from(JSON.stringify(participantView), 'utf8');
-  for (const leak of ['cid-alice', 'cid-bob', 'cid-cara', 'Alice', 'Untrusted current name']) {
+  for (const leak of ['cid-alice', 'cid-bob', 'cid-cara', 'Alice', 'Untrusted current name',
+    sourceReply.wire_id]) {
     assert.equal(rendered.includes(leak), false, `${leak} leaked into the participant history view`);
   }
 
   // non-anonymous participant view keeps real authors but still drops routing identities
   const plain = fixture();
-  plain.packet.inbox.push(incoming());
+  plain.packet.inbox.push(incoming({ reply_to: sourceReply }));
   await plain.pump.pump(ROOM_ID);
+  plain.packet.sendCalls.length = 0;
   const plainView = await plain.service.history(ROOM_ID, { view: 'participant' });
+  assert.equal(plain.packet.sendCalls.length, 0);
   assert.equal(plainView[0].author.identity, 'cid-alice');
   assert.equal('recipient_identities' in plainView[0], false);
+  assert.equal('source_reply_to' in plainView[0], false);
 });
 
 // ---- Removed members at intake ---------------------------------------------

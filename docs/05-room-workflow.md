@@ -14,6 +14,42 @@ Update the display name with `ours-cowork room settings <room-id> --name "New na
 
 Runtime commands are default-deny. Per-CID grants use `command-grant` and `command-revoke`. An operator may instead register a durable role policy with `role-command-set <room-id> --role <label> --commands <comma-list>` and inspect it with `role-command-grants`; use `--commands none` to remove it. A role policy authorizes only an authenticated, active seat whose durable admission role exactly matches the policy. Display names, message labels, pending seats, removed seats, and caller-supplied role text never confer authority. Removing a role policy does not remove an independently configured per-CID grant.
 
+## Scoped reply threads
+
+The dedicated `start_thread` runtime command creates a scoped reply thread after an operator grants that exact command name. Discover and invoke it through the SDK's generic command APIs, then use the SDK's native reply field:
+
+```ts
+const definitions = await client.listContactCommands({ contact: roomCid });
+const start = definitions.find(c => c.name === 'start_thread');
+if (!start) throw new Error('This room does not advertise start_thread');
+await client.sendCommand({ contact: roomCid, command: start.name,
+  arguments: { topic: 'Review', participant_ids: selectedParticipantIds,
+    idempotency_key: stableKeyForThisCreation } });
+// Receive the room's root normally; reply using YOUR received root wire ID.
+await client.sendMessage({ contact: roomCid, text: 'My reply',
+  reply_to_wire_id: receivedRoot.wire_id });
+// Omitting reply_to_wire_id creates an ordinary whole-room message.
+```
+
+Here, `client` is an existing bound Ours client and `roomCid` is its room contact CID. Obtain `selectedParticipantIds` from the room's separately permitted `list-members` roster command; they are the chosen stable participant IDs and must include the creator. `stableKeyForThisCreation` is an opaque client-generated key reused only for identical retries. `receivedRoot` is this member's incoming copy of the root message, not another member's copy.
+
+The input object has exactly `topic`, `participant_ids`, and `idempotency_key`. A topic contains 1–120 Unicode code points, contains at least one non-whitespace character, excludes Unicode control and format characters, and is trimmed after the raw value passes those bounds. An idempotency key contains 1–128 ASCII characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, and `-`. The participant list contains one or more distinct, active roster IDs. A one-member thread is valid; its replies are archived and acknowledged with no other recipient.
+
+The authenticated creator must be active, selected, and granted `start_thread`. Creation records the selected seats as immutable pairs of participant ID and CID. Later admissions are not backfilled, and removing then re-admitting a CID does not restore access under its new participant ID. Roots and replies go only to selected original seats that are still active. A member does not need a `start_thread` grant to reply after receiving a root. Each recipient replies to its own received wire ID; Cowork translates each relayed reply to that recipient's copy of the immediate parent.
+
+A successful command result is `{"ok":true,"thread_id":"<thread-id>","status":"accepted"}`. Acceptance means the root and its immutable recipient work were stored; delivery to each selected member proceeds independently and may be partial. Repeating the same creator key with the same normalized topic and participant set, in any participant order, returns the original receipt. Use these public errors without relying on diagnostic details:
+
+| Error | Meaning |
+| --- | --- |
+| `unauthorized` | The caller is not an active granted creator, or the same creator/key belongs to an earlier seat incarnation. |
+| `invalid_request` | The command object or one of its bounded fields does not match the advertised schema. |
+| `invalid_members` | A selected ID is duplicate, unknown, inactive, or does not include the creator. |
+| `idempotency_conflict` | The creator reused a key with a different normalized topic or participant set. |
+| `reply_target_unavailable` | A reply target is missing, invalid, expired, ambiguous, foreign to the sender, or no longer authorized. The content is rejected and is never broadcast. |
+| `thread_files_unsupported` | A file targets a scoped root or descendant; version one scoped threads carry messages only. |
+
+Invalid scoped replies and scoped file attempts are durably rejected before their inbox item is acknowledged. Cowork makes one best-effort attempt to send the submitting member a private, fixed error-code notice; that notice can be lost, and a restart does not repeat it. The rejected content, target, and routing details are not included in the notice. If Cowork cannot prove a selected recipient's local parent copy during relay or restart, that recipient's delivery ends with a terminal unavailable result; private content is not sent without its reply link.
+
 Membership changes are deliberately independent operator actions. Add a participant by issuing an invite for the intended role and admitting that identity; remove a participant with `ours-cowork room remove <room-id> <participant>`. To preserve coverage, add and confirm the new participant before removing the old one. To remove a dead participant first, remove it and issue a new invite afterward. Cowork does not combine these actions into a replacement operation or infer successor lineage.
 
 Participant removal has no durable intent or result phase. Cowork asks the shared daemon to remove the contact, treats an already-absent exact contact as completion, and then records the seat as removed. If the daemon completed removal but its response or the following metadata save was lost, repeat the same remove command; the retry observes the absent contact and finishes the local update. Old prerelease `membership_intent` and `membership_result` history records remain readable but are inert: reconciliation, rebind, messaging, close, and deletion never replay them.
@@ -32,7 +68,7 @@ Room-scoped operations also appear in the room identity's ours catalog with thei
 
 Use the RPC arguments without `room_id`; the receiving room fixes the target. For example, an operator grants `ours-cowork room command-grant <room-id> <caller-cid> room.settings`, then that active member calls `room.settings` with `{"status":"review"}` using ours command transport. A grant for one name grants none of the other names. The SDK returns a correlated result containing `{ok:true,result:<service value>}` or `{ok:false,error:<code>}`. History returns one page; follow `seq` with `after` to fetch more.
 
-`list-members` retains its contact-safe roster. `remove-member` retains its epoch, confirm and no-self-removal gates. The separate `room.participant.remove` command instead grants the full operator removal behavior. `room.show`, `room.participants` and operator-view history return operator metadata. Policy-administration commands can delegate more privileges; `room.message` and `room.say` authorize room/role authorship. Assign these permissions deliberately. Command results may include invite material; do not relay them into chat.
+`start_thread`, `list-members`, and `remove-member` are dedicated runtime commands rather than shared management routes. `list-members` retains its contact-safe roster. `remove-member` retains its epoch, confirm and no-self-removal gates. The separate `room.participant.remove` command instead grants the full operator removal behavior. `room.show` returns only public room settings and mission content; `room.participants` returns participant IDs, roles, and states. Runtime `room.history` returns only messages visible to the authenticated active seat, with viewer-local cursors, and rejects operator view. Runtime `room.message` and `room.say` return only an accepted message-ID receipt. Host management routes retain their full operator results. Policy-administration commands can delegate more privileges; `room.message` and `room.say` authorize room/role authorship. Assign these permissions deliberately. Command results may include invite material; do not relay them into chat.
 
 Host lifecycle and global room creation/listing are excluded. `room.accept` accepts invitation input through its separate grant and remains unavailable through REST. Ours close/delete return a durable accepted receipt before closing the reply channel; verify completion through management. Close retains archive/files; delete requires `confirm:true`, closes first, and erases local room data. Pending lifecycle requests resume after restart; failed requests remain visible in room metadata for explicit management retry. Missing replies do not prove a mutation failed.
 

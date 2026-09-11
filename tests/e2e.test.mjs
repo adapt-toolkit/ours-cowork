@@ -505,10 +505,30 @@ if (process.argv.includes('--e2e-driver')) {
       room = await runCli(['room', 'show', roomId]);
       const catalog = await waitFor(async () => {
         const commands = await alice.client.listContactCommands({ contact: roomCid });
-        return commands.length === 26 ? commands : undefined;
+        return commands.length === 27 ? commands : undefined;
       }, 'bounded room command catalog');
-      assert.equal(catalog.length, 26);
-      assert.deepEqual(catalog.slice(0, 2).map((command) => command.name), ['list-members', 'remove-member']);
+      assert.equal(catalog.length, 27);
+      assert.deepEqual(catalog.slice(0, 3).map((command) => command.name), [
+        'start_thread', 'list-members', 'remove-member',
+      ]);
+      assert.deepEqual(catalog[0].input_schema, {
+        type: 'object',
+        additionalProperties: false,
+        required: ['topic', 'participant_ids', 'idempotency_key'],
+        properties: {
+          topic: {
+            type: 'string', minLength: 1, maxLength: 120,
+            pattern: '^(?![\\s\\S]*[\\p{Cc}\\p{Cf}])[\\s\\S]*\\S[\\s\\S]*$',
+          },
+          participant_ids: {
+            type: 'array', minItems: 1, uniqueItems: true,
+            items: { type: 'string', pattern: '^[0-7][0-9a-hjkmnp-tv-z]{25}$' },
+          },
+          idempotency_key: {
+            type: 'string', pattern: '^[A-Za-z0-9._:-]{1,128}$',
+          },
+        },
+      });
       assert(catalog.some((command) => command.name === 'room.message'));
       const listRequest = await alice.client.sendCommand({
         contact: roomCid, command: 'list-members', arguments: {},
@@ -552,7 +572,20 @@ if (process.argv.includes('--e2e-driver')) {
       assert(relayed);
       const shown = await sharedCall('room.show', {});
       assert.equal(shown.ok, true, 'independent command after a refused command and post');
-      assert.equal(shown.result.status, 'shared-command-verified');
+      assert.deepEqual(shown.result, {
+        room_id: roomId,
+        room_name: created.room_name,
+        state: 'active',
+        mission: {
+          goal: 'Ship the release',
+          briefing: 'Keep evidence and blockers explicit',
+          briefing_version: 1,
+        },
+        anonymous: false,
+        quiet_membership: false,
+        membership_epoch: room.membership_epoch,
+      });
+      assert.equal('status' in shown.result, false);
       stage('consumer-callback-reentry');
       const credential = await restRpc('consumer.handler.credential.set', { handler: 'consumer', token: consumerToken });
       assert.deepEqual(credential, { handler: 'consumer', configured: true });

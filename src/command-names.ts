@@ -27,5 +27,5 @@ export const SHARED_ROOM_COMMANDS = [
 ] as const;
 
 export const RUNTIME_COMMAND_NAMES = [
-  'list-members', 'remove-member', ...SHARED_ROOM_COMMANDS,
+  'start_thread', 'list-members', 'remove-member', ...SHARED_ROOM_COMMANDS,
 ] as const;

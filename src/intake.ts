@@ -18,6 +18,8 @@ import type { FileInboxItem, InboxItem, RoomPacket } from './packets.ts';
 import type { CoworkStore, RoomMutex } from './storage.ts';
 import { generateUlid } from './ulid.ts';
 import { readReplyRows, selectReply } from './reply-threading.ts';
+import { classifyThreadAssociation, publicThreadAuthor, publicThreadMetadata, resolveIntakeScope, threadRelayEligible } from './threads.ts';
+import { ThreadFailure } from './thread-contracts.ts';
 
 type IntakeStore = Pick<CoworkStore, 'mutex' | 'load' | 'save' | 'append' | 'read'>
   & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'relayRecipientsNeedingIntent'>>;
@@ -252,34 +254,37 @@ export class IntakePump {
     packet: RoomPacket,
     item: FileInboxItem,
   ): Promise<void> {
-    const parsedName = FileNameSchema.safeParse(item.filename);
-    const parsedMime = FileMimeSchema.safeParse(item.mime);
-    // The current SDK boundary rejects this metadata before persistence. This
-    // defensive drain handles an older archived item so one poison unread item cannot
-    // make every daemon restart fail at resumePending.
-    if (!parsedName.success || !parsedMime.success) {
-      await packet.acknowledgeFile(item);
-      return;
-    }
-    if (item.data.length > MAX_FILE_BYTES) {
-      throw new RangeError(`room files must be at most ${MAX_FILE_BYTES} bytes (2 MiB)`);
-    }
     const room = await this.store.load(roomId);
-    const seat = room.seats.find(
-      (candidate) => candidate.identity === item.sender_id && candidate.state === 'active',
-    );
-    if (room.state !== 'active' || !seat) {
-      if (room.state === 'active') await this.bounceRemovedSender(roomId, room, packet, item);
+    const [stored] = await queryStore(this.store, roomId, { sourceFileId: item.file_id, limit: 1 });
+    if (this.isRejectedReplay(stored, item)) {
       await packet.acknowledgeFile(item);
       return;
     }
-    const [storedFile] = await queryStore(this.store, roomId, { kind: 'file', sourceFileId: item.file_id, limit: 1 });
-    let file = this.findSourceFile(storedFile === undefined ? [] : [storedFile], item);
+    let file = this.findSourceFile(stored === undefined ? [] : [stored], item);
     if (!file) {
-      const recipientIdentities = unique(room.seats
-        .filter((recipient) => recipient.state === 'active')
-        .map((recipient) => recipient.identity)
-        .filter((identity) => identity !== seat.identity));
+      const seat = room.seats.find(candidate => candidate.identity === item.sender_id && candidate.state === 'active');
+      const known = room.seats.some(candidate => candidate.identity === item.sender_id);
+      if (!known || (item.reply_to == null && (room.state !== 'active' || !seat))) {
+        if (room.state === 'active') await this.bounceRemovedSender(roomId, room, packet, item);
+        await packet.acknowledgeFile(item);
+        return;
+      }
+      const disposition = await this.freshScopeUnlocked(room, item);
+      if (!disposition) {
+        await packet.acknowledgeFile(item);
+        return;
+      }
+      if (!seat) throw new Error('authorized file sender has no active seat');
+      const parsedName = FileNameSchema.safeParse(item.filename);
+      const parsedMime = FileMimeSchema.safeParse(item.mime);
+      // Drain legacy poison metadata after checking saved-source integrity and scope.
+      if (!parsedName.success || !parsedMime.success) {
+        await packet.acknowledgeFile(item);
+        return;
+      }
+      if (item.data.length > MAX_FILE_BYTES) {
+        throw new RangeError(`room files must be at most ${MAX_FILE_BYTES} bytes (2 MiB)`);
+      }
       const bytes = Buffer.from(item.data);
       const appended = await this.store.append(roomId, {
         version: 1,
@@ -296,7 +301,7 @@ export class IntakePump {
         size: bytes.length,
         sha256: createHash('sha256').update(bytes).digest('hex'),
         data_base64: bytes.toString('base64'),
-        recipient_identities: recipientIdentities,
+        recipient_identities: disposition.recipients,
         source_file_id: item.file_id,
         ...(item.wire_id === '' ? {} : { source_wire_id: item.wire_id }),
         ...(item.reply_to == null ? {} : { source_reply_to: item.reply_to }),
@@ -316,25 +321,27 @@ export class IntakePump {
     acknowledge = true,
   ): Promise<void> {
     const room = await this.store.load(roomId);
-    const seat = room.seats.find(
-      (candidate) => candidate.identity === item.sender_id && candidate.state === 'active',
-    );
-    if (room.state !== 'active' || !seat) {
-      // Inbox entries are ordinary SDK identity state, not an authorization source.
-      // Refused entries are deliberately drained without creating an archive
-      // message, intent, wire send, or result.
-      if (room.state === 'active') await this.bounceRemovedSender(roomId, room, packet, item);
+    const [stored] = await queryStore(this.store, roomId, { sourceMsgId: item.msg_id, limit: 1 });
+    if (this.isRejectedReplay(stored, item)) {
       if (acknowledge) await this.acknowledgeMessage(roomId, packet, item);
       return;
     }
-
-    const [storedMessage] = await queryStore(this.store, roomId, { kind: 'message', sourceMsgId: item.msg_id, limit: 1 });
-    let message = this.findSourceMessage(storedMessage === undefined ? [] : [storedMessage], item);
+    let message = this.findSourceMessage(stored === undefined ? [] : [stored], item);
     if (!message) {
-      const recipientIdentities = unique(room.seats
-        .filter((recipient) => recipient.state === 'active')
-        .map((recipient) => recipient.identity)
-        .filter((identity) => identity !== seat.identity));
+      const seat = room.seats.find(candidate => candidate.identity === item.sender_id && candidate.state === 'active');
+      const known = room.seats.some(candidate => candidate.identity === item.sender_id);
+      if (!known || (item.reply_to == null && (room.state !== 'active' || !seat))) {
+        // A wholly unknown sender has no room seat to bind a rejection to.
+        if (room.state === 'active') await this.bounceRemovedSender(roomId, room, packet, item);
+        if (acknowledge) await this.acknowledgeMessage(roomId, packet, item);
+        return;
+      }
+      const disposition = await this.freshScopeUnlocked(room, item);
+      if (!disposition) {
+        if (acknowledge) await this.acknowledgeMessage(roomId, packet, item);
+        return;
+      }
+      if (!seat) throw new Error('authorized message sender has no active seat');
       const appended = await this.store.append(roomId, {
         version: 1,
         kind: 'message',
@@ -353,7 +360,8 @@ export class IntakePump {
           : {}),
         category: 'chat',
         text: item.text,
-        recipient_identities: recipientIdentities,
+        recipient_identities: disposition.recipients,
+        ...(disposition.scope === undefined ? {} : { scope: disposition.scope }),
         source_msg_id: item.msg_id,
         ...(item.wire_id === '' ? {} : { source_wire_id: item.wire_id }),
         ...(item.reply_to == null ? {} : { source_reply_to: item.reply_to }),
@@ -371,6 +379,76 @@ export class IntakePump {
     // retrying the expected row. The promoted row is already read and must not
     // be acknowledged a second time.
     if (acknowledge) await this.acknowledgeMessage(roomId, packet, item);
+  }
+
+  private async freshScopeUnlocked(room: Room, item: InboxItem | FileInboxItem) {
+    try {
+      const rows = item.reply_to == null ? [] : await readReplyRows(this.store, room.room_id);
+      const beforeSeq = item.reply_to == null ? 1 : await this.nextRecordSeq(room.room_id);
+      return resolveIntakeScope(room, rows, item, beforeSeq);
+    } catch (error) {
+      if (!(error instanceof ThreadFailure)) throw error;
+      await this.recordRejectionUnlocked(room, item, error);
+      return undefined;
+    }
+  }
+
+  private async nextRecordSeq(roomId: string): Promise<number> {
+    if (this.store.query) {
+      const [last] = await this.store.query(roomId, { descending: true, limit: 1 });
+      if (last && (last.room_id !== roomId || !Number.isSafeInteger(last.seq) || last.seq < 1)) {
+        throw new Error('intake archive tail is invalid');
+      }
+      return (last?.seq ?? 0) + 1;
+    }
+    let after = 0;
+    for (;;) {
+      const page = await this.store.read(roomId, { after, limit: JOURNAL_WORK_BATCH_SIZE });
+      if (page.length === 0) return after + 1;
+      for (const row of page) {
+        if (row.room_id !== roomId || !Number.isSafeInteger(row.seq) || row.seq <= after) {
+          throw new Error('intake archive cursor did not advance');
+        }
+        after = row.seq;
+      }
+    }
+  }
+
+  private isRejectedReplay(record: CommunicationRecord | undefined, item: InboxItem | FileInboxItem): boolean {
+    if (record?.kind !== 'intake_rejection') return false;
+    const file = 'file_id' in item;
+    if (record.source_kind !== (file ? 'file' : 'message')
+      || (file ? record.source_file_id !== item.file_id : record.source_msg_id !== item.msg_id)
+      || record.source_wire_id !== item.wire_id || record.sender_identity !== item.sender_id
+      || record.fingerprint !== inputFingerprint(item)) {
+      throw new Error('inbox source does not match its durable intake rejection');
+    }
+    return true;
+  }
+
+  private async recordRejectionUnlocked(room: Room, item: InboxItem | FileInboxItem, error: ThreadFailure): Promise<void> {
+    const seat = room.seats.find(seat => seat.identity === item.sender_id && seat.state === 'active')
+      ?? room.seats.find(seat => seat.identity === item.sender_id);
+    if (!seat || typeof item.wire_id !== 'string' || item.wire_id.length === 0) {
+      throw new Error('intake rejection requires a known seat and source wire');
+    }
+    if (error.code !== 'reply_target_unavailable' && error.code !== 'thread_files_unsupported') throw error;
+    await this.store.append(room.room_id, {
+      version: 1, kind: 'intake_rejection', room_id: room.room_id, at: this.now(),
+      ...('file_id' in item ? { source_kind: 'file' as const, source_file_id: item.file_id }
+        : { source_kind: 'message' as const, source_msg_id: item.msg_id }),
+      source_wire_id: item.wire_id, sender_identity: item.sender_id, sender_participant_id: seat.participant_id,
+      fingerprint: inputFingerprint(item), error: error.code, notification_attempt_claimed: true,
+    });
+    // The durable refusal is also the one-time claim. A crash may lose the notice;
+    // replay never repeats it, even when transport failed after accepting a send.
+    try {
+      await sendRoomBody(this.packet(room.room_id), item.sender_id, {
+        version: 1, kind: 'room_msg', room_id: room.room_id, room_name: room.room_name,
+        message_id: this.nextMessageId(), at: this.now(), text: error.code,
+        author: { identity: room.identity_cid, display_name: room.identity_name, role: ROOM_ROLE },
+      });
+    } catch { /* refusal remains durable; the fixed private notification is best effort */ }
   }
 
   private acknowledgeMessage(roomId: string, packet: RoomPacket, expected: InboxItem): Promise<void> {
@@ -513,29 +591,47 @@ export class IntakePump {
       // A dangling intent is invalid cross-record state. Do not compound it
       // with a network effect or a result that would claim a send was tried.
       if ((message === undefined) === (file === undefined)) continue;
-      const recipients = message?.recipient_identities ?? file!.recipient_identities;
-      if (!recipients.includes(intent.recipient_identity)) continue;
-      if (!activeCids.has(intent.recipient_identity) && removedCids.has(intent.recipient_identity)) {
-        // The seat was removed after fan-out: terminal result, never a send.
-        const skipped = await this.store.append(roomId, {
-          version: 1,
-          kind: 'relay_result',
-          room_id: roomId,
-          at: this.now(),
-          intent_record_id: intent.record_id,
-          ...(intent.message_id === undefined ? {} : { message_id: intent.message_id }),
-          ...(intent.file_id === undefined ? {} : { file_id: intent.file_id }),
-          recipient_identity: intent.recipient_identity,
-          status: 'skipped_removed',
-        });
-        if (skipped.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
+      const source = message ?? file!;
+      const replyRows = source.source_reply_to === undefined && message?.scope === undefined
+        && message?.thread_root === undefined ? [] : await readReplyRows(this.store, roomId);
+      const decision = selectReply(replyRows, roomId, source, intent.recipient_identity);
+      let publicThread: Record<string, unknown> = {};
+      let scopedAuthor: MessageRecord['author'] | undefined;
+      try {
+        const association = classifyThreadAssociation(room, replyRows, source);
+        if (association.state === 'scoped') {
+          const { root, scope } = association;
+          if (!message || !message.recipient_identities.includes(intent.recipient_identity)
+            || message.seq >= intent.seq
+            || !root.thread_root.members.some(member => member.identity === intent.recipient_identity)) {
+            throw new ThreadFailure('reply_target_unavailable');
+          }
+          if (!threadRelayEligible(room, root.thread_root, intent.recipient_identity)) {
+            await this.skipRelay(roomId, intent, 'skipped_removed');
+            continue;
+          }
+          const metadata = publicThreadMetadata({ ...root, thread_root: root.thread_root }, room);
+          scopedAuthor = publicThreadAuthor(message, root.thread_root, room);
+          if (message.message_id === root.message_id) {
+            publicThread = { thread: { schema_version: 1, thread_id: root.message_id }, thread_root: metadata };
+          } else {
+            if (decision.state !== 'linked' || decision.parentKey !== scope.parent_key) {
+              throw new ThreadFailure('reply_target_unavailable');
+            }
+            publicThread = { thread: { schema_version: 1, thread_id: root.message_id } };
+          }
+        } else {
+          if (!source.recipient_identities.includes(intent.recipient_identity)) continue;
+          if (!activeCids.has(intent.recipient_identity) && removedCids.has(intent.recipient_identity)) {
+            await this.skipRelay(roomId, intent, 'skipped_removed');
+            continue;
+          }
+        }
+      } catch (error) {
+        if (!(error instanceof ThreadFailure)) throw error;
+        await this.skipRelay(roomId, intent, 'skipped_reply_unavailable');
         continue;
       }
-
-      const source = message ?? file!;
-      const replyRows = source.source_reply_to === undefined
-        ? [] : await readReplyRows(this.store, roomId);
-      const decision = selectReply(replyRows, roomId, source, intent.recipient_identity);
       const replyTo = decision.replyTo;
 
       if (file !== undefined) {
@@ -598,11 +694,12 @@ export class IntakePump {
         room_name: room.room_name,
         message_id: message!.message_id,
         // An anonymous author leaves the archive only in alias form.
-        author: message!.author_alias === undefined ? message!.author : {
+        author: scopedAuthor ?? (message!.author_alias === undefined ? message!.author : {
           identity: message!.author_alias.participant_id,
           display_name: message!.author_alias.alias,
           role: message!.author.role,
-        },
+        }),
+        ...publicThread,
         text: message!.text,
         at: message!.at,
         ...(message!.briefing_role === undefined ? {} : { briefing_role: message!.briefing_role }),
@@ -627,6 +724,20 @@ export class IntakePump {
       if (appended.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
       }
     }
+  }
+
+  private async skipRelay(
+    roomId: string, intent: RelayIntentRecord,
+    status: 'skipped_removed' | 'skipped_reply_unavailable',
+  ): Promise<void> {
+    const result = await this.store.append(roomId, {
+      version: 1, kind: 'relay_result', room_id: roomId, at: this.now(),
+      intent_record_id: intent.record_id,
+      ...(intent.message_id === undefined ? {} : { message_id: intent.message_id }),
+      ...(intent.file_id === undefined ? {} : { file_id: intent.file_id }),
+      recipient_identity: intent.recipient_identity, status,
+    });
+    if (result.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
   }
 
   private findSourceMessage(records: CommunicationRecord[], item: InboxItem): MessageRecord | undefined {
@@ -692,10 +803,23 @@ async function queryStore(
   options: Parameters<CoworkStore['query']>[1],
 ): Promise<CommunicationRecord[]> {
   if (store.query) return store.query(roomId, options);
-  let records = await store.read(roomId);
-  records = records.filter((record) => {
+  const archive: CommunicationRecord[] = [];
+  let after = 0;
+  for (;;) {
+    const page = await store.read(roomId, { after, limit: JOURNAL_WORK_BATCH_SIZE });
+    if (page.length === 0) break;
+    for (const row of page) {
+      if (row.room_id !== roomId || !Number.isSafeInteger(row.seq) || row.seq <= after) {
+        throw new Error('intake archive cursor did not advance');
+      }
+      archive.push(row);
+      after = row.seq;
+    }
+  }
+  let records = archive.filter((record) => {
     const value = record as CommunicationRecord & Record<string, unknown>;
-    return (options.kind === undefined || record.kind === options.kind)
+    return (options.after === undefined || record.seq > options.after)
+      && (options.kind === undefined || record.kind === options.kind)
       && (options.messageId === undefined || value.message_id === options.messageId)
       && (options.fileId === undefined || value.file_id === options.fileId)
       && (options.sourceMsgId === undefined || value.source_msg_id === options.sourceMsgId)
@@ -703,7 +827,7 @@ async function queryStore(
       && (options.recipientIdentity === undefined || value.recipient_identity === options.recipientIdentity);
   });
   if (options.unresolvedResultKind) {
-    const completed = new Set((await store.read(roomId))
+    const completed = new Set(archive
       .filter((record) => record.kind === options.unresolvedResultKind)
       .map((record) => (record as CommunicationRecord & { intent_record_id: string }).intent_record_id));
     records = records.filter((record) => !completed.has(record.record_id));
@@ -725,8 +849,14 @@ function canonicalValue(value: unknown): unknown {
   return value;
 }
 
-function unique(values: string[]): string[] {
-  return [...new Set(values)];
+/** Fingerprint authenticated input only; sender-claimed display names are inert. */
+export function inputFingerprint(item: InboxItem | FileInboxItem): string {
+  return createHash('sha256').update(canonicalJson({
+    sender: item.sender_id, wire: item.wire_id, date: item.date, reply: item.reply_to ?? null,
+    ...('file_id' in item ? { kind: 'file', id: item.file_id, filename: item.filename, mime: item.mime,
+      sha256: createHash('sha256').update(item.data).digest('hex') }
+      : { kind: 'message', id: item.msg_id, text: item.text }),
+  })).digest('hex');
 }
 
 function wireKind(

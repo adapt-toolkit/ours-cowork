@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import Ajv from 'ajv';
 import { OursError } from '@ours.network/sdk';
 import {
   ContactAlreadyAbsentError,
@@ -13,6 +14,7 @@ import {
   SdkRoomPacket,
 } from '../src/packets.ts';
 import { SharedOursHost } from '../src/ours-runtime.ts';
+import { StartThreadInputSchema } from '../src/thread-contracts.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const IDENTITY = 'ours-cowork:Room 01jz6y7n';
@@ -399,24 +401,71 @@ test('SDK room packet publishes only the bounded membership commands and keeps h
   };
   const packet = new SdkRoomPacket(IDENTITY, CID, client);
   const handlers = {
+    startThread: async () => ({ ok: true }),
     listMembers: async () => ({ ok: true }),
     removeMember: async () => ({ ok: true }),
   };
   await packet.registerRuntimeCommands(handlers);
   assert.deepEqual(client.registeredCommands.map((command) => command.name), [
-    'list-members', 'remove-member',
+    'start_thread', 'list-members', 'remove-member',
   ]);
   assert.equal(client.registeredCommands.some((command) => command.name === 'add-seat'), false);
-  assert.equal(client.registeredCommands[0].handler, handlers.listMembers);
-  assert.equal(client.registeredCommands[1].handler, handlers.removeMember);
-  assert.deepEqual(client.registeredCommands[0].input_schema, {
+  assert.equal(client.registeredCommands[0].handler, handlers.startThread);
+  assert.equal(client.registeredCommands[1].handler, handlers.listMembers);
+  assert.equal(client.registeredCommands[2].handler, handlers.removeMember);
+  assert.deepEqual(client.registeredCommands[1].input_schema, {
     type: 'object', additionalProperties: false,
   });
-  assert.deepEqual(client.registeredCommands[1].input_schema.required, [
+  assert.deepEqual(client.registeredCommands[2].input_schema.required, [
     'participant_id', 'expected_membership_epoch', 'confirm',
   ]);
-  assert.deepEqual(client.registeredCommands[1].input_schema.properties.confirm, { const: true });
+  assert.deepEqual(client.registeredCommands[2].input_schema.properties.confirm, { const: true });
   assert.equal(client.calls.filter(([name]) => name === 'chooseIdentity').length, 1);
+});
+
+test('start_thread catalog and server schema accept the same Unicode topic boundaries', async () => {
+  const client = blankClient();
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  const contexts = [];
+  const handlers = {
+    startThread: async (input, context) => {
+      contexts.push(context);
+      return { ok: true, normalized_topic: StartThreadInputSchema.parse(input).topic };
+    },
+    listMembers: async () => ({ ok: true }),
+    removeMember: async () => ({ ok: true }),
+  };
+  await packet.registerRuntimeCommands(handlers);
+  const command = client.registeredCommands.find(({ name }) => name === 'start_thread');
+  assert(command);
+  assert.deepEqual(command.input_schema.required, ['topic', 'participant_ids', 'idempotency_key']);
+  assert.deepEqual(Object.keys(command.input_schema.properties).sort(), [
+    'idempotency_key', 'participant_ids', 'topic',
+  ]);
+  assert.equal(command.input_schema.additionalProperties, false);
+  const validate = new Ajv({ strict: true, validateFormats: false, unicodeRegExp: true }).compile(command.input_schema);
+  const base = { participant_ids: [ROOM_ID], idempotency_key: 'request-1' };
+  const cases = [
+    ['61 emoji', '😀'.repeat(61), true],
+    ['120 emoji', '😀'.repeat(120), true],
+    ['121 emoji', '😀'.repeat(121), false],
+    ['whitespace', ' \t ', false],
+    ['NUL', 'bad\u0000topic', false],
+    ['format', 'bad\u200btopic', false],
+    ['padded', ' Review ', true],
+    ['padded raw limit', ` ${'x'.repeat(118)} `, true],
+    ['padded above raw limit', ` ${'x'.repeat(119)} `, false],
+  ];
+  for (const [label, topic, expected] of cases) {
+    const input = { ...base, topic };
+    assert.equal(validate(input), expected, `${label}: catalog`);
+    assert.equal(StartThreadInputSchema.safeParse(input).success, expected, `${label}: server`);
+  }
+  const context = Object.freeze({ sender_cid: CID, sender_name: 'Peer', request_wire_id: 'wire-command' });
+  assert.deepEqual(await command.handler({ ...base, topic: ' Review ' }, context), {
+    ok: true, normalized_topic: 'Review',
+  });
+  assert.equal(contexts[0], context);
 });
 
 test('SDK room packet drains typed rows without exposing them as chat or losing a raced text row', async () => {
@@ -873,4 +922,58 @@ test('consumer configuration checks the daemon SDK release, not its control prot
     await host.shutdown();
     assert.equal(releases, 1);
   }
+});
+
+test('runtime history catalog accepts participant cursors and refuses host view or viewer overrides', async()=>{
+ const client=blankClient(); const packet=new SdkRoomPacket(IDENTITY,CID,client);
+ await packet.registerRuntimeCommands({listMembers:async()=>({}),removeMember:async()=>({}),sharedCommand:async()=>({})});
+ const cmd=client.registeredCommands.find(x=>x.name==='room.history');
+ const validate=new Ajv({strict:false}).compile(cmd.input_schema);
+ for(const input of [{},{after:0,limit:2},{view:'participant'}]) assert.equal(validate(input),true);
+ for(const input of [{view:'operator'},{viewer_cid:CID},{viewerCid:CID},{room_id:ROOM_ID}]) assert.equal(validate(input),false);
+});
+
+test('real SDK command results persist only authenticated viewer history across store restart',async(t)=>{
+ const { OursClient }=await import('@ours.network/sdk/client');
+ const { CoworkStore }=await import('../src/storage.ts');
+ const { RoomService }=await import('../src/service.ts');
+ const sdkHistory=await import(new URL('./history.js',import.meta.resolve('@ours.network/sdk')));
+ const dir=mkdtempSync(join(tmpdir(),'cowork-history-command-'));
+ const identity={dir:join(dir,'sdk-identity')};
+ t.after(()=>{sdkHistory.closeHistory(identity);rmSync(dir,{recursive:true,force:true});});
+ const a='A'.repeat(64),b='B'.repeat(64),c='C'.repeat(64),at='2026-08-02T10:11:12.000Z';
+ const seats=[a,b,c].map((identity,i)=>({identity,display_name:`Member ${i}`,role:'builder',invite_id:'invite-1',accepted_at:at,state:'active',participant_id:`01jz6y7n8p9q0r1s2t3v4w5xa${i+1}`}));
+ const store=new CoworkStore(join(dir,'cowork'));
+ await store.create({version:2,room_id:ROOM_ID,room_name:'SDK room',identity_name:'ours-cowork:SDK room',identity_cid:CID,mission:{goal:'Ship',briefing:'Common',briefing_version:1},role_briefings:{},state:'active',seats,invites:[],created_at:at,activated_at:at,anonymous:false,quiet_membership:false,membership_epoch:3,command_grants:[{caller_cid:c,command:'room.history'}]});
+ const rootId='01jz6y7n8p9q0r1s2t3v4w5xt1';
+ const message={version:1,kind:'message',room_id:ROOM_ID,at,author:{identity:a,display_name:'Member 0',role:'builder'},category:'chat',recipient_identities:[a,b]};
+ await store.append(ROOM_ID,{...message,message_id:rootId,text:'Thread: secret',scope:{thread_id:rootId},thread_root:{schema_version:1,thread_id:rootId,topic:'secret',creator_participant_id:seats[0].participant_id,members:seats.slice(0,2).map(({identity,participant_id})=>({identity,participant_id})),idempotency_key:'hidden-key',fingerprint:'0'.repeat(64)}});
+ await store.append(ROOM_ID,{...message,message_id:'01jz6y7n8p9q0r1s2t3v4w5xt2',text:'Public update',recipient_identities:[a,b,c]});
+ let next=0;
+ const client=new OursClient({url:'http://sdk.test',leaseToken:'test',fetch:async(url,options)=>{
+  const method=url.split('/').at(-1);const input=JSON.parse(options.body);
+  let value;
+  if(method==='setCommandCatalog') value={published:true};
+  else if(method==='getMessages') value=sdkHistory.takeUnreadMessages(identity,input);
+  else if(method==='sendCommandResult') {
+   sdkHistory.ingestApplicationEvent(identity,{kind:'message',messageKind:'command_result',direction:'out',wireId:`result-${next++}`,peerCid:input.contact,peerName:'Caller',occurredAtMs:Date.parse(at),encryption:'e2e',replyToWireId:input.reply_to_wire_id,body:JSON.stringify(input.outcome)});
+   value={sent:true,wire_id:`result-${next-1}`,history_stored:true};
+  } else throw new Error(`unexpected SDK transport operation ${method}`);
+  return new Response(JSON.stringify(value),{status:200,headers:{'content-type':'application/json'}});
+ }});
+ const packet=new SdkRoomPacket('ours-cowork:SDK room',CID,client);
+ const service=new RoomService(new CoworkStore(join(dir,'cowork')),{get:()=>packet});
+ await service.reloadConsumerCommands(ROOM_ID);
+ for(const [wire,args] of [['public',{}],['escalate',{view:'operator'}],['spoof',{viewer_cid:a}]]) {
+  sdkHistory.ingestApplicationEvent(identity,{kind:'message',messageKind:'command',direction:'in',wireId:wire,peerCid:c,peerName:'Caller',occurredAtMs:Date.parse(at),encryption:'e2e',body:JSON.stringify({command:'room.history',arguments:args})});
+ }
+ await client.getMessages({limit:3});
+ sdkHistory.closeHistory(identity);
+ const persisted=sdkHistory.getMessageHistoryItem(identity,'result-0');
+ assert.equal(persisted.message_kind,'command_result');
+ const output=JSON.parse(persisted.body).result;
+ assert.equal(output.ok,true);
+ assert.deepEqual(output.result.map(r=>({text:r.text,seq:r.seq,record_id:r.record_id})),[{text:'Public update',seq:1,record_id:`${ROOM_ID}:participant:${seats[2].participant_id}:1`}]);
+ for(const leak of ['secret','hidden-key','recipient_identities','source_wire_id','scope','fingerprint']) assert.equal(persisted.body.includes(leak),false,leak);
+ for(const wire of ['result-1','result-2']) assert.deepEqual(JSON.parse(sdkHistory.getMessageHistoryItem(identity,wire).body).result,{ok:false,error:'invalid_request'});
 });

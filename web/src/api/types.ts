@@ -3,7 +3,7 @@ import { isNormalizedRoomName } from '../roomName';
 export type RoomState = 'provisioning' | 'active' | 'closing' | 'closed';
 export type InviteMode = 'one_time' | 'public';
 export type InviteState = 'live' | 'consumed' | 'revoked' | 'replacement_required' | 'receipt_pending';
-export type RelayStatus = 'queued' | 'send_failed' | 'skipped_removed';
+export type RelayStatus = 'queued' | 'send_failed' | 'skipped_removed' | 'skipped_reply_unavailable';
 
 export interface MissionDto {
   goal: string;
@@ -131,7 +131,21 @@ interface RecordCommonDto {
   at: string;
 }
 
+export interface ThreadScopeDto { thread_id: string; parent_key?: string; }
+export interface ThreadRootDto {
+  schema_version: 1; thread_id: string; topic: string; creator_participant_id: string;
+  members: Array<{ identity: string; participant_id: string }>;
+  idempotency_key: string; fingerprint: string;
+}
+export interface IntakeRejectionRecordDto extends RecordCommonDto {
+  kind: 'intake_rejection'; source_kind: 'message' | 'file'; source_msg_id?: number; source_file_id?: number;
+  source_wire_id: string; sender_identity: string; sender_participant_id: string;
+  fingerprint: string; error: 'reply_target_unavailable' | 'thread_files_unsupported'; notification_attempt_claimed: true;
+}
+
 export interface MessageRecordDto extends RecordCommonDto {
+  scope?: ThreadScopeDto;
+  thread_root?: ThreadRootDto;
   kind: 'message';
   message_id: string;
   author: AuthorDto;
@@ -196,7 +210,7 @@ export interface MembershipResultRecordDto extends RecordCommonDto {
   kind: 'membership_result';
   intent_record_id: string;
   participant_id: string;
-  status: Exclude<RelayStatus, 'skipped_removed'>;
+  status: 'queued' | 'send_failed';
   notified: boolean;
   key_material_retained: true;
   uncertain_after_restart?: true;
@@ -211,13 +225,14 @@ export interface CloseNoticeResultRecordDto extends RecordCommonDto {
   kind: 'close_notice_result';
   intent_record_id: string;
   recipient_identity: string;
-  status: Exclude<RelayStatus, 'skipped_removed'>;
+  status: 'queued' | 'send_failed';
   notified: boolean;
   key_material_retained: true;
   uncertain_after_restart?: true;
 }
 
 export type OperationalRecordDto =
+  | IntakeRejectionRecordDto
   | FileRecordDto
   | RelayIntentRecordDto
   | RelayResultRecordDto
@@ -231,7 +246,7 @@ export type CommunicationRecordDto = MessageRecordDto | OperationalRecordDto;
 const ROOM_STATES = new Set<unknown>(['provisioning', 'active', 'closing', 'closed']);
 const INVITE_MODES = new Set<unknown>(['one_time', 'public']);
 const INVITE_STATES = new Set<unknown>(['live', 'consumed', 'revoked', 'replacement_required', 'receipt_pending']);
-const RELAY_STATUSES = new Set<unknown>(['queued', 'send_failed', 'skipped_removed']);
+const RELAY_STATUSES = new Set<unknown>(['queued', 'send_failed', 'skipped_removed', 'skipped_reply_unavailable']);
 const DELIVERY_STATUSES = new Set<unknown>(['queued', 'send_failed']);
 const LOWER_CROCKFORD_ULID = /^[0-7][0-9a-hjkmnp-tv-z]{25}$/;
 const CANONICAL_CONTAINER_ID = /^[0-9A-F]{64}$/;
@@ -447,6 +462,47 @@ function invalidRecoveryReceipt(): never {
   throw new Error('daemon returned an invalid recovery receipt for this room state');
 }
 
+function isThreadScope(value: unknown): value is ThreadScopeDto {
+  return isRecord(value) && hasExactKeys(value, ['thread_id'], ['parent_key']) && isLowerCrockfordUlid(value.thread_id)
+    && (value.parent_key === undefined || (typeof value.parent_key === 'string'
+      && /^(?:message|file):[0-7][0-9a-hjkmnp-tv-z]{25}$/.test(value.parent_key)));
+}
+
+function isThreadRoot(value: unknown): value is ThreadRootDto {
+  if (!isRecord(value) || !hasExactKeys(value, ['schema_version', 'thread_id', 'topic', 'creator_participant_id', 'members', 'idempotency_key', 'fingerprint'])
+    || value.schema_version !== 1 || !isLowerCrockfordUlid(value.thread_id) || !isLowerCrockfordUlid(value.creator_participant_id)
+    || typeof value.topic !== 'string' || Array.from(value.topic).length < 1 || Array.from(value.topic).length > 120
+    || value.topic.trim() !== value.topic || value.topic.trim().length === 0 || /[\p{Cc}\p{Cf}]/u.test(value.topic)
+    || typeof value.idempotency_key !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(value.idempotency_key)
+    || typeof value.fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(value.fingerprint)
+    || !Array.isArray(value.members) || value.members.length === 0) return false;
+  const ids = new Set<string>(), identities = new Set<string>();
+  for (const member of value.members) {
+    if (!isRecord(member) || !hasExactKeys(member, ['identity', 'participant_id']) || !isLowerCrockfordUlid(member.participant_id)
+      || typeof member.identity !== 'string' || !CANONICAL_CONTAINER_ID.test(member.identity)
+      || ids.has(member.participant_id) || identities.has(member.identity)) return false;
+    ids.add(member.participant_id); identities.add(member.identity);
+  }
+  return ids.has(value.creator_participant_id);
+}
+
+function hasValidMessageThread(value: Record<string, unknown>): boolean {
+  if (value.scope !== undefined && !isThreadScope(value.scope)) return false;
+  if (value.thread_root !== undefined && !isThreadRoot(value.thread_root)) return false;
+  const scope = value.scope as ThreadScopeDto | undefined;
+  const root = value.thread_root as ThreadRootDto | undefined;
+  if (root) {
+    const creator = root.members.find(member => member.participant_id === root.creator_participant_id);
+    return scope !== undefined && scope.thread_id === value.message_id && root.thread_id === value.message_id
+      && scope.parent_key === undefined && value.category === 'chat' && value.text === `Thread: ${root.topic}`
+      && isAuthor(value.author) && creator?.identity === value.author.identity
+      && (value.author_alias === undefined || (isAuthorAlias(value.author_alias) && value.author_alias.participant_id === root.creator_participant_id))
+      && value.source_msg_id === undefined && value.source_wire_id === undefined && value.source_reply_to === undefined;
+  }
+  return scope === undefined || (scope.parent_key !== undefined && scope.thread_id !== value.message_id
+    && value.source_reply_to !== undefined && value.category === 'chat');
+}
+
 export function isCommunicationRecordDto(value: unknown): value is CommunicationRecordDto {
   if (!hasRecordCommon(value)) return false;
   switch (value.kind) {
@@ -454,17 +510,27 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
       return hasExactKeys(
         value,
         [...RECORD_COMMON_KEYS, 'message_id', 'author', 'category', 'text', 'recipient_identities'],
-        ['author_alias', 'briefing_role', 'briefing_version', 'membership', 'source_msg_id', 'source_wire_id', 'source_reply_to'],
+        ['author_alias', 'briefing_role', 'briefing_version', 'membership', 'source_msg_id', 'source_wire_id', 'source_reply_to', 'scope', 'thread_root'],
       )
         && isLowerCrockfordUlid(value.message_id)
         && isAuthor(value.author)
         && (value.author_alias === undefined || isAuthorAlias(value.author_alias))
         && isMessageCategory(value)
+        && hasValidMessageThread(value)
         && isUtf8Bounded(value.text, MAX_TEXT_BYTES)
         && isUniqueStringArray(value.recipient_identities)
         && (value.source_msg_id === undefined || isNonNegativeSafeInteger(value.source_msg_id))
         && optionalString(value.source_wire_id)
         && (value.source_reply_to === undefined || isReplyReference(value.source_reply_to));
+    case 'intake_rejection':
+      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'source_kind', 'source_wire_id', 'sender_identity',
+        'sender_participant_id', 'fingerprint', 'error', 'notification_attempt_claimed'], ['source_msg_id', 'source_file_id'])
+        && ((value.source_kind === 'message' && isNonNegativeSafeInteger(value.source_msg_id) && value.source_file_id === undefined)
+          || (value.source_kind === 'file' && isNonNegativeSafeInteger(value.source_file_id) && value.source_msg_id === undefined))
+        && isString(value.source_wire_id) && isString(value.sender_identity) && isLowerCrockfordUlid(value.sender_participant_id)
+        && typeof value.fingerprint === 'string' && /^[0-9a-f]{64}$/.test(value.fingerprint)
+        && (value.error === 'reply_target_unavailable' || value.error === 'thread_files_unsupported')
+        && value.notification_attempt_claimed === true;
     case 'relay_intent':
       return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'recipient_identity'], ['message_id', 'file_id'])
         && hasExactlyOneRelaySubject(value)

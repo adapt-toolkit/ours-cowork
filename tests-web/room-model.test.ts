@@ -583,3 +583,31 @@ describe('room lifecycle model', () => {
     expect(unmetInviteCount(target)).toBe(4);
   });
 });
+
+describe('host thread archive decoding',()=>{
+ const participant='01jz6y7n8p9q0r1s2t3v4w5x72';
+ const root={...message(2),author:{identity:CALLER_CID,display_name:'Alice',role:'builder'},text:'Thread: Review',scope:{thread_id:MESSAGE_ID},thread_root:{schema_version:1,thread_id:MESSAGE_ID,topic:'Review',creator_participant_id:participant,members:[{identity:CALLER_CID,participant_id:participant}],idempotency_key:'host-secret',fingerprint:'0'.repeat(64)}};
+ const child={...message(3),message_id:'01jz6y7n8p9q0r1s2t3v4w5x73',scope:{thread_id:MESSAGE_ID,parent_key:`message:${MESSAGE_ID}`},source_reply_to:{wire_id:'root-copy'}};
+ const rejection={version:1,room_id:ROOM_ID,seq:4,record_id:`${ROOM_ID}:4`,at:AT,kind:'intake_rejection',source_kind:'message',source_msg_id:0,source_wire_id:'rejected-wire',sender_identity:CALLER_CID,sender_participant_id:participant,fingerprint:'0'.repeat(64),error:'reply_target_unavailable',notification_attempt_claimed:true};
+ const skipped={...event(5),kind:'relay_result',intent_record_id:`${ROOM_ID}:4`,status:'skipped_reply_unavailable'};
+ it('accepts complete host root, descendant, rejection and unavailable relay rows with global IDs',()=>{
+  expect(isHistoryDto([message(1),root,child,rejection,skipped])).toBe(true);
+  expect(projectChat([root,child] as CommunicationRecordDto[]).map(x=>'text' in x ? x.text : '')).toEqual(['Thread: Review','message 3']);
+ });
+ it('rejects malformed thread metadata, rejection subjects, and participant-local record IDs',()=>{
+  const variants=[
+   {...root,record_id:`${ROOM_ID}:participant:${participant}:2`},
+   {...root,scope:{...root.scope,extra:true}},
+   {...root,scope:{thread_id:MESSAGE_ID,parent_key:`message:${MESSAGE_ID}`}},
+   {...root,thread_root:{...root.thread_root,members:[...root.thread_root.members,...root.thread_root.members]}},
+   {...root,thread_root:{...root.thread_root,creator_participant_id:child.message_id}},
+   {...root,thread_root:{...root.thread_root,members:[{...root.thread_root.members[0],extra:true}]}},
+   {...root,thread_root:{...root.thread_root,fingerprint:'bad'}},
+   {...root,thread_root:{...root.thread_root,topic:' padded '}},
+   {...child,scope:{...child.scope,parent_key:'unknown'}},
+   {...child,scope:{thread_id:MESSAGE_ID}},
+   {...rejection,source_file_id:2}, {...rejection,source_kind:'file'}, {...rejection,extra:true},
+  ];
+  for(const row of variants) expect(isHistoryDto([row])).toBe(false);
+ });
+});

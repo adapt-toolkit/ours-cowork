@@ -101,7 +101,7 @@ async function stopChild(child, description) {
 }
 
 if (process.argv.includes('--reply-relay-driver')) {
-  test('ordinary SDK clients preserve room reply parents and Messenger renders them', async (t) => {
+  test('ordinary SDK clients preserve scoped replies across Cowork restart without excluded arrivals', async (t) => {
     const scratch = mkdtempSync(join(tmpdir(), 'cowork-reply-relay-'));
     const oursStateDir = join(scratch, 'shared-ours');
     const coworkStateDir = join(scratch, 'cowork');
@@ -559,6 +559,166 @@ if (process.argv.includes('--reply-relay-driver')) {
       };
       stage('sdk-chain-verified');
 
+      // A broadcast fallback, duplicate creation, or forgotten durable recipient wire
+      // must fail through real SDK histories, unread metadata, and arrival events.
+      const arrivals = [];
+      const abortNotifications = new AbortController();
+      let notificationFailure;
+      const notificationTask = (async () => {
+        for await (const event of c.client.watchNotifications(c.name, {
+          since: 0, kinds: ['inbound'], signal: abortNotifications.signal,
+        })) arrivals.push(event);
+      })().catch((error) => { notificationFailure = error; });
+      t.after(async () => { abortNotifications.abort(); await notificationTask; });
+      async function observedArrival(wire) {
+        await waitFor(() => {
+          if (notificationFailure) throw notificationFailure;
+          return arrivals.some((event) => event.wire_id === wire);
+        }, `C notification for ${wire}`);
+        assert.equal(notificationFailure, undefined);
+      }
+      await observedArrival(wBC);
+      const beforeHistory = await history(c);
+      const beforeArrivals = arrivals.length;
+      const unreadC = async () => {
+        const row = (await c.client.unread()).identities.find((item) => item.name === c.name);
+        assert(row, 'C retains unread ordinary room messages');
+        return row;
+      };
+      const beforeUnread = await unreadC();
+      const beforeWires = new Set(beforeHistory.map((row) => row.wire_id));
+      const barriers = [];
+      async function assertExcluded() {
+        const rows = await history(c);
+        assert.deepEqual(rows.filter((row) => !beforeWires.has(row.wire_id)).map((row) => row.wire_id).sort(),
+          barriers.map((row) => row.wire_id).sort(), 'only ordinary barriers enter C history');
+        const unread = await unreadC();
+        assert.equal(unread.count, beforeUnread.count + barriers.length, 'only ordinary barriers increase unread');
+        assert.equal(unread.files, beforeUnread.files);
+        assert.deepEqual(unread.unread_files, beforeUnread.unread_files);
+        assert.deepEqual(unread.recent, [...beforeUnread.recent, ...barriers.map((row) => ({
+          from: beforeUnread.recent.at(-1).from, msg_id: row.msg_id, date: row.date,
+        }))].slice(-10), 'no scoped message metadata enters unread recent');
+        assert.equal(notificationFailure, undefined);
+        const events = arrivals.slice(beforeArrivals);
+        assert.deepEqual(events.map((event) => event.wire_id).sort(), barriers.map((row) => row.wire_id).sort(),
+          'C receives exactly the ordinary barrier notifications, with no scoped wire/file metadata');
+        for (const event of events) {
+          assert.equal(event.event, 'message_received');
+          assert.equal(event.sender_id, roomCid);
+          assert.deepEqual(Object.keys(event).sort(),
+            ['event', 'sender_id', 'sender_name', 'from', 'msg_id', 'wire_id', 'date'].sort(),
+            'arrival notifications remain content-free');
+        }
+      }
+      async function ordinaryBarrier(label) {
+        const text = `ordinary barrier ${label} ${suffix}`;
+        sendWire(await a.client.sendMessage({ contact: roomCid, text }));
+        const row = await findRoomMessage(c, text, a.cid);
+        assert.equal(roomBody(row).thread, undefined, 'no reply target means no implicit thread');
+        assert.equal(row.reply_to, null);
+        barriers.push(row);
+        await observedArrival(row.wire_id);
+        await assertExcluded();
+      }
+      async function startThread(arguments_) {
+        const requestWire = sendWire(await a.client.sendCommand({
+          contact: roomCid, command: 'start_thread', arguments: arguments_,
+        }));
+        const row = await waitFor(async () => (await history(a)).find((item) =>
+          item.direction === 'in' && item.message_kind === 'command_result'
+          && item.reply_to?.wire_id === requestWire), `start_thread result for ${requestWire}`);
+        const outcome = JSON.parse(row.text);
+        assert.equal(outcome.ok, true, JSON.stringify(outcome));
+        assert.equal(outcome.result.ok, true, JSON.stringify(outcome));
+        assert.equal(outcome.result.status, 'accepted');
+        return { request_wire: requestWire, result_wire: row.wire_id, thread_id: outcome.result.thread_id };
+      }
+      await runCowork(['room', 'command-grant', roomId, a.cid, 'start_thread']);
+      const current = await runCowork(['room', 'show', roomId]);
+      const selected = current.seats.filter((seat) => [a.cid, b.cid].includes(seat.identity))
+        .map((seat) => seat.participant_id);
+      assert.equal(selected.length, 2);
+      const command = await waitFor(async () => (await a.client.listContactCommands({ contact: roomCid }))
+        .find((item) => item.name === 'start_thread'), 'generic start_thread catalog');
+      assert(command.input_schema);
+      const args = { topic: `Scoped ${suffix}`, participant_ids: selected, idempotency_key: `e2e-${suffix}` };
+      const firstCommand = await startThread(args);
+      const [rootA, rootB] = await Promise.all([
+        findRoomMessage(a, `Thread: ${args.topic}`, a.cid), findRoomMessage(b, `Thread: ${args.topic}`, a.cid),
+      ]);
+      const tid = roomBody(rootA).thread.thread_id;
+      assert.equal(firstCommand.thread_id, tid);
+      assert.equal(roomBody(rootB).thread.thread_id, tid);
+      assert.notEqual(rootA.wire_id, rootB.wire_id);
+      const text1 = `Scoped B ${suffix}`;
+      const bSource = sendWire(await b.client.sendMessage({ contact: roomCid, text: text1, reply_to_wire_id: rootB.wire_id }));
+      const bAtA = await findRoomMessage(a, text1, b.cid);
+      assert.deepEqual(bAtA.reply_to, { wire_id: rootA.wire_id });
+      assert.equal(roomBody(bAtA).thread.thread_id, tid);
+      const text2 = `Scoped A nested ${suffix}`;
+      sendWire(await a.client.sendMessage({ contact: roomCid, text: text2, reply_to_wire_id: bAtA.wire_id }));
+      const aAtB = await findRoomMessage(b, text2, a.cid);
+      assert.deepEqual(aAtB.reply_to, { wire_id: bSource });
+      assert.equal(roomBody(aAtB).thread.thread_id, tid);
+      const fileName = `scoped-${suffix}.txt`;
+      const fileWire = sendWire(await b.client.sendFile({ contact: roomCid, filename: fileName,
+        mime: 'text/plain', data_base64: Buffer.from('private thread attachment').toString('base64'),
+        reply_to_wire_id: rootB.wire_id }));
+      await findRoomMessage(b, 'thread_files_unsupported', roomCid);
+      const retryArgs = { ...args, participant_ids: [...selected].reverse() };
+      const retryCommand = await startThread(retryArgs);
+      assert.equal(retryCommand.thread_id, tid);
+      assert.notEqual(retryCommand.request_wire, firstCommand.request_wire);
+      await assertExcluded();
+      await ordinaryBarrier('before restart');
+      const adminHistory = () => runCowork(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
+      const adminBefore = await adminHistory();
+      assert.equal(adminBefore.filter((row) => row.kind === 'message' && row.thread_root?.thread_id === tid).length, 1);
+      assert(adminBefore.some((row) => row.kind === 'message' && row.text === text2));
+      assert(adminBefore.some((row) => row.kind === 'intake_rejection' && row.source_wire_id === fileWire
+        && row.error === 'thread_files_unsupported'));
+      stage('scoped-sdk-verified');
+
+      await runCowork(['stop']);
+      await assert.rejects(runCowork(['status']), /daemon_unavailable.*ours-cowork is stopped/);
+      await runCowork(['start']);
+      await waitFor(async () => (await runCowork(['status'])).running === true, 'restarted isolated Cowork readiness');
+      await waitFor(async () => {
+        const room = await runCowork(['room', 'show', roomId]);
+        return room.state === 'active' && room.identity_cid === roomCid
+          && peers.every((peer) => room.seats.some((seat) => seat.identity === peer.cid && seat.state === 'active'));
+      }, 'restored room and seats');
+      const restartCommand = await startThread(retryArgs);
+      assert.equal(restartCommand.thread_id, tid);
+      assert.notEqual(restartCommand.request_wire, retryCommand.request_wire);
+      const restartText = `Scoped B after restart ${suffix}`;
+      sendWire(await b.client.sendMessage({ contact: roomCid, text: restartText, reply_to_wire_id: rootB.wire_id }));
+      const restartedAtA = await findRoomMessage(a, restartText, b.cid);
+      assert.deepEqual(restartedAtA.reply_to, { wire_id: rootA.wire_id });
+      assert.equal(roomBody(restartedAtA).thread.thread_id, tid);
+      await assertExcluded();
+      await ordinaryBarrier('after restart');
+      const adminAfter = await adminHistory();
+      assert.equal(adminAfter.filter((row) => row.kind === 'message' && row.thread_root?.thread_id === tid).length, 1);
+      assert(adminAfter.some((row) => row.kind === 'message' && row.text === restartText));
+      for (const peer of [a, b]) {
+        assert.equal((await history(peer)).filter((row) => roomBody(row)?.text === `Thread: ${args.topic}`).length, 1,
+          `${peer.label} receives one root across retries and restart`);
+      }
+      const secrets = [tid, args.topic, text1, text2, restartText, fileName, fileWire];
+      assert.equal((await history(c)).some((row) => secrets.some((secret) => JSON.stringify(row).includes(secret))), false);
+      evidence.scoped = { thread_id: tid, root_wires: { A: rootA.wire_id, B: rootB.wire_id },
+        commands: [firstCommand, retryCommand, restartCommand],
+        nested_reply_to: aAtB.reply_to, restarted_reply_to: restartedAtA.reply_to,
+        excluded_unread_before: beforeUnread, excluded_unread_after: await unreadC(),
+        excluded_arrivals: arrivals.slice(beforeArrivals), file_refusal_wire: fileWire,
+        root_count: 1, restarted_test_owned_cowork: true };
+      abortNotifications.abort();
+      await notificationTask;
+      assert.equal(notificationFailure, undefined);
+      stage('scoped-restart-verified');
+
       if (MESSENGER_ROOT) {
         evidence.command = [
           `COWORK_REPLY_MESSENGER_ROOT=${MESSENGER_ROOT}`,
@@ -606,7 +766,7 @@ if (process.argv.includes('--reply-relay-driver')) {
     }
   });
 } else {
-  test('real ordinary SDK room clients preserve per-recipient reply threading', async (t) => {
+  test('real generic SDK clients preserve ordinary and scoped reply threading across restart', async (t) => {
     const driverEnv = { ...process.env };
     delete driverEnv.NODE_TEST_CONTEXT;
     const child = spawn(process.execPath, [THIS_FILE, '--reply-relay-driver'], {

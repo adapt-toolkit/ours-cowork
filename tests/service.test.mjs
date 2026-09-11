@@ -11,6 +11,7 @@ import {
   sdkIdentityNameError,
 } from '../src/contracts.ts';
 import { ContactAlreadyAbsentError, LegacyCoworkStateError, packInvite } from '../src/packets.ts';
+import { ThreadFailure } from '../src/thread-contracts.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const ALICE_CID = 'A'.repeat(64);
@@ -2298,6 +2299,269 @@ async function sharedCommandFixture(options = {}) {
 
 const sharedContext = Object.freeze({ sender_cid: ALICE_CID, sender_name: 'Untrusted label', request_wire_id: 'request' });
 
+function threadRoots(records) {
+  return records.filter((record) => record.kind === 'message' && record.thread_root !== undefined);
+}
+
+function publicThreadRoot() {
+  const thread_id = '01jz6y7n8p9q0r1s2t3v4w5xaa';
+  return {
+    at: '2026-09-10T10:11:12.000Z', message_id: thread_id,
+    author: { identity: ALICE_CID, display_name: 'Alice', role: 'builder' },
+    author_alias: { participant_id: '01jz6y7n8p9q0r1s2t3v4w5xab', alias: 'builder #1' },
+    scope: { thread_id },
+    thread_root: {
+      schema_version: 1, thread_id, topic: 'Review',
+      creator_participant_id: '01jz6y7n8p9q0r1s2t3v4w5xab',
+      members: [
+        { participant_id: '01jz6y7n8p9q0r1s2t3v4w5xab', identity: ALICE_CID },
+        { participant_id: '01jz6y7n8p9q0r1s2t3v4w5xac', identity: BOB_CID },
+      ],
+      idempotency_key: 'private-key', fingerprint: 'a'.repeat(64),
+    },
+  };
+}
+
+test('publicThreadMetadata exposes participant IDs and the room-safe creator snapshot', async () => {
+  const { publicThreadMetadata } = await import('../src/threads.ts');
+  assert.equal(typeof publicThreadMetadata, 'function');
+  const root = publicThreadRoot();
+  const { message_id: thread_id } = root;
+  const expected = {
+    schema_version: 1, thread_id, topic: 'Review',
+    creator: { identity: ALICE_CID, display_name: 'Alice', role: 'builder' },
+    participant_ids: ['01jz6y7n8p9q0r1s2t3v4w5xab', '01jz6y7n8p9q0r1s2t3v4w5xac'],
+    created_at: root.at,
+  };
+  const { author_alias: _anonymousAlias, ...namedRoot } = root;
+  assert.deepEqual(publicThreadMetadata(namedRoot, { anonymous: false }), expected);
+  assert.deepEqual(publicThreadMetadata(root, { anonymous: true }), {
+    ...expected,
+    creator: { identity: '01jz6y7n8p9q0r1s2t3v4w5xab', display_name: 'builder #1', role: 'builder' },
+  });
+  assert.equal(JSON.stringify(publicThreadMetadata(root, { anonymous: false })).includes(ALICE_CID), true);
+  assert.equal(JSON.stringify(publicThreadMetadata(root, { anonymous: false })).includes(BOB_CID), false);
+  assert.equal(JSON.stringify(publicThreadMetadata(root, { anonymous: false })).includes('private-key'), false);
+});
+
+test('publicThreadMetadata fails closed on absent, malformed, or mismatched anonymous aliases', async () => {
+  const { publicThreadMetadata } = await import('../src/threads.ts');
+  const root = publicThreadRoot();
+  const corrupt = [
+    { ...root, author_alias: undefined },
+    { ...root, author_alias: { ...root.author_alias, participant_id: 'not-a-participant-id' } },
+    { ...root, author_alias: { ...root.author_alias, participant_id: root.thread_root.members[1].participant_id } },
+  ];
+  for (const candidate of corrupt) {
+    assert.throws(
+      () => publicThreadMetadata(candidate, { anonymous: true }),
+      (error) => error instanceof ThreadFailure
+        && error.code === 'reply_target_unavailable'
+        && error.message === 'reply_target_unavailable',
+    );
+  }
+});
+
+test('start_thread needs a grant and deduplicates normalized retries', async () => {
+  const f = await sharedCommandFixture();
+  const call = f.registry.get(ROOM_ID).runtimeCommands.startThread;
+  assert.equal(typeof call, 'function');
+  const seats = (await f.store.load(ROOM_ID)).seats.filter((seat) => seat.state === 'active');
+  const args = { topic: ' Review ', participant_ids: seats.map((seat) => seat.participant_id), idempotency_key: 'request-1' };
+  assert.deepEqual(await call(args, sharedContext), { ok: false, error: 'unauthorized' });
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'start_thread' });
+  const first = await call(args, sharedContext);
+  assert.equal(first.ok, true);
+  const second = await call(
+    { ...args, participant_ids: [...args.participant_ids].reverse() },
+    { ...sharedContext, request_wire_id: 'new-wire' },
+  );
+  assert.deepEqual(second, first);
+  assert.deepEqual(await call({ ...args, topic: 'Different' }, sharedContext), {
+    ok: false, error: 'idempotency_conflict',
+  });
+  const roots = threadRoots(await f.store.read(ROOM_ID));
+  assert.equal(roots.length, 1);
+  assert.equal(roots[0].source_wire_id, undefined);
+  assert.equal(roots[0].text, 'Thread: Review');
+  assert.equal(roots[0].thread_root.topic, 'Review');
+  assert.deepEqual(
+    roots[0].recipient_identities.slice().sort(),
+    seats.map((seat) => seat.identity).sort(),
+  );
+});
+
+test('start_thread binds authenticated context and supports explicit or inherited grants', async () => {
+  for (const grant of ['explicit', 'role']) {
+    const f = await sharedCommandFixture();
+    const call = f.registry.get(ROOM_ID).runtimeCommands.startThread;
+    const seats = (await f.store.load(ROOM_ID)).seats.filter((seat) => seat.state === 'active');
+    const args = { topic: 'Bound room', participant_ids: [seats[0].participant_id], idempotency_key: `grant-${grant}` };
+    if (grant === 'explicit') {
+      await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'start_thread' });
+    } else {
+      await f.service.setRuntimeRoleCommands(ROOM_ID, { role: seats[0].role, commands: ['start_thread'] });
+    }
+    assert.deepEqual(await call({ ...args, sender_name: 'Spoofed' }, sharedContext), {
+      ok: false, error: 'invalid_request',
+    });
+    assert.deepEqual(await call({ ...args, room_id: '01jz6y7n8p9q0r1s2t3v4w5x7z' }, sharedContext), {
+      ok: false, error: 'invalid_request',
+    });
+    const receipt = await call(args, { ...sharedContext, sender_name: 'Definitely not Alice' });
+    assert.equal(receipt.ok, true);
+    const [root] = threadRoots(await f.store.read(ROOM_ID));
+    assert.equal(root.room_id, ROOM_ID);
+    assert.deepEqual(root.author, { identity: ALICE_CID, display_name: 'Alice', role: seats[0].role });
+  }
+});
+
+test('start_thread fails closed without appending work for unavailable callers and invalid selections', async () => {
+  const cases = [
+    ['creator excluded', (room) => [room.seats[1].participant_id], 'invalid_members'],
+    ['duplicate member', (room) => [room.seats[0].participant_id, room.seats[0].participant_id], 'invalid_members'],
+    ['unknown member', () => ['01jz6y7n8p9q0r1s2t3v4w5xff'], 'invalid_members'],
+  ];
+  for (const [label, selected, error] of cases) {
+    const f = await sharedCommandFixture();
+    await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'start_thread' });
+    const room = await f.store.load(ROOM_ID);
+    const before = (await f.store.read(ROOM_ID)).length;
+    const result = await f.registry.get(ROOM_ID).runtimeCommands.startThread({
+      topic: 'Review', participant_ids: selected(room), idempotency_key: label.replaceAll(' ', '-'),
+    }, sharedContext);
+    assert.deepEqual(result, { ok: false, error }, label);
+    assert.equal((await f.store.read(ROOM_ID)).length, before, label);
+  }
+
+  for (const state of ['inactive room', 'pending lifecycle', 'removed caller', 'removed selection']) {
+    const f = await sharedCommandFixture();
+    await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'start_thread' });
+    const room = await f.store.load(ROOM_ID);
+    const alice = room.seats.find((seat) => seat.identity === ALICE_CID);
+    const bob = room.seats.find((seat) => seat.identity === BOB_CID);
+    let context = sharedContext;
+    let ids = [alice.participant_id];
+    let error = 'room_unavailable';
+    if (state === 'inactive room') f.store.rooms.get(ROOM_ID).state = 'closing';
+    if (state === 'pending lifecycle') {
+      f.store.rooms.get(ROOM_ID).lifecycle_request = {
+        request_id: 'wire-close', command: 'room.close', caller_cid: ALICE_CID,
+        accepted_at: '2026-08-02T10:11:12.000Z', state: 'pending',
+      };
+    }
+    if (state === 'removed caller') {
+      await f.service.removeParticipant(ROOM_ID, { participant: ALICE_CID, notify: false });
+      error = 'unauthorized';
+    }
+    if (state === 'removed selection') {
+      await f.service.removeParticipant(ROOM_ID, { participant: BOB_CID, notify: false });
+      ids = [alice.participant_id, bob.participant_id];
+      error = 'invalid_members';
+    }
+    const before = (await f.store.read(ROOM_ID)).length;
+    assert.deepEqual(await f.registry.get(ROOM_ID).runtimeCommands.startThread({
+      topic: 'Review', participant_ids: ids, idempotency_key: state.replaceAll(' ', '-'),
+    }, context), { ok: false, error }, state);
+    assert.equal((await f.store.read(ROOM_ID)).length, before, state);
+  }
+});
+
+test('start_thread keeps the original audience on retries and rejects a new creator incarnation', async () => {
+  const f = await sharedCommandFixture();
+  await f.service.setRuntimeRoleCommands(ROOM_ID, { role: 'builder', commands: ['start_thread'] });
+  const call = f.registry.get(ROOM_ID).runtimeCommands.startThread;
+  const seats = (await f.store.load(ROOM_ID)).seats.filter((seat) => seat.state === 'active');
+  const args = { topic: 'Stable', participant_ids: seats.map((seat) => seat.participant_id), idempotency_key: 'stable-key' };
+  const first = await call(args, sharedContext);
+  await f.service.removeParticipant(ROOM_ID, { participant: BOB_CID, notify: false });
+  assert.deepEqual(await call(args, { ...sharedContext, request_wire_id: 'retry-after-leave' }), first);
+  const [root] = threadRoots(await f.store.read(ROOM_ID));
+  assert.deepEqual(
+    root.thread_root.members,
+    seats.map(({ participant_id, identity }) => ({ participant_id, identity }))
+      .sort((left, right) => left.participant_id.localeCompare(right.participant_id)),
+  );
+
+  await f.service.removeParticipant(ROOM_ID, { participant: ALICE_CID, notify: false });
+  const [liveInvite] = (await f.service.showRoom(ROOM_ID)).invites.filter((candidate) => candidate.state === 'live');
+  await f.service.revokeInvite(ROOM_ID, liveInvite.invite_id);
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  await admit(f, invite, ALICE_CID, 'Alice again');
+  assert.deepEqual(await call(args, { ...sharedContext, request_wire_id: 'reused-cid' }), {
+    ok: false, error: 'unauthorized',
+  });
+  assert.equal(threadRoots(await f.store.read(ROOM_ID)).length, 1);
+});
+
+test('start_thread serializes concurrent retries and conflicting uses of one key', async () => {
+  const f = await sharedCommandFixture();
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'start_thread' });
+  const call = f.registry.get(ROOM_ID).runtimeCommands.startThread;
+  const [alice] = (await f.store.load(ROOM_ID)).seats.filter((seat) => seat.identity === ALICE_CID);
+  const args = { topic: 'Concurrent', participant_ids: [alice.participant_id], idempotency_key: 'parallel-key' };
+  const same = await Promise.all(Array.from({ length: 8 }, (_, index) => call(args, {
+    ...sharedContext, request_wire_id: `same-${index}`,
+  })));
+  assert.equal(new Set(same.map((result) => JSON.stringify(result))).size, 1);
+  assert.equal(threadRoots(await f.store.read(ROOM_ID)).length, 1);
+
+  const conflict = await Promise.all([
+    call({ ...args, topic: 'First', idempotency_key: 'conflict-key' }, { ...sharedContext, request_wire_id: 'first' }),
+    call({ ...args, topic: 'Second', idempotency_key: 'conflict-key' }, { ...sharedContext, request_wire_id: 'second' }),
+  ]);
+  assert.deepEqual(conflict.map((result) => result.ok).sort(), [false, true]);
+  assert.equal(conflict.find((result) => !result.ok).error, 'idempotency_conflict');
+  assert.equal(threadRoots(await f.store.read(ROOM_ID)).length, 2);
+});
+
+test('start_thread resumes pending relay work only after releasing the command mutex', async () => {
+  const f = await sharedCommandFixture();
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'start_thread' });
+  const original = f.service.intake.resumePending.bind(f.service.intake);
+  let ownershipAtResume = 'not called';
+  f.service.intake.resumePending = async (roomId) => {
+    ownershipAtResume = f.store.ownership.getStore();
+    return original(roomId);
+  };
+  const [alice] = (await f.store.load(ROOM_ID)).seats.filter((seat) => seat.identity === ALICE_CID);
+  const result = await f.registry.get(ROOM_ID).runtimeCommands.startThread({
+    topic: 'Resume safely', participant_ids: [alice.participant_id], idempotency_key: 'resume-outside',
+  }, sharedContext);
+  assert.equal(result.ok, true);
+  assert.equal(ownershipAtResume, undefined);
+});
+
+test('start_thread rejects a projected public root envelope above 262144 UTF-8 bytes', async () => {
+  const f = await sharedCommandFixture();
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'start_thread' });
+  const room = f.store.rooms.get(ROOM_ID);
+  const alphabet = '0123456789abcdefghjkmnpqrstvwxyz';
+  const participantId = (value) => {
+    let encoded = '';
+    for (let current = value; encoded.length < 25; current = Math.floor(current / 32)) {
+      encoded = alphabet[current % 32] + encoded;
+    }
+    return `0${encoded}`;
+  };
+  const extra = Array.from({ length: 10_000 }, (_, index) => ({
+    participant_id: participantId(index + 100),
+    identity: index.toString(16).padStart(64, '0').toUpperCase(),
+    display_name: `Member ${index}`,
+    role: 'builder', invite_id: 'core-invite-1', accepted_at: room.activated_at,
+    state: 'active',
+  }));
+  room.seats.push(...extra);
+  const selected = [room.seats.find((seat) => seat.identity === ALICE_CID), ...extra];
+  const before = (await f.store.read(ROOM_ID)).length;
+  assert.deepEqual(await f.registry.get(ROOM_ID).runtimeCommands.startThread({
+    topic: 'Large audience',
+    participant_ids: selected.map((seat) => seat.participant_id),
+    idempotency_key: 'large-audience',
+  }, sharedContext), { ok: false, error: 'invalid_request' });
+  assert.equal((await f.store.read(ROOM_ID)).length, before);
+});
+
 test('every shared command refuses ungranted, spoofed, cross-room and removed callers', async () => {
   const { SHARED_ROOM_COMMANDS } = await import('../src/command-names.ts');
   const f = await sharedCommandFixture();
@@ -2314,7 +2578,7 @@ test('every shared command refuses ungranted, spoofed, cross-room and removed ca
   }
 });
 
-test('shared ours commands and management routes produce equal results and durable effects', async () => {
+test('shared commands preserve management effects with deliberate participant result projections', async () => {
   const { SHARED_ROOM_COMMANDS } = await import('../src/command-names.ts');
   const { createServiceRoutes, createPrivateServiceRoutes, classifyServiceError } = await import('../src/command-routes.ts');
   const f = await sharedCommandFixture();
@@ -2360,6 +2624,17 @@ test('shared ours commands and management routes produce equal results and durab
     let expected;
     try { expected = { ok: true, result: await routes[name].run({ ...input, room_id: ROOM_ID }) }; }
     catch (error) { expected = { ok: false, error: classifyServiceError(error) }; }
+    if (expected.ok && name === 'room.show') {
+      const { room_id, room_name, state, mission, anonymous, quiet_membership, membership_epoch } = expected.result;
+      expected.result = { room_id, room_name, state, mission, anonymous, quiet_membership, membership_epoch };
+    } else if (expected.ok && name === 'room.participants') {
+      expected.result = expected.result.map(({ participant_id, role, state }) => ({ participant_id, role, state }));
+    } else if (expected.ok && name === 'room.history') {
+      expected.result = expected.result.map((row, index) => ({ ...row, seq: index + 1,
+        record_id: `${ROOM_ID}:participant:${before.seats.find(seat => seat.identity === ALICE_CID).participant_id}:${index + 1}` }));
+    } else if (expected.ok && (name === 'room.message' || name === 'room.say')) {
+      expected.result = { message_id: expected.result.message_id, accepted: true };
+    }
     const actual = await call(name, input, sharedContext);
     assert.deepEqual(actual, JSON.parse(JSON.stringify(expected)), name);
     assert.deepEqual(await g.store.load(ROOM_ID), await f.store.load(ROOM_ID), `${name} metadata`);
@@ -2569,4 +2844,35 @@ test('accepted lifecycle shutdown refuses a later consumer invocation before HTT
   const handlers = f.registry.get(ROOM_ID).runtimeCommands;
   assert.equal((await handlers.sharedCommand('room.close', {}, sharedContext)).result.status, 'accepted');
   assert.deepEqual(await handlers.consumerCommands[0].handler({ id: 1 }, sharedContext), { ok: false, error: 'unauthorized' });
+});
+
+test('runtime history cannot escalate or select another viewer, and commands expose safe results', async () => {
+ const f=await sharedCommandFixture();
+ const call=f.registry.get(ROOM_ID).runtimeCommands.sharedCommand;
+ for(const command of ['room.history','room.show','room.participants','room.message','room.say']) await f.service.grantRuntimeCommand(ROOM_ID,{caller_cid:ALICE_CID,command});
+ for(const input of [{view:'operator'},{view:'host'},{view:'Participant'},{view:null},{viewerCid:BOB_CID},{viewer_cid:BOB_CID},{sender_cid:BOB_CID},{after:-1}]) assert.deepEqual(await call('room.history',input,sharedContext),{ok:false,error:'invalid_request'});
+ for(const input of [{},{view:'participant'}]) {
+  const out=await call('room.history',input,sharedContext); assert.equal(out.ok,true);
+  for(const row of out.result) { assert.equal(row.kind,'message'); assert.equal(row.recipient_identities,undefined); assert.equal(row.source_wire_id,undefined); assert.match(row.record_id,/:participant:/); }
+ }
+ const show=await call('room.show',{},sharedContext);
+ assert.deepEqual(Object.keys(show.result).sort(),['anonymous','membership_epoch','mission','quiet_membership','room_id','room_name','state']);
+ const roster=await call('room.participants',{},sharedContext);
+ roster.result.forEach(seat=>assert.deepEqual(Object.keys(seat).sort(),['participant_id','role','state']));
+ await f.service.addRestRole(ROOM_ID,{role:'Reporter'});
+ for(const [name,input] of [['room.message',{text:'Public post'}],['room.say',{role:'Reporter',text:'Role post'}]]) {
+  const out=await call(name,input,sharedContext); assert.equal(out.ok,true);
+  assert.deepEqual(Object.keys(out.result).sort(),['accepted','message_id']); assert.equal(out.result.accepted,true);
+ }
+});
+
+test('participant history scans bounded raw pages before applying the visible cursor',async()=>{
+ const f=await sharedCommandFixture();
+ const original=await f.service.participantHistory(ROOM_ID,ALICE_CID,{});
+ for(let i=0;i<70;i++) await f.store.append(ROOM_ID,{version:1,kind:'relay_result',room_id:ROOM_ID,at:TIMES[0],intent_record_id:`${ROOM_ID}:1`,message_id:MESSAGE_IDS[0],recipient_identity:BOB_CID,status:'send_failed'});
+ await f.service.postMessage(ROOM_ID,{text:'After hidden activity'});
+ const read=f.store.read.bind(f.store);
+ f.store.read=async(id,page)=>{assert(page.limit<=64);return read(id,{...page,limit:Math.min(page.limit,7)});};
+ const after=await f.service.participantHistory(ROOM_ID,ALICE_CID,{after:original.length,limit:1});
+ assert.deepEqual(after.map(x=>({text:x.text,seq:x.seq})),[{text:'After hidden activity',seq:original.length+1}]);
 });

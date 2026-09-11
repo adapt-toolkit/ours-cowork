@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ContainerIdSchema, RuntimeCommandNameSchema } from './contracts.ts';
+import { ContainerIdSchema, RuntimeCommandGrantPatternSchema } from './contracts.ts';
 import type { AuthenticatedRouteTable } from './transports.ts';
 
 export interface RoomServiceApi {
@@ -57,10 +57,10 @@ const RestRoleParams = z.object({
   room_id: z.string(), role: z.string(),
 }).strict();
 const RuntimeCommandGrantParams = z.object({
-  room_id: z.string(), caller_cid: ContainerIdSchema, command: RuntimeCommandNameSchema,
+  room_id: z.string(), caller_cid: ContainerIdSchema, command: RuntimeCommandGrantPatternSchema,
 }).strict();
 const RuntimeRoleCommandGrantParams = z.object({
-  room_id: z.string(), role: z.string(), commands: z.array(RuntimeCommandNameSchema),
+  room_id: z.string(), role: z.string(), commands: z.array(RuntimeCommandGrantPatternSchema),
 }).strict();
 const ParticipantRemoveParams = z.object({
   room_id: z.string(), participant: z.string(), notify: z.boolean().optional(),

@@ -9,7 +9,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { ensureRuntimeState, loadConfig, type CoworkConfig } from './config.ts';
-import { MAX_EXTERNAL_INVITE_BYTES, MAX_MANAGEMENT_RESPONSE_BYTES, RuntimeCommandNameSchema } from './contracts.ts';
+import { MAX_EXTERNAL_INVITE_BYTES, MAX_MANAGEMENT_RESPONSE_BYTES, RuntimeCommandGrantPatternSchema } from './contracts.ts';
 
 const EXIT = {
   success: 0,
@@ -354,8 +354,8 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
       const value = requiredFlag(parsed, '--commands', 'room role-command-set');
       const commands = value === 'none' ? [] : value.split(',');
       if (new Set(commands).size !== commands.length || commands.some(item =>
-        !RuntimeCommandNameSchema.safeParse(item).success)) {
-        usageError('--commands must be a unique comma-separated list of built-in command names or none');
+        !RuntimeCommandGrantPatternSchema.safeParse(item).success)) {
+        usageError('--commands must be a unique comma-separated list of command names, * or namespace.* patterns, or none');
       }
       return { method: 'room.command.role.set', params: { room_id: roomId, role, commands } };
     }
@@ -364,8 +364,8 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
       const [roomId, callerCid, runtimeCommand] = exactPositionals(
         parseOptions(args), 3, `room ${command}`,
       );
-      if (!RuntimeCommandNameSchema.safeParse(runtimeCommand).success) {
-        usageError('runtime command must be a supported built-in command name');
+      if (!RuntimeCommandGrantPatternSchema.safeParse(runtimeCommand).success) {
+        usageError('runtime command must be a supported command name, * or namespace.* pattern');
       }
       return {
         method: command === 'command-grant'

@@ -25,6 +25,16 @@ const API_VERSION = '1';
 
 type JsonSchema = Record<string, unknown>;
 
+const commandGrantPatternProperty: JsonSchema = {
+  anyOf: [
+    { type: 'string', enum: [...RUNTIME_COMMAND_NAMES] },
+    { type: 'string', maxLength: 128, pattern: '^consumer\\.[a-z0-9][a-z0-9.-]*[a-z0-9]$' },
+    { type: 'string', enum: ['*'] },
+    { type: 'string', maxLength: 128, pattern: '^(?:[a-z0-9][a-z0-9-]*\\.)+\\*$' },
+  ],
+  description: 'Exact command, * for all runtime commands, or terminal namespace.*. Patterns also cover future matching commands.',
+};
+
 export interface RpcMethodDocumentation {
   /** Envelope `method` value, identical to the REST route table key. */
   readonly method: string;
@@ -109,7 +119,7 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
   },
   {
     method: 'room.command.definition.put', summary: 'Register or replace a consumer command',
-    description: 'Registers a consumer.* command for the ours catalog using an exact host-configured handler reference. Replacement clears grants for that name. Local definitions cannot be replaced here. A published:false result means desired state is committed; use reload to retry publication.',
+    description: 'Registers a consumer.* command for the ours catalog using an exact host-configured handler reference. Replacement clears exact grants for that name; wildcard grants remain effective. Local definitions cannot be replaced here. A published:false result means desired state is committed; use reload to retry publication.',
     params: params({ room_id: roomIdProperty, expected_revision: { type: 'integer', minimum: 0 }, definition: {
       type: 'object', additionalProperties: false, required: ['name', 'description', 'input_schema', 'handler'],
       properties: { name: { type: 'string', maxLength: 128, pattern: '^consumer\\.[a-z0-9][a-z0-9.-]*[a-z0-9]$' }, description: { type: 'string', minLength: 1, maxLength: 1024 }, input_schema: { type: 'object' }, handler: { type: 'string', minLength: 1, maxLength: 128 } },
@@ -118,7 +128,7 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
   },
   {
     method: 'room.command.definition.delete', summary: 'Delete a REST consumer command',
-    description: 'Deletes the desired definition and its CID/role grants. Requires the current registry revision. Local commands must be removed from their file and reloaded.',
+    description: 'Deletes the desired definition and its exact CID/role grants; wildcard grants remain stored. Requires the current registry revision. Local commands must be removed from their file and reloaded.',
     params: params({ room_id: roomIdProperty, expected_revision: { type: 'integer', minimum: 0 }, name: { type: 'string' } }, ['room_id', 'expected_revision', 'name']),
     result: 'Updated revision, published and definitions.', example: { room_id: EXAMPLE_ROOM_ID, expected_revision: 1, name: 'consumer.orders' },
   },
@@ -298,7 +308,7 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     method: 'room.command.grants',
     summary: 'List runtime-command grants',
     description: 'Lists the default-deny grants that bind one active participant CID to one '
-      + 'room runtime command.',
+      + 'room runtime command name or stored wildcard pattern.',
     params: params({ room_id: roomIdProperty }, ['room_id']),
     result: 'An array of `{caller_cid, command}` grants.',
     example: { room_id: EXAMPLE_ROOM_ID },
@@ -316,13 +326,11 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     method: 'room.command.role.set',
     summary: 'Set a role runtime-command policy',
     description: 'Atomically replaces the command policy for one exact role. An empty command '
-      + 'list removes the policy without removing independent per-CID grants.',
+      + 'list removes the policy without removing independent per-CID grants. Accepts exact names, * and namespace.* patterns.',
     params: params({
       room_id: roomIdProperty,
       role: { type: 'string', minLength: 1, description: 'Exact admitted seat role.' },
-      commands: { type: 'array', uniqueItems: true, items: {
-        anyOf: [{ type: 'string', enum: [...RUNTIME_COMMAND_NAMES] }, { type: 'string', maxLength: 128, pattern: '^consumer\\.[a-z0-9][a-z0-9.-]*[a-z0-9]$' }],
-      } },
+      commands: { type: 'array', uniqueItems: true, items: commandGrantPatternProperty },
     }, ['room_id', 'role', 'commands']),
     result: 'The complete sorted role-policy list after the idempotent update.',
     example: { room_id: EXAMPLE_ROOM_ID, role: 'Owner', commands: ['list-members', 'remove-member'] },
@@ -330,12 +338,12 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
   {
     method: 'room.command.grant',
     summary: 'Authorize a runtime command caller',
-    description: 'Idempotently grants one command to one exact active participant CID. Display '
-      + 'names and roles are never authority.',
+    description: 'Idempotently grants one command name or dynamic pattern to one exact active participant CID. Display '
+      + 'names and caller-supplied roles are never authority. * and room.* include permission administration and room lifecycle commands; * also covers future or replaced consumer commands.',
     params: params({
       room_id: roomIdProperty,
       caller_cid: { type: 'string', pattern: '^[0-9A-Fa-f]{64}$', description: 'Authenticated caller CID.' },
-      command: { anyOf: [{ type: 'string', enum: [...RUNTIME_COMMAND_NAMES] }, { type: 'string', maxLength: 128, pattern: '^consumer\\.[a-z0-9][a-z0-9.-]*[a-z0-9]$' }] },
+      command: commandGrantPatternProperty,
     }, ['room_id', 'caller_cid', 'command']),
     result: 'The complete sorted grant list after the idempotent update.',
     example: { room_id: EXAMPLE_ROOM_ID, caller_cid: 'A'.repeat(64), command: 'list-members' },
@@ -343,12 +351,12 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
   {
     method: 'room.command.revoke',
     summary: 'Revoke a runtime command caller',
-    description: 'Idempotently removes one exact CID/command grant. Revocation is persisted '
+    description: 'Idempotently removes only the exact stored CID/name or CID/pattern entry; overlapping grants remain effective. Revocation is persisted '
       + 'before subsequent command dispatch can acquire the room mutex.',
     params: params({
       room_id: roomIdProperty,
       caller_cid: { type: 'string', pattern: '^[0-9A-Fa-f]{64}$', description: 'Authenticated caller CID.' },
-      command: { anyOf: [{ type: 'string', enum: [...RUNTIME_COMMAND_NAMES] }, { type: 'string', maxLength: 128, pattern: '^consumer\\.[a-z0-9][a-z0-9.-]*[a-z0-9]$' }] },
+      command: commandGrantPatternProperty,
     }, ['room_id', 'caller_cid', 'command']),
     result: 'The complete sorted grant list after the idempotent update.',
     example: { room_id: EXAMPLE_ROOM_ID, caller_cid: 'A'.repeat(64), command: 'remove-member' },

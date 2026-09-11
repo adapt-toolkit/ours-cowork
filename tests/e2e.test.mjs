@@ -572,7 +572,20 @@ if (process.argv.includes('--e2e-driver')) {
       assert(relayed);
       const shown = await sharedCall('room.show', {});
       assert.equal(shown.ok, true, 'independent command after a refused command and post');
-      assert.equal(shown.result.status, 'shared-command-verified');
+      assert.deepEqual(shown.result, {
+        room_id: roomId,
+        room_name: created.room_name,
+        state: 'active',
+        mission: {
+          goal: 'Ship the release',
+          briefing: 'Keep evidence and blockers explicit',
+          briefing_version: 1,
+        },
+        anonymous: false,
+        quiet_membership: false,
+        membership_epoch: room.membership_epoch,
+      });
+      assert.equal('status' in shown.result, false);
       stage('consumer-callback-reentry');
       const credential = await restRpc('consumer.handler.credential.set', { handler: 'consumer', token: consumerToken });
       assert.deepEqual(credential, { handler: 'consumer', configured: true });

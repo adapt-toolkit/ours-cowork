@@ -138,3 +138,25 @@ test('root lookup rejects ordinary, duplicate, and malformed root rows', () => {
     /reply_target_unavailable/,
   );
 });
+
+// Consumers must resolve each hop in its saved author's namespace, with ordering
+// guards, instead of trusting a scope.parent_key or recursively scanning wire text.
+test('association uses authenticated ancestry and bounds cyclic or forward private targets', async () => {
+  const { classifyThreadAssociation: classify } = await import('../src/threads.ts');
+  const root = rootMessage();
+  const r = { room_id: root.room_id, anonymous: false };
+  const child = { ...root, seq: 2, record_id: `${root.room_id}:2`, message_id: ids[0],
+    thread_root: undefined, source_wire_id: 'child-source', source_reply_to: { wire_id: 'loop' },
+    scope: { thread_id: root.message_id, parent_key: `message:${root.message_id}` } };
+  for (const target of ['child-source', 'forward', 'unknown']) {
+    const source = { ...child, source_reply_to: { wire_id: target } };
+    const future = { ...child, seq: 3, record_id: `${root.room_id}:3`, message_id: ids[1], source_wire_id: 'forward',
+      source_reply_to: { wire_id: 'child-source' } };
+    assert.throws(() => classify(r, [root, source, future], source), /reply_target_unavailable/);
+  }
+  const legacy = { ...child, scope: undefined, source_reply_to: { wire_id: 'old-unknown' } };
+  assert.deepEqual(classify(r, [root, legacy], legacy), { state: 'ordinary' });
+  // The same wire belongs to a different author; it is not this legacy row's parent.
+  const other = { ...child, author: { ...child.author, identity: seats[1].identity }, source_wire_id: 'old-unknown' };
+  assert.deepEqual(classify(r, [root, other, legacy], legacy), { state: 'ordinary' });
+});

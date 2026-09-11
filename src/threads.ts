@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import type { FileInboxItem, InboxItem } from './packets.ts';
-import { resolveReplyParent, type Row } from './reply-threading.ts';
+import { resolveReplyParent, type Item, type ParentResolution, type Row } from './reply-threading.ts';
 
 import { AuthorAliasSchema, type CommunicationRecord, type Room, type Seat } from './contracts.ts';
 import {
@@ -152,6 +152,61 @@ export function findThreadRoot(
   return root;
 }
 
+type ThreadAssociation =
+  | { state: 'ordinary' }
+  | { state: 'scoped'; root: MessageRecord & { thread_root: ThreadRoot }; scope: ThreadScope };
+
+/**
+ * Classify saved routing evidence, never message text. Walk native ancestry in each
+ * saved author's namespace, then validate every association from oldest to newest.
+ * Missing legacy targets remain ordinary; proven private ancestry cannot lose scope.
+ * Iteration and strictly decreasing sequence numbers bound corrupt/cyclic archives.
+ */
+export function classifyThreadAssociation(
+  room: Pick<Room, 'room_id' | 'anonymous'>, rows: readonly Row[], source: Item,
+): ThreadAssociation {
+  const chain: { item: Item; resolved: ParentResolution }[] = [];
+  const seen = new Set<string>();
+  let item = source;
+  for (;;) {
+    const key = item.kind === 'message' ? `message:${item.message_id}` : `file:${item.file_id}`;
+    if (item.room_id !== room.room_id || seen.has(key) || chain.length > rows.length) {
+      throw new ThreadFailure('reply_target_unavailable');
+    }
+    seen.add(key);
+    const resolved = resolveReplyParent(rows, room.room_id, item.author.identity,
+      item.source_reply_to?.wire_id, item.seq);
+    chain.push({ item, resolved });
+    if (resolved.state !== 'resolved') break;
+    if (resolved.parent.item.seq >= item.seq) throw new ThreadFailure('reply_target_unavailable');
+    item = resolved.parent.item;
+  }
+  let association: ThreadAssociation = { state: 'ordinary' };
+  for (const { item, resolved } of chain.reverse()) {
+    const declared = item.kind === 'message' && (item.scope !== undefined || item.thread_root !== undefined);
+    if (!declared && association.state === 'ordinary') continue;
+    const scope = ThreadScopeSchema.safeParse(item.kind === 'message' ? item.scope : undefined);
+    if (item.kind !== 'message' || !scope.success || item.category !== 'chat'
+      || rows.filter(row => row.room_id === room.room_id && row.kind === 'message'
+        && row.message_id === item.message_id).length !== 1) {
+      throw new ThreadFailure('reply_target_unavailable');
+    }
+    const root = findThreadRoot(rows.filter(row => row.room_id === room.room_id), scope.data.thread_id);
+    if (!root?.thread_root) throw new ThreadFailure('reply_target_unavailable');
+    publicThreadMetadata({ ...root, thread_root: root.thread_root }, room);
+    publicThreadAuthor(item, root.thread_root, room);
+    if (item.message_id !== root.message_id) {
+      if (item.thread_root !== undefined || root.seq >= item.seq
+        || resolved.state !== 'resolved' || scope.data.parent_key !== resolved.parent.key
+        || association.state !== 'scoped' || association.root.message_id !== root.message_id) {
+        throw new ThreadFailure('reply_target_unavailable');
+      }
+    }
+    association = { state: 'scoped', root: { ...root, thread_root: root.thread_root }, scope: scope.data };
+  }
+  return association;
+}
+
 /** Authorize the authenticated sender's explicit target before any source append. */
 export function resolveIntakeScope(
   room: Room, rows: readonly Row[], item: InboxItem | FileInboxItem, beforeSeq: number,
@@ -169,12 +224,10 @@ export function resolveIntakeScope(
   }
   const resolved = resolveReplyParent(rows, room.room_id, item.sender_id, reply.wire_id, beforeSeq);
   if (resolved.state !== 'resolved') throw new ThreadFailure('reply_target_unavailable');
-  const parent = resolved.parent.item;
-  if (parent.kind === 'file' || (parent.scope === undefined && parent.thread_root === undefined)) return ordinary();
-  const scope = ThreadScopeSchema.safeParse(parent.scope);
-  if (!scope.success) throw new ThreadFailure('reply_target_unavailable');
-  const root = findThreadRoot(rows, scope.data.thread_id);
-  if (!root?.thread_root || !activeThreadSeat(room, root.thread_root, item.sender_id)) {
+  const association = classifyThreadAssociation(room, rows, resolved.parent.item);
+  if (association.state === 'ordinary') return ordinary();
+  const { root } = association;
+  if (!activeThreadSeat(room, root.thread_root, item.sender_id)) {
     throw new ThreadFailure('reply_target_unavailable');
   }
   if ('file_id' in item) throw new ThreadFailure('thread_files_unsupported');

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -961,3 +962,178 @@ test('thread file refusal survives SQLite restart with no blob, fanout, or repea
   assert.equal((await reopened.query(ROOM_ID, { sourceFileId: 82 })).length, 1);
   assert.deepEqual(readdirSync(join(stateDir, 'rooms', ROOM_ID, 'blobs')), []);
 });
+
+// Actual CoworkStore + IntakePump, with only the external packet transport replaced.
+// The break: treating a scope-erased delivered parent as ordinary expands a private audience.
+async function ancestryFixture(t, { anonymous = false, depth = 1 } = {}) {
+  const { IntakePump } = await import('../src/intake.ts');
+  const { RoomService } = await import('../src/service.ts');
+  const { stateDir, store, cleanup } = temporaryStore(); t.after(cleanup);
+  const seats = ['A', 'B', 'C'].map((letter, i) => ({
+    identity: letter.repeat(64), display_name: letter, role: 'builder', invite_id: `invite-${letter}`,
+    accepted_at: AT, participant_id: `01jz6y7n8p9q0r1s2t3v4w5xa${i + 1}`, state: 'active',
+    ...(anonymous ? { alias: `Builder ${i + 1}` } : {}),
+  }));
+  await store.create(room({ state: 'active', activated_at: AT, seats, anonymous }));
+  const [a, b, c] = seats;
+  for (const index of [98, 99]) await store.append(ROOM_ID, message(index, {
+    author: { identity: c.identity, display_name: c.display_name, role: c.role },
+    ...(anonymous ? { author_alias: { participant_id: c.participant_id, alias: c.alias } } : {}),
+    text: `ordinary baseline ${index}`, recipient_identities: [],
+  }));
+  const rootId = message(100).message_id;
+  const members = [a, b].map(({ identity, participant_id }) => ({ identity, participant_id }));
+  await store.append(ROOM_ID, message(100, {
+    author: { identity: a.identity, display_name: a.display_name, role: a.role },
+    ...(anonymous ? { author_alias: { participant_id: a.participant_id, alias: a.alias } } : {}),
+    text: 'Thread: PRIVATE root', recipient_identities: [a.identity, b.identity], scope: { thread_id: rootId },
+    thread_root: { schema_version: 1, thread_id: rootId, topic: 'PRIVATE root',
+      creator_participant_id: a.participant_id, members, idempotency_key: 'ancestry-root', fingerprint: '0'.repeat(64) },
+  }));
+  const inbox = [], files = [], sends = [], fileSends = [];
+  let serial = 0, messageIndex = 101, beforeAck;
+  const packet = {
+    listUnreadMessages: async () => [...inbox], listUnreadFiles: async () => [...files],
+    acknowledgeMessage: async () => { await beforeAck?.(); inbox.shift(); },
+    acknowledgeFile: async () => { await beforeAck?.(); files.shift(); },
+    send: async (recipient, body, replyTo) => {
+      const wire_id = `received-${++serial}-${recipient[0]}`;
+      sends.push({ recipient, body, replyTo, wire_id }); return { status: 'queued', wire_id };
+    },
+    sendFile: async (...args) => { fileSends.push(args); return { status: 'queued', wire_id: `file-${++serial}` }; },
+  };
+  const registry = { get: () => packet };
+  let current = store;
+  const pump = () => new IntakePump(current, registry, { now: () => AT, messageId: () => message(messageIndex++).message_id });
+  const history = page => new RoomService(current, registry).participantHistory(ROOM_ID, c.identity, page);
+  await pump().resumePending(ROOM_ID);
+  // Put the root and its first child on different bounded archive read pages.
+  if (depth > 1) for (let i = 0; i < 65; i++) await store.append(ROOM_ID, intakeRejection('message', 1000 + i));
+  let target = sends.find(s => s.recipient === b.identity).wire_id;
+  let sender = b;
+  const ancestors = [];
+  for (let i = 0; i < depth; i++) {
+    const recipient = sender === b ? a : b;
+    inbox.push({ msg_id: 200 + i, sender_id: sender.identity, sender_name: 'untrusted', date: AT,
+      wire_id: `source-${i}`, text: `PRIVATE ancestor ${i}`, reply_to: { wire_id: target } });
+    sends.length = 0;
+    await pump().pump(ROOM_ID);
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0].recipient, recipient.identity);
+    assert.equal(JSON.parse(sends[0].body).thread.thread_id, rootId);
+    ancestors.push((await current.query(ROOM_ID, { sourceMsgId: 200 + i }))[0]);
+    target = sends[0].wire_id; sender = recipient;
+  }
+  const corrupt = (change = row => { delete row.scope; }) => {
+    const db = new Database(join(stateDir, 'rooms', ROOM_ID, 'archive.sqlite3'));
+    for (const ancestor of ancestors) {
+      const row = JSON.parse(db.prepare('SELECT payload_json FROM records WHERE seq = ?').get(ancestor.seq).payload_json);
+      change(row);
+      db.prepare('UPDATE records SET payload_json = ? WHERE seq = ?').run(JSON.stringify(row), row.seq);
+    }
+    db.close();
+  };
+  const reopen = () => { current = new CoworkStore(stateDir); };
+  sends.length = 0;
+  return { stateDir, seats, a, b, c, rootId, target, sender, ancestors, inbox, files, sends, fileSends,
+    pump, history, corrupt, reopen, store: () => current, beforeAck: fn => { beforeAck = fn; } };
+}
+
+for (const anonymous of [false, true]) for (const depth of [1, 3]) for (const kind of ['message', 'file']) {
+  test(`scope-erased ancestry refuses ${kind} after SQLite reopen (${depth} ancestors, anonymous=${anonymous})`, async t => {
+    const f = await ancestryFixture(t, { depth, anonymous });
+    const pages = [{}, { after: 0, limit: 1 }, { after: 1, limit: 1 }];
+    const before = await Promise.all(pages.map(f.history));
+    const roomBefore = await f.store().load(ROOM_ID);
+    f.corrupt(); f.reopen();
+    // Losing only scope is still strict-schema valid: the real store decodes every row.
+    await f.store().read(ROOM_ID);
+    const item = { sender_id: f.sender.identity, sender_name: 'untrusted', date: AT,
+      wire_id: `rejected-${kind}`, reply_to: { wire_id: f.target },
+      ...(kind === 'message' ? { msg_id: 300, text: 'PRIVATE new reply' }
+        : { file_id: 300, filename: 'PRIVATE-file.txt', mime: 'text/plain', data: Buffer.from('PRIVATE bytes') }) };
+    (kind === 'message' ? f.inbox : f.files).push(item);
+    const query = kind === 'message' ? { sourceMsgId: 300 } : { sourceFileId: 300 };
+    f.beforeAck(async () => {
+      const rows = await f.store().query(ROOM_ID, query);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].kind, 'intake_rejection', 'refusal must be durable before ACK');
+      assert.equal(rows[0].error, 'reply_target_unavailable');
+      throw new Error('restart before ACK');
+    });
+    await assert.rejects(f.pump().pump(ROOM_ID), /restart before ACK/);
+    const [refusal] = await f.store().query(ROOM_ID, query);
+    assert.equal(refusal.notification_attempt_claimed, true);
+    assert.equal(f.sends.length, 1);
+    assert.equal(f.sends[0].recipient, f.sender.identity);
+    assert.equal(JSON.parse(f.sends[0].body).text, 'reply_target_unavailable');
+    assert.equal(f.sends[0].replyTo, undefined);
+    for (const secret of ['PRIVATE', f.target, f.rootId, f.c.identity]) {
+      assert.equal(JSON.stringify(refusal).includes(secret), false);
+      assert.equal(f.sends[0].body.includes(secret), false);
+    }
+    assert.deepEqual(f.fileSends, []);
+    assert.deepEqual(readdirSync(join(f.stateDir, 'rooms', ROOM_ID, 'blobs')), []);
+    f.beforeAck(undefined); f.reopen();
+    await f.pump().pump(ROOM_ID);
+    assert.equal(f.inbox.length + f.files.length, 0);
+    assert.equal(f.sends.length, 1, 'a persisted notification claim prevents replay notice');
+    assert.equal((await f.store().query(ROOM_ID, query)).length, 1);
+    assert.deepEqual(await Promise.all(pages.map(f.history)), before);
+    assert.deepEqual(await f.store().load(ROOM_ID), roomBefore, 'no room summary or notification metadata changes');
+    assert.deepEqual(await f.store().recordsNeedingRelayIntents(ROOM_ID), []);
+  });
+}
+
+for (const kind of ['message', 'file']) {
+  test(`scope-erased ancestry terminally skips already accepted ${kind} after SQLite reopen`, async t => {
+    const f = await ancestryFixture(t, { depth: 3, anonymous: true });
+    const before = await f.history({});
+    // Reproduce durable work accepted by the previous fail-open intake implementation.
+    const draft = kind === 'message' ? message(401, { text: 'PRIVATE pending reply', source_msg_id: 401 }) : {
+      version: 1, kind: 'file', room_id: ROOM_ID, at: AT, file_id: message(401).message_id,
+      filename: 'PRIVATE-pending.txt', mime: 'text/plain', size: 7, data_base64: Buffer.from('PRIVATE').toString('base64'),
+      sha256: createHash('sha256').update('PRIVATE').digest('hex'), source_file_id: 401,
+    };
+    const child = await f.store().append(ROOM_ID, { ...draft,
+      author: { identity: f.sender.identity, display_name: f.sender.display_name, role: f.sender.role },
+      author_alias: { participant_id: f.sender.participant_id, alias: f.sender.alias },
+      source_wire_id: 'pending-source', source_reply_to: { wire_id: f.target },
+      recipient_identities: f.seats.filter(s => s !== f.sender).map(s => s.identity),
+    });
+    f.corrupt(); f.reopen();
+    await f.pump().resumePending(ROOM_ID);
+    assert.deepEqual(f.sends, [], 'pending corrupt chain must emit neither bodies nor file notices');
+    assert.deepEqual(f.fileSends, []);
+    const results = await f.store().query(ROOM_ID, { kind: 'relay_result',
+      ...(kind === 'message' ? { messageId: child.message_id } : { fileId: child.file_id }) });
+    assert.equal(results.length, 2);
+    assert.ok(results.every(r => r.status === 'skipped_reply_unavailable'));
+    assert.deepEqual(await f.history({}), before);
+    f.reopen(); await f.pump().resumePending(ROOM_ID);
+    assert.deepEqual(f.sends, []); assert.deepEqual(f.fileSends, []);
+  });
+}
+
+for (const corruption of ['wrong-parent-key', 'wrong-thread', 'missing-alias', 'wrong-alias']) {
+  test(`deep native ancestry refuses ${corruption} in a delivered intermediate on restart`, async t => {
+    const f = await ancestryFixture(t, { depth: 3, anonymous: true });
+    const before = await f.history({});
+    f.corrupt(row => {
+      if (row.source_msg_id !== 200) return;
+      if (corruption === 'wrong-parent-key') row.scope.parent_key = `message:${row.message_id}`;
+      if (corruption === 'wrong-thread') row.scope.thread_id = message(999).message_id;
+      if (corruption === 'missing-alias') delete row.author_alias;
+      if (corruption === 'wrong-alias') row.author_alias.participant_id = f.c.participant_id;
+    });
+    f.reopen();
+    f.inbox.push({ msg_id: 500, sender_id: f.sender.identity, sender_name: 'untrusted', date: AT,
+      wire_id: 'after-inconsistent-ancestor', text: 'PRIVATE new reply', reply_to: { wire_id: f.target } });
+    await f.pump().pump(ROOM_ID);
+    const [refusal] = await f.store().query(ROOM_ID, { sourceMsgId: 500 });
+    assert.equal(refusal.kind, 'intake_rejection');
+    assert.equal(refusal.error, 'reply_target_unavailable');
+    assert.deepEqual(f.sends.map(s => [s.recipient, JSON.parse(s.body).text]), [[f.sender.identity, 'reply_target_unavailable']]);
+    assert.deepEqual(await f.history({}), before);
+  });
+}

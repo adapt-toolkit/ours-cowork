@@ -82,3 +82,15 @@ test('participant pages enforce visible limits and serialized byte bounds',async
  const second=p(room,large,seats[2].identity,{after:first.at(-1).seq,limit:15});
  assert.equal(first.length+second.length,15);
 });
+
+test('recursive native ancestry hides accepted scope-erased chains while preserving ordinary pages', async () => {
+ const {projectParticipantHistory:p}=await api();
+ const {scope: _scope,...missing}=child;
+ const descendants=Array.from({length:3},(_,i)=>({...row(6+i,`01jz6y7n8p9q0r1s2t3v4w5xt${i+5}`,'PRIVATE deeper reply'),
+   source_wire_id:`deep-source-${i}`,source_reply_to:{wire_id:i===0?'child-wire':`deep-source-${i-1}`}}));
+ const last={...visible,seq:10,record_id:`${roomId}:10`,message_id:'01jz6y7n8p9q0r1s2t3v4w5xt8',text:'last ordinary'};
+ const rows=JSON.parse(JSON.stringify([visible,root,intent,result,missing,...descendants,last]));
+ for(const page of [{},{after:0,limit:1},{after:1,limit:1},{after:2,limit:1}]) {
+   assert.deepEqual(p(room,rows,seats[2].identity,page),p(room,[visible,last],seats[2].identity,page));
+ }
+});

@@ -1812,7 +1812,8 @@ for (const kind of ['message', 'file']) {
       if (denial === 'missing-root' || denial === 'descendant') {
         await f.store.append(ROOM_ID, { version: 1, kind: 'message', room_id: ROOM_ID, at: AT,
           message_id: MESSAGE_IDS[3], author: { identity: f.b.identity, display_name: f.b.display_name, role: f.b.role },
-          category: 'chat', text: 'Private descendant', source_wire_id: 'descendant-source', recipient_identities: [],
+          category: 'chat', text: 'Private descendant', source_wire_id: 'descendant-source',
+          source_reply_to: { wire_id: f.bWire }, recipient_identities: [],
           scope: { thread_id: denial === 'missing-root' ? MESSAGE_IDS[2] : f.root.message_id, parent_key: `message:${f.root.message_id}` } });
         reply = { wire_id: 'descendant-source' };
       }

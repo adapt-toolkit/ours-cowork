@@ -4,9 +4,9 @@ import {
   MembershipNoticeSchema, MessageTextSchema, Rfc3339Schema, RoleSchema,
   type CommunicationRecord, type Room,
 } from './contracts.ts';
-import { resolveReplyParent, type Row } from './reply-threading.ts';
-import { ThreadFailure, ThreadScopeSchema } from './thread-contracts.ts';
-import { activeThreadSeat, findThreadRoot, publicThreadAuthor, publicThreadMetadata } from './threads.ts';
+import type { Row } from './reply-threading.ts';
+import { ThreadFailure } from './thread-contracts.ts';
+import { activeThreadSeat, classifyThreadAssociation, publicThreadAuthor, publicThreadMetadata } from './threads.ts';
 
 const PublicThreadSchema = z.object({ schema_version: z.literal(1), thread_id: LowerCrockfordUlidSchema }).strict();
 const PublicThreadMetadataSchema = PublicThreadSchema.extend({
@@ -78,29 +78,17 @@ export function projectParticipantHistory(
   let ordinal = 0, bytes = 2;
   for (const record of records) {
     if (record.kind !== 'message' || record.room_id !== room.room_id) continue;
-    const resolved = resolveReplyParent(replyRows, room.room_id, record.author.identity,
-      record.source_reply_to?.wire_id, record.seq);
-    const parent = resolved.state === 'resolved' ? resolved.parent.item : undefined;
-    const scoped = record.scope !== undefined || record.thread_root !== undefined
-      || (parent?.kind === 'message' && (parent.scope !== undefined || parent.thread_root !== undefined));
     let author = record.author;
     let thread: ParticipantHistoryRecord['thread'];
     let thread_root: ParticipantHistoryRecord['thread_root'];
     try {
-      if (scoped) {
-        const scope = ThreadScopeSchema.safeParse(record.scope);
-        if (!scope.success || record.category !== 'chat') continue;
-        const root = findThreadRoot(records, scope.data.thread_id);
-        if (!root?.thread_root || !activeThreadSeat(room, root.thread_root, viewerCid)) continue;
-        const metadata = publicThreadMetadata({ ...root, thread_root: root.thread_root }, room);
+      const association = classifyThreadAssociation(room, replyRows, record);
+      if (association.state === 'scoped') {
+        const { root } = association;
+        if (!activeThreadSeat(room, root.thread_root, viewerCid)) continue;
+        const metadata = publicThreadMetadata(root, room);
         author = publicThreadAuthor(record, root.thread_root, room);
         if (record.message_id === root.message_id) thread_root = metadata;
-        else {
-          const parentScope = ThreadScopeSchema.safeParse(parent?.kind === 'message' ? parent.scope : undefined);
-          if (record.thread_root !== undefined || root.seq >= record.seq || resolved.state !== 'resolved'
-            || scope.data.parent_key !== resolved.parent.key || !parentScope.success
-            || parentScope.data.thread_id !== root.message_id) continue;
-        }
         thread = { schema_version: 1, thread_id: root.message_id };
       } else if (record.author_alias !== undefined) {
         const alias = AuthorAliasSchema.parse(record.author_alias);

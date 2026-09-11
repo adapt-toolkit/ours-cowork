@@ -17,9 +17,9 @@ import {
 import type { FileInboxItem, InboxItem, RoomPacket } from './packets.ts';
 import type { CoworkStore, RoomMutex } from './storage.ts';
 import { generateUlid } from './ulid.ts';
-import { readReplyRows, resolveReplyParent, selectReply } from './reply-threading.ts';
-import { findThreadRoot, publicThreadAuthor, publicThreadMetadata, resolveIntakeScope, threadRelayEligible } from './threads.ts';
-import { ThreadFailure, ThreadScopeSchema } from './thread-contracts.ts';
+import { readReplyRows, selectReply } from './reply-threading.ts';
+import { classifyThreadAssociation, publicThreadAuthor, publicThreadMetadata, resolveIntakeScope, threadRelayEligible } from './threads.ts';
+import { ThreadFailure } from './thread-contracts.ts';
 
 type IntakeStore = Pick<CoworkStore, 'mutex' | 'load' | 'save' | 'append' | 'read'>
   & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'relayRecipientsNeedingIntent'>>;
@@ -594,26 +594,15 @@ export class IntakePump {
       const source = message ?? file!;
       const replyRows = source.source_reply_to === undefined && message?.scope === undefined
         && message?.thread_root === undefined ? [] : await readReplyRows(this.store, roomId);
-      const resolved = resolveReplyParent(replyRows, roomId, source.author.identity,
-        source.source_reply_to?.wire_id, source.seq);
-      // A missing child scope must not turn a known private parent into a broadcast.
-      const parent = resolved.state === 'resolved' ? resolved.parent.item : undefined;
-      const scoped = message?.scope !== undefined || message?.thread_root !== undefined
-        || (parent?.kind === 'message' && (parent.scope !== undefined || parent.thread_root !== undefined));
       const decision = selectReply(replyRows, roomId, source, intent.recipient_identity);
       let publicThread: Record<string, unknown> = {};
       let scopedAuthor: MessageRecord['author'] | undefined;
-      if (scoped) {
-        try {
-          const scope = ThreadScopeSchema.safeParse(message?.scope);
-          if (!message || !scope.success || message.category !== 'chat'
-            || !message.recipient_identities.includes(intent.recipient_identity)
+      try {
+        const association = classifyThreadAssociation(room, replyRows, source);
+        if (association.state === 'scoped') {
+          const { root, scope } = association;
+          if (!message || !message.recipient_identities.includes(intent.recipient_identity)
             || message.seq >= intent.seq
-            || replyRows.filter(r => r.kind === 'message' && r.message_id === message.message_id).length !== 1) {
-            throw new ThreadFailure('reply_target_unavailable');
-          }
-          const root = findThreadRoot(replyRows, scope.data.thread_id);
-          if (!root?.thread_root
             || !root.thread_root.members.some(member => member.identity === intent.recipient_identity)) {
             throw new ThreadFailure('reply_target_unavailable');
           }
@@ -626,27 +615,22 @@ export class IntakePump {
           if (message.message_id === root.message_id) {
             publicThread = { thread: { schema_version: 1, thread_id: root.message_id }, thread_root: metadata };
           } else {
-            const parentScope = ThreadScopeSchema.safeParse(parent?.kind === 'message' ? parent.scope : undefined);
-            if (message.thread_root !== undefined || root.seq >= message.seq
-              || scope.data.parent_key === undefined || resolved.state !== 'resolved'
-              || resolved.parent.key !== scope.data.parent_key || !parentScope.success
-              || parentScope.data.thread_id !== root.message_id || decision.state !== 'linked'
-              || decision.parentKey !== scope.data.parent_key) {
+            if (decision.state !== 'linked' || decision.parentKey !== scope.parent_key) {
               throw new ThreadFailure('reply_target_unavailable');
             }
             publicThread = { thread: { schema_version: 1, thread_id: root.message_id } };
           }
-        } catch (error) {
-          if (!(error instanceof ThreadFailure)) throw error;
-          await this.skipRelay(roomId, intent, 'skipped_reply_unavailable');
-          continue;
+        } else {
+          if (!source.recipient_identities.includes(intent.recipient_identity)) continue;
+          if (!activeCids.has(intent.recipient_identity) && removedCids.has(intent.recipient_identity)) {
+            await this.skipRelay(roomId, intent, 'skipped_removed');
+            continue;
+          }
         }
-      } else {
-        if (!source.recipient_identities.includes(intent.recipient_identity)) continue;
-        if (!activeCids.has(intent.recipient_identity) && removedCids.has(intent.recipient_identity)) {
-          await this.skipRelay(roomId, intent, 'skipped_removed');
-          continue;
-        }
+      } catch (error) {
+        if (!(error instanceof ThreadFailure)) throw error;
+        await this.skipRelay(roomId, intent, 'skipped_reply_unavailable');
+        continue;
       }
       const replyTo = decision.replyTo;
 

@@ -2876,3 +2876,123 @@ test('participant history scans bounded raw pages before applying the visible cu
  const after=await f.service.participantHistory(ROOM_ID,ALICE_CID,{after:original.length,limit:1});
  assert.deepEqual(after.map(x=>({text:x.text,seq:x.seq})),[{text:'After hidden activity',seq:original.length+1}]);
 });
+
+test('wildcard grant requests cannot bootstrap authority through participant dispatch', async () => {
+  const f = await sharedCommandFixture();
+  const call = f.registry.get(ROOM_ID).runtimeCommands.sharedCommand;
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'room.show' });
+  const before = await f.service.showRoom(ROOM_ID);
+  for (const command of ['*', 'room.*']) {
+    for (const context of [sharedContext, { ...sharedContext, sender_cid: OUTSIDER_CID, sender_name: 'Owner' }]) {
+      assert.deepEqual(await call('room.command.grant', { caller_cid: ALICE_CID, command }, context), {
+        ok: false, error: 'unauthorized',
+      });
+      assert.deepEqual(await call('room.command.role.set', { role: 'builder', commands: [command] }, context), {
+        ok: false, error: 'unauthorized',
+      });
+    }
+  }
+  assert.deepEqual(await f.service.showRoom(ROOM_ID), before, 'denied grant writes preserve durable room state');
+});
+
+test('wildcard namespace grants delegate shared commands without granting unrelated command families', async () => {
+  const f = await sharedCommandFixture();
+  const commands = f.registry.get(ROOM_ID).runtimeCommands;
+  await assert.rejects(f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: OUTSIDER_CID, command: '*' }), /not an active room identity/);
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'room.*' });
+  assert.equal((await commands.sharedCommand('room.show', {}, sharedContext)).ok, true);
+  const identity = (await f.service.showRoom(ROOM_ID)).identity_cid;
+  assert.equal((await commands.sharedCommand('room.rebind', {}, sharedContext)).ok, true);
+  assert.equal((await f.service.showRoom(ROOM_ID)).identity_cid, identity);
+  assert.equal((await commands.sharedCommand('room.show', {}, sharedContext)).ok, true);
+  assert.deepEqual(await commands.listMembers({}, sharedContext), { ok: false, error: 'unauthorized' });
+  const participants = (await f.store.load(ROOM_ID)).seats.map(s => s.participant_id);
+  const thread = { topic: 'Wildcard', participant_ids: participants, idempotency_key: 'wildcard' };
+  assert.deepEqual(await commands.startThread(thread, sharedContext), { ok: false, error: 'unauthorized' });
+  assert.deepEqual(await commands.sharedCommand('room.show', {}, { ...sharedContext, sender_cid: OUTSIDER_CID }), { ok: false, error: 'unauthorized' });
+  assert.deepEqual(await commands.sharedCommand('room.show', { room_id: ROOM_ID }, sharedContext), { ok: false, error: 'invalid_request' });
+  assert.deepEqual(await commands.sharedCommand('room.*', {}, sharedContext), { ok: false, error: 'invalid_request' });
+  assert.equal((await commands.sharedCommand('room.command.grant', { caller_cid: BOB_CID, command: '*' }, sharedContext)).ok, true);
+  const bob = { ...sharedContext, sender_cid: BOB_CID };
+  assert.equal((await commands.listMembers({}, bob)).ok, true);
+  assert.equal((await commands.startThread(thread, bob)).ok, true);
+  await f.service.removeParticipant(ROOM_ID, { participant: BOB_CID });
+  assert.deepEqual(await commands.listMembers({}, bob), { ok: false, error: 'unauthorized' });
+  assert.equal((await f.service.runtimeCommandGrants(ROOM_ID)).some(g => g.caller_cid === BOB_CID), false);
+});
+
+test('wildcard revocation removes only the stored pattern and preserves exact and role grants', async () => {
+  const f = await sharedCommandFixture();
+  const call = f.registry.get(ROOM_ID).runtimeCommands.sharedCommand;
+  for (const command of ['*', 'room.show']) await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command });
+  assert.equal((await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: '*' })).length, 2);
+  await f.service.setRuntimeRoleCommands(ROOM_ID, { role: 'builder', commands: ['room.briefing.*'] });
+  await f.service.revokeRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'room.*' });
+  assert.equal((await f.service.runtimeCommandGrants(ROOM_ID)).length, 2);
+  await f.service.revokeRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: '*' });
+  assert.deepEqual(await f.service.revokeRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: '*' }), [{ caller_cid: ALICE_CID, command: 'room.show' }]);
+  assert.equal((await call('room.show', {}, sharedContext)).ok, true);
+  assert.equal((await call('room.briefing.role.set', { role: 'builder', text: 'Wildcard role' }, sharedContext)).ok, true);
+  assert.deepEqual(await call('room.settings', { status: 'denied' }, sharedContext), { ok: false, error: 'unauthorized' });
+  await f.service.setRuntimeRoleCommands(ROOM_ID, { role: 'builder', commands: [] });
+  assert.deepEqual(await call('room.briefing.role.set', { role: 'builder', text: 'Denied' }, sharedContext), { ok: false, error: 'unauthorized' });
+});
+
+test('wildcard grants cover future and replaced consumers while publication and registration still gate execution', async (t) => {
+  for (const pattern of ['*', 'consumer.*']) {
+    const f = await consumerFixture(t);
+    await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: pattern });
+    await f.service.registerConsumerCommand(ROOM_ID, { expected_revision: 0, definition: f.definition });
+    const packet = f.registry.get(ROOM_ID);
+    const call = packet.runtimeCommands.consumerCommands[0].handler;
+    assert.deepEqual(await call({ id: 1 }, sharedContext), { ok: false, error: 'consumer_handler_unavailable' });
+    await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: f.definition.name });
+    await f.service.registerConsumerCommand(ROOM_ID, { expected_revision: 1, definition: { ...f.definition, description: 'Replaced' } });
+    assert.deepEqual(await f.service.runtimeCommandGrants(ROOM_ID), [{ caller_cid: ALICE_CID, command: pattern }]);
+    assert.deepEqual(await call({ id: 1 }, sharedContext), { ok: false, error: 'consumer_handler_unavailable' });
+    await f.service.deleteConsumerCommand(ROOM_ID, { expected_revision: 2, name: f.definition.name });
+    assert.deepEqual(await call({ id: 1 }, sharedContext), { ok: false, error: 'unauthorized' });
+    const register = packet.registerRuntimeCommands.bind(packet);
+    packet.registerRuntimeCommands = async () => { throw new Error('publication unavailable'); };
+    await f.service.registerConsumerCommand(ROOM_ID, { expected_revision: 3, definition: f.definition });
+    assert.deepEqual(await call({ id: 1 }, sharedContext), { ok: false, error: 'unauthorized' });
+    packet.registerRuntimeCommands = register;
+    await f.service.reloadConsumerCommands(ROOM_ID);
+    assert.deepEqual(await call({ id: 1 }, sharedContext), { ok: false, error: 'consumer_handler_unavailable' });
+    await f.service.revokeRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: pattern });
+    await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'room.*' });
+    assert.deepEqual(await call({ id: 1 }, sharedContext), { ok: false, error: 'unauthorized' });
+  }
+});
+
+test('wildcard CID and role grants survive disk restart and still enforce lifecycle and membership', async (t) => {
+  const f = await consumerFixture(t);
+  const { CoworkStore } = await import('../src/storage.ts');
+  const stateDir = `${f.root}/state`;
+  const disk = new CoworkStore(stateDir);
+  await disk.create(await f.store.load(ROOM_ID));
+  const service = new RoomService(disk, f.registry, { consumerCommands: f.config });
+  await service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'room.*' });
+  await service.setRuntimeRoleCommands(ROOM_ID, { role: 'builder', commands: ['consumer.*'] });
+  await service.registerConsumerCommand(ROOM_ID, { expected_revision: 0, definition: f.definition });
+  const restoredDisk = new CoworkStore(stateDir);
+  const restoredRegistry = new FakeRegistry();
+  const room = await restoredDisk.load(ROOM_ID);
+  restoredRegistry.restoreResult = new FakePacket(room.identity_name, room.identity_cid);
+  const restored = new RoomService(restoredDisk, restoredRegistry, { consumerCommands: f.config });
+  await restored.recoverPacket(ROOM_ID);
+  assert.deepEqual(await restored.runtimeCommandGrants(ROOM_ID), [{ caller_cid: ALICE_CID, command: 'room.*' }]);
+  assert.deepEqual(await restored.runtimeRoleCommandGrants(ROOM_ID), [{ role: 'builder', commands: ['consumer.*'] }]);
+  const commands = restoredRegistry.get(ROOM_ID).runtimeCommands;
+  assert.equal((await commands.sharedCommand('room.show', {}, sharedContext)).ok, true);
+  const consumer = commands.consumerCommands[0].handler;
+  assert.deepEqual(await consumer({ id: 1 }, sharedContext), { ok: false, error: 'consumer_handler_unavailable' });
+  const bob = { ...sharedContext, sender_cid: BOB_CID };
+  assert.deepEqual(await consumer({ id: 1 }, bob), { ok: false, error: 'consumer_handler_unavailable' });
+  await restored.removeParticipant(ROOM_ID, { participant: BOB_CID });
+  assert.deepEqual(await consumer({ id: 1 }, bob), { ok: false, error: 'unauthorized' });
+  const active = await restoredDisk.load(ROOM_ID);
+  await restoredDisk.save({ ...active, lifecycle_request: { request_id: 'close-pending', command: 'room.close', caller_cid: ALICE_CID, accepted_at: active.activated_at, state: 'pending' } });
+  assert.deepEqual(await commands.sharedCommand('room.show', {}, sharedContext), { ok: false, error: 'room_unavailable' });
+  assert.deepEqual(await consumer({ id: 1 }, sharedContext), { ok: false, error: 'unauthorized' });
+});

@@ -47,7 +47,7 @@ import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
 import { IntakePump } from './intake.ts';
 import { createServiceRoutes, createPrivateServiceRoutes, classifyServiceError } from './command-routes.ts';
 import { ConsumerHandlers, ConsumerDefinitionSchema, type ConsumerConfiguration, type ConsumerDefinition, type StoredConsumerDefinition } from './consumer-commands.ts';
-import { SHARED_ROOM_COMMANDS } from './command-names.ts';
+import { commandGrantMatches, SHARED_ROOM_COMMANDS } from './command-names.ts';
 import { generateUlid } from './ulid.ts';
 import { readReplyRows } from './reply-threading.ts';
 import {
@@ -875,11 +875,11 @@ export class RoomService {
 
   private hasRuntimeCommandGrant(room: Room, callerCid: string, command: RuntimeCommandName): boolean {
     if (room.command_grants.some((grant) =>
-      grant.caller_cid === callerCid && grant.command === command)) return true;
+      grant.caller_cid === callerCid && commandGrantMatches(grant.command, command))) return true;
     const caller = room.seats.find((seat) =>
       seat.state === 'active' && seat.identity === callerCid);
     return caller !== undefined && room.role_command_grants.some((grant) =>
-      grant.role === caller.role && grant.commands.includes(command));
+      grant.role === caller.role && grant.commands.some((pattern) => commandGrantMatches(pattern, command)));
   }
 
   private async beginRemovalUnlocked(room: Room, seat: Seat, notify: boolean): Promise<RemovalReceipt> {
@@ -1218,7 +1218,7 @@ export class RoomService {
 
   /** List the operator-managed runtime-command grants for one room. */
   private assertRegisteredConsumerName(room: Room, name: string): void {
-    if (name.startsWith('consumer.') && !(room.consumer_commands ?? []).some((definition) => definition.name === name)) {
+    if (name.startsWith('consumer.') && !name.endsWith('.*') && !(room.consumer_commands ?? []).some((definition) => definition.name === name)) {
       throw new RoomServiceError('consumer command is not registered');
     }
   }
@@ -1367,7 +1367,7 @@ export class RoomService {
     });
   }
 
-  /** Grant one exact command to one active authenticated room identity. Idempotent. */
+  /** Grant one command selector to one active authenticated room identity. Idempotent. */
   async grantRuntimeCommand(roomId: string, input: unknown): Promise<RuntimeCommandGrant[]> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const request = RuntimeCommandGrantInputSchema.parse(input);
@@ -1393,7 +1393,7 @@ export class RoomService {
     });
   }
 
-  /** Revoke one exact command grant. Absence is already the requested state. */
+  /** Remove only the exact stored selector; overlapping grants remain effective. */
   async revokeRuntimeCommand(roomId: string, input: unknown): Promise<RuntimeCommandGrant[]> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const request = RuntimeCommandGrantInputSchema.parse(input);

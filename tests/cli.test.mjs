@@ -176,6 +176,9 @@ test('usage errors exit 2 before touching the daemon', async () => {
     ['room', 'say', 'room1', '--text', 'no role'],
     ['room', 'say', 'room1', '--role', 'Reviewer'],
     ['room', 'rest-role', 'room1'],
+    ['room', 'command-grant', 'room1', 'A'.repeat(64), 'room*'],
+    ['room', 'command-revoke', 'room1', 'A'.repeat(64), '*.show'],
+    ['room', 'role-command-set', 'room1', '--role', 'builder', '--commands', 'room.*.show'],
   ]) {
     const result = await runCli(args, { env: { OURS_COWORK_STATE_DIR: join(tmpdir(), 'absent-cowork-cli') } });
     assert.equal(result.code, 2, args.join(' '));
@@ -350,6 +353,10 @@ test('room commands send exactly one JSONL request over management.sock', async 
     { args: ['room', 'rest-role', 'room1', '--role', 'Reviewer'], method: 'room.role.rest.add', params: { room_id: 'room1', role: 'Reviewer' } },
     { args: ['room', 'rest-role', 'room1', '--role', 'Reviewer', '--remove'], method: 'room.role.rest.remove', params: { room_id: 'room1', role: 'Reviewer' } },
   ];
+  for (const command of ['*', 'room.*', 'room.command.*', 'consumer.*']) {
+    for (const action of ['grant', 'revoke']) cases.push({ args: ['room', `command-${action}`, 'room1', 'A'.repeat(64), command], method: `room.command.${action}`, params: { room_id: 'room1', caller_cid: 'A'.repeat(64), command } });
+  }
+  cases.push({ args: ['room', 'role-command-set', 'room1', '--role', 'builder', '--commands', 'room.*,consumer.*'], method: 'room.command.role.set', params: { room_id: 'room1', role: 'builder', commands: ['room.*', 'consumer.*'] } });
   for (const expected of cases) {
     await withRpc((request) => ({ result: request.method === 'room.history' ? [] : { ok: true } }), async (rpc) => {
       const result = await runCli(expected.args, { env: rpc.env });

@@ -14,9 +14,51 @@ Update the display name with `ours-cowork room settings <room-id> --name "New na
 
 Runtime commands are default-deny. Per-CID grants use `command-grant` and `command-revoke`. An operator may instead register a durable role policy with `role-command-set <room-id> --role <label> --commands <comma-list>` and inspect it with `role-command-grants`; use `--commands none` to remove it. A role policy authorizes only an authenticated, active seat whose durable admission role exactly matches the policy. Display names, message labels, pending seats, removed seats, and caller-supplied role text never confer authority. Removing a role policy does not remove an independently configured per-CID grant.
 
+### Wildcard command grants
+
+CID grants and role policies accept exact command names, `*`, and a terminal
+`namespace.*` pattern. Quote patterns in the shell:
+
+```sh
+ours-cowork room command-grant <room-id> <caller-cid> '*'
+ours-cowork room command-grant <room-id> <caller-cid> 'room.*'
+ours-cowork room role-command-set <room-id> --role Reviewer --commands 'room.briefing.*,consumer.orders.*'
+ours-cowork room command-revoke <room-id> <caller-cid> 'room.*'
+```
+
+Use the same strings in the `command` field of `room.command.grant` / `revoke`
+and the `commands` array of `room.command.role.set` over RPC or ours transport.
+Invocation still requires a concrete command name; patterns are permissions only.
+
+`*` covers all room runtime commands, including `start_thread`, `list-members`,
+`remove-member`, shared `room.*` commands and registered `consumer.*` commands.
+`room.*` covers only names beginning with `room.`; it excludes those dedicated
+commands and consumer commands. `room.command.*` includes deeper descendants.
+Namespace segments use lowercase ASCII letters, digits and hyphens, start with a
+letter or digit, and are separated by dots; a namespace pattern is at most 128
+characters. Empty segments, internal stars, `room*`, `*.show`, regex, whitespace
+and case folding are unsupported. A valid namespace need not exist yet.
+
+Patterns are stored and listed verbatim, and match future commands dynamically.
+Consumer replacement/deletion still clears exact grants for the changed name,
+but retains wildcard grants: once a matching consumer is registered and published
+again, the wildcard authorizes it. Registration and publication checks still apply.
+
+`*` and `room.*` include permission administration and room close/delete commands,
+so their holders can delegate privileges. Granting them requires the same management
+access or existing permission to invoke the relevant grant command. Patterns never
+bypass authenticated CID, active membership, room scope, lifecycle checks, or
+participant result visibility; they do not authorize host/global management APIs.
+
+Granting an identical CID/pattern is idempotent. Revocation removes only the exact
+stored entry, not all matching names: revoking `room.show` does not override a retained
+`room.*`, and revoking `room.*` leaves independent exact or role grants in effect.
+Patterns survive restart, and per-CID grants are removed with participant removal
+just like exact grants. Empty role command lists remove the role policy.
+
 ## Scoped reply threads
 
-The dedicated `start_thread` runtime command creates a scoped reply thread after an operator grants that exact command name. Discover and invoke it through the SDK's generic command APIs, then use the SDK's native reply field:
+The dedicated `start_thread` runtime command creates a scoped reply thread after an operator grants `start_thread` or `*`. Discover and invoke it through the SDK's generic command APIs, then use the SDK's native reply field:
 
 ```ts
 const definitions = await client.listContactCommands({ contact: roomCid });
@@ -66,7 +108,7 @@ Every web action has an equivalent CLI fallback in the room commands above and i
 
 Room-scoped operations also appear in the room identity's ours catalog with their RPC names: `room.settings`, `room.briefing.role.set`, `room.briefing.role.delete`, `room.invite`, `room.participant.remove`, `room.revoke`, `room.recover`, `room.recover.confirm`, `room.show`, `room.participants`, `room.command.grants`, `room.command.role.grants`, `room.command.role.set`, `room.command.grant`, `room.command.revoke`, `room.history`, `room.message`, `room.say`, `room.role.rest.add`, `room.role.rest.remove`, `room.accept`, `room.rebind`, `room.close`, and `room.delete`.
 
-Use the RPC arguments without `room_id`; the receiving room fixes the target. For example, an operator grants `ours-cowork room command-grant <room-id> <caller-cid> room.settings`, then that active member calls `room.settings` with `{"status":"review"}` using ours command transport. A grant for one name grants none of the other names. The SDK returns a correlated result containing `{ok:true,result:<service value>}` or `{ok:false,error:<code>}`. History returns one page; follow `seq` with `after` to fetch more.
+Use the RPC arguments without `room_id`; the receiving room fixes the target. For example, an operator grants `ours-cowork room command-grant <room-id> <caller-cid> room.settings`, then that active member calls `room.settings` with `{"status":"review"}` using ours command transport. An exact-name grant grants none of the other names. The SDK returns a correlated result containing `{ok:true,result:<service value>}` or `{ok:false,error:<code>}`. History returns one page; follow `seq` with `after` to fetch more.
 
 `start_thread`, `list-members`, and `remove-member` are dedicated runtime commands rather than shared management routes. `list-members` retains its contact-safe roster. `remove-member` retains its epoch, confirm and no-self-removal gates. The separate `room.participant.remove` command instead grants the full operator removal behavior. `room.show` returns only public room settings and mission content; `room.participants` returns participant IDs, roles, and states. Runtime `room.history` returns only messages visible to the authenticated active seat, with viewer-local cursors, and rejects operator view. Runtime `room.message` and `room.say` return only an accepted message-ID receipt. Host management routes retain their full operator results. Policy-administration commands can delegate more privileges; `room.message` and `room.say` authorize room/role authorship. Assign these permissions deliberately. Command results may include invite material; do not relay them into chat.
 

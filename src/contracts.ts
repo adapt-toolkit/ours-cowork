@@ -43,9 +43,16 @@ export const ContainerIdSchema = z.string().regex(/^[0-9a-f]{64}$/i, 'must be a 
 
 export const RuntimeCommandNameSchema = z.union([z.enum(RUNTIME_COMMAND_NAMES), ConsumerCommandNameSchema]);
 
+/** Grant selectors are separate from concrete command invocation names. */
+export const RuntimeCommandNamespacePatternSchema = z.string().max(128)
+  .regex(/^(?:[a-z0-9][a-z0-9-]*\.)+\*$/);
+export const RuntimeCommandGrantPatternSchema = z.union([
+  RuntimeCommandNameSchema, z.literal('*'), RuntimeCommandNamespacePatternSchema,
+]);
+
 export const RuntimeCommandGrantSchema = z.object({
   caller_cid: ContainerIdSchema,
-  command: RuntimeCommandNameSchema,
+  command: RuntimeCommandGrantPatternSchema,
 }).strict();
 
 function isStrictRfc3339(value: string): boolean {
@@ -148,7 +155,7 @@ export const RoleSchema = utf8Bounded('role', MAX_ROLE_BYTES);
 export const ROOM_ROLE = 'room';
 export const RuntimeRoleCommandGrantSchema = z.object({
   role: RoleSchema,
-  commands: z.array(RuntimeCommandNameSchema).superRefine((commands, context) => {
+  commands: z.array(RuntimeCommandGrantPatternSchema).superRefine((commands, context) => {
     const seen = new Set<string>();
     for (const [index, command] of commands.entries()) {
       if (seen.has(command)) {

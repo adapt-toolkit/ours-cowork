@@ -150,6 +150,7 @@ class FakePacket {
   mintInvite() { throw new Error('not used'); }
   revokeInvite() { throw new Error('not used'); }
   listInvites() { return []; }
+  async refreshContacts() {}
   listContacts() { return []; }
   removeContact() { throw new Error('not used'); }
 }
@@ -2304,4 +2305,44 @@ test('authenticated history hides scoped intake activity while host legacy histo
   store.rooms.get(ROOM_ID).seats.find(s=>s.identity===f.a.identity).participant_id='01jz6y7n8p9q0r1s2t3v4w5xff';
   assert.deepEqual((await restarted.participantHistory(ROOM_ID,f.a.identity,{})).map(r=>r.text),['Participant update']);
  }
+});
+
+for (const transport of ['text', 'file-metadata', 'file-body']) {
+  test(`missing contact during ${transport} send does not block a valid recipient`, async () => {
+    const f = fixture();
+    if (transport === 'text') f.packet.inbox.push(incoming());
+    else f.packet.fileInbox.push(incomingFile());
+    const failure = recipient => { if (recipient === 'cid-bob') throw new Error('missing contact'); };
+    if (transport === 'file-body') f.packet.beforeSendFile = failure;
+    else f.packet.beforeSend = failure;
+    await assert.rejects(f.pump.pump(ROOM_ID), /missing contact/);
+    const results = byKind(await f.store.read(ROOM_ID), 'relay_result');
+    assert.equal(results.some(r => r.recipient_identity === 'cid-bob'), false, 'ambiguous failed recipient remains result-less');
+    assert.equal(results.find(r => r.recipient_identity === 'cid-cara').status, 'queued');
+    f.packet.beforeSend = undefined;
+    f.packet.beforeSendFile = undefined;
+    const restarted = new IntakePump(f.store, f.registry, { now: () => AT });
+    await restarted.resumePending(ROOM_ID);
+    assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 2);
+  });
+}
+
+test('delivery isolation reaches recipients beyond the journal batch, storage failure still stops sends', async () => {
+  const f = fixture();
+  const recipients = Array.from({ length: 66 }, (_, i) => `cid-recipient-${i}`);
+  const source = { version: 1, kind: 'message', room_id: ROOM_ID, message_id: MESSAGE_IDS[0],
+    at: AT, author: room().seats[0], category: 'chat', text: 'Batch delivery', recipient_identities: recipients };
+  await f.store.append(ROOM_ID, source);
+  for (const recipient_identity of recipients) await f.store.append(ROOM_ID, {
+    version: 1, kind: 'relay_intent', room_id: ROOM_ID, at: AT, message_id: MESSAGE_IDS[0], recipient_identity,
+  });
+  f.packet.beforeSend = recipient => { if (recipient === recipients[0]) throw new Error('missing first contact'); };
+  await assert.rejects(f.pump.resumePending(ROOM_ID), /missing first contact/);
+  assert.equal(f.packet.sendCalls.at(-1).recipient, recipients.at(-1));
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 65);
+  const g = fixture();
+  g.packet.inbox.push(incoming());
+  g.store.beforeAppend = draft => { if (draft.kind === 'relay_result') throw new Error('storage unavailable'); };
+  await assert.rejects(g.pump.pump(ROOM_ID), /storage unavailable/);
+  assert.equal(g.packet.sendCalls.length, 1);
 });

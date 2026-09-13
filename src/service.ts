@@ -1671,6 +1671,9 @@ export class RoomService {
 
   private async reconcileUnlocked(room: Room, packet: RoomPacket): Promise<Room> {
     if (room.state === 'closed' || room.state === 'closing') return room;
+    // Read under the room mutex, after queued daemon transactions settle. A raw
+    // notification is only a hint, and cached contacts may predate a deletion.
+    await packet.refreshContacts();
     const contactsByCid = new Map<string, { displayName: string; inviteId?: string }>();
     for (const contact of packet.listContacts()) {
       if (contactsByCid.has(contact.container_id)) continue;
@@ -1679,6 +1682,22 @@ export class RoomService {
         displayName: contact.name,
         ...(authenticatedInvite === undefined ? {} : { inviteId: authenticatedInvite }),
       });
+    }
+    // Keep the admitted seat as a durable lifecycle record. Absence cannot tell
+    // us whether removal was local or remote, and is not an admission failure.
+    let epoch = room.membership_epoch;
+    const departed = new Set<string>();
+    const reconciledSeats = room.seats.map((seat): Seat => {
+      if (seat.state !== 'active' || contactsByCid.has(seat.identity)) return seat;
+      departed.add(seat.identity);
+      return { ...seat, state: 'removed', removed_at: this.now(),
+        removed_epoch: ++epoch, removal_reason: 'contact_absent' };
+    });
+    if (departed.size > 0) {
+      room = await this.store.save(RoomSchema.parse({ ...room, seats: reconciledSeats,
+        membership_epoch: epoch,
+        command_grants: room.command_grants.filter(grant => !departed.has(grant.caller_cid)),
+      }));
     }
     const inviteById = new Map(room.invites.map((invite) => [invite.invite_id, invite]));
     const existingCids = new Set(room.seats

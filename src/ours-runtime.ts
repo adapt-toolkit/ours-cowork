@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 
-import type { AttachOursClientOptions, OursClient } from '@ours.network/sdk';
+import type { AttachOursClientOptions, NotificationEvent, OursClient } from '@ours.network/sdk';
 
 import type { CoworkConfig } from './config.ts';
 
@@ -12,7 +12,7 @@ export interface OursRuntimeClientFactory {
   createClient(leaseToken?: string): Promise<OursClient>;
   /** Return only daemon identities whose names are in cowork's durable room set. */
   listIdentityNames(localNames: ReadonlySet<string>): Promise<Set<string>>;
-  onIdentityNotify(listener: (identityName: string) => void): () => void;
+  onIdentityNotify(listener: (identityName: string, event?: NotificationEvent) => void): () => void;
   trackIdentity(identityName: string): () => void;
 }
 
@@ -45,7 +45,7 @@ export function createOursHost(
 export class SharedOursHost implements OursRuntimeHost {
   private readonly log: (...parts: unknown[]) => void;
   private readonly attach: AttachClient;
-  private readonly listeners = new Set<(identityName: string) => void>();
+  private readonly listeners = new Set<(identityName: string, event?: NotificationEvent) => void>();
   private readonly watchers = new Map<string, IdentityWatcher>();
   private readonly watchLeaseToken = `cowork-watch-${randomBytes(16).toString('hex')}`;
   private watchClient?: OursClient;
@@ -92,7 +92,7 @@ export class SharedOursHost implements OursRuntimeHost {
     return new Set(rows.flatMap((row) => localNames.has(row.name) ? [row.name] : []));
   }
 
-  onIdentityNotify(listener: (identityName: string) => void): () => void {
+  onIdentityNotify(listener: (identityName: string, event?: NotificationEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
@@ -178,7 +178,7 @@ export class SharedOursHost implements OursRuntimeHost {
         }
         for (let settled = await step; !settled.done; settled = await step) {
           backoffMs = WATCH_RETRY_MIN_MS;
-          this.announce(identityName);
+          this.announce(identityName, settled.value);
           step = stream.next();
         }
         if (!signal.aborted) {
@@ -196,9 +196,9 @@ export class SharedOursHost implements OursRuntimeHost {
     }
   }
 
-  private announce(identityName: string): void {
+  private announce(identityName: string, event?: NotificationEvent): void {
     for (const listener of this.listeners) {
-      try { listener(identityName); } catch (error) {
+      try { listener(identityName, event); } catch (error) {
         this.log(`cowork SDK notification listener failed for ${identityName}:`, error);
       }
     }

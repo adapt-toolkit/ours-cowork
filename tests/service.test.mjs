@@ -155,6 +155,7 @@ class FakePacket {
   }
 
   listInvites() { return structuredClone(this.invites); }
+  async refreshContacts() {}
   listContacts() { return structuredClone(this.contacts); }
   async registerRuntimeCommands(handlers) { this.runtimeCommands = handlers; }
   async rebind() { return { name: this.name, cid: this.cid, status: 'rebound' }; }
@@ -2027,9 +2028,9 @@ test('a lost metadata save leaves no removal intent and a retry converges from c
     intents: [], results: [], notices: [],
   });
 
-  // Reconciliation remains usable and never replays historical removal work.
+  // Reconciliation now repairs the lost save from authoritative absence.
   await f.service.reconcileRoom(ROOM_ID);
-  assert.equal((await f.service.showRoom(ROOM_ID)).seats.find((seat) => seat.identity === 'cid-alice').state, 'active');
+  assert.equal((await f.service.showRoom(ROOM_ID)).seats.find((seat) => seat.identity === 'cid-alice').state, 'removed');
 
   // The same explicit remove observes the absent contact and finishes locally.
   const receipt = await f.service.removeParticipant(ROOM_ID, { participant: 'cid-alice' });
@@ -2037,7 +2038,7 @@ test('a lost metadata save leaves no removal intent and a retry converges from c
   const room = await f.service.showRoom(ROOM_ID);
   assert.equal(room.seats.find((seat) => seat.identity === 'cid-alice').state, 'removed');
   assert.equal(room.membership_epoch, epochBefore + 1);
-  assert.deepEqual(packet.removeContactCalls, ['cid-alice', 'cid-alice']);
+  assert.deepEqual(packet.removeContactCalls, ['cid-alice']);
   const settled = membershipRecords(await f.store.read(ROOM_ID));
   assert.equal(settled.intents.length, 0);
   assert.equal(settled.results.length, 0);
@@ -2995,4 +2996,85 @@ test('wildcard CID and role grants survive disk restart and still enforce lifecy
   await restoredDisk.save({ ...active, lifecycle_request: { request_id: 'close-pending', command: 'room.close', caller_cid: ALICE_CID, accepted_at: active.activated_at, state: 'pending' } });
   assert.deepEqual(await commands.sharedCommand('room.show', {}, sharedContext), { ok: false, error: 'room_unavailable' });
   assert.deepEqual(await consumer({ id: 1 }, sharedContext), { ok: false, error: 'unauthorized' });
+});
+
+test('contact deletion reconciles active seats once across duplicate wakes and restart, preserving admissions', async () => {
+  const f = evolutionFixture();
+  await create(f);
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  await admit(f, invite, ALICE_CID, 'Same name');
+  await admit(f, invite, BOB_CID, 'Same name');
+  await f.service.grantRuntimeCommand(ROOM_ID, { caller_cid: ALICE_CID, command: 'list-members' });
+  const before = await f.service.showRoom(ROOM_ID);
+  const packet = f.registry.get(ROOM_ID);
+  // Refresh, not the stale cache or event, proves absence.
+  packet.refreshContacts = async () => { packet.contacts = packet.contacts.filter(c => c.container_id !== ALICE_CID); };
+  await Promise.all([f.service.notifyRoom(ROOM_ID, 'contact_removed'), f.service.notifyRoom(ROOM_ID, 'contact_removed')]);
+  const after = await f.service.showRoom(ROOM_ID);
+  const alice = after.seats.find(s => s.identity === ALICE_CID);
+  assert.equal(alice.state, 'removed');
+  assert.equal(alice.removal_reason, 'contact_absent');
+  assert.equal(alice.accepted_at, before.seats.find(s => s.identity === ALICE_CID).accepted_at);
+  assert.equal(after.membership_epoch, before.membership_epoch + 1);
+  assert.equal(after.command_grants.some(g => g.caller_cid === ALICE_CID), false);
+  assert.deepEqual(after.invites, before.invites);
+  const restarted = new RoomService(f.store, f.registry);
+  await restarted.notifyRoom(ROOM_ID, 'contact_removed');
+  assert.deepEqual((await restarted.showRoom(ROOM_ID)).seats, after.seats);
+  const sent = [];
+  packet.send = async cid => { sent.push(cid); return { status: 'queued', wire_id: 'remaining' }; };
+  const post = await restarted.postMessage(ROOM_ID, { text: 'Still delivering' });
+  assert.deepEqual(post.recipient_identities, [BOB_CID]);
+  assert.deepEqual(sent, [BOB_CID]);
+});
+
+test('missed deletion recovers from contacts, pending admissions and present contacts survive late events', async () => {
+  const f = evolutionFixture();
+  await create(f);
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  await admit(f, invite, ALICE_CID, 'Alice');
+  const packet = f.registry.get(ROOM_ID);
+  await f.service.notifyRoom(ROOM_ID, 'contact_removed');
+  assert.equal((await f.service.showRoom(ROOM_ID)).seats[0].state, 'active', 'late notice cannot remove a present CID');
+  packet.contacts = [];
+  const restarted = new RoomService(f.store, f.registry);
+  await restarted.reconcileRoom(ROOM_ID);
+  assert.equal((await restarted.showRoom(ROOM_ID)).seats[0].state, 'removed');
+  const epoch = (await restarted.showRoom(ROOM_ID)).membership_epoch;
+  await restarted.reconcileRoom(ROOM_ID);
+  assert.equal((await restarted.showRoom(ROOM_ID)).membership_epoch, epoch);
+  // An external invitation awaiting asynchronous verification is not a departure.
+  const g = evolutionFixture();
+  await create(g);
+  await g.service.acceptExternalInvite(ROOM_ID, { invite: packInvite(Buffer.from('test-invite')), role: 'builder' });
+  const pending = (await g.service.showRoom(ROOM_ID)).seats;
+  await g.service.notifyRoom(ROOM_ID, 'contact_removed');
+  assert.deepEqual((await g.service.showRoom(ROOM_ID)).seats, pending);
+});
+
+test('failed contact refresh cannot evict members, and late deletion after readmission preserves the new seat', async () => {
+  const f = evolutionFixture();
+  await create(f);
+  const { invite } = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'builder', min_accepts: 1 });
+  await admit(f, invite, ALICE_CID, 'Alice');
+  const packet = f.registry.get(ROOM_ID);
+  const before = await f.service.showRoom(ROOM_ID);
+  packet.refreshContacts = async () => { throw new Error('contact fetch unavailable'); };
+  await assert.rejects(f.service.notifyRoom(ROOM_ID, 'contact_removed'), /contact fetch unavailable/);
+  assert.deepEqual(await f.service.showRoom(ROOM_ID), before);
+  packet.refreshContacts = async () => {};
+  packet.contacts = [];
+  await f.service.notifyRoom(ROOM_ID, 'contact_removed');
+  const oldSeat = (await f.service.showRoom(ROOM_ID)).seats[0];
+  packet.supportsInviteProvenance = true;
+  const next = await f.service.createInvite(ROOM_ID, { mode: 'public', role: 'reviewer', min_accepts: 1 });
+  packet.contacts = [{ name: 'Renamed', container_id: ALICE_CID, accepted_via_invite_id: next.invite.invite_id }];
+  await f.service.reconcileRoom(ROOM_ID);
+  const readmitted = await f.service.showRoom(ROOM_ID);
+  assert.equal(readmitted.seats.length, 2);
+  assert.equal(readmitted.seats[1].state, 'active');
+  assert.notEqual(readmitted.seats[1].participant_id, oldSeat.participant_id);
+  await f.service.notifyRoom(ROOM_ID, 'contact_removed');
+  assert.deepEqual((await f.service.showRoom(ROOM_ID)).seats, readmitted.seats);
+  assert.equal((await f.service.showRoom(ROOM_ID)).membership_epoch, readmitted.membership_epoch);
 });

@@ -577,13 +577,27 @@ export class IntakePump {
     const removedCids = new Set(room.seats
       .filter((seat) => seat.state === 'removed')
       .map((seat) => seat.identity));
+    let firstDeliveryError: unknown;
+    let deliveryFailed = false;
+    // Preserve result-less ambiguous sends for recovery, but attempt independent
+    // recipients before surfacing the error. Storage failures still stop the pump.
+    const attempt = async <T>(send: () => Promise<T>): Promise<T | undefined> => {
+      try { return await send(); } catch (error) {
+        if (!deliveryFailed) firstDeliveryError = error;
+        deliveryFailed = true;
+        return undefined;
+      }
+    };
     let after = 0;
     for (;;) {
       const pending = await queryStore(this.store, roomId, {
         kind: 'relay_intent', unresolvedResultKind: 'relay_result', after,
         limit: JOURNAL_WORK_BATCH_SIZE,
       }) as RelayIntentRecord[];
-      if (pending.length === 0) return;
+      if (pending.length === 0) {
+        if (deliveryFailed) throw firstDeliveryError;
+        return;
+      }
       for (const intent of pending) {
         after = intent.seq;
       const [message] = intent.message_id === undefined ? [] : await queryStore(this.store, roomId, { kind: 'message', messageId: intent.message_id, limit: 1 }) as MessageRecord[];
@@ -636,7 +650,7 @@ export class IntakePump {
 
       if (file !== undefined) {
         const uploader = file.author_alias?.alias ?? file.author.display_name;
-        const notice = await sendRoomBody(packet, intent.recipient_identity, {
+        const notice = await attempt(() => sendRoomBody(packet, intent.recipient_identity, {
           version: 1 as const,
           kind: 'room_msg' as const,
           room_id: roomId,
@@ -649,7 +663,8 @@ export class IntakePump {
           },
           text: `${uploader} sent a file`,
           at: file.at,
-        }, replyTo);
+        }, replyTo));
+        if (notice === undefined) continue;
         if (notice.status === 'send_failed') {
           const failed = await this.store.append(roomId, {
             version: 1,
@@ -664,13 +679,14 @@ export class IntakePump {
           if (failed.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
           continue;
         }
-        const outcome = await packet.sendFile(
+        const outcome = await attempt(() => packet.sendFile(
           intent.recipient_identity,
           file.filename,
           file.mime,
           Buffer.from(file.data_base64, 'base64'),
           replyTo,
-        );
+        ));
+        if (outcome === undefined) continue;
         const appended = await this.store.append(roomId, {
           version: 1,
           kind: 'relay_result',
@@ -709,7 +725,8 @@ export class IntakePump {
       // RoomPacket.send returns only an observed queued/refused outcome. A
       // thrown call remains result-less because its acceptance is unknown and
       // will deliberately be retried on restart with the stable message ID.
-      const outcome = await sendRoomBody(packet, intent.recipient_identity, unsigned, replyTo);
+      const outcome = await attempt(() => sendRoomBody(packet, intent.recipient_identity, unsigned, replyTo));
+      if (outcome === undefined) continue;
       const appended = await this.store.append(roomId, {
         version: 1,
         kind: 'relay_result',

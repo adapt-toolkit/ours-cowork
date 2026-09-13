@@ -977,3 +977,99 @@ test('real SDK command results persist only authenticated viewer history across 
  for(const leak of ['secret','hidden-key','recipient_identities','source_wire_id','scope','fingerprint']) assert.equal(persisted.body.includes(leak),false,leak);
  for(const wire of ['result-1','result-2']) assert.deepEqual(JSON.parse(sdkHistory.getMessageHistoryItem(identity,wire).body).result,{ok:false,error:'invalid_request'});
 });
+
+test('typed SDK contact removal routes by immutable room CID, reconciles every affected room and survives disk restart', async t => {
+  const { OursClient } = await import('@ours.network/sdk/client');
+  const { CoworkStore } = await import('../src/storage.ts');
+  const { RoomService } = await import('../src/service.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-contact-lifecycle-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const peer = 'C'.repeat(64), remaining = 'D'.repeat(64), at = '2026-08-02T10:11:12.000Z';
+  const roomIds = [ROOM_ID, '01jz6y7n8p9q0r1s2t3v4w5x70'];
+  const clients = roomIds.map(() => {
+    const client = blankClient();
+    client.contacts = [peer, remaining].map(container_id => ({ container_id, name: 'Same label' }));
+    return client;
+  });
+  let listener;
+  const notifications = [];
+  const store = new CoworkStore(dir);
+  let service;
+  const registry = new PacketRegistry({
+    onIdentityNotify(fn) { listener = fn; return () => {}; },
+    trackIdentity() { return () => {}; },
+    async listIdentityNames() { return new Set(); },
+    async createClient() { return clients.shift(); },
+  }, dir, { onNotify(roomId, event) { notifications.push(service.notifyRoom(roomId, event)); } });
+  const originals = [...clients];
+  for (const [i, roomId] of roomIds.entries()) {
+    const name = `ours-cowork:Lifecycle ${i}`;
+    const packet = await registry.create(roomId, name);
+    await store.create({ version: 2, room_id: roomId, room_name: `Lifecycle ${i}`,
+      identity_name: name, identity_cid: packet.cid, mission: { goal: 'Ship', briefing: 'Common', briefing_version: 1 },
+      role_briefings: {}, state: 'active', invites: [], created_at: at, activated_at: at,
+      anonymous: false, quiet_membership: false, membership_epoch: 2,
+      command_grants: [{ caller_cid: peer, command: 'list-members' }],
+      seats: [peer, remaining].map((identity, j) => ({ identity, display_name: 'Same label', role: 'builder',
+        invite_id: 'already-accepted', accepted_at: at, state: 'active', participant_id: `01jz6y7n8p9q0r1s2t3v4w5xa${j+1}` })),
+    });
+  }
+  service = new RoomService(store, registry);
+  // The actual public SDK watcher normalizes the daemon event; the registry
+  // refreshes state before waking the service. No display-name authority.
+  const signal = { event: 'contact_removed', identity_cid: CID, cid: peer, by: 'peer' };
+  const sdk = new OursClient({ url: 'http://test.invalid', leaseToken: 'test', fetch: async () =>
+    new Response(JSON.stringify({ cursor: 1, events: [signal] }), { headers: { 'content-type': 'application/json' } }) });
+  const stream = sdk.watchNotifications('room', { since: 0 });
+  const event = (await stream.next()).value;
+  await stream.return();
+  originals.forEach(client => { client.contacts = client.contacts.filter(c => c.container_id !== peer); });
+  listener('ours-cowork:Lifecycle 0', { ...event, identity_cid: 'F'.repeat(64) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(notifications.length, 0, 'old identity with reused name cannot trigger reconciliation');
+  for (let i = 0; i < 2; i++) listener(`ours-cowork:Lifecycle ${i}`, event);
+  await new Promise(resolve => setImmediate(resolve));
+  await Promise.all(notifications);
+  for (const roomId of roomIds) {
+    const room = await store.load(roomId);
+    assert.equal(room.seats[0].state, 'removed');
+    assert.equal(room.seats[0].removal_reason, 'contact_absent');
+    assert.equal(room.seats[1].state, 'active');
+    assert.equal(room.command_grants.length, 0);
+    assert.equal(room.membership_epoch, 3);
+  }
+  const restored = new CoworkStore(dir);
+  const restarted = new RoomService(restored, registry);
+  for (const roomId of roomIds) {
+    await restarted.notifyRoom(roomId, 'contact_removed');
+    const message = await restarted.postMessage(roomId, { text: 'Remaining member receives this' });
+    assert.deepEqual(message.recipient_identities, [remaining]);
+    assert.equal((await restored.load(roomId)).membership_epoch, 3);
+  }
+});
+
+test('shared host forwards typed lifecycle events and resyncs when a watch reconnects', async () => {
+  const event = { event: 'contact_removed', identity_cid: CID, cid: 'C'.repeat(64), by: 'peer' };
+  let watches = 0;
+  let resolveSeen;
+  const seen = new Promise(resolve => { resolveSeen = resolve; });
+  const observed = [];
+  const host = new SharedOursHost(() => {}, async () => ({
+    async *watchNotifications() {
+      watches++;
+      if (watches === 1) { yield event; throw new Error('disconnected'); }
+      yield event;
+    },
+    async releaseLease() {},
+  }));
+  await host.boot();
+  host.onIdentityNotify((name, value) => {
+    observed.push([name, value]);
+    if (watches > 1 && value) resolveSeen();
+  });
+  host.trackIdentity(IDENTITY);
+  await seen;
+  await host.shutdown();
+  assert(observed.filter(([, value]) => value === undefined).length >= 2, 'startup and reconnect request authoritative resync');
+  assert.equal(observed.filter(([, value]) => value === event).length, 2);
+});

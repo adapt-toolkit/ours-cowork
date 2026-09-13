@@ -214,6 +214,7 @@ export const SeatSchema = z.object({
   participant_id: LowerCrockfordUlidSchema,
   state: SeatStateSchema,
   alias: NonEmptyStringSchema.optional(),
+  removal_reason: z.literal('contact_absent').optional(),
   removed_at: Rfc3339Schema.optional(),
   removed_epoch: z.number().int().nonnegative().safe().optional(),
   // Read and discard prerelease successor lineage. New rooms expose only
@@ -227,7 +228,7 @@ export const SeatSchema = z.object({
         context.addIssue({ code: z.ZodIssueCode.custom, path: [field], message: `pending seats require ${field}` });
       }
     }
-    for (const field of ['accepted_at', 'removed_at', 'removed_epoch', 'bounced_at'] as const) {
+    for (const field of ['accepted_at', 'removed_at', 'removed_epoch', 'bounced_at', 'removal_reason'] as const) {
       if (seat[field] !== undefined) {
         context.addIssue({ code: z.ZodIssueCode.custom, path: [field], message: `${field} is forbidden on pending seats` });
       }
@@ -258,7 +259,7 @@ export const SeatSchema = z.object({
     if (seat.accepted_at === undefined) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ['accepted_at'], message: 'active seats require accepted_at' });
     }
-    for (const field of ['removed_at', 'removed_epoch', 'bounced_at'] as const) {
+    for (const field of ['removed_at', 'removed_epoch', 'bounced_at', 'removal_reason'] as const) {
       if (seat[field] !== undefined) {
         context.addIssue({
           code: z.ZodIssueCode.custom,

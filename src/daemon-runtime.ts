@@ -81,7 +81,7 @@ export interface DaemonShutdownResult { requiresProcessExit: boolean }
 /** Packet notifications which may add durable room work. */
 export function isIntakeNotification(event: string): boolean {
   return event === 'message_received' || event === 'file_received'
-    || event === 'contact_accepted' || event === 'contact_added';
+    || event === 'contact_accepted' || event === 'contact_added' || event === 'contact_removed';
 }
 
 export class DaemonShutdownError extends AggregateError {

@@ -171,12 +171,14 @@ export class PacketRegistry {
     this.onNotify = options.onNotify ?? (() => {});
     this.rebindSleep = options.rebindSleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.rebindRandom = options.rebindRandom ?? Math.random;
-    this.unsubscribe = host.onIdentityNotify((name) => {
+    this.unsubscribe = host.onIdentityNotify((name, event) => {
       const found = [...this.packets.entries()].find(([, packet]) => packet.name === name);
       if (!found) return;
       const [roomId, packet] = found;
+      // A delayed event for a previous identity with the same name has no authority.
+      if (event?.event === 'contact_removed' && event.identity_cid !== packet.cid) return;
       void packet.refresh().then(
-        () => this.onNotify(roomId, 'message_received'),
+        () => this.onNotify(roomId, event?.event === 'contact_removed' ? 'contact_removed' : 'message_received'),
         (error) => this.log(`[${name}] failed to refresh SDK state after notification:`, error),
       );
     });

@@ -28,10 +28,10 @@ const INERT_BUNDLED_URL_PREFIXES = [
   'https://reactjs.org/docs/error-decoder.html',
 ];
 const MAIN_TEST_SCRIPT = 'node --import tsx --test --test-concurrency=1 tests/*.test.mjs';
-const DOC_NAMES = Array.from({ length: 11 }, (_, index) => `docs/${String(index + 1).padStart(2, '0')}-${[
+const DOC_NAMES = [...Array.from({ length: 11 }, (_, index) => `docs/${String(index + 1).padStart(2, '0')}-${[
   'prerequisites', 'installation', 'configuration', 'daemon-lifecycle', 'room-workflow',
   'invites', 'messaging-history', 'backup-restore', 'service-management', 'limitations', 'web-console',
-][index]}.md`);
+][index]}.md`), 'docs/contact-deletion.md'];
 
 function normalized(path) {
   return relative(ROOT, path).split(sep).join('/');

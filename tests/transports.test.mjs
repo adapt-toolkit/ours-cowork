@@ -286,6 +286,40 @@ test('REST is unauthenticated, loopback-only, emits no CORS, and excludes daemon
   }
 });
 
+test('REST explicitly binds 0.0.0.0 without relaxing loopback request checks', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-rest-container-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  let calls = 0;
+  const dispatcher = new RpcDispatcher({
+    ping: { auth: true, run: async () => { calls += 1; return { pong: true }; } },
+  });
+  const server = new TransportServer({
+    socketPath: join(dir, 'management.sock'),
+    rest: { enabled: true, port: 0, host: '0.0.0.0' },
+    ...dispatchers(dispatcher),
+  });
+  await server.start();
+  t.after(() => server.stop());
+  assert.equal(server.restAddress.address, '0.0.0.0');
+  const port = server.restAddress.port;
+  const body = JSON.stringify({ version: 1, id: 1, method: 'ping', params: {} });
+
+  const accepted = await request(port, { body });
+  assert.equal(accepted.statusCode, 200);
+  assert.deepEqual(accepted.json.result, { pong: true });
+
+  for (const options of [
+    { host: `cowork:${port}` },
+    { headers: { 'content-type': 'application/json', origin: `http://localhost:${port}` } },
+    { headers: { 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' } },
+  ]) {
+    const rejected = await request(port, { body, ...options });
+    assert.equal(rejected.statusCode, 403);
+    assert.equal(rejected.json.error.code, 'forbidden');
+  }
+  assert.equal(calls, 1);
+});
+
 test('REST preserves correlated service errors over their actual non-2xx statuses', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-rest-errors-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

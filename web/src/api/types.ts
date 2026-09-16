@@ -24,6 +24,7 @@ export interface ParticipantDto {
   alias?: string;
   removed_at?: string;
   removed_epoch?: number;
+  removal_reason?: 'contact_absent';
   bounced_at?: string;
 }
 
@@ -631,7 +632,7 @@ function isParticipant(value: unknown, requireV2?: boolean): value is Participan
     v2
       ? ['identity', 'display_name', 'role', 'invite_id', 'participant_id', 'state']
       : ['identity', 'display_name', 'role', 'invite_id', 'accepted_at'],
-    v2 ? ['accepted_at', 'requested_at', 'invite_sha256', 'alias', 'removed_at', 'removed_epoch', 'bounced_at'] : [],
+    v2 ? ['accepted_at', 'requested_at', 'invite_sha256', 'alias', 'removed_at', 'removed_epoch', 'removal_reason', 'bounced_at'] : [],
   )) return false;
   if (!isString(value.identity)
     || !isString(value.display_name)
@@ -646,6 +647,7 @@ function isParticipant(value: unknown, requireV2?: boolean): value is Participan
       && optionalString(value.alias)
       && optionalStrictRfc3339(value.removed_at)
       && (value.removed_epoch === undefined || isNonNegativeSafeInteger(value.removed_epoch))
+      && (value.removal_reason === undefined || (value.state === 'removed' && value.removal_reason === 'contact_absent'))
       && optionalStrictRfc3339(value.bounced_at))) return false;
   if ((value.requested_at === undefined) !== (value.invite_sha256 === undefined)) return false;
   if (value.state === 'pending') {

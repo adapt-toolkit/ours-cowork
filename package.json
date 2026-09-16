@@ -23,19 +23,20 @@
     "test": "node --import tsx --test --test-concurrency=1 tests/*.test.mjs",
     "test:web": "vitest run",
     "test:browser": "node --test tests/browser-smoke.test.mjs",
-    "test:release": "node --test tests/static-gates.test.mjs"
+    "test:release": "node --test tests/static-gates.test.mjs",
+    "test:v1-lifecycle": "node tests/v1-lifecycle.integration.mjs"
   },
   "dependencies": {
-    "@ours.network/sdk": "3.7.2",
+    "@ours.network/sdk": "file:vendor/ours.network-sdk.tgz",
     "ajv": "8.20.0",
-    "better-sqlite3": "11.10.0",
+    "better-sqlite3": "13.0.3",
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@adapt-toolkit/broker": "0.10.12",
-    "@ours.network/cli": "2.7.2",
+    "@ours.network/cli": "file:vendor/ours.network-cli.tgz",
     "@testing-library/jest-dom": "6.6.3",
     "@testing-library/react": "16.1.0",
     "@testing-library/user-event": "14.5.2",

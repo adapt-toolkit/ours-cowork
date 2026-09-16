@@ -15,11 +15,14 @@ export const CoworkConfigSchema = z.object({
   consumer_commands: ConsumerConfigurationSchema.optional(),
   rest: z.object({
     enabled: z.boolean(),
+    host: z.enum(['127.0.0.1', '0.0.0.0']).optional(),
     port: z.number().int().min(1).max(65_535),
   }).strict(),
 }).strict();
 
 export type CoworkConfig = z.infer<typeof CoworkConfigSchema>;
+
+export const MANAGEMENT_SOCKET_NAME = 'management.sock';
 
 export interface RuntimeState {
   socketPath: string;
@@ -96,6 +99,7 @@ export function loadConfig(
       ...(file.consumer_commands === undefined ? {} : { consumer_commands: file.consumer_commands }),
       rest: {
         enabled: restPort === undefined ? file.rest.enabled : true,
+        ...(file.rest.host === undefined ? {} : { host: file.rest.host }),
         port: restPort ?? file.rest.port,
       },
     });
@@ -150,7 +154,7 @@ export function ensureRuntimeState(config: CoworkConfig, io: ConfigIo = {}): Run
   assertSecureDirectory(fs, roomsPath, 'rooms directory');
 
   return {
-    socketPath: join(stateDir, 'management.sock'),
+    socketPath: join(stateDir, MANAGEMENT_SOCKET_NAME),
     pidPath: join(stateDir, 'daemon.pid'),
     lockPath: join(stateDir, 'daemon.lock'),
   };

@@ -905,6 +905,9 @@ test('a service definition carries the standard shared-daemon selection and neve
     OURS_COWORK_STATE_DIR: stateDir,
     OURS_PORT: '3071',
     OURS_STATE_DIR: daemonStateDir,
+    OURS_DAEMON_URL: 'http://127.0.0.1:3071',
+    OURS_DAEMON_ID: '12345678-1234-1234-1234-123456789abc',
+    OURS_DAEMON_CREDENTIAL_PATH: join(daemonStateDir, 'daemon-token'),
   };
   try {
     const installed = await runCli(['install-service'], { env });
@@ -912,6 +915,9 @@ test('a service definition carries the standard shared-daemon selection and neve
     const unit = await readFile(join(home, '.config', 'systemd', 'user', 'ours-cowork.service'), 'utf8');
     assert.match(unit, /^Environment="OURS_PORT=3071"$/m);
     assert.match(unit, new RegExp(`^Environment="OURS_STATE_DIR=${daemonStateDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"$`, 'm'));
+    assert.match(unit, /^Environment="OURS_DAEMON_URL=http:\/\/127\.0\.0\.1:3071"$/m);
+    assert.match(unit, /^Environment="OURS_DAEMON_ID=12345678-1234-1234-1234-123456789abc"$/m);
+    assert(unit.includes('Environment="OURS_DAEMON_CREDENTIAL_PATH='));
     assert.doesNotMatch(unit, TOKEN_PATTERN);
     assert.doesNotMatch(unit, /management-token|Bearer|api[_-]?token/i);
     // The shared daemon may well come up after this unit; retrying forever at
@@ -926,6 +932,9 @@ test('a service definition carries the standard shared-daemon selection and neve
         OURS_PORT: undefined,
         OURS_STATE_DIR: undefined,
         OURS_CONFIG: undefined,
+        OURS_DAEMON_URL: undefined,
+        OURS_DAEMON_ID: undefined,
+        OURS_DAEMON_CREDENTIAL_PATH: undefined,
       },
     });
     assert.equal(standard.code, 0, standard.stderr);

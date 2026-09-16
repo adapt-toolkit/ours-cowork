@@ -15,7 +15,7 @@ The localhost HTTP console has no authentication. Keep it bound to `127.0.0.1`; 
 
 The same listener describes its own room management REST API: `http://127.0.0.1:3052/openapi.json` is the OpenAPI 3.1 document and `http://127.0.0.1:3052/docs` is the browser UI for it. Both are read-only, load no remote assets, and follow the console's loopback-only exposure rules.
 
-Start or install the shared daemon with `@ours.network/cli` 2.7.2 before starting cowork. Cowork never embeds, starts, stops, or silently substitutes an ours daemon. It uses the SDK-standard shared selection (the default `~/.ours` daemon, `OURS_CONFIG`, or a coherent `OURS_PORT` plus `OURS_STATE_DIR` selection) and fails clearly when that daemon is unavailable or mismatched.
+Start or install the shared daemon with the selected V1 `@ours.network/cli` before starting cowork. Cowork never embeds, starts, stops, or silently substitutes an ours daemon. V1 selection uses `OURS_DAEMON_URL`, `OURS_DAEMON_ID` and `OURS_DAEMON_CREDENTIAL_PATH` together; each room has an independent external owner and requests read the protected current-token file. The temporary legacy SDK selection remains only when the V1 inputs are absent. See [configuration](docs/03-configuration.md) for the exact selection and refusal behavior.
 
 The shared daemon retains application payload history outside its protocol packets: each identity has a `history.sqlite3` database and immutable content-addressed file blobs. Cowork authorizes unread metadata by authenticated CID, reads the corresponding persistent history or blob, durably archives the room item and its complete fan-out, and only then advances that exact SDK unread item. There is no packet-inbox fallback, defer queue, host outbox, or cross-store transaction.
 
@@ -45,3 +45,35 @@ ours-cowork docs web
 Before production use, read the limitations topic. In particular, backups require a stopped daemon and restore uses the complete state directory.
 Lost room identity leases are recovered automatically with a non-force bind and exact persisted-CID proof. Operators can invoke the same safe path explicitly with `ours-cowork room rebind <room-id>`; it never recreates an established identity or steals a live lease.
 The localhost host-management CLI/API and web Archive retain full scoped-thread visibility for administrators, including excluded-member traffic that participant APIs hide. Runtime `room.history` is an authenticated, grant-gated participant view with viewer-local cursors; host cursors and participant cursors are not interchangeable. The shared SDK history remains local to each identity and does not define Cowork routing or host archive retention.
+
+## Container lifecycle verification
+
+After building with the selected locked SDK/CLI artifacts, run
+`npm run test:v1-lifecycle` in an isolated Docker environment. This existing
+integration uses the installed CLI and local development broker with temporary
+state; it checks the explicit daemon-selection and room-recovery path. It does
+not verify an external production broker or a complete Compose deployment.
+For the existing browser smoke (`npm run test:browser`), provide system Chrome
+or Chromium through `COWORK_CHROME_PATH`; no browser is needed by the server.
+
+### Build with selected SDK and CLI archives
+
+Run in the build container with Node 22+, npm and tar available:
+
+```sh
+node scripts/build-selected.mjs --sdk /artifacts/ours.network-sdk-3.7.2.tgz --cli /artifacts/ours.network-cli-2.7.2.tgz --out-dir /artifacts/consumer
+```
+
+The recipe validates package names, installs and builds in disposable staging,
+then writes one complete portable npm archive. Stdout is a JSON object with its
+actual `filename`; build/npm logs go to stderr. Normal source manifests, locks
+and installed dependencies are preserved. The installer must install the same
+selected SDK and CLI archives alongside this package; its final dependency
+versions come from those archives. Existing bundling choices are unchanged.
+
+Focused build/install verification (two real builds, including changed bytes
+under identical input names and versions, plus a missing-vendor negative check):
+
+```sh
+node scripts/check-build-selected.mjs --sdk /artifacts/ours.network-sdk-3.7.2.tgz --cli /artifacts/ours.network-cli-2.7.2.tgz
+```

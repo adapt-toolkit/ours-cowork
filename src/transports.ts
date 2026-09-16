@@ -101,7 +101,7 @@ export class RpcDispatcher {
 
 export interface TransportServerOptions {
   socketPath: string;
-  rest: { enabled: boolean; port: number };
+  rest: { enabled: boolean; host?: '127.0.0.1' | '0.0.0.0'; port: number };
   unixDispatcher: RpcDispatcher;
   restDispatcher: RpcDispatcher;
   staticHandler?: StaticWebHandler;
@@ -170,7 +170,7 @@ export class TransportServer {
           });
         });
         this.httpServer = rest;
-        await listen(rest, this.options.rest.port, '127.0.0.1');
+        await listen(rest, this.options.rest.port, this.options.rest.host ?? '127.0.0.1');
       }
     } catch (error) {
       const quarantined = this.quarantinePublicPath();
@@ -570,7 +570,8 @@ function isJsonMediaType(value: string | undefined): boolean {
 /**
  * Serve the read-only OpenAPI document and its browser UI. These carry no room
  * state and no secrets, so they follow the static console's exposure rules:
- * loopback-only listener, `'self'`-only CSP, and no remote asset of any kind.
+ * host-loopback-only publication (a container may explicitly listen on
+ * `0.0.0.0`), `'self'`-only CSP, and no remote asset of any kind.
  */
 async function serveApiDocs(
   request: http.IncomingMessage,
@@ -660,7 +661,7 @@ function readBody(request: http.IncomingMessage, limit: number): Promise<{ ok: t
   });
 }
 
-function unixSocketIsLive(path: string): Promise<boolean> {
+export function unixSocketIsLive(path: string): Promise<boolean> {
   return new Promise((resolveProbe, rejectProbe) => {
     const socket = net.createConnection(path);
     const timer = setTimeout(() => {

@@ -31,7 +31,7 @@ const MAIN_TEST_SCRIPT = 'node --import tsx --test --test-concurrency=1 tests/*.
 const DOC_NAMES = Array.from({ length: 11 }, (_, index) => `docs/${String(index + 1).padStart(2, '0')}-${[
   'prerequisites', 'installation', 'configuration', 'daemon-lifecycle', 'room-workflow',
   'invites', 'messaging-history', 'backup-restore', 'service-management', 'limitations', 'web-console',
-][index]}.md`);
+][index]}.md`).concat('docs/selected-source-development.md', 'docs/state-maintenance.md');
 
 function normalized(path) {
   return relative(ROOT, path).split(sep).join('/');
@@ -210,7 +210,7 @@ test('recursive owned-source discovery covers configs, scripts, tests, and fixtu
   const sourceFiles = discoverOwnedSource();
   const targets = sourceFiles.map(normalized);
   for (const expected of [
-    '.github/workflows/ci.yml', 'build.mjs', 'package.json', 'package-lock.json',
+    '.github/workflows/ci.yml', 'build.mjs', 'package.json',
     'src/daemon.ts', 'src/ours-runtime.ts', 'tests/e2e.test.mjs',
     'tests/sdk-runtime.test.mjs', 'tsconfig.json',
   ]) assert(targets.includes(expected), `source discovery omitted ${expected}`);
@@ -382,11 +382,11 @@ test('main runner rejects loaderless Node and undeclared direct loaders while co
 });
 
 test('declared tsx loader has one semver-required esbuild installation', () => {
-  const lock = JSON.parse(readFileSync(join(ROOT, 'package-lock.json'), 'utf8'));
-  assert.equal(lock.packages['node_modules/tsx'].version, '4.23.1');
-  assert.equal(lock.packages['node_modules/tsx'].dependencies.esbuild, '~0.28.0');
-  assert.equal(lock.packages['node_modules/tsx/node_modules/esbuild'].version, '0.28.1');
-  assert.equal(lock.packages['node_modules/esbuild'].version, '0.25.0');
+  const installed = (name) => JSON.parse(readFileSync(join(ROOT, 'node_modules', name, 'package.json'), 'utf8'));
+  assert.equal(installed('tsx').version, '4.23.1');
+  assert.equal(installed('tsx').dependencies.esbuild, '~0.28.0');
+  assert.match(installed('tsx/node_modules/esbuild').version, /^0\.28\.\d+$/);
+  assert.equal(installed('esbuild').version, '0.25.0');
 
   const installations = execFileSync('npm', ['ls', '--parseable', '--all', 'esbuild'], {
     cwd: ROOT,

@@ -27,7 +27,7 @@
     "test:v1-lifecycle": "node tests/v1-lifecycle.integration.mjs"
   },
   "dependencies": {
-    "@ours.network/sdk": "file:vendor/ours.network-sdk.tgz",
+    "@ours.network/sdk": "3.8.0",
     "ajv": "8.20.0",
     "better-sqlite3": "13.0.3",
     "react": "18.3.1",
@@ -36,7 +36,7 @@
   },
   "devDependencies": {
     "@adapt-toolkit/broker": "0.10.12",
-    "@ours.network/cli": "file:vendor/ours.network-cli.tgz",
+    "@ours.network/cli": "2.8.0",
     "@testing-library/jest-dom": "6.6.3",
     "@testing-library/react": "16.1.0",
     "@testing-library/user-event": "14.5.2",

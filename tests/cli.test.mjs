@@ -3,7 +3,7 @@ import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs
 import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import test, { after } from 'node:test';
 import { pathToFileURL } from 'node:url';
@@ -19,6 +19,12 @@ import {
 
 const ROOT = resolve(new URL('..', import.meta.url).pathname);
 const CLI = join(ROOT, 'dist', 'cli.js');
+// The selected CLI leaves native SQLite external; copied-entry fixtures need its installed dependencies.
+async function copyCliWithDependencies(destination) {
+  await writeFile(destination, await readFile(CLI));
+  await symlink(join(ROOT, 'node_modules'), join(dirname(destination), 'node_modules'), 'dir');
+}
+
 const TOKEN_PATTERN = /\b[0-9a-f]{64}\b/;
 const CLEAN_CONFIG_DIR = await mkdtemp(join(tmpdir(), 'ours-cowork-cli-tests-'));
 const CLEAN_COWORK_CONFIG = join(CLEAN_CONFIG_DIR, 'config.json');
@@ -767,7 +773,7 @@ test('--json serve emits exactly one JSON value and suppresses supervised diagno
   for (const behavior of ['clean', 'nonzero', 'throw']) {
     const directory = await mkdtemp(join(tmpdir(), 'cowork serve copy '));
     const cli = join(directory, 'cli.js');
-    await writeFile(cli, await readFile(CLI));
+    await copyCliWithDependencies(cli);
     await chmod(cli, 0o700);
     const daemon = behavior === 'throw'
       ? `export async function runSupervisor(options) { if (!options?.quiet) console.error('worker diagnostic'); throw new Error('supervisor failed'); }\n`
@@ -957,7 +963,7 @@ test('launchd captures exact absolute argv with XML-sensitive paths and runs wit
   await mkdir(stateDir, { mode: 0o700 });
   await mkdir(binDir, { mode: 0o700 });
   await mkdir(emptyPath, { mode: 0o700 });
-  await writeFile(copiedCli, await readFile(CLI));
+  await copyCliWithDependencies(copiedCli);
   await chmod(copiedCli, 0o700);
   await writeFile(join(binDir, 'launchctl'), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
   await chmod(join(binDir, 'launchctl'), 0o700);
@@ -1044,7 +1050,7 @@ test('systemd ExecStart independently quotes runtime and CLI paths with spaces a
   await mkdir(unusual, { recursive: true, mode: 0o700 });
   await mkdir(binDir, { mode: 0o700 });
   await mkdir(stateDir, { mode: 0o700 });
-  await writeFile(copiedCli, await readFile(CLI));
+  await copyCliWithDependencies(copiedCli);
   await chmod(copiedCli, 0o700);
   await symlink(process.execPath, copiedNode);
   for (const name of ['systemctl', 'loginctl']) {
@@ -1089,7 +1095,7 @@ test('reinstall replaces captured runtime and CLI paths without stale or duplica
   await mkdir(binDir, { mode: 0o700 });
   await mkdir(stateDir, { mode: 0o700 });
   for (const cli of [firstCli, secondCli]) {
-    await writeFile(cli, await readFile(CLI));
+    await copyCliWithDependencies(cli);
     await chmod(cli, 0o700);
   }
   for (const name of ['systemctl', 'loginctl']) {

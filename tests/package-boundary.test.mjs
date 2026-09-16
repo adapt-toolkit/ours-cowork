@@ -6,7 +6,8 @@ const read = (file) => readFile(new URL(`../${file}`, import.meta.url), 'utf8');
 
 test('package stays an independent cowork daemon', async () => {
   const pkg = JSON.parse(await read('package.json'));
-  const lock = JSON.parse(await read('package-lock.json'));
+  // Selected-source development installs actual archives without a repository lockfile.
+  const installed = async (name) => JSON.parse(await read(`node_modules/${name}/package.json`));
   const dependencies = { ...pkg.dependencies, ...pkg.devDependencies };
 
   assert.equal(pkg.name, '@ours.network/cowork');
@@ -14,16 +15,16 @@ test('package stays an independent cowork daemon', async () => {
   assert.equal(dependencies['@ours.network/sdk'], '3.8.0');
   assert.equal(pkg.devDependencies['@ours.network/cli'], '2.8.0');
   assert.equal(dependencies['better-sqlite3'], '13.0.3');
-  assert.equal(lock.packages['node_modules/better-sqlite3'].version, dependencies['better-sqlite3']);
+  assert.equal((await installed('better-sqlite3')).version, dependencies['better-sqlite3']);
   assert.equal('@adapt-toolkit/sdk' in dependencies, false);
   assert.equal('@adapt-toolkit/sdk-native' in dependencies, false);
   assert.equal(dependencies.zod, '^3.23.8');
   const forbiddenPackage = `@ours.network/${'mcp'}`;
   assert.equal(forbiddenPackage in dependencies, false);
 
-  const sdkVersion = lock.packages['node_modules/@ours.network/sdk'].version;
+  const sdkVersion = (await installed('@ours.network/sdk')).version;
   const sdkMajor = sdkVersion.split('.')[0];
-  const cliVersion = lock.packages['node_modules/@ours.network/cli'].version;
+  const cliVersion = (await installed('@ours.network/cli')).version;
   assert.equal(sdkVersion, '3.8.0');
   assert.equal(cliVersion, '2.8.0');
   const publicDocs = {

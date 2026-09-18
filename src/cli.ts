@@ -117,6 +117,7 @@ function usage(): string {
 
 Usage:
   ours-cowork [--json] start|stop|restart|status|serve|web
+  ours-cowork [--json] prepare-backup
   ours-cowork [--json] install-service|uninstall-service
   ours-cowork [--json] room <command> [arguments]
   ours-cowork [--json] docs [topic]
@@ -832,6 +833,9 @@ function serviceEnvironment(config: CoworkConfig): Record<string, string> {
     ...(process.env.OURS_CONFIG === undefined ? {} : { OURS_CONFIG: process.env.OURS_CONFIG }),
     ...(process.env.OURS_PORT === undefined ? {} : { OURS_PORT: process.env.OURS_PORT }),
     ...(process.env.OURS_STATE_DIR === undefined ? {} : { OURS_STATE_DIR: process.env.OURS_STATE_DIR }),
+    ...(process.env.OURS_DAEMON_URL === undefined ? {} : { OURS_DAEMON_URL: process.env.OURS_DAEMON_URL }),
+    ...(process.env.OURS_DAEMON_ID === undefined ? {} : { OURS_DAEMON_ID: process.env.OURS_DAEMON_ID }),
+    ...(process.env.OURS_DAEMON_CREDENTIAL_PATH === undefined ? {} : { OURS_DAEMON_CREDENTIAL_PATH: process.env.OURS_DAEMON_CREDENTIAL_PATH }),
   };
 }
 
@@ -1073,6 +1077,17 @@ async function execute(args: string[], output: Output): Promise<void> {
   if (args.length !== 1) usageError(`${command} takes no arguments`);
   const config = loadCliConfig();
   switch (command) {
+    case 'prepare-backup': {
+      try {
+        const { prepareStateForBackup } = await import('./state-maintenance.ts');
+        const result = await prepareStateForBackup(config);
+        output.success(result, `ours-cowork state prepared for backup; removed ${result.removed} socket residues`);
+      } catch (error) {
+        throw new CliError(EXIT.invalidState, 'invalid_state',
+          error instanceof Error ? error.message : 'failed to prepare cowork state for backup', { cause: error });
+      }
+      return;
+    }
     case 'serve': {
       const modulePath = './' + 'daemon.js';
       const daemon = await import(modulePath) as { runSupervisor: (options?: { quiet?: boolean }) => Promise<number> };

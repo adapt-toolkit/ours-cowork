@@ -78,7 +78,7 @@ jobs:
       - run: npm run typecheck
       - run: npm run typecheck:web
       - run: npm run build
-      - run: test -f dist/daemon.js && test -f dist/cli.js && test -f dist/web/index.html && test -f dist/web/assets/app.js && test -f dist/web/assets/app.css && test "$(find dist/web -type f | wc -l)" -eq 3 && test "$(find docs -maxdepth 1 -name '*.md' | wc -l)" -eq 11
+      - run: test -f dist/daemon.js && test -f dist/cli.js && test -f dist/web/index.html && test -f dist/web/assets/app.js && test -f dist/web/assets/app.css && test "$(find dist/web -type f | wc -l)" -eq 3 && test "$(find docs -maxdepth 1 -name '*.md' | wc -l)" -eq 13
       - run: npm run test:release
       - run: npm test
       - run: npm run test:web

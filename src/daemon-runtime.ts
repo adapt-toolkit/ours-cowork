@@ -47,6 +47,7 @@ export interface DaemonHost {
   boot(): Promise<void>;
   close(): void;
   shutdown?(): Promise<DaemonHostShutdownResult>;
+  quiesce?(): Promise<void>;
 }
 
 export interface DaemonStore {
@@ -55,6 +56,7 @@ export interface DaemonStore {
 
 export interface DaemonRegistry {
   unhostAll(): Promise<void>;
+  quiesce?(): Promise<void>;
   unhost?(roomId: string): Promise<void>;
 }
 
@@ -108,6 +110,8 @@ export interface CoworkDaemonOptions {
   log?: (...parts: unknown[]) => void;
   onStage?: (stage: DaemonStage) => void;
   control?: DaemonControl;
+  registerOwner?: (owner: string) => Promise<void>;
+  beforeTerminalRelease?: () => Promise<void>;
 }
 
 export interface DaemonControl {
@@ -187,7 +191,7 @@ export class CoworkDaemon {
     this.options.onStage?.('post-lock');
     this.checkpoint();
     try {
-      this.host = this.options.host ?? createOursHost(config, this.options.log);
+      this.host = this.options.host ?? createOursHost(config, this.options.log, this.options.registerOwner);
       this.store = this.options.store ?? new CoworkStore(config.stateDir);
 
       // The closure deliberately queues notifications until every recovery
@@ -350,17 +354,28 @@ export class CoworkDaemon {
       }
       this.pidWritten = false;
     } catch (error) { errors.push(error); }
-    try { await this.registry?.unhostAll(); } catch (error) { errors.push(error); }
-    if (this.hostStartAttempted || this.hostBooted) {
+    let terminalReady = true;
+    if (this.options.beforeTerminalRelease) {
       try {
-        if (this.host?.shutdown) {
-          const result = await this.host.shutdown();
-          requiresProcessExit ||= result?.requiresProcessExit === true;
+        await this.host?.quiesce?.();
+        await this.registry?.quiesce?.();
+        if (errors.length > 0) throw new Error('cannot attest SessionEnd before successful intake drain');
+        await this.options.beforeTerminalRelease();
+      } catch (error) { errors.push(error); terminalReady = false; }
+    }
+    if (terminalReady) {
+      try { await this.registry?.unhostAll(); } catch (error) { errors.push(error); }
+      if (this.hostStartAttempted || this.hostBooted) {
+        try {
+          if (this.host?.shutdown) {
+            const result = await this.host.shutdown();
+            requiresProcessExit ||= result?.requiresProcessExit === true;
+          }
+          else this.host?.close();
+        } catch (error) {
+          requiresProcessExit ||= requiresExitFrom(error);
+          errors.push(error);
         }
-        else this.host?.close();
-      } catch (error) {
-        requiresProcessExit ||= requiresExitFrom(error);
-        errors.push(error);
       }
     }
     this.hostBooted = false;

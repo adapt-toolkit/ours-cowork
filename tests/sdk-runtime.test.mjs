@@ -165,6 +165,7 @@ class FakeClient {
   }
 
   async removeIdentity(input) { this.calls.push(['removeIdentity', structuredClone(input)]); }
+  async close() {}
   async releaseLease() { this.calls.push(['releaseLease']); return { released: [IDENTITY] }; }
 }
 
@@ -870,6 +871,7 @@ test('shared host attaches through SDK 3, filters daemon-global names, and relea
       return [{ name: IDENTITY }, { name: 'unrelated-human' }, { name: 'other-app-room' }];
     },
     async releaseLease() { calls.push(['releaseLease', 'watch']); return { released: [] }; },
+    async close() {},
     async *watchNotifications() { /* no events */ },
   };
   const room = blankClient();
@@ -901,23 +903,114 @@ test('shared host exposes attach failure and never falls back to another runtime
 });
 
 
+test('V1 shared host passes one verified selection to distinct external room owners', async () => {
+  const calls=[];
+  const fake={async releaseLease(){return {failed:0};},async close(){}};
+  const env={OURS_DAEMON_URL:'http://127.0.0.1:3050',OURS_DAEMON_ID:'12345678-1234-1234-1234-123456789abc',OURS_DAEMON_CREDENTIAL_PATH:'/run/ours/current'};
+  const host=new SharedOursHost(()=>{},async options=>{calls.push(options);return fake;},env);
+  try {
+    await host.boot(); await host.createClient(); await host.createClient();
+    assert.equal(new Set(calls.map(c=>c.leaseToken)).size,3);
+    for(const call of calls) {
+      assert.equal(call.endpoint,env.OURS_DAEMON_URL);
+      assert.equal(call.expectedInstanceId,env.OURS_DAEMON_ID);
+      assert.equal(call.credentialPath,env.OURS_DAEMON_CREDENTIAL_PATH);
+      assert.equal(call.sessionMode,'external');
+      assert.equal(call.token,undefined);
+    }
+    await host.createClient('same-owner-after-transport-retry');
+    assert.equal(calls.at(-1).leaseToken,'same-owner-after-transport-retry');
+  } finally {await host.shutdown();}
+});
+
+test('partial V1 selection refuses before attachment with no legacy fallback', async()=>{
+  let calls=0;
+  const host=new SharedOursHost(()=>{},async()=>{calls++;return {};},{OURS_DAEMON_ID:'12345678-1234-1234-1234-123456789abc'});
+  await assert.rejects(host.boot(),/requires.*OURS_DAEMON_URL.*OURS_DAEMON_ID.*OURS_DAEMON_CREDENTIAL_PATH/);
+  assert.equal(calls,0);
+});
+
+test('room terminal release waits for an already-running notification refresh',async()=>{
+  let finish; const gate=new Promise(resolve=>{finish=resolve;});
+  const client=blankClient();
+  client.listContacts=async()=>{await gate;return {contacts:[],pending:[],roots:{},degraded:[],renames:{}};};
+  const packet=new SdkRoomPacket(IDENTITY,CID,client);
+  const refresh=packet.refresh(); const close=packet.close();
+  try {
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(client.calls.some(([name])=>name==='releaseLease'),false,'release cannot race active refresh');
+  } finally {finish();await Promise.allSettled([refresh,close]);}
+});
+
+test('room terminal cleanup rejects existing release result failures',async()=>{
+  const client=blankClient();client.releaseLease=async()=>({failed:1});
+  await assert.rejects(new SdkRoomPacket(IDENTITY,CID,client).close(),/cleanup incomplete/);
+});
+
+test('host shutdown waits for watchers already untracked by room teardown',async()=>{
+  let finish;const gate=new Promise(resolve=>{finish=resolve;});let released=false;
+  const client={async *watchNotifications(){await gate;},async releaseLease(){released=true;return {failed:0};},async close(){}};
+  const host=new SharedOursHost(()=>{},async()=>client,{});
+  await host.boot();const untrack=host.trackIdentity(IDENTITY);untrack();
+  const shutdown=host.shutdown();
+  try {
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(released,false,'terminal release waits for aborted iterator completion');
+  } finally {finish();await shutdown;}
+});
+
+test('owner registration completes before watcher and room SDK admission', async () => {
+  const admitted = [];
+  const registrations = [];
+  let allow;
+  const host = new SharedOursHost(() => {}, async (options) => {
+    admitted.push(options.leaseToken);
+    return { releaseLease: async () => ({ failed: 0 }), close: async () => {} };
+  }, {}, async (owner) => {
+    registrations.push(owner);
+    await new Promise((resolve) => { allow = resolve; });
+  });
+  const boot = host.boot();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(admitted.length, 0, 'watcher attached before owner registration ACK');
+  assert.equal(registrations.length, 1);
+  allow(); await boot;
+  const room = host.createClient('room-exact-owner');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(admitted.length, 1, 'room attached before owner registration ACK');
+  assert.equal(registrations[1], 'room-exact-owner');
+  allow(); await room;
+  assert.deepEqual(admitted, registrations);
+  await host.shutdown();
+});
+
+test('cancelled owner registration prevents SDK admission', async () => {
+  let attaches = 0;
+  const host = new SharedOursHost(() => {}, async () => { attaches++; }, {},
+    async () => { throw new Error('owner admission cancelled'); });
+  await assert.rejects(host.boot(), /owner admission cancelled/);
+  assert.equal(attaches, 0);
+});
+
 test('consumer configuration checks the daemon SDK release, not its control protocol', async () => {
-  for (const version of ['3.7.0', '3.7.1', '3.6.99', '3.7.2-rc.1', 'unknown']) {
+  for (const version of ['3.7.0', '3.7.1', '3.6.99', '3.7.2-rc.1', '3.7.2-nightly.1', '3.8.1-', 'unknown']) {
     let releases = 0;
     const host = new SharedOursHost(() => {}, async () => ({
       version: async () => ({ version, protocol: 2 }),
-      releaseLease: async () => { releases++; },
-    }), true);
+      releaseLease: async () => { releases++; return { failed: 0 }; },
+      close: async () => {},
+    }), {}, undefined, true);
     await assert.rejects(host.boot(), /SDK 3.7.2/);
     assert.equal(releases, 1);
     await host.shutdown();
   }
-  for (const version of ['3.7.2', '3.7.3', '3.8.0', '4.0.0']) {
+  for (const version of ['3.7.2', '3.7.2+build.1', '3.7.3', '3.7.3-rc.1', '3.8.0', '3.8.1-nightly.3', '4.0.0']) {
     let releases = 0;
     const host = new SharedOursHost(() => {}, async () => ({
       version: async () => ({ version, protocol: 2 }),
-      releaseLease: async () => { releases++; },
-    }), true);
+      releaseLease: async () => { releases++; return { failed: 0 }; },
+      close: async () => {},
+    }), {}, undefined, true);
     await host.boot();
     await host.shutdown();
     assert.equal(releases, 1);
@@ -1060,7 +1153,8 @@ test('shared host forwards typed lifecycle events and resyncs when a watch recon
       if (watches === 1) { yield event; throw new Error('disconnected'); }
       yield event;
     },
-    async releaseLease() {},
+    async releaseLease() { return { failed: 0 }; },
+    async close() {},
   }));
   await host.boot();
   host.onIdentityNotify((name, value) => {

@@ -295,6 +295,13 @@ export class PacketRegistry {
     }
   }
 
+  async quiesce(): Promise<void> {
+    this.unsubscribe();
+    for (const untrack of this.trackers.values()) untrack();
+    this.trackers.clear();
+    await Promise.all([...this.packets.values()].map((packet) => packet.quiesce()));
+  }
+
   async unhostAll(): Promise<void> {
     this.unsubscribe();
     for (const roomId of [...this.trackers.keys()]) this.untrack(roomId);
@@ -694,11 +701,24 @@ export class SdkRoomPacket implements RoomPacket {
     return { status: notified ? 'queued' : 'send_failed', notified, key_material_retained: true };
   }
 
-  async close(): Promise<void> { await this.client.releaseLease(); }
+  async quiesce(): Promise<void> {
+    // Notification refresh is started outside the service intake queue. Wait for
+    // its existing work before retiring the owner, including a failed refresh.
+    await Promise.allSettled([this.refreshWork, this.contactRefreshWork, this.rebindWork]);
+  }
+
+  async close(): Promise<void> {
+    await this.quiesce();
+    try {
+      const result = await this.client.releaseLease();
+      if (result.failed > 0) throw new Error('room lease cleanup incomplete');
+    } finally { await this.client.close(); }
+  }
 
   async destroy(): Promise<void> {
+    await this.quiesce();
     await this.client.removeIdentity({ name: this.name });
-    await this.client.releaseLease();
+    await this.close();
   }
 }
 

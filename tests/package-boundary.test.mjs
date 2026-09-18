@@ -6,22 +6,27 @@ const read = (file) => readFile(new URL(`../${file}`, import.meta.url), 'utf8');
 
 test('package stays an independent cowork daemon', async () => {
   const pkg = JSON.parse(await read('package.json'));
+  // Selected-source development installs actual archives without a repository lockfile.
+  const installed = async (name) => JSON.parse(await read(`node_modules/${name}/package.json`));
   const dependencies = { ...pkg.dependencies, ...pkg.devDependencies };
 
   assert.equal(pkg.name, '@ours.network/cowork');
   assert.equal(pkg.bin['ours-cowork'], 'dist/cli.js');
-  assert.equal(dependencies['@ours.network/sdk'], '3.7.2');
-  assert.equal(pkg.devDependencies['@ours.network/cli'], '2.7.2');
-  assert.equal(dependencies['better-sqlite3'], '11.10.0');
+  assert.equal(dependencies['@ours.network/sdk'], '3.8.1-nightly.3');
+  assert.equal(pkg.devDependencies['@ours.network/cli'], '2.8.1-nightly.1');
+  assert.equal(dependencies['better-sqlite3'], '13.0.3');
+  assert.equal((await installed('better-sqlite3')).version, dependencies['better-sqlite3']);
   assert.equal('@adapt-toolkit/sdk' in dependencies, false);
   assert.equal('@adapt-toolkit/sdk-native' in dependencies, false);
   assert.equal(dependencies.zod, '^3.23.8');
   const forbiddenPackage = `@ours.network/${'mcp'}`;
   assert.equal(forbiddenPackage in dependencies, false);
 
-  const sdkVersion = dependencies['@ours.network/sdk'];
+  const sdkVersion = (await installed('@ours.network/sdk')).version;
   const sdkMajor = sdkVersion.split('.')[0];
-  const cliVersion = pkg.devDependencies['@ours.network/cli'];
+  const cliVersion = (await installed('@ours.network/cli')).version;
+  assert.equal(sdkVersion, '3.8.1-nightly.3');
+  assert.equal(cliVersion, '2.8.1-nightly.1');
   const publicDocs = {
     README: await read('README.md'),
     prerequisites: await read('docs/01-prerequisites.md'),
@@ -29,11 +34,13 @@ test('package stays an independent cowork daemon', async () => {
     configuration: await read('docs/03-configuration.md'),
   };
   assert(publicDocs.README.includes(`@ours.network/sdk\` ${sdkMajor}`));
-  assert(publicDocs.README.includes(`@ours.network/cli\` ${cliVersion}`));
-  assert(publicDocs.prerequisites.includes(`@ours.network/sdk\` ${sdkVersion}`));
+  assert(publicDocs.README.includes('selected V1 `@ours.network/cli`'));
+  assert(publicDocs.prerequisites.includes('selected V1 `@ours.network/sdk` artifact'));
   assert.match(publicDocs.prerequisites, new RegExp(`@ours\\.network/cli@${cliVersion.replaceAll('.', '\\.')}`));
   assert.match(publicDocs.installation, new RegExp(`@ours\\.network/cli@${cliVersion.replaceAll('.', '\\.')}`));
-  assert.match(publicDocs.configuration, new RegExp(`SDK ${sdkMajor}\\b`));
+  assert.match(publicDocs.configuration, /OURS_DAEMON_URL/);
+  assert.match(publicDocs.configuration, /OURS_DAEMON_ID/);
+  assert.match(publicDocs.configuration, /OURS_DAEMON_CREDENTIAL_PATH/);
 
   await assert.rejects(access(new URL('../.gitmodules', import.meta.url)));
 

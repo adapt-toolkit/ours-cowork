@@ -993,7 +993,7 @@ test('cancelled owner registration prevents SDK admission', async () => {
 });
 
 test('consumer configuration checks the daemon SDK release, not its control protocol', async () => {
-  for (const version of ['3.7.0', '3.7.1', '3.6.99', '3.7.2-rc.1', 'unknown']) {
+  for (const version of ['3.7.0', '3.7.1', '3.6.99', '3.7.2-rc.1', '3.7.2-nightly.1', '3.8.1-', 'unknown']) {
     let releases = 0;
     const host = new SharedOursHost(() => {}, async () => ({
       version: async () => ({ version, protocol: 2 }),
@@ -1004,7 +1004,7 @@ test('consumer configuration checks the daemon SDK release, not its control prot
     assert.equal(releases, 1);
     await host.shutdown();
   }
-  for (const version of ['3.7.2', '3.7.3', '3.8.0', '4.0.0']) {
+  for (const version of ['3.7.2', '3.7.2+build.1', '3.7.3', '3.7.3-rc.1', '3.8.0', '3.8.1-nightly.3', '4.0.0']) {
     let releases = 0;
     const host = new SharedOursHost(() => {}, async () => ({
       version: async () => ({ version, protocol: 2 }),

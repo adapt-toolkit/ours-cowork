@@ -78,9 +78,9 @@ export class SharedOursHost implements OursRuntimeHost {
     try {
       if (this.requireDynamicCatalogs) {
         const { version } = await client.version();
-        const parts = /^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
-        const [major, minor, patch] = parts ? parts.slice(1).map(Number) : [0, 0, 0];
-        if (!(major! > 3 || (major === 3 && (minor! > 7 || (minor === 7 && patch! >= 2))))) {
+        const parts = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
+        const [major, minor, patch] = parts ? parts.slice(1, 4).map(Number) : [0, 0, 0];
+        if (!(major! > 3 || (major === 3 && (minor! > 7 || (minor === 7 && (patch! > 2 || (patch === 2 && !parts?.[4]))))))) {
           throw new Error('consumer commands require shared daemon SDK 3.7.2 or newer (ours CLI 2.7.2)');
         }
       }

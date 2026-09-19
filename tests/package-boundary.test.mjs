@@ -12,7 +12,7 @@ test('package stays an independent cowork daemon', async () => {
 
   assert.equal(pkg.name, '@ours.network/cowork');
   assert.equal(pkg.bin['ours-cowork'], 'dist/cli.js');
-  assert.equal(dependencies['@ours.network/sdk'], '3.8.1-nightly.3');
+  assert.equal(dependencies['@ours.network/sdk'], '3.8.1-nightly.4');
   assert.equal(pkg.devDependencies['@ours.network/cli'], '2.8.1-nightly.1');
   assert.equal(dependencies['better-sqlite3'], '13.0.3');
   assert.equal((await installed('better-sqlite3')).version, dependencies['better-sqlite3']);
@@ -25,7 +25,7 @@ test('package stays an independent cowork daemon', async () => {
   const sdkVersion = (await installed('@ours.network/sdk')).version;
   const sdkMajor = sdkVersion.split('.')[0];
   const cliVersion = (await installed('@ours.network/cli')).version;
-  assert.equal(sdkVersion, '3.8.1-nightly.3');
+  assert.equal(sdkVersion, '3.8.1-nightly.4');
   assert.equal(cliVersion, '2.8.1-nightly.1');
   const publicDocs = {
     README: await read('README.md'),

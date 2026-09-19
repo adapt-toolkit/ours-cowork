@@ -10,7 +10,7 @@ ours-cowork docs
 Install and start the shared ours daemon first:
 
 ```sh
-npm install --global @ours.network/cli@2.8.1-nightly.2
+npm install --global @ours.network/cli@2.8.1-nightly.4
 ours daemon start
 ours daemon status --json
 ```

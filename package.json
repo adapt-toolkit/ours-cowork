@@ -27,7 +27,7 @@
     "test:v1-lifecycle": "node tests/v1-lifecycle.integration.mjs"
   },
   "dependencies": {
-    "@ours.network/sdk": "3.8.1-nightly.3",
+    "@ours.network/sdk": "3.8.1-nightly.4",
     "ajv": "8.20.0",
     "better-sqlite3": "13.0.3",
     "react": "18.3.1",

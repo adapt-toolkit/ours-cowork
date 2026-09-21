@@ -12,8 +12,10 @@ test('package stays an independent cowork daemon', async () => {
 
   assert.equal(pkg.name, '@ours.network/cowork');
   assert.equal(pkg.bin['ours-cowork'], 'dist/cli.js');
-  assert.equal(dependencies['@ours.network/sdk'], '3.8.1-nightly.4');
-  assert.equal(pkg.devDependencies['@ours.network/cli'], '2.8.1-nightly.2');
+  assert.equal(dependencies['@ours.network/sdk'], '3.8.1-nightly.9');
+  assert.equal(pkg.devDependencies['@ours.network/cli'], '2.8.1-nightly.7');
+  assert.equal(pkg.devDependencies['@ours.network/daemon'], '3.8.1-nightly.1');
+  assert.equal(pkg.dependencies['@ours.network/daemon'], undefined);
   assert.equal(dependencies['better-sqlite3'], '13.0.3');
   assert.equal((await installed('better-sqlite3')).version, dependencies['better-sqlite3']);
   assert.equal('@adapt-toolkit/sdk' in dependencies, false);
@@ -25,8 +27,11 @@ test('package stays an independent cowork daemon', async () => {
   const sdkVersion = (await installed('@ours.network/sdk')).version;
   const sdkMajor = sdkVersion.split('.')[0];
   const cliVersion = (await installed('@ours.network/cli')).version;
-  assert.equal(sdkVersion, '3.8.1-nightly.4');
-  assert.equal(cliVersion, '2.8.1-nightly.2');
+  const daemonVersion = (await installed('@ours.network/daemon')).version;
+  assert.equal(daemonVersion, '3.8.1-nightly.1');
+  assert.deepEqual((await installed('@ours.network/sdk')).dependencies ?? {}, {});
+  assert.equal(sdkVersion, '3.8.1-nightly.9');
+  assert.equal(cliVersion, '2.8.1-nightly.7');
   const publicDocs = {
     README: await read('README.md'),
     prerequisites: await read('docs/01-prerequisites.md'),
@@ -34,10 +39,10 @@ test('package stays an independent cowork daemon', async () => {
     configuration: await read('docs/03-configuration.md'),
   };
   assert(publicDocs.README.includes(`@ours.network/sdk\` ${sdkMajor}`));
-  assert(publicDocs.README.includes('selected V1 `@ours.network/cli`'));
+  assert(publicDocs.README.includes('selected `@ours.network/daemon`'));
   assert(publicDocs.prerequisites.includes('selected V1 `@ours.network/sdk` artifact'));
-  assert.match(publicDocs.prerequisites, new RegExp(`@ours\\.network/cli@${cliVersion.replaceAll('.', '\\.')}`));
-  assert.match(publicDocs.installation, new RegExp(`@ours\\.network/cli@${cliVersion.replaceAll('.', '\\.')}`));
+  assert.match(publicDocs.prerequisites, new RegExp(`@ours\\.network/daemon@${daemonVersion.replaceAll('.', '\\.')}`));
+  assert.match(publicDocs.installation, new RegExp(`@ours\\.network/daemon@${daemonVersion.replaceAll('.', '\\.')}`));
   assert.match(publicDocs.configuration, /OURS_DAEMON_URL/);
   assert.match(publicDocs.configuration, /OURS_DAEMON_ID/);
   assert.match(publicDocs.configuration, /OURS_DAEMON_CREDENTIAL_PATH/);

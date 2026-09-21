@@ -118,7 +118,7 @@ function rejectRemovedEnvironment(env: ConfigEnvironment): void {
   if (removed.length === 0) return;
   throw new CoworkConfigError(
     `${removed.join(', ')} ${removed.length === 1 ? 'was' : 'were'} removed: ours-cowork now attaches only to the shared ours daemon. ` +
-    'Configure that daemon with @ours.network/cli and select it through the standard OURS_CONFIG, OURS_PORT, and OURS_STATE_DIR inputs.',
+    'Configure that daemon with @ours.network/daemon and select it through the standard OURS_CONFIG, OURS_PORT, and OURS_STATE_DIR inputs.',
   );
 }
 
@@ -128,7 +128,7 @@ function rejectRemovedConfig(value: unknown, path: string): void {
   if (removed.length === 0) return;
   throw new CoworkConfigError(
     `cowork config at ${path} contains removed ${removed.join(' and ')} ${removed.length === 1 ? 'key' : 'keys'}: ` +
-    'ours-cowork now attaches only to the shared ours daemon. Remove those keys and configure the daemon with @ours.network/cli.',
+    'ours-cowork now attaches only to the shared ours daemon. Remove those keys and configure the daemon with @ours.network/daemon.',
   );
 }
 

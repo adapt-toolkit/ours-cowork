@@ -11,7 +11,7 @@ import { command, sleep, startProcess, stopProcess, unusedPort, waitFor, waitFor
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = join(ROOT, process.env.COWORK_V1_DIST ?? 'dist', 'cli.js');
-const OURS_CLI = join(ROOT, 'node_modules/@ours.network/cli/dist/cli.js');
+const OURS_CLI = join(ROOT, 'node_modules/@ours.network/daemon/dist/cli.js');
 const state = mkdtempSync(join(tmpdir(), 'cowork-v1-integration-'));
 const daemonState = join(state, 'ours');
 mkdirSync(daemonState, {mode: 0o700});

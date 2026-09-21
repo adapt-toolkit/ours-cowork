@@ -154,7 +154,7 @@ test('cowork configuration is app-local and removed daemon/broker keys fail with
     }), { mode: 0o600 });
     assert.throws(
       () => loadConfig({ OURS_COWORK_CONFIG: path }),
-      /removed.*shared ours daemon.*@ours\.network\/cli/i,
+      /removed.*shared ours daemon.*@ours\.network\/daemon/i,
     );
   }
   for (const name of [

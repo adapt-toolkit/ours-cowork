@@ -43,7 +43,7 @@ API requests never fall back to legacy mode. `ours-cowork install-service` prese
 chosen non-secret standard selection values, including the V1 UUID and credential
 file path. Cowork’s strict application config schema is unchanged.
 
-The old cowork keys `brokerUrl` and `daemon`, and the old overrides `OURS_COWORK_BROKER_URL`, `OURS_COWORK_DAEMON_MODE`, `OURS_COWORK_DAEMON_ENDPOINT`, and `OURS_COWORK_DAEMON_STATE_DIR`, have been removed. Supplying any of them is a startup error with migration guidance; they are never silently ignored. Configure broker and daemon lifecycle with `@ours.network/cli` instead.
+The old cowork keys `brokerUrl` and `daemon`, and the old overrides `OURS_COWORK_BROKER_URL`, `OURS_COWORK_DAEMON_MODE`, `OURS_COWORK_DAEMON_ENDPOINT`, and `OURS_COWORK_DAEMON_STATE_DIR`, have been removed. Supplying any of them is a startup error with migration guidance; they are never silently ignored. Configure broker and daemon lifecycle with `@ours.network/daemon` instead.
 
 Cowork persists each room's exact `identity_name` in durable room metadata before creating that identity. It filters the daemon-global identity list by those local names. This is application bookkeeping only: cowork does not infer ownership, root/role membership, provenance, or a same-user security boundary.
 

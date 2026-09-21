@@ -1030,7 +1030,7 @@ test('real SDK command results persist only authenticated viewer history across 
  const { OursClient }=await import('@ours.network/sdk/client');
  const { CoworkStore }=await import('../src/storage.ts');
  const { RoomService }=await import('../src/service.ts');
- const sdkHistory=await import(new URL('./history.js',import.meta.resolve('@ours.network/sdk')));
+ const sdkHistory=await import(new URL('../node_modules/@ours.network/daemon/dist/runtime/history.js', import.meta.url));
  const dir=mkdtempSync(join(tmpdir(),'cowork-history-command-'));
  const identity={dir:join(dir,'sdk-identity')};
  t.after(()=>{sdkHistory.closeHistory(identity);rmSync(dir,{recursive:true,force:true});});

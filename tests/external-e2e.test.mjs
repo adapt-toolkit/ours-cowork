@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 const THIS_FILE = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(THIS_FILE), '..');
 const CLI = join(ROOT, 'dist', 'cli.js');
-const OURS_CLI = join(ROOT, 'node_modules', '@ours.network', 'cli', 'dist', 'cli.js');
+const OURS_CLI = join(ROOT, 'node_modules', '@ours.network', 'daemon', 'dist', 'cli.js');
 const SUCCESS = 'COWORK_EXTERNAL_DRIVER_SUCCESS';
 const FAILURE = 'COWORK_EXTERNAL_DRIVER_FAILURE';
 const sleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
@@ -184,7 +184,7 @@ if (process.argv.includes('--external-driver')) {
 
     try {
       assert(existsSync(CLI), 'build the daemon and CLI before running the external-mode E2E');
-      assert(existsSync(OURS_CLI), 'install @ours.network/cli 2.7.2 before running the shared-daemon E2E');
+      assert(existsSync(OURS_CLI), 'install @ours.network/daemon 3.8.1-nightly.1 before running the shared-daemon E2E');
       const brokerPort = await unusedPort();
       broker = spawn(process.execPath, [join(ROOT, 'node_modules/.bin/adapt-broker'), '--host', '127.0.0.1', '--port', String(brokerPort), '--test_mode'], {
         cwd: ROOT,

@@ -14,7 +14,7 @@ const THIS_FILE = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(THIS_FILE), '..');
 const COWORK_CLI = join(ROOT, 'dist', 'cli.js');
 const OURS_CLI = process.env.COWORK_OURS_CLI_PATH
-  ?? join(ROOT, 'node_modules', '@ours.network', 'cli', 'dist', 'cli.js');
+  ?? join(ROOT, 'node_modules', '@ours.network', 'daemon', 'dist', 'cli.js');
 const BROKER = join(ROOT, 'node_modules', '.bin', 'adapt-broker');
 const MESSENGER_ROOT = process.env.COWORK_REPLY_MESSENGER_ROOT;
 const MESSENGER_ENTRY = process.env.COWORK_REPLY_MESSENGER_ENTRY ?? 'dist';
@@ -351,7 +351,7 @@ if (process.argv.includes('--reply-relay-driver')) {
 
     try {
       assert(existsSync(COWORK_CLI), 'run npm run build before the reply-relay E2E test');
-      assert(existsSync(OURS_CLI), 'install the ordinary ours CLI before the reply-relay E2E test');
+      assert(existsSync(OURS_CLI), 'install the published ours-daemon before the reply-relay E2E test');
       assert(existsSync(BROKER), 'install the local test broker before the reply-relay E2E test');
       if (EVIDENCE_DIR) {
         mkdirSync(EVIDENCE_DIR, { recursive: true, mode: 0o700 });

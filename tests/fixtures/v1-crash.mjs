@@ -13,7 +13,7 @@ const mode = process.argv[2] ?? 'worker';
 assert(['worker', 'parent-loss', 'delayed'].includes(mode), 'Unknown finite crash fixture mode');
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const CLI = join(ROOT, 'dist/cli.js');
-const OURS_CLI = join(ROOT, 'node_modules/@ours.network/cli/dist/cli.js');
+const OURS_CLI = join(ROOT, 'node_modules/@ours.network/daemon/dist/cli.js');
 const state = mkdtempSync(join(tmpdir(), `cowork-v1-${mode}-`));
 const coworkState = join(state, 'cowork');
 const daemonState = join(state, 'ours'); mkdirSync(daemonState, {mode: 0o700});

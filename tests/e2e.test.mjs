@@ -13,7 +13,7 @@ const THIS_FILE = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(THIS_FILE), '..');
 const CLI = join(ROOT, 'dist', 'cli.js');
 const OURS_CLI = process.env.COWORK_OURS_CLI_PATH
-  ?? join(ROOT, 'node_modules', '@ours.network', 'cli', 'dist', 'cli.js');
+  ?? join(ROOT, 'node_modules', '@ours.network', 'daemon', 'dist', 'cli.js');
 const SUCCESS = 'COWORK_E2E_DRIVER_SUCCESS';
 const FAILURE = 'COWORK_E2E_DRIVER_FAILURE';
 const sleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
@@ -264,7 +264,7 @@ if (process.argv.includes('--e2e-driver')) {
 
     try {
       assert(existsSync(CLI), 'build the daemon and CLI before running E2E');
-      assert(existsSync(OURS_CLI), 'install @ours.network/cli 2.7.2 before running E2E');
+      assert(existsSync(OURS_CLI), 'install @ours.network/daemon 3.8.1-nightly.1 before running E2E');
       const port = await unusedPort();
 
       broker = spawn(process.execPath, [join(ROOT, 'node_modules/.bin/adapt-broker'), '--host', '127.0.0.1', '--port', String(port), '--test_mode'], {

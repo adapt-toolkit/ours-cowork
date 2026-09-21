@@ -405,6 +405,12 @@ if (process.argv.includes('--reply-relay-driver')) {
       stage('cowork-ready');
 
       const { attachOursClient } = await import('@ours.network/sdk');
+      const bootstrap = await attachOursClient({ env: oursEnv, leaseToken: 'cowork-reply-bootstrap' });
+      try {
+        await bootstrap.createRootIdentity({ name: 'Reply Human', bio: '', exposeLocal: false });
+      } finally {
+        await bootstrap.releaseLease();
+      }
       const suffix = `${process.pid}-${Date.now().toString(36)}`;
       const [a, b, c] = await Promise.all([
         createPeer(attachOursClient, 'A', suffix),

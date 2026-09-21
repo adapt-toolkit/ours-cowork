@@ -264,7 +264,7 @@ if (process.argv.includes('--e2e-driver')) {
 
     try {
       assert(existsSync(CLI), 'build the daemon and CLI before running E2E');
-      assert(existsSync(OURS_CLI), 'install @ours.network/daemon 3.8.1-nightly.1 before running E2E');
+      assert(existsSync(OURS_CLI), 'install @ours.network/daemon 3.8.1-nightly.2 before running E2E');
       const port = await unusedPort();
 
       broker = spawn(process.execPath, [join(ROOT, 'node_modules/.bin/adapt-broker'), '--host', '127.0.0.1', '--port', String(port), '--test_mode'], {
@@ -338,6 +338,7 @@ if (process.argv.includes('--e2e-driver')) {
 
       const { attachOursClient } = await import('@ours.network/sdk');
       observer = await attachOursClient({ env: oursEnv, leaseToken: 'cowork-e2e-observer' });
+      await observer.createRootIdentity({ name: 'Cowork Human', bio: '', exposeLocal: false });
       const [alice, bob, charlie, successor] = await Promise.all([
         createPeer(attachOursClient, 'Alice'),
         createPeer(attachOursClient, 'Bob'),

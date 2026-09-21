@@ -184,7 +184,7 @@ if (process.argv.includes('--external-driver')) {
 
     try {
       assert(existsSync(CLI), 'build the daemon and CLI before running the external-mode E2E');
-      assert(existsSync(OURS_CLI), 'install @ours.network/daemon 3.8.1-nightly.1 before running the shared-daemon E2E');
+      assert(existsSync(OURS_CLI), 'install @ours.network/daemon 3.8.1-nightly.2 before running the shared-daemon E2E');
       const brokerPort = await unusedPort();
       broker = spawn(process.execPath, [join(ROOT, 'node_modules/.bin/adapt-broker'), '--host', '127.0.0.1', '--port', String(brokerPort), '--test_mode'], {
         cwd: ROOT,
@@ -213,6 +213,7 @@ if (process.argv.includes('--external-driver')) {
       await waitForPort(oursPort);
       const { attachOursClient } = await import('@ours.network/sdk');
       observer = await attachOursClient({ env: oursEnv, leaseToken: 'cowork-external-observer' });
+      await observer.createRootIdentity({ name: 'External Human', bio: '', exposeLocal: false });
       assert.equal(resolve((await observer.stateDir()).stateDir), resolve(daemonStateDir));
       stage('shared-daemon-ready');
 

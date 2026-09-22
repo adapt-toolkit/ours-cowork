@@ -121,6 +121,7 @@ Usage:
   ours-cowork [--json] install-service|uninstall-service
   ours-cowork [--json] room <command> [arguments]
   ours-cowork [--json] docs [topic]
+  ours-cowork [--json] capabilities
 
 Room commands:
   create [--name <display-name>] --goal <text> --briefing <text> [--anonymous] [--quiet-membership]
@@ -1051,6 +1052,12 @@ async function execute(args: string[], output: Output): Promise<void> {
   if (command === 'help' || command === '--help' || command === '-h') {
     if (args.length !== 1 && args.length !== 0) usageError('help takes no arguments');
     output.success({ usage: usage() }, usage());
+    return;
+  }
+  if (command === 'capabilities') {
+    if (args.length !== 1) usageError('capabilities takes no arguments');
+    const capabilities = ['cowork.http-management-v1'];
+    output.success({ capabilities }, capabilities.join('\n'));
     return;
   }
   if (command === 'docs') {

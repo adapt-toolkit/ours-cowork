@@ -1,0 +1,31 @@
+import React from 'react';
+import { afterEach, expect, test, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { BrowserSession } from '../web/src/BrowserSession';
+vi.mock('../web/src/App',()=>({CoworkApp:()=> <div>Room console</div>}));
+afterEach(()=>{cleanup();vi.unstubAllGlobals();history.replaceState(null,'','/');});
+test('nested gateway login uses an in-memory credential and reload requires it again',async()=>{
+  history.replaceState(null,'','/base/cowork/');
+  const calls:Array<[string,RequestInit|undefined]>=[];
+  vi.stubGlobal('fetch',vi.fn(async (url:string,options?:RequestInit)=>{
+    calls.push([url,options]);
+    if(url.endsWith('client-config'))return {ok:true,json:async()=>({authenticatedBrowser:true})};
+    const body=JSON.parse(options?.body as string);
+    return {ok:true,json:async()=>({version:1,id:body.id,result:[]})};
+  }));
+  const first=render(<BrowserSession/>);
+  fireEvent.change(await screen.findByLabelText('Server credential'),{target:{value:'test-server-credential'}});
+  fireEvent.click(screen.getByRole('button',{name:'Connect'}));
+  await screen.findByText('Room console');
+  expect(calls[0][0]).toBe('/base/cowork/client-config');
+  expect(calls[0][1]?.credentials).toBe('same-origin');
+  const login=calls.find(([url])=>url.endsWith('browser/rpc'))!;
+  expect(login[0]).toBe('/base/cowork/browser/rpc');
+  expect(login[1]?.headers).toMatchObject({'x-ours-api-token':'test-server-credential'});
+  expect(login[1]?.redirect).toBe('error');
+  expect(login[1]?.credentials).toBe('same-origin');
+  expect(localStorage.length).toBe(0);expect(sessionStorage.length).toBe(0);
+  expect(location.href).not.toContain('test-server-credential');
+  first.unmount();render(<BrowserSession/>);
+  await waitFor(()=>expect(screen.getByLabelText('Server credential')).toHaveValue(''));
+});

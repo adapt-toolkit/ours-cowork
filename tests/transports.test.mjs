@@ -979,3 +979,35 @@ for (const kind of ['regular file', 'symlink', 'socket']) {
     }
   });
 }
+
+test('opt-in HTTP management requires authorization and excludes daemon control at the application boundary', async t => {
+  const dir=mkdtempSync(join(tmpdir(),'cowork-http-management-'));
+  t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  let calls=0;
+  const ordinary={'room.list':{auth:true,run:()=>[]}};
+  const management={...ordinary,'room.accept':{auth:true,run:()=>{calls++;return {state:'pending'};}}};
+  const server=new TransportServer({socketPath:join(dir,'management.sock'),rest:{enabled:true,port:0},
+    unixDispatcher:new RpcDispatcher({...management,'daemon.shutdown':{auth:true,run:()=>({})}}),
+    restDispatcher:new RpcDispatcher(ordinary),
+    management:{dispatcher:new RpcDispatcher(management),authorize:async request=>request.headers['x-ours-api-token']==='issued-test-token'},
+  });
+  await server.start();t.after(()=>server.stop());
+  const envelope=method=>JSON.stringify({version:1,id:'request',method,params:{}});
+  const invoke=(method,headers={})=>request(server.restAddress.port,{path:'/management/rpc',host:'server.example',body:envelope(method),headers:{'content-type':'application/json',...headers}});
+  assert.equal((await invoke('room.accept')).statusCode,401);
+  assert.equal((await invoke('room.accept',{'x-ours-api-token':'wrong'})).statusCode,401);
+  assert.equal(calls,0);
+  assert.equal((await invoke('room.accept',{'x-ours-api-token':'issued-test-token'})).statusCode,200);
+  assert.equal(calls,1);
+  for(const method of ['daemon.shutdown','daemon.status','unknown'])assert.equal((await invoke(method,{'x-ours-api-token':'issued-test-token'})).statusCode,404);
+  assert.equal((await invoke('room.accept',{'x-ours-api-token':'issued-test-token',origin:'https://server.example'})).statusCode,403);
+  assert.equal(calls,1);
+  const browser=(method,headers={})=>request(server.restAddress.port,{path:'/browser/rpc',host:'server.example',body:envelope(method),headers:{'content-type':'application/json',...headers}});
+  assert.equal((await browser('room.list')).statusCode,401);
+  assert.equal((await browser('room.list',{'x-ours-api-token':'issued-test-token',origin:'https://server.example','sec-fetch-site':'same-origin'})).statusCode,200);
+  assert.equal((await browser('room.list',{'x-ours-api-token':'issued-test-token',origin:'https://evil.example'})).statusCode,403);
+  assert.equal((await browser('room.list',{'x-ours-api-token':'issued-test-token','sec-fetch-site':'cross-site'})).statusCode,403);
+  assert.equal((await browser('room.accept',{'x-ours-api-token':'issued-test-token'})).statusCode,404);
+  assert.equal((await browser('daemon.shutdown',{'x-ours-api-token':'issued-test-token'})).statusCode,404);
+  assert.deepEqual((await request(server.restAddress.port,{path:'/client-config',method:'GET'})).json,{authenticatedBrowser:true});
+});

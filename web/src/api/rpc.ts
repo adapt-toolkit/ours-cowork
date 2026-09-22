@@ -36,6 +36,7 @@ export interface RpcCallOptions {
   fetch?: typeof globalThis.fetch;
   signal?: AbortSignal;
   timeoutMs?: number;
+  browserCredential?: string;
 }
 
 export function rpcTimeoutForMethod(method: string): number {
@@ -61,10 +62,13 @@ export async function rpcCall<T>(
   }, options.timeoutMs ?? rpcTimeoutForMethod(method));
 
   try {
-    const response = await fetchRequest('/rpc', {
+    const path = new URL('.', globalThis.location.href).pathname + (options.browserCredential === undefined ? 'rpc' : 'browser/rpc');
+    const response = await fetchRequest(path, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...(options.browserCredential === undefined ? {} : { 'x-ours-api-token': options.browserCredential }) },
+      // Keep an authenticated same-origin front proxy session alongside the server token.
       credentials: 'same-origin',
+      redirect: 'error',
       body: JSON.stringify({ version: 1, id: requestId, method, params }),
       signal: controller.signal,
     });

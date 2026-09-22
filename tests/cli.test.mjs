@@ -1200,3 +1200,11 @@ test('service install identifies an unsafe Node executable and preserves the exi
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test('capabilities is an offline exact-artifact probe', async () => {
+  const result = await runCli(['--json', 'capabilities'], {env:{OURS_COWORK_CONFIG:'/nonexistent/gateway-probe.json'}});
+  assert.equal(result.code, 0, result.stderr);
+  const body = JSON.parse(result.stdout);
+  assert.equal(body.ok, true);
+  assert.ok(body.result.capabilities.includes('cowork.http-management-v1'));
+});

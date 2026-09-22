@@ -1,3 +1,4 @@
+import { createManagementAuthorizer } from './http-management.ts';
 // SDK-backed daemon runtime. The SDK-free daemon-worker bootstrap imports this
 // only after installing its IPC shutdown/disconnect handlers.
 
@@ -283,6 +284,12 @@ export class CoworkDaemon {
         : { ...serviceRoutes, ...createPrivateServiceRoutes(realService) };
       const unixDispatcher = new RpcDispatcher(unixRoutes);
       const restDispatcher = new RpcDispatcher(serviceRoutes);
+      const authorizeManagement = createManagementAuthorizer(process.env);
+      // Deliberately omit createDaemonControlRoutes from the HTTP allowlist.
+      const management = authorizeManagement ? {
+        dispatcher: new RpcDispatcher({ ...serviceRoutes, ...createPrivateServiceRoutes(realService) }),
+        authorize: authorizeManagement,
+      } : undefined;
       const staticHandler = createStaticWebHandler(loadWebAssets(
         fileURLToPath(new URL('./web/', import.meta.url)),
       ));
@@ -291,6 +298,8 @@ export class CoworkDaemon {
         rest: config.rest,
         unixDispatcher,
         restDispatcher,
+        management,
+        publicOrigin: process.env.OURS_COWORK_PUBLIC_ORIGIN,
         staticHandler,
         log: this.options.log,
       });

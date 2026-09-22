@@ -121,3 +121,8 @@
   .file-version__details strong { grid-row: auto; }
   .file-group__latest { overflow-wrap: anywhere; }
 }
+
+.connection-panel { width: min(480px, calc(100% - 32px)); margin: 10vh auto; padding: 24px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.connection-panel p { color: var(--text-muted); line-height: 1.55; }
+.connection-panel form { display: grid; gap: 12px; }
+.connection-panel input { padding: 10px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--bg); color: var(--text); }

@@ -179,7 +179,7 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
   } satisfies AuthenticatedRouteTable;
 }
 
-/** Secret-bearing mutation routes are deliberately available only to the Unix dispatcher. */
+/** Secret-bearing routes require a private socket or explicitly authenticated HTTP management. */
 export function createPrivateServiceRoutes(service: RoomServiceApi): AuthenticatedRouteTable {
   return {
     'room.accept': { auth: true, run: (params) => {

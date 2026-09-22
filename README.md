@@ -79,3 +79,22 @@ node scripts/check-build-selected.mjs --sdk /artifacts/ours.network-sdk-3.7.2.tg
 ```
 
 For development against the selected, unpublished SDK/CLI sources, see [selected-source development](docs/selected-source-development.md).
+
+### Authenticated HTTP gateway management
+
+The installer can enable `OURS_COWORK_HTTP_MANAGEMENT=1` with a pinned
+`OURS_DAEMON_URL` and `OURS_DAEMON_ID`. `/management/rpc` accepts the existing
+issued `X-Ours-Api-Token` and verifies it against that daemon on every request.
+It exposes the room service methods, including `room.accept`, but excludes
+`daemon.status` and `daemon.shutdown`; supervisor control remains local.
+Invalid/revoked credentials, instance mismatch, redirects and daemon outages fail
+closed. Browser-origin requests cannot use machine management.
+
+The separate `/browser/rpc` uses the ordinary room routes and also requires an
+issued token. The browser prompt explains its operator authority; the token stays
+in memory and is cleared by reload. `OURS_COWORK_PUBLIC_ORIGIN` pins the exact
+external HTTP(S) origin behind a gateway. Same-origin proxy credentials remain
+available, and assets/RPC paths work beneath a nested `/base/cowork/` mount.
+The legacy unauthenticated loopback `/rpc` must remain blocked at the gateway.
+All applications on the gateway origin share trust; a prefix is not isolation.
+`ours-cowork --json capabilities` advertises `cowork.http-management-v1`.

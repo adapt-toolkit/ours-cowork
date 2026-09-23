@@ -3089,3 +3089,42 @@ test('runtime command readers pause while provisioning and resume after activati
   await f.store.save({ ...saved, state: 'active', activated_at: TIMES[1] });
   assert.equal(await packet.runtimeCommands.shouldPause(), false);
 });
+
+test('planned role counts hold Owner-only activation before member invites exist', async () => {
+  const f = fixture();
+  const requirements = [{ role: 'Owner', count: 1 }, { role: 'Developer', count: 2 }];
+  await f.service.createRoom({ goal: 'Whole team', briefing: 'Wait for everyone.', activation_requirements: requirements });
+  const packet = f.registry.get(ROOM_ID);
+  packet.supportsInviteProvenance = true;
+  await f.service.acceptExternalInvite(ROOM_ID, { role: 'Owner', invite: packInvite(Buffer.from('owner-public')), expected_cid: 'AB'.repeat(32) });
+  packet.contacts = [{ name: 'Owner', container_id: 'AB'.repeat(32) }];
+  let room = await f.service.reconcileRoom(ROOM_ID);
+  assert.equal(room.state, 'provisioning');
+  assert.deepEqual((await f.store.load(ROOM_ID)).activation_requirements, requirements);
+  assert.equal(f.store.records.get(ROOM_ID).filter(r => r.kind === 'message' && r.category === 'briefing').length, 0);
+  const dev = await f.service.createInvite(ROOM_ID, { role: 'Developer', mode: 'public', min_accepts: 1 });
+  packet.contacts.push({ name: 'Dev1', container_id: ALICE_CID, accepted_via_invite_id: dev.invite.invite_id });
+  room = await f.service.reconcileRoom(ROOM_ID);
+  assert.equal(room.state, 'provisioning', 'satisfied issued invites do not replace sealed planned counts');
+  const observer = await f.service.createInvite(ROOM_ID, { role: 'Observer', mode: 'public', min_accepts: 1 });
+  packet.contacts.push({ name: 'Observer', container_id: OUTSIDER_CID, accepted_via_invite_id: observer.invite.invite_id });
+  room = await f.service.reconcileRoom(ROOM_ID);
+  assert.equal(room.state, 'provisioning', 'unplanned role cannot fill missing planned seat');
+  packet.contacts.push({ name: 'Dev2', container_id: BOB_CID, accepted_via_invite_id: dev.invite.invite_id });
+  room = await f.service.reconcileRoom(ROOM_ID);
+  assert.equal(room.state, 'active');
+  const records = structuredClone(f.store.records.get(ROOM_ID));
+  assert.equal(records.filter(r => r.kind === 'message' && r.category === 'briefing').length, 1);
+  assert.equal(records.filter(r => r.kind === 'relay_intent').length, 4, 'briefing covers every admitted seat');
+  await f.service.reconcileRoom(ROOM_ID);
+  assert.deepEqual(f.store.records.get(ROOM_ID), records, 'briefing activation is not repeated');
+  await assert.rejects(f.service.updateRoom(ROOM_ID, { activation_requirements: [] }), /unrecognized/i);
+});
+
+test('invalid planned activation role counts fail before packet creation', async () => {
+  for (const activation_requirements of [[{role:'Developer',count:0}], [{role:'Developer',count:1},{role:'Developer',count:2}]]) {
+    const f=fixture();
+    await assert.rejects(f.service.createRoom({goal:'Plan',briefing:'Plan',activation_requirements}));
+    assert.equal(f.registry.createCalls.length,0);
+  }
+});

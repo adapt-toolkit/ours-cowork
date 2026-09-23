@@ -440,11 +440,24 @@ function refineRoomLineage(room: RoomLineageView, context: z.RefinementCtx): voi
   }
 }
 
+const ActivationRequirementsSchema = z.array(z.object({
+  role: RoleSchema,
+  count: z.number().int().min(1).max(1000),
+}).strict()).max(1000).superRefine((requirements, context) => {
+  const seen = new Set<string>();
+  for (const [index, requirement] of requirements.entries()) {
+    if (seen.has(requirement.role)) context.addIssue({ code: z.ZodIssueCode.custom,
+      path: [index, 'role'], message: 'activation roles must be unique' });
+    seen.add(requirement.role);
+  }
+});
+
 const RoomCommonShape = {
   room_id: LowerCrockfordUlidSchema,
   identity_name: NonEmptyStringSchema,
   identity_cid: z.string(),
   state: RoomStateSchema,
+  activation_requirements: ActivationRequirementsSchema.optional(),
   status: NonEmptyStringSchema.optional(),
   invites: z.array(RoomInviteSchema),
   created_at: Rfc3339Schema,
@@ -660,6 +673,7 @@ export const CreateRoomInputSchema = z.object({
   briefing: MissionTextSchema,
   anonymous: z.boolean().optional(),
   quiet_membership: z.boolean().optional(),
+  activation_requirements: ActivationRequirementsSchema.optional(),
 }).strict();
 
 export const UpdateRoomInputSchema = z.object({

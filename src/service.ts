@@ -240,6 +240,9 @@ export class RoomService {
         quiet_membership: settings.quiet_membership ?? false,
         membership_epoch: 0,
         state: 'provisioning',
+        ...(settings.activation_requirements === undefined ? {} : {
+          activation_requirements: settings.activation_requirements,
+        }),
         status: 'packet_pending',
         invites: [],
         seats: [],
@@ -1802,7 +1805,9 @@ export class RoomService {
       .filter((invite) => invite.state !== 'revoked')
       .every((invite) => invite.accepted_cids.length >= invite.min_accepts);
     const admitted = [...activatedPending, ...newSeats];
-    if (next.state === 'provisioning' && activeSeats(next).length > 0 && requirementsMet) {
+    const plannedRolesMet = (next.activation_requirements ?? []).every(requirement =>
+      activeSeats(next).filter(seat => seat.role === requirement.role).length >= requirement.count);
+    if (next.state === 'provisioning' && activeSeats(next).length > 0 && requirementsMet && plannedRolesMet) {
       const activationAt = await this.ensureActivationBriefing(next, activeSeats(next));
       next = RoomSchema.parse({ ...next, state: 'active', activated_at: activationAt });
     } else if (next.state === 'active' && admitted.length > 0) {

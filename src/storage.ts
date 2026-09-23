@@ -24,6 +24,8 @@ const SQLITE_SCHEMA_VERSION = 2;
 const DEFAULT_WORK_BATCH_SIZE = 64;
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 const SQLITE_V2_EXTENSION_DDL = `
+  CREATE UNIQUE INDEX IF NOT EXISTS records_upload_id
+  ON records(json_extract(payload_json,'$.upload_id')) WHERE kind='file';
   CREATE UNIQUE INDEX IF NOT EXISTS records_thread_creation_key
   ON records(json_extract(payload_json,'$.author.identity'),
              json_extract(payload_json,'$.thread_root.idempotency_key'))
@@ -53,6 +55,7 @@ export interface ArchiveQueryOptions {
   kind?: CommunicationRecord['kind'];
   messageId?: string;
   fileId?: string;
+  uploadId?: string;
   sourceMsgId?: number;
   sourceFileId?: number;
   intentRecordId?: string;
@@ -107,6 +110,18 @@ export class CoworkStore {
   private readonly beforeRecordCommit?: () => void;
   private readonly roomMutexes = new Map<string, RoomQueue>();
   private readonly lockOwnership = new AsyncLocalStorage<ReadonlyMap<string, LockOwnership>>();
+  private readonly archiveWaiters = new Map<string, Set<() => void>>();
+
+  subscribeArchive(roomId: string, wake: () => void): () => void {
+    const id = this.roomId(roomId);
+    const waiting = this.archiveWaiters.get(id) ?? new Set<() => void>();
+    if (waiting.size >= 100 || (!this.archiveWaiters.has(id) && this.archiveWaiters.size >= 1024)) throw new CoworkStorageError("too many event subscribers");
+    waiting.add(wake); this.archiveWaiters.set(id, waiting);
+    return () => { waiting.delete(wake); if (!waiting.size) this.archiveWaiters.delete(id); };
+  }
+
+  wakeArchiveReaders(): void { for (const waiting of this.archiveWaiters.values()) for (const wake of waiting) { try { wake(); } catch { /* Readers cannot invalidate a durable commit. */ } } }
+
   private readonly reconciledBlobRooms = new Set<string>();
 
   constructor(stateDir: string, options: CoworkStoreOptions = {}) {
@@ -269,7 +284,9 @@ export class CoworkStore {
             this.beforeRecordCommit?.();
             return record;
           });
-          return transaction.immediate();
+          const committed = transaction.immediate();
+          for (const wake of this.archiveWaiters.get(id) ?? []) { try { wake(); } catch { /* Readers cannot invalidate a durable commit. */ } }
+          return committed;
         });
       } catch (error) {
         if (blob?.created) this.removeUnreferencedBlob(id, blob.path);
@@ -301,6 +318,7 @@ export class CoworkStore {
         const clauses: string[] = []; const values: unknown[] = [];
         const add = (column: string, value: unknown): void => { if (value !== undefined) { clauses.push(`r.${column} = ?`); values.push(value); } };
         add('kind', options.kind); add('message_id', options.messageId); add('file_id', options.fileId);
+        if (options.uploadId !== undefined) { clauses.push("json_extract(r.payload_json,'$.upload_id') = ?"); values.push(options.uploadId); }
         add('source_msg_id', options.sourceMsgId); add('source_file_id', options.sourceFileId);
         add('intent_record_id', options.intentRecordId); add('recipient_identity', options.recipientIdentity);
         add('category', options.category); add('membership_epoch', options.membershipEpoch);

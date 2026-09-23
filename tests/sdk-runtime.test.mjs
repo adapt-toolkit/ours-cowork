@@ -1073,3 +1073,30 @@ test('shared host forwards typed lifecycle events and resyncs when a watch recon
   assert(observed.filter(([, value]) => value === undefined).length >= 2, 'startup and reconnect request authoritative resync');
   assert.equal(observed.filter(([, value]) => value === event).length, 2);
 });
+
+
+test('mintInvite waits for stale in-flight snapshot then refreshes the generated invite', async () => {
+  const client = new FakeClient();
+  let releaseContacts;
+  let contactsEntered;
+  const entered = new Promise(resolve => { contactsEntered = resolve; });
+  const paused = new Promise(resolve => { releaseContacts = resolve; });
+  let first = true;
+  client.listContacts = async () => {
+    if (first) { first = false; contactsEntered(); await paused; }
+    return {contacts:[]};
+  };
+  client.generateInvite = async () => {
+    client.invites = [{invite_id:'new-invite',mode:'one_time'}];
+    return {blob:'opaque-test-blob',inviteId:'new-invite'};
+  };
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  const staleRefresh = packet.refresh();
+  await entered;
+  const minted = packet.mintInvite('one_time');
+  await new Promise(resolve => setImmediate(resolve));
+  releaseContacts();
+  await staleRefresh;
+  await minted;
+  assert.deepEqual(packet.listInvites(), [{invite_id:'new-invite',mode:'one_time'}]);
+});

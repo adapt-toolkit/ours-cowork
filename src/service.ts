@@ -240,6 +240,9 @@ export class RoomService {
         quiet_membership: settings.quiet_membership ?? false,
         membership_epoch: 0,
         state: 'provisioning',
+        ...(settings.activation_requirements === undefined ? {} : {
+          activation_requirements: settings.activation_requirements,
+        }),
         status: 'packet_pending',
         invites: [],
         seats: [],
@@ -380,7 +383,10 @@ export class RoomService {
     const registered = await this.store.load(roomId);
     this.publishedConsumerRevisions.delete(roomId);
     await packet.registerRuntimeCommands?.({
-      shouldPause: async () => (await this.store.load(roomId)).lifecycle_request?.state === 'pending',
+      shouldPause: async () => {
+        const room = await this.store.load(roomId);
+        return room.state === 'provisioning' || room.lifecycle_request?.state === 'pending';
+      },
       consumerCommands: (registered.consumer_commands ?? []).map((definition) => ({
         name: definition.name, description: definition.description,
         input_schema: definition.input_schema as Record<string, JsonValue>,
@@ -1799,7 +1805,9 @@ export class RoomService {
       .filter((invite) => invite.state !== 'revoked')
       .every((invite) => invite.accepted_cids.length >= invite.min_accepts);
     const admitted = [...activatedPending, ...newSeats];
-    if (next.state === 'provisioning' && activeSeats(next).length > 0 && requirementsMet) {
+    const plannedRolesMet = (next.activation_requirements ?? []).every(requirement =>
+      activeSeats(next).filter(seat => seat.role === requirement.role).length >= requirement.count);
+    if (next.state === 'provisioning' && activeSeats(next).length > 0 && requirementsMet && plannedRolesMet) {
       const activationAt = await this.ensureActivationBriefing(next, activeSeats(next));
       next = RoomSchema.parse({ ...next, state: 'active', activated_at: activationAt });
     } else if (next.state === 'active' && admitted.length > 0) {

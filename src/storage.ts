@@ -24,6 +24,8 @@ const SQLITE_SCHEMA_VERSION = 2;
 const DEFAULT_WORK_BATCH_SIZE = 64;
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 const SQLITE_V2_EXTENSION_DDL = `
+  CREATE UNIQUE INDEX IF NOT EXISTS records_upload_id
+  ON records(json_extract(payload_json,'$.upload_id')) WHERE kind='file';
   CREATE UNIQUE INDEX IF NOT EXISTS records_thread_creation_key
   ON records(json_extract(payload_json,'$.author.identity'),
              json_extract(payload_json,'$.thread_root.idempotency_key'))
@@ -53,6 +55,7 @@ export interface ArchiveQueryOptions {
   kind?: CommunicationRecord['kind'];
   messageId?: string;
   fileId?: string;
+  uploadId?: string;
   sourceMsgId?: number;
   sourceFileId?: number;
   intentRecordId?: string;
@@ -315,6 +318,7 @@ export class CoworkStore {
         const clauses: string[] = []; const values: unknown[] = [];
         const add = (column: string, value: unknown): void => { if (value !== undefined) { clauses.push(`r.${column} = ?`); values.push(value); } };
         add('kind', options.kind); add('message_id', options.messageId); add('file_id', options.fileId);
+        if (options.uploadId !== undefined) { clauses.push("json_extract(r.payload_json,'$.upload_id') = ?"); values.push(options.uploadId); }
         add('source_msg_id', options.sourceMsgId); add('source_file_id', options.sourceFileId);
         add('intent_record_id', options.intentRecordId); add('recipient_identity', options.recipientIdentity);
         add('category', options.category); add('membership_epoch', options.membershipEpoch);

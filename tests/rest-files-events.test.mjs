@@ -7,7 +7,7 @@ import {randomUUID} from 'node:crypto';
 import {CoworkStore} from '../src/storage.ts';
 import {RoomService} from '../src/service.ts';
 import {createServiceRoutes} from '../src/command-routes.ts';
-import {RpcDispatcher} from '../src/transports.ts';
+import {RpcDispatcher,TransportServer} from '../src/transports.ts';
 
 async function fixture(){
  const root=await mkdtemp(join(tmpdir(),'cowork-rest-')),store=new CoworkStore(root),sent=[];
@@ -65,5 +65,36 @@ test('failed archive commit cannot wake event readers with a non-durable upload'
   const service=new RoomService(failing,{get:()=>undefined});
   await assert.rejects(service.sendFile(f.room.room_id,input()),/failed to append/);
   assert.equal(wakeCount,0);assert.equal((await f.store.read(f.room.room_id)).length,0);unsubscribe();
+ }finally{await f.close();}
+});
+
+
+test('HTTP accepts the maximum decoded file and rejects oversized uploads', async () => {
+ const f=await fixture(); let server;
+ try {
+  const dispatcher=new RpcDispatcher(createServiceRoutes(f.service));
+  server=new TransportServer({socketPath:join(f.root,'management.sock'),rest:{enabled:true,port:0},restDispatcher:dispatcher,unixDispatcher:dispatcher});
+  await server.start();
+  const call=async(params)=> {
+   const response=await fetch(`http://127.0.0.1:${server.restAddress.port}/rpc`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({version:1,id:'upload',method:'room.file.send',params:{room_id:f.room.room_id,...params}})});
+   return {status:response.status,value:await response.json()};
+  };
+  const accepted=await call({...input(),data_base64:Buffer.alloc(2*1024*1024,42).toString('base64')});
+  assert.equal(accepted.status,200);assert.equal(accepted.value.result.size,2*1024*1024);
+  const rejected=await call({...input(),data_base64:Buffer.alloc(2*1024*1024+1).toString('base64')});
+  assert.equal(rejected.status,400);assert(rejected.value.error);
+ } finally { if(server) await server.stop(); await f.close(); }
+});
+
+test('shutdown wakes idle event readers and listener failures cannot invalidate acceptance',async()=>{
+ const f=await fixture();try {
+  const waiting=f.service.events(f.room.room_id,{after:0,wait_ms:20000});
+  f.service.beginShutdown();
+  assert.equal((await waiting).records.length,0);
+  const unsubscribe=f.store.subscribeArchive(f.room.room_id,()=>{throw Error('reader failed');});
+  const receipt=await f.service.sendFile(f.room.room_id,input());
+  assert.equal(receipt.state,'archived');
+  assert.equal((await f.store.read(f.room.room_id))[0].file_id,receipt.file_id);
+  unsubscribe();
  }finally{await f.close();}
 });

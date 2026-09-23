@@ -1468,16 +1468,10 @@ export class RoomService {
       const room = await this.store.load(id);
       this.assertPostable(id,room);
       if (!room.rest_roles.includes(request.role)) throw new RoomServiceError('file role is not registered for REST authorship');
-      let after = 0;
-      for (;;) {
-        const page = await this.store.read(id,{after,limit:64});
-        if (!page.length) break;
-        for (const previous of page) {
-          after = previous.seq;
-          if (previous.kind !== 'file' || previous.upload_id !== request.upload_id) continue;
-          if (previous.sha256 !== sha256 || previous.filename !== request.filename || previous.mime !== request.mime || previous.author.role !== request.role) throw new RoomServiceError('upload idempotency conflict');
-          return previous;
-        }
+      const [previous] = await queryStore(this.store, id, {kind:'file',uploadId:request.upload_id,limit:1});
+      if (previous?.kind === 'file') {
+        if (previous.sha256 !== sha256 || previous.filename !== request.filename || previous.mime !== request.mime || previous.author.role !== request.role) throw new RoomServiceError('upload idempotency conflict');
+        return previous;
       }
       return this.store.append(id,{
         version:1,kind:'file',room_id:id,at:this.now(),file_id:generateUlid(),upload_id:request.upload_id,
@@ -2205,6 +2199,7 @@ async function queryStore(
       && (options.after === undefined || record.seq > options.after)
       && (options.messageId === undefined || value.message_id === options.messageId)
       && (options.fileId === undefined || value.file_id === options.fileId)
+      && (options.uploadId === undefined || value.upload_id === options.uploadId)
       && (options.intentRecordId === undefined || value.intent_record_id === options.intentRecordId)
       && (options.recipientIdentity === undefined || value.recipient_identity === options.recipientIdentity)
       && (options.category === undefined || value.category === options.category)

@@ -73,3 +73,32 @@ Reply translation changes transport metadata only. Incoming sentence references 
 The web console projects participant and room-authored messages plus the briefing into Communication. Relay, file, recovery, close, and failure records are excluded from chat and shown in Events; Archive retains the complete ordered record stream, including archived file bytes. Messages appear only after the authoritative history refresh observes them.
 
 Version one polls rather than receiving pushed updates: the room list refreshes every five seconds, while the selected room, participants, and history refresh every two seconds. Polling pauses in a hidden tab, coalesces overlap, and refreshes after confirmed mutations. CLI history remains the fallback when a browser is unavailable.
+
+
+## Operator file uploads and archive events
+
+Authenticated REST and Unix RPC clients can create a room with `activate_empty: true`
+to make its provisioned identity active before participants join. The default remains
+activation on admission. Register a REST role with `room.role.rest.add`, then call
+`room.file.send` with `room_id`, `role`, a UUID `upload_id`, `filename`, `mime`, and
+canonical `data_base64`. Files are limited to 2 MiB decoded; RPC requests to 3 MiB.
+
+The file is authored by the room identity under the registered role. The archive
+stores an `upload_id` instead of inventing native `source_file_id` or wire metadata.
+Its commit also persists relay work for the current active seats. The returned
+`state: "archived"` confirms durable acceptance, not recipient delivery. Repeating
+an upload ID with identical role, bytes and metadata returns the same file; a
+conflicting reuse fails. Persist the upload ID before sending so ambiguous failures
+can be retried safely. No bridge participant is required.
+
+`room.events` accepts `room_id`, the last processed archive sequence as `after`,
+`limit` (1–100, default 50), and `wait_ms` (0–20000, default 20000). It returns ordered
+operator archive `records` and `next_after`; an empty timeout leaves the cursor
+unchanged. An append wakes a waiting call after the archive transaction commits.
+Save the cursor only after processing records, reconnect using it, and deduplicate
+by room and sequence. The archive is durable across restarts; the wake notification
+itself is transient. Responses obey the existing history byte budget.
+
+This is an operator API: events include private archive metadata and file bytes.
+Applications must enforce their own audience rules before projecting events to
+users. Neither endpoint is exposed as a participant command.

@@ -3078,3 +3078,14 @@ test('failed contact refresh cannot evict members, and late deletion after readm
   assert.deepEqual((await f.service.showRoom(ROOM_ID)).seats, readmitted.seats);
   assert.equal((await f.service.showRoom(ROOM_ID)).membership_epoch, readmitted.membership_epoch);
 });
+
+
+test('runtime command readers pause while provisioning and resume after activation', async () => {
+  const f = fixture();
+  await create(f);
+  const packet = f.registry.get(ROOM_ID);
+  assert.equal(await packet.runtimeCommands.shouldPause(), true);
+  const saved = await f.store.load(ROOM_ID);
+  await f.store.save({ ...saved, state: 'active', activated_at: TIMES[1] });
+  assert.equal(await packet.runtimeCommands.shouldPause(), false);
+});

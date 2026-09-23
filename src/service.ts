@@ -380,7 +380,10 @@ export class RoomService {
     const registered = await this.store.load(roomId);
     this.publishedConsumerRevisions.delete(roomId);
     await packet.registerRuntimeCommands?.({
-      shouldPause: async () => (await this.store.load(roomId)).lifecycle_request?.state === 'pending',
+      shouldPause: async () => {
+        const room = await this.store.load(roomId);
+        return room.state === 'provisioning' || room.lifecycle_request?.state === 'pending';
+      },
       consumerCommands: (registered.consumer_commands ?? []).map((definition) => ({
         name: definition.name, description: definition.description,
         input_schema: definition.input_schema as Record<string, JsonValue>,

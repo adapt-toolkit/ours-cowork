@@ -220,29 +220,36 @@ export class IntakePump {
     if (failure !== undefined) throw failure;
   }
 
+  private async shouldPause(roomId: string): Promise<boolean> {
+    // Admission can complete after members have already sent their first update.
+    // Keep that SDK inbox intact until activation permits durable room intake.
+    return (await this.store.load(roomId)).state === 'provisioning'
+      || Boolean(await this.options.shouldPause?.(roomId));
+  }
+
   private async drainAndRelay(roomId: string, packet: RoomPacket): Promise<void> {
     for (;;) {
-      if (await this.options.shouldPause?.(roomId)) break;
+      if (await this.shouldPause(roomId)) break;
       await packet.drainRuntimeCommands?.(
         (item) => this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false)),
       );
-      if (await this.options.shouldPause?.(roomId)) break;
+      if (await this.shouldPause(roomId)) break;
       const messages = await packet.listUnreadMessages(INTAKE_BATCH_SIZE);
       const files = await packet.listUnreadFiles(INTAKE_BATCH_SIZE);
       if (messages.length === 0 && files.length === 0) break;
       for (const item of messages) {
-        if (await this.options.shouldPause?.(roomId)) break;
+        if (await this.shouldPause(roomId)) break;
         await this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false));
         // SDK acknowledgement can dispatch a newly promoted typed command.
         await packet.acknowledgeMessage(item,
           (unexpected) => this.lock(roomId, () => this.processInboxItem(roomId, packet, unexpected, false)));
       }
       for (const item of files) {
-        if (await this.options.shouldPause?.(roomId)) break;
+        if (await this.shouldPause(roomId)) break;
         await this.lock(roomId, () => this.processFileInboxItem(roomId, packet, item));
       }
     }
-    if (await this.options.shouldPause?.(roomId)) return;
+    if (await this.shouldPause(roomId)) return;
     await this.lock(roomId, async () => {
       await this.completeSnapshotIntents(roomId);
       await this.relayPendingUnlocked(roomId, packet);

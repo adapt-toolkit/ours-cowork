@@ -237,7 +237,7 @@ export class TransportServer {
       buffered = Buffer.concat([buffered, chunk]);
       if (buffered.length > MAX_REQUEST_BYTES && buffered.indexOf(0x0a) < 0) {
         rejected = true;
-        socket.end(`${JSON.stringify(errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'))}\n`);
+        socket.end(`${JSON.stringify(errorResponse(null, 'request_too_large', `request exceeds ${MAX_REQUEST_BYTES} bytes`))}\n`);
         return;
       }
       for (;;) {
@@ -247,7 +247,7 @@ export class TransportServer {
         buffered = buffered.subarray(newline + 1);
         if (line.length > MAX_REQUEST_BYTES) {
           rejected = true;
-          socket.end(`${JSON.stringify(errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'))}\n`);
+          socket.end(`${JSON.stringify(errorResponse(null, 'request_too_large', `request exceeds ${MAX_REQUEST_BYTES} bytes`))}\n`);
           return;
         }
         const operation = this.dispatchBytes(this.options.unixDispatcher, line).then((response) => {
@@ -303,14 +303,14 @@ export class TransportServer {
       const declared = request.headers['content-length'];
       if (declared !== undefined && (!/^[0-9]+$/.test(declared) || Number(declared) > MAX_REQUEST_BYTES)) {
         activateResponse();
-        sendJson(response, 413, errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'));
+        sendJson(response, 413, errorResponse(null, 'request_too_large', `request exceeds ${MAX_REQUEST_BYTES} bytes`));
         request.resume();
         return await responseFinished(response);
       }
       const body = await readBody(request, MAX_REQUEST_BYTES);
       if (!body.ok) {
         activateResponse();
-        sendJson(response, 413, errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'));
+        sendJson(response, 413, errorResponse(null, 'request_too_large', `request exceeds ${MAX_REQUEST_BYTES} bytes`));
         return await responseFinished(response);
       }
       activateResponse();

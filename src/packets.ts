@@ -444,11 +444,12 @@ export class SdkRoomPacket implements RoomPacket {
   }
 
   private async refreshUnlocked(): Promise<void> {
-    await this.refreshContactsUnlocked();
-    this.invites = (await this.client.listInvites()).flatMap((invite) =>
+    const invites: typeof this.invites = (await this.client.listInvites()).flatMap((invite) =>
       invite.mode === 'one_time' || invite.mode === 'public'
         ? [{ invite_id: invite.invite_id, mode: invite.mode }]
         : []);
+    await this.refreshContactsUnlocked();
+    this.invites = invites;
   }
 
   refreshContacts(): Promise<void> {
@@ -473,6 +474,7 @@ export class SdkRoomPacket implements RoomPacket {
 
   async mintInvite(mode: InviteMode): Promise<{ blob: string; invite_id: string; reusable: boolean }> {
     const result = await this.runBound(() => this.client.generateInvite({ mode }));
+    if (this.refreshWork) await this.refreshWork;
     await this.refresh();
     return { blob: result.blob, invite_id: result.inviteId, reusable: mode === 'public' };
   }

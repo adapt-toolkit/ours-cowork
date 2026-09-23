@@ -107,6 +107,18 @@ export class CoworkStore {
   private readonly beforeRecordCommit?: () => void;
   private readonly roomMutexes = new Map<string, RoomQueue>();
   private readonly lockOwnership = new AsyncLocalStorage<ReadonlyMap<string, LockOwnership>>();
+  private readonly archiveWaiters = new Map<string, Set<() => void>>();
+
+  subscribeArchive(roomId: string, wake: () => void): () => void {
+    const id = this.roomId(roomId);
+    const waiting = this.archiveWaiters.get(id) ?? new Set<() => void>();
+    if (waiting.size >= 100 || (!this.archiveWaiters.has(id) && this.archiveWaiters.size >= 1024)) throw new CoworkStorageError("too many event subscribers");
+    waiting.add(wake); this.archiveWaiters.set(id, waiting);
+    return () => { waiting.delete(wake); if (!waiting.size) this.archiveWaiters.delete(id); };
+  }
+
+  wakeArchiveReaders(): void { for (const waiting of this.archiveWaiters.values()) for (const wake of waiting) { try { wake(); } catch { /* Readers cannot invalidate a durable commit. */ } } }
+
   private readonly reconciledBlobRooms = new Set<string>();
 
   constructor(stateDir: string, options: CoworkStoreOptions = {}) {
@@ -269,7 +281,9 @@ export class CoworkStore {
             this.beforeRecordCommit?.();
             return record;
           });
-          return transaction.immediate();
+          const committed = transaction.immediate();
+          for (const wake of this.archiveWaiters.get(id) ?? []) { try { wake(); } catch { /* Readers cannot invalidate a durable commit. */ } }
+          return committed;
         });
       } catch (error) {
         if (blob?.created) this.removeUnreferencedBlob(id, blob.path);

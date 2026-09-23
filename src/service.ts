@@ -9,6 +9,7 @@ import {
   ContainerIdSchema,
   roomIdentityName,
   CreateRoomInputSchema,
+  FileNameSchema, FileMimeSchema, MAX_FILE_BYTES,
   DEFAULT_ROLE,
   defaultRoomName,
   InviteModeSchema,
@@ -119,7 +120,7 @@ const RemoveParticipantInputSchema = z.object({
 
 type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | 'append' | 'read' | 'delete'>
   & Pick<CoworkStore, 'discardPendingProvisioning'>
-  & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'briefingDeliveryTimes'>>;
+  & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'briefingDeliveryTimes' | 'subscribeArchive' | 'wakeArchiveReaders'>>;
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 type CloseNoticeIntentRecord = Extract<CommunicationRecord, { kind: 'close_notice_intent' }>;
 
@@ -197,6 +198,7 @@ export class RoomService {
   private readonly nextMessageId: () => string;
   private readonly intake: IntakePump;
   private readonly provisioningCheckpoint: NonNullable<RoomServiceOptions['provisioningCheckpoint']>;
+  private eventsStopping = false;
   private readonly identityNameTails = new Map<string, Promise<void>>();
 
   constructor(store: Store, packets: RoomPacketRegistry, options: RoomServiceOptions = {}) {
@@ -268,7 +270,7 @@ export class RoomService {
       }
       this.provisioningCheckpoint('metadata');
       const { status: _packetPending, ...created } = provisional;
-      const room = await this.store.save(RoomSchema.parse({ ...created, identity_cid: packet.cid }));
+      const room = await this.store.save(RoomSchema.parse({ ...created, identity_cid: packet.cid, ...(settings.activate_empty ? {state:'active',activated_at:this.now()} : {}) }));
       await this.registerRuntimeCommands(roomId, packet);
       return room;
     }));
@@ -1197,6 +1199,8 @@ export class RoomService {
   }
 
   beginShutdown(): void {
+    this.eventsStopping = true;
+    this.store.wakeArchiveReaders?.();
     this.intake.beginShutdown();
   }
 
@@ -1430,6 +1434,63 @@ export class RoomService {
       }
       return projectParticipantHistory(room, records, viewerCid, request);
     });
+  }
+
+  /** Authenticated operator long-poll. Subscribe before reading to avoid lost wakes.
+   * Cursor is durable archive sequence; delivery can repeat and consumers deduplicate. */
+  async events(roomId: string, input: unknown) {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const options = z.object({after:z.number().int().nonnegative().safe(),limit:z.number().int().min(1).max(100).default(50),wait_ms:z.number().int().min(0).max(20000).default(20000)}).strict().parse(input);
+    let wake!: () => void;
+    const changed = new Promise<void>(resolve => { wake = resolve; });
+    const unsubscribe = this.store.subscribeArchive?.(id, wake);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      let records = await this.history(id, {after:options.after,limit:options.limit,view:'operator'});
+      if (!records.length && options.wait_ms > 0 && !this.eventsStopping) {
+        timer = setTimeout(wake, options.wait_ms);
+        await changed;
+        records = await this.history(id, {after:options.after,limit:options.limit,view:'operator'});
+      }
+      return {room_id:id,records,next_after:records.length ? records[records.length-1]!.seq : options.after};
+    } finally { if (timer) clearTimeout(timer); unsubscribe?.(); }
+  }
+
+  /** Archive and enqueue a room-authored file without an infrastructure seat.
+   * upload_id is an idempotency key scoped to this room, never a native wire ID. */
+  async sendFile(roomId: string, input: unknown) {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = z.object({upload_id:z.string().uuid(),role:RoleSchema,filename:FileNameSchema,mime:FileMimeSchema,data_base64:z.string().max(4*Math.ceil(MAX_FILE_BYTES/3))}).strict().parse(input);
+    const bytes = Buffer.from(request.data_base64,'base64');
+    if (bytes.toString('base64') !== request.data_base64 || bytes.length > MAX_FILE_BYTES) throw new RoomServiceError('invalid file bytes');
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    const record = await this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertPostable(id,room);
+      if (!room.rest_roles.includes(request.role)) throw new RoomServiceError('file role is not registered for REST authorship');
+      let after = 0;
+      for (;;) {
+        const page = await this.store.read(id,{after,limit:64});
+        if (!page.length) break;
+        for (const previous of page) {
+          after = previous.seq;
+          if (previous.kind !== 'file' || previous.upload_id !== request.upload_id) continue;
+          if (previous.sha256 !== sha256 || previous.filename !== request.filename || previous.mime !== request.mime || previous.author.role !== request.role) throw new RoomServiceError('upload idempotency conflict');
+          return previous;
+        }
+      }
+      return this.store.append(id,{
+        version:1,kind:'file',room_id:id,at:this.now(),file_id:generateUlid(),upload_id:request.upload_id,
+        author:{identity:room.identity_cid,display_name:request.role,role:request.role},
+        filename:request.filename,mime:request.mime,size:bytes.length,sha256,data_base64:request.data_base64,
+        recipient_identities:uniqueIdentities(activeSeats(room).map(seat=>seat.identity)),
+      });
+    });
+    // The archive commit already includes durable relay work; a later pump can
+    // resume it. A failed delivery must not invalidate the accepted upload.
+    void this.intake.resumePending(id).catch(() => {});
+    if (record.kind !== 'file') throw new RoomServiceError('unexpected upload record');
+    return {room_id:id,file_id:record.file_id,upload_id:request.upload_id,seq:record.seq,filename:record.filename,mime:record.mime,size:record.size,sha256:record.sha256,state:'archived' as const};
   }
 
   async history(

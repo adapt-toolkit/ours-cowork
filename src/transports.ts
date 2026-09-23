@@ -11,7 +11,7 @@ import { apiDocsAsset } from './openapi.ts';
 export { createServiceRoutes, createPrivateServiceRoutes, type RoomServiceApi } from './command-routes.ts';
 import { CONTENT_SECURITY_POLICY, createStaticWebHandler, safePathname, type StaticWebHandler } from './web.ts';
 
-export const MAX_REQUEST_BYTES = 1024 * 1024;
+export const MAX_REQUEST_BYTES = 3 * 1024 * 1024; // 2 MiB file encoded as base64 plus bounded metadata.
 export const HTTP_HEADERS_TIMEOUT_MS = 5_000;
 export const HTTP_REQUEST_TIMEOUT_MS = 10_000;
 export const HTTP_BODY_IDLE_TIMEOUT_MS = 5_000;

@@ -720,8 +720,8 @@ test('real daemon start, status, and stop use the management control session', {
       response.writeHead(status, { 'content-type': 'application/json' });
       response.end(JSON.stringify(body));
     };
-    if (request.method === 'GET' && request.url === '/state-dir') {
-      send(200, { stateDir: sharedStateDir, version: '2.0.1', compat: 1 });
+    if (request.method === 'GET' && request.url === '/selection') {
+      send(200, { schema: 1, instanceId: '11111111-1111-4111-8111-111111111111', capabilities: ['external-sessions-v1'] });
       return;
     }
     if (request.method === 'POST' && request.url === '/api/v1/releaseLease'
@@ -745,8 +745,9 @@ test('real daemon start, status, and stop use the management control session', {
   }), { mode: 0o600 });
   const env = {
     OURS_COWORK_CONFIG: configPath,
-    OURS_PORT: String(address.port),
-    OURS_STATE_DIR: sharedStateDir,
+    OURS_DAEMON_URL: `http://127.0.0.1:${address.port}`,
+    OURS_DAEMON_ID: '11111111-1111-4111-8111-111111111111',
+    OURS_DAEMON_CREDENTIAL_PATH: join(sharedStateDir, 'daemon-token'),
   };
   t.after(async () => {
     const pidPath = join(stateDir, 'daemon.pid');

@@ -24,7 +24,7 @@ function sharedDaemonEnvironment(configPath) {
     'OURS_CONFIG', 'OURS_PORT', 'OURS_STATE_DIR', 'OURS_API_TOKEN',
     'OURS_BROKER_URL', 'OURS_API_VISIBILITY', 'OURS_GC_INTERVAL_MS',
   ]) delete env[key];
-  return { ...env, OURS_CONFIG: configPath };
+  return { ...env, OURS_CONFIG: configPath, OURS_DAEMON_ID: '11111111-1111-4111-8111-111111111111' };
 }
 
 async function unusedPort() {
@@ -80,6 +80,7 @@ if (process.argv.includes('--e2e-driver')) {
     let oursProxy;
     let consumerServer;
     let oursEnv;
+    let oursSelection;
     let coworkEnv;
     let observer;
     const peerClients = [];
@@ -200,7 +201,7 @@ if (process.argv.includes('--e2e-driver')) {
 
     async function createPeer(attachOursClient, name) {
       const client = await attachOursClient({
-        env: oursEnv,
+        ...oursSelection,
         leaseToken: `cowork-e2e-${name.toLowerCase()}`,
       });
       const created = await client.createIdentity({
@@ -290,6 +291,10 @@ if (process.argv.includes('--e2e-driver')) {
       oursEnv = sharedDaemonEnvironment(oursConfigPath);
       await runOurs(['daemon', 'start']);
       await waitForPort(oursPort);
+      oursSelection = {
+        endpoint: `http://127.0.0.1:${oursPort}`, expectedInstanceId: oursEnv.OURS_DAEMON_ID,
+        credentialPath: join(oursStateDir, 'daemon-token'), sessionMode: 'external', env: {},
+      };
 
       // Cowork alone talks through this transparent local proxy. One armed
       // removeContact response can be lost after the real daemon commits it,
@@ -337,7 +342,7 @@ if (process.argv.includes('--e2e-driver')) {
       });
 
       const { attachOursClient } = await import('@ours.network/sdk');
-      observer = await attachOursClient({ env: oursEnv, leaseToken: 'cowork-e2e-observer' });
+      observer = await attachOursClient({ ...oursSelection, leaseToken: 'cowork-e2e-observer' });
       await observer.createRootIdentity({ name: 'Cowork Human', bio: '', exposeLocal: false });
       const [alice, bob, charlie, successor] = await Promise.all([
         createPeer(attachOursClient, 'Alice'),
@@ -392,6 +397,8 @@ if (process.argv.includes('--e2e-driver')) {
       coworkEnv = {
         ...sharedDaemonEnvironment(coworkOursConfigPath),
         OURS_COWORK_CONFIG: configPath,
+        OURS_DAEMON_URL: `http://127.0.0.1:${oursProxyPort}`,
+        OURS_DAEMON_CREDENTIAL_PATH: join(oursStateDir, 'daemon-token'),
       };
 
       await runCli(['start']);

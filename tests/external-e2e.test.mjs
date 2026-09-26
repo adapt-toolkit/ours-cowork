@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -21,7 +21,7 @@ function sharedDaemonEnvironment(configPath) {
     'OURS_CONFIG', 'OURS_PORT', 'OURS_STATE_DIR', 'OURS_API_TOKEN',
     'OURS_BROKER_URL', 'OURS_API_VISIBILITY', 'OURS_GC_INTERVAL_MS',
   ]) delete env[key];
-  return { ...env, OURS_CONFIG: configPath };
+  return { ...env, OURS_CONFIG: configPath, OURS_DAEMON_ID: '11111111-1111-4111-8111-111111111111' };
 }
 
 async function unusedPort() {
@@ -212,7 +212,11 @@ if (process.argv.includes('--external-driver')) {
       await runOurs(['daemon', 'start']);
       await waitForPort(oursPort);
       const { attachOursClient } = await import('@ours.network/sdk');
-      observer = await attachOursClient({ env: oursEnv, leaseToken: 'cowork-external-observer' });
+      observer = await attachOursClient({
+        endpoint: `http://127.0.0.1:${oursPort}`, expectedInstanceId: oursEnv.OURS_DAEMON_ID,
+        credentialPath: join(daemonStateDir, 'daemon-token'), sessionMode: 'external', env: {},
+        leaseToken: 'cowork-external-observer',
+      });
       await observer.createRootIdentity({ name: 'External Human', bio: '', exposeLocal: false });
       assert.equal(resolve((await observer.stateDir()).stateDir), resolve(daemonStateDir));
       stage('shared-daemon-ready');
@@ -223,7 +227,7 @@ if (process.argv.includes('--external-driver')) {
         stateDir: join(stateDir, 'cowork'),
         rest: { enabled: false, port: 3052 },
       }), { mode: 0o600 });
-      coworkEnv = { ...oursEnv, OURS_COWORK_CONFIG: configPath };
+      coworkEnv = { ...oursEnv, OURS_COWORK_CONFIG: configPath, OURS_DAEMON_URL: `http://127.0.0.1:${oursPort}`, OURS_DAEMON_CREDENTIAL_PATH: join(daemonStateDir, 'daemon-token') };
 
       await runCli(['start']);
       await waitFor(async () => (await runCli(['status'])).running === true, 'external-mode daemon status');
@@ -293,7 +297,7 @@ if (process.argv.includes('--external-driver')) {
         apiVisibility: 'owner',
       }), { mode: 0o600 });
       const deadEnv = coworkEnv;
-      coworkEnv = { ...deadEnv, OURS_COWORK_CONFIG: deadConfig, OURS_CONFIG: deadOursConfig };
+      coworkEnv = { ...deadEnv, OURS_COWORK_CONFIG: deadConfig, OURS_CONFIG: deadOursConfig, OURS_DAEMON_URL: `http://127.0.0.1:${JSON.parse(readFileSync(deadOursConfig, 'utf8')).port}` };
       await runCli(['start'], 45_000, 'internal');
       const stopped = await runCli(['status'], 20_000, 'daemon_unavailable');
       assert.equal(stopped.code, 'daemon_unavailable');

@@ -222,11 +222,14 @@ if (process.argv.includes('--e2e-driver')) {
       for (const client of peerClients) {
         try { await client.releaseLease(); }
         catch (error) { cleanupErrors.push(new Error(`release peer lease: ${error.message}`)); }
+        finally { await client.close(); }
       }
       try { await observer?.releaseLease(); }
       catch (error) { cleanupErrors.push(new Error(`release observer lease: ${error.message}`)); }
+      finally { await observer?.close(); }
       if (oursProxy) {
         try {
+          oursProxy.closeAllConnections();
           await new Promise((resolveClose, reject) => oursProxy.close((error) =>
             error ? reject(error) : resolveClose()));
         } catch (error) { cleanupErrors.push(new Error(`close ours fault proxy: ${error.message}`)); }

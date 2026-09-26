@@ -1,6 +1,7 @@
+import { startProcess, stopProcess } from './fixtures/v1-runtime.mjs';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -21,7 +22,7 @@ function sharedDaemonEnvironment(configPath) {
     'OURS_CONFIG', 'OURS_PORT', 'OURS_STATE_DIR', 'OURS_API_TOKEN',
     'OURS_BROKER_URL', 'OURS_API_VISIBILITY', 'OURS_GC_INTERVAL_MS',
   ]) delete env[key];
-  return { ...env, OURS_CONFIG: configPath };
+  return { ...env, OURS_CONFIG: configPath, OURS_DAEMON_ID: '11111111-1111-4111-8111-111111111111' };
 }
 
 async function unusedPort() {
@@ -68,6 +69,7 @@ if (process.argv.includes('--external-driver')) {
     let broker;
     let brokerExit;
     let oursEnv;
+    let daemon;
     let observer;
     let coworkEnv;
     let completed = false;
@@ -111,44 +113,7 @@ if (process.argv.includes('--external-driver')) {
       return body.result;
     }
 
-    async function runOurs(args, timeoutMs = 35_000) {
-      const child = spawn(process.execPath, [
-        OURS_CLI,
-        ...args,
-        '--config', oursEnv.OURS_CONFIG,
-        '--json',
-      ], {
-        cwd: ROOT,
-        env: oursEnv,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let stdout = '';
-      let stderr = '';
-      child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
-      child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
-      let timer;
-      const result = await Promise.race([
-        new Promise((exit) => {
-          child.once('error', (error) => exit({ error }));
-          child.once('exit', (code, signal) => exit({ code, signal }));
-        }),
-        new Promise((late) => { timer = setTimeout(() => late({ timeout: true }), timeoutMs); }),
-      ]);
-      clearTimeout(timer);
-      if (result.timeout) {
-        child.kill('SIGKILL');
-        await new Promise((exit) => child.once('exit', exit));
-        throw new Error(`ours CLI timed out: ${args.join(' ')}`);
-      }
-      if (result.error) throw result.error;
-      if (result.code !== 0) {
-        throw new Error(`ours CLI failed (${args.join(' ')}): exit=${result.code} ${stdout}\n${stderr}`);
-      }
-      let body;
-      try { body = JSON.parse(stdout); }
-      catch { throw new Error(`ours CLI returned invalid JSON (${args.join(' ')}): ${stdout}\n${stderr}`); }
-      return body;
-    }
+
 
     t.after(async () => {
       if (coworkEnv) {
@@ -157,8 +122,11 @@ if (process.argv.includes('--external-driver')) {
       }
       try { await observer?.releaseLease(); }
       catch (error) { cleanupErrors.push(new Error(`release observer lease: ${error.message}`)); }
-      if (oursEnv) {
-        try { await runOurs(['daemon', 'stop'], 20_000); }
+      if (daemon) {
+        try {
+          await stopProcess(daemon);
+          assert.equal((await daemon.exited).code, 0, 'fixture daemon must exit cleanly');
+        }
         catch (error) { cleanupErrors.push(new Error(`stop shared ours daemon: ${error.message}`)); }
       }
       if (broker) {
@@ -209,10 +177,15 @@ if (process.argv.includes('--external-driver')) {
         apiVisibility: 'owner',
       }), { mode: 0o600 });
       oursEnv = sharedDaemonEnvironment(oursConfigPath);
-      await runOurs(['daemon', 'start']);
+      // Own the fixture process directly, including its bounded graceful shutdown.
+      daemon = startProcess([OURS_CLI, 'daemon', 'serve', '--config', oursConfigPath], oursEnv, ROOT);
       await waitForPort(oursPort);
       const { attachOursClient } = await import('@ours.network/sdk');
-      observer = await attachOursClient({ env: oursEnv, leaseToken: 'cowork-external-observer' });
+      observer = await attachOursClient({
+        endpoint: `http://127.0.0.1:${oursPort}`, expectedInstanceId: oursEnv.OURS_DAEMON_ID,
+        credentialPath: join(daemonStateDir, 'daemon-token'), sessionMode: 'external', env: {},
+        leaseToken: 'cowork-external-observer',
+      });
       await observer.createRootIdentity({ name: 'External Human', bio: '', exposeLocal: false });
       assert.equal(resolve((await observer.stateDir()).stateDir), resolve(daemonStateDir));
       stage('shared-daemon-ready');
@@ -223,7 +196,7 @@ if (process.argv.includes('--external-driver')) {
         stateDir: join(stateDir, 'cowork'),
         rest: { enabled: false, port: 3052 },
       }), { mode: 0o600 });
-      coworkEnv = { ...oursEnv, OURS_COWORK_CONFIG: configPath };
+      coworkEnv = { ...oursEnv, OURS_COWORK_CONFIG: configPath, OURS_DAEMON_URL: `http://127.0.0.1:${oursPort}`, OURS_DAEMON_CREDENTIAL_PATH: join(daemonStateDir, 'daemon-token') };
 
       await runCli(['start']);
       await waitFor(async () => (await runCli(['status'])).running === true, 'external-mode daemon status');
@@ -293,7 +266,7 @@ if (process.argv.includes('--external-driver')) {
         apiVisibility: 'owner',
       }), { mode: 0o600 });
       const deadEnv = coworkEnv;
-      coworkEnv = { ...deadEnv, OURS_COWORK_CONFIG: deadConfig, OURS_CONFIG: deadOursConfig };
+      coworkEnv = { ...deadEnv, OURS_COWORK_CONFIG: deadConfig, OURS_CONFIG: deadOursConfig, OURS_DAEMON_URL: `http://127.0.0.1:${JSON.parse(readFileSync(deadOursConfig, 'utf8')).port}` };
       await runCli(['start'], 45_000, 'internal');
       const stopped = await runCli(['status'], 20_000, 'daemon_unavailable');
       assert.equal(stopped.code, 'daemon_unavailable');

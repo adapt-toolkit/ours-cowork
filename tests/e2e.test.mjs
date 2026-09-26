@@ -1,3 +1,4 @@
+import { startProcess, stopProcess } from './fixtures/v1-runtime.mjs';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -24,7 +25,7 @@ function sharedDaemonEnvironment(configPath) {
     'OURS_CONFIG', 'OURS_PORT', 'OURS_STATE_DIR', 'OURS_API_TOKEN',
     'OURS_BROKER_URL', 'OURS_API_VISIBILITY', 'OURS_GC_INTERVAL_MS',
   ]) delete env[key];
-  return { ...env, OURS_CONFIG: configPath };
+  return { ...env, OURS_CONFIG: configPath, OURS_DAEMON_ID: '11111111-1111-4111-8111-111111111111' };
 }
 
 async function unusedPort() {
@@ -80,6 +81,8 @@ if (process.argv.includes('--e2e-driver')) {
     let oursProxy;
     let consumerServer;
     let oursEnv;
+    let daemon;
+    let oursSelection;
     let coworkEnv;
     let observer;
     const peerClients = [];
@@ -124,44 +127,7 @@ if (process.argv.includes('--e2e-driver')) {
       return body.result;
     }
 
-    async function runOurs(args, timeoutMs = 35_000) {
-      const child = spawn(process.execPath, [
-        OURS_CLI,
-        ...args,
-        '--config', oursEnv.OURS_CONFIG,
-        '--json',
-      ], {
-        cwd: ROOT,
-        env: oursEnv,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let stdout = '';
-      let stderr = '';
-      child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
-      child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
-      let timer;
-      const result = await Promise.race([
-        new Promise((resolveExit) => {
-          child.once('error', (error) => resolveExit({ error }));
-          child.once('exit', (code, signal) => resolveExit({ code, signal }));
-        }),
-        new Promise((resolveTimeout) => { timer = setTimeout(() => resolveTimeout({ timeout: true }), timeoutMs); }),
-      ]);
-      clearTimeout(timer);
-      if (result.timeout) {
-        child.kill('SIGKILL');
-        await new Promise((resolveExit) => child.once('exit', resolveExit));
-        throw new Error(`ours CLI timed out: ${args.join(' ')}`);
-      }
-      if (result.error) throw result.error;
-      if (result.code !== 0) {
-        throw new Error(`ours CLI failed (${args.join(' ')}): exit=${result.code} ${stdout}\n${stderr}`);
-      }
-      let body;
-      try { body = JSON.parse(stdout); }
-      catch { throw new Error(`ours CLI returned invalid JSON (${args.join(' ')}): ${stdout}\n${stderr}`); }
-      return body;
-    }
+
 
     async function restartCoworkAfterFullExit() {
       await runCli(['stop']);
@@ -200,7 +166,7 @@ if (process.argv.includes('--e2e-driver')) {
 
     async function createPeer(attachOursClient, name) {
       const client = await attachOursClient({
-        env: oursEnv,
+        ...oursSelection,
         leaseToken: `cowork-e2e-${name.toLowerCase()}`,
       });
       const created = await client.createIdentity({
@@ -221,11 +187,14 @@ if (process.argv.includes('--e2e-driver')) {
       for (const client of peerClients) {
         try { await client.releaseLease(); }
         catch (error) { cleanupErrors.push(new Error(`release peer lease: ${error.message}`)); }
+        finally { await client.close(); }
       }
       try { await observer?.releaseLease(); }
       catch (error) { cleanupErrors.push(new Error(`release observer lease: ${error.message}`)); }
+      finally { await observer?.close(); }
       if (oursProxy) {
         try {
+          oursProxy.closeAllConnections();
           await new Promise((resolveClose, reject) => oursProxy.close((error) =>
             error ? reject(error) : resolveClose()));
         } catch (error) { cleanupErrors.push(new Error(`close ours fault proxy: ${error.message}`)); }
@@ -234,8 +203,11 @@ if (process.argv.includes('--e2e-driver')) {
         consumerServer.closeAllConnections();
         await new Promise((done) => consumerServer.close(done));
       }
-      if (oursEnv) {
-        try { await runOurs(['daemon', 'stop'], 20_000); }
+      if (daemon) {
+        try {
+          await stopProcess(daemon);
+          assert.equal((await daemon.exited).code, 0, 'fixture daemon must exit cleanly');
+        }
         catch (error) { cleanupErrors.push(new Error(`stop shared ours daemon: ${error.message}`)); }
       }
       if (broker) {
@@ -288,8 +260,13 @@ if (process.argv.includes('--e2e-driver')) {
         apiVisibility: 'owner',
       }), { mode: 0o600 });
       oursEnv = sharedDaemonEnvironment(oursConfigPath);
-      await runOurs(['daemon', 'start']);
+      // Own the fixture process directly, including its bounded graceful shutdown.
+      daemon = startProcess([OURS_CLI, 'daemon', 'serve', '--config', oursConfigPath], oursEnv, ROOT);
       await waitForPort(oursPort);
+      oursSelection = {
+        endpoint: `http://127.0.0.1:${oursPort}`, expectedInstanceId: oursEnv.OURS_DAEMON_ID,
+        credentialPath: join(oursStateDir, 'daemon-token'), sessionMode: 'external', env: {},
+      };
 
       // Cowork alone talks through this transparent local proxy. One armed
       // removeContact response can be lost after the real daemon commits it,
@@ -337,7 +314,7 @@ if (process.argv.includes('--e2e-driver')) {
       });
 
       const { attachOursClient } = await import('@ours.network/sdk');
-      observer = await attachOursClient({ env: oursEnv, leaseToken: 'cowork-e2e-observer' });
+      observer = await attachOursClient({ ...oursSelection, leaseToken: 'cowork-e2e-observer' });
       await observer.createRootIdentity({ name: 'Cowork Human', bio: '', exposeLocal: false });
       const [alice, bob, charlie, successor] = await Promise.all([
         createPeer(attachOursClient, 'Alice'),
@@ -392,6 +369,8 @@ if (process.argv.includes('--e2e-driver')) {
       coworkEnv = {
         ...sharedDaemonEnvironment(coworkOursConfigPath),
         OURS_COWORK_CONFIG: configPath,
+        OURS_DAEMON_URL: `http://127.0.0.1:${oursProxyPort}`,
+        OURS_DAEMON_CREDENTIAL_PATH: join(oursStateDir, 'daemon-token'),
       };
 
       await runCli(['start']);

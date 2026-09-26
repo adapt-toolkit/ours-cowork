@@ -1,3 +1,4 @@
+import { startProcess, stopProcess } from './fixtures/v1-runtime.mjs';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -80,6 +81,7 @@ if (process.argv.includes('--e2e-driver')) {
     let oursProxy;
     let consumerServer;
     let oursEnv;
+    let daemon;
     let oursSelection;
     let coworkEnv;
     let observer;
@@ -125,44 +127,7 @@ if (process.argv.includes('--e2e-driver')) {
       return body.result;
     }
 
-    async function runOurs(args, timeoutMs = 35_000) {
-      const child = spawn(process.execPath, [
-        OURS_CLI,
-        ...args,
-        '--config', oursEnv.OURS_CONFIG,
-        '--json',
-      ], {
-        cwd: ROOT,
-        env: oursEnv,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let stdout = '';
-      let stderr = '';
-      child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
-      child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
-      let timer;
-      const result = await Promise.race([
-        new Promise((resolveExit) => {
-          child.once('error', (error) => resolveExit({ error }));
-          child.once('exit', (code, signal) => resolveExit({ code, signal }));
-        }),
-        new Promise((resolveTimeout) => { timer = setTimeout(() => resolveTimeout({ timeout: true }), timeoutMs); }),
-      ]);
-      clearTimeout(timer);
-      if (result.timeout) {
-        child.kill('SIGKILL');
-        await new Promise((resolveExit) => child.once('exit', resolveExit));
-        throw new Error(`ours CLI timed out: ${args.join(' ')}`);
-      }
-      if (result.error) throw result.error;
-      if (result.code !== 0) {
-        throw new Error(`ours CLI failed (${args.join(' ')}): exit=${result.code} ${stdout}\n${stderr}`);
-      }
-      let body;
-      try { body = JSON.parse(stdout); }
-      catch { throw new Error(`ours CLI returned invalid JSON (${args.join(' ')}): ${stdout}\n${stderr}`); }
-      return body;
-    }
+
 
     async function restartCoworkAfterFullExit() {
       await runCli(['stop']);
@@ -238,8 +203,11 @@ if (process.argv.includes('--e2e-driver')) {
         consumerServer.closeAllConnections();
         await new Promise((done) => consumerServer.close(done));
       }
-      if (oursEnv) {
-        try { await runOurs(['daemon', 'stop'], 20_000); }
+      if (daemon) {
+        try {
+          await stopProcess(daemon);
+          assert.equal((await daemon.exited).code, 0, 'fixture daemon must exit cleanly');
+        }
         catch (error) { cleanupErrors.push(new Error(`stop shared ours daemon: ${error.message}`)); }
       }
       if (broker) {
@@ -292,7 +260,8 @@ if (process.argv.includes('--e2e-driver')) {
         apiVisibility: 'owner',
       }), { mode: 0o600 });
       oursEnv = sharedDaemonEnvironment(oursConfigPath);
-      await runOurs(['daemon', 'start']);
+      // Own the fixture process directly, including its bounded graceful shutdown.
+      daemon = startProcess([OURS_CLI, 'daemon', 'serve', '--config', oursConfigPath], oursEnv, ROOT);
       await waitForPort(oursPort);
       oursSelection = {
         endpoint: `http://127.0.0.1:${oursPort}`, expectedInstanceId: oursEnv.OURS_DAEMON_ID,

@@ -1,3 +1,4 @@
+import { startProcess, stopProcess } from './fixtures/v1-runtime.mjs';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -68,6 +69,7 @@ if (process.argv.includes('--external-driver')) {
     let broker;
     let brokerExit;
     let oursEnv;
+    let daemon;
     let observer;
     let coworkEnv;
     let completed = false;
@@ -111,44 +113,7 @@ if (process.argv.includes('--external-driver')) {
       return body.result;
     }
 
-    async function runOurs(args, timeoutMs = 35_000) {
-      const child = spawn(process.execPath, [
-        OURS_CLI,
-        ...args,
-        '--config', oursEnv.OURS_CONFIG,
-        '--json',
-      ], {
-        cwd: ROOT,
-        env: oursEnv,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let stdout = '';
-      let stderr = '';
-      child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
-      child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
-      let timer;
-      const result = await Promise.race([
-        new Promise((exit) => {
-          child.once('error', (error) => exit({ error }));
-          child.once('exit', (code, signal) => exit({ code, signal }));
-        }),
-        new Promise((late) => { timer = setTimeout(() => late({ timeout: true }), timeoutMs); }),
-      ]);
-      clearTimeout(timer);
-      if (result.timeout) {
-        child.kill('SIGKILL');
-        await new Promise((exit) => child.once('exit', exit));
-        throw new Error(`ours CLI timed out: ${args.join(' ')}`);
-      }
-      if (result.error) throw result.error;
-      if (result.code !== 0) {
-        throw new Error(`ours CLI failed (${args.join(' ')}): exit=${result.code} ${stdout}\n${stderr}`);
-      }
-      let body;
-      try { body = JSON.parse(stdout); }
-      catch { throw new Error(`ours CLI returned invalid JSON (${args.join(' ')}): ${stdout}\n${stderr}`); }
-      return body;
-    }
+
 
     t.after(async () => {
       if (coworkEnv) {
@@ -157,8 +122,11 @@ if (process.argv.includes('--external-driver')) {
       }
       try { await observer?.releaseLease(); }
       catch (error) { cleanupErrors.push(new Error(`release observer lease: ${error.message}`)); }
-      if (oursEnv) {
-        try { await runOurs(['daemon', 'stop'], 20_000); }
+      if (daemon) {
+        try {
+          await stopProcess(daemon);
+          assert.equal((await daemon.exited).code, 0, 'fixture daemon must exit cleanly');
+        }
         catch (error) { cleanupErrors.push(new Error(`stop shared ours daemon: ${error.message}`)); }
       }
       if (broker) {
@@ -209,7 +177,8 @@ if (process.argv.includes('--external-driver')) {
         apiVisibility: 'owner',
       }), { mode: 0o600 });
       oursEnv = sharedDaemonEnvironment(oursConfigPath);
-      await runOurs(['daemon', 'start']);
+      // Own the fixture process directly, including its bounded graceful shutdown.
+      daemon = startProcess([OURS_CLI, 'daemon', 'serve', '--config', oursConfigPath], oursEnv, ROOT);
       await waitForPort(oursPort);
       const { attachOursClient } = await import('@ours.network/sdk');
       observer = await attachOursClient({

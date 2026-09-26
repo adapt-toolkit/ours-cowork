@@ -1,3 +1,4 @@
+import { startProcess, stopProcess } from './fixtures/v1-runtime.mjs';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -28,8 +29,12 @@ function isolatedEnvironment(configPath) {
   for (const key of Object.keys(env)) {
     if (key === 'OURS_CONFIG' || key.startsWith('OURS_')) delete env[key];
   }
+  return { ...env, OURS_CONFIG: configPath };
+}
+
+function daemonEnvironment(configPath) {
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
-  return { ...env, OURS_CONFIG: configPath,
+  return { ...isolatedEnvironment(configPath),
     OURS_DAEMON_ID: '33333333-3333-4333-8333-333333333333',
     OURS_DAEMON_URL: `http://127.0.0.1:${config.port}`,
     OURS_DAEMON_CREDENTIAL_PATH: join(config.stateDir, 'daemon-token'),
@@ -115,6 +120,7 @@ if (process.argv.includes('--reply-relay-driver')) {
     let broker;
     let brokerExit;
     let oursEnv;
+    let daemon;
     let oursSelection;
     let coworkEnv;
     let completed = false;
@@ -174,9 +180,6 @@ if (process.argv.includes('--reply-relay-driver')) {
       catch { throw new Error(`CLI returned invalid JSON (${args.join(' ')}):\n${stdout}\n${stderr}`); }
     }
 
-    async function runOurs(args, timeoutMs = 35_000) {
-      return runJson(OURS_CLI, [...args, '--config', oursEnv.OURS_CONFIG, '--json'], oursEnv, timeoutMs);
-    }
 
     async function runCowork(args, timeoutMs = 35_000) {
       const body = await runJson(COWORK_CLI, ['--json', ...args], coworkEnv, timeoutMs);
@@ -237,7 +240,7 @@ if (process.argv.includes('--reply-relay-driver')) {
       assert(existsSync(messengerCli), `Messenger CLI is missing: ${messengerCli}`);
       await release(peer);
       const port = await unusedPort();
-      const messengerEnv = isolatedEnvironment(oursEnv.OURS_CONFIG);
+      const messengerEnv = daemonEnvironment(oursEnv.OURS_CONFIG);
       Object.assign(messengerEnv, {
         OURS_MESSENGER_IDENTITY: peer.name,
         OURS_MESSENGER_FORCE: 'false',
@@ -317,8 +320,11 @@ if (process.argv.includes('--reply-relay-driver')) {
         try { await runCowork(['stop'], 20_000); }
         catch (error) { cleanupErrors.push(new Error(`stop Cowork daemon: ${error.message}`)); }
       }
-      if (oursEnv) {
-        try { await runOurs(['daemon', 'stop'], 20_000); }
+      if (daemon) {
+        try {
+          await stopProcess(daemon);
+          assert.equal((await daemon.exited).code, 0, 'fixture daemon must exit cleanly');
+        }
         catch (error) { cleanupErrors.push(new Error(`stop ours daemon: ${error.message}`)); }
       }
       if (broker) {
@@ -383,12 +389,13 @@ if (process.argv.includes('--reply-relay-driver')) {
         stateDir: oursStateDir,
         apiVisibility: 'owner',
       }), { mode: 0o600 });
-      oursEnv = isolatedEnvironment(oursConfigPath);
+      oursEnv = daemonEnvironment(oursConfigPath);
       evidence.isolation.ours_config = {
         path: oursConfigPath, broker_url: `ws://127.0.0.1:${brokerPort}`,
         port: oursPort, state_dir: oursStateDir, api_visibility: 'owner',
       };
-      await runOurs(['daemon', 'start']);
+      // Own the fixture process directly, including its bounded graceful shutdown.
+      daemon = startProcess([OURS_CLI, 'daemon', 'serve', '--config', oursConfigPath], oursEnv, ROOT);
       await waitForPort(oursPort, 'isolated ours daemon');
       stage('ours-daemon-ready');
       oursSelection = { endpoint: oursEnv.OURS_DAEMON_URL, expectedInstanceId: oursEnv.OURS_DAEMON_ID,
@@ -402,7 +409,7 @@ if (process.argv.includes('--reply-relay-driver')) {
         rest: { enabled: true, port: restPort },
       }), { mode: 0o600 });
       coworkEnv = {
-        ...isolatedEnvironment(oursConfigPath),
+        ...daemonEnvironment(oursConfigPath),
         OURS_COWORK_CONFIG: coworkConfigPath,
       };
       evidence.isolation.cowork_config = {

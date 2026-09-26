@@ -28,7 +28,12 @@ function isolatedEnvironment(configPath) {
   for (const key of Object.keys(env)) {
     if (key === 'OURS_CONFIG' || key.startsWith('OURS_')) delete env[key];
   }
-  return { ...env, OURS_CONFIG: configPath };
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  return { ...env, OURS_CONFIG: configPath,
+    OURS_DAEMON_ID: '33333333-3333-4333-8333-333333333333',
+    OURS_DAEMON_URL: `http://127.0.0.1:${config.port}`,
+    OURS_DAEMON_CREDENTIAL_PATH: join(config.stateDir, 'daemon-token'),
+  };
 }
 
 async function unusedPort() {
@@ -110,6 +115,7 @@ if (process.argv.includes('--reply-relay-driver')) {
     let broker;
     let brokerExit;
     let oursEnv;
+    let oursSelection;
     let coworkEnv;
     let completed = false;
     let failure;
@@ -207,7 +213,7 @@ if (process.argv.includes('--reply-relay-driver')) {
 
     async function createPeer(attachOursClient, label, suffix) {
       const name = `Reply ${label} ${suffix}`;
-      const client = await attachOursClient({ env: oursEnv, leaseToken: `cowork-reply-${label}-${suffix}` });
+      const client = await attachOursClient({ ...oursSelection, leaseToken: `cowork-reply-${label}-${suffix}` });
       const created = await client.createIdentity({
         name, bio: `isolated Cowork reply participant ${label}`,
         exposeLocal: false, localAutoAccept: true,
@@ -302,9 +308,9 @@ if (process.argv.includes('--reply-relay-driver')) {
 
     t.after(async () => {
       for (const peer of peers) {
-        if (!peer.leased) continue;
-        try { await peer.client.releaseLease(); }
+        try { if (peer.leased) await peer.client.releaseLease(); }
         catch (error) { cleanupErrors.push(new Error(`release ${peer.label} lease: ${error.message}`)); }
+        finally { await peer.client.close(); }
         peer.leased = false;
       }
       if (coworkEnv) {
@@ -385,6 +391,8 @@ if (process.argv.includes('--reply-relay-driver')) {
       await runOurs(['daemon', 'start']);
       await waitForPort(oursPort, 'isolated ours daemon');
       stage('ours-daemon-ready');
+      oursSelection = { endpoint: oursEnv.OURS_DAEMON_URL, expectedInstanceId: oursEnv.OURS_DAEMON_ID,
+        credentialPath: oursEnv.OURS_DAEMON_CREDENTIAL_PATH, sessionMode: 'external', env: {} };
 
       const restPort = await unusedPort();
       const coworkConfigPath = join(scratch, 'cowork.json');
@@ -405,11 +413,11 @@ if (process.argv.includes('--reply-relay-driver')) {
       stage('cowork-ready');
 
       const { attachOursClient } = await import('@ours.network/sdk');
-      const bootstrap = await attachOursClient({ env: oursEnv, leaseToken: 'cowork-reply-bootstrap' });
+      const bootstrap = await attachOursClient({ ...oursSelection, leaseToken: 'cowork-reply-bootstrap' });
       try {
         await bootstrap.createRootIdentity({ name: 'Reply Human', bio: '', exposeLocal: false });
       } finally {
-        await bootstrap.releaseLease();
+        try { await bootstrap.releaseLease(); } finally { await bootstrap.close(); }
       }
       const suffix = `${process.pid}-${Date.now().toString(36)}`;
       const [a, b, c] = await Promise.all([

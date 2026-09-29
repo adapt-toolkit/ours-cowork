@@ -157,7 +157,7 @@ export class TransportServer {
     await this.cleanupStalePrivateSockets();
     const unix = net.createServer((socket) => this.handleUnix(socket));
     this.unixServer = unix;
-    const privateSocketPath = `${this.options.socketPath}.private-${process.pid}-${randomBytes(6).toString('hex')}`;
+    const privateSocketPath = `${this.options.socketPath}.private-${randomBytes(6).toString('hex')}`;
     this.privateSocketPath = privateSocketPath;
     try {
       await listen(unix, privateSocketPath);

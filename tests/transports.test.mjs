@@ -240,6 +240,17 @@ test('role-authorship verbs are reachable over REST with strict params and no ne
   }
 });
 
+test('private Unix listener preserves paths near the portable socket length limit', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-long-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const socketPath = join(dir, 's'.repeat(81 - Buffer.byteLength(dir)));
+  assert.equal(Buffer.byteLength(socketPath), 82);
+  const dispatcher = new RpcDispatcher({ echo: { auth: true, run: async () => ({ ok: true }) } });
+  const server = new TransportServer({ socketPath, rest: { enabled: false, port: 1 }, ...dispatchers(dispatcher) });
+  await server.start(); t.after(() => server.stop());
+  assert.equal(lstatSync(socketPath).mode & 0o777, 0o600);
+});
+
 test('REST is unauthenticated, loopback-only, emits no CORS, and excludes daemon control routes', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-transport-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

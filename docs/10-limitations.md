@@ -68,4 +68,4 @@ Cowork records send_failed with metadata_wire_id and no binary wire_id. This is 
 observed partial file outcome: the notice was accepted, and the bytes were not
 sent. Failed durability of this terminal record retains the same failure barrier.
 
-A binary transport failure after an accepted file notice permits independently eligible recipients in the current serial pass, while deferring the failed recipient. It blocks subsequent passes and lifecycle cleanup; its typed failure takes precedence over ordinary errors at startup. Preparation or observed-result append failures stop the pass immediately.
+A binary transport failure after an accepted file notice permits independently eligible recipients in the current serial pass, while deferring the failed recipient. It blocks subsequent passes and lifecycle cleanup; its typed failure takes precedence over ordinary errors at startup. Preparation, failed binding recovery (including identity mismatch), or observed-result append failures stop the pass immediately.

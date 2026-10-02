@@ -64,4 +64,4 @@ crash/restart boundary with the existing at-least-once limitations. A file notic
 accepted before closure/shutdown suppresses its binary and records send_failed
 plus the accepted metadata wire, rather than claiming queued file bytes.
 
-A binary transport failure after an accepted file notice permits independently eligible recipients in the current serial pass, while deferring the failed recipient. It blocks subsequent passes and lifecycle cleanup; its typed failure takes precedence over ordinary errors at startup. Preparation or observed-result append failures stop the pass immediately.
+A binary transport failure after an accepted file notice permits independently eligible recipients in the current serial pass, while deferring the failed recipient. It blocks subsequent passes and lifecycle cleanup; its typed failure takes precedence over ordinary errors at startup. Preparation, failed binding recovery (including identity mismatch), or observed-result append failures stop the pass immediately.

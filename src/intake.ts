@@ -558,7 +558,7 @@ export class IntakePump {
       if (!dispatched) return;
       try { await dispatched.work; return; } catch (error) {
         if (bindingRecovery === 0 && isDefiniteBindingRefusal(error)) {
-          try { await packet.rebind(); } catch { return; }
+          await packet.rebind();
           continue;
         }
         return; // Durable one-time claim forbids replay of ambiguous notice.
@@ -698,7 +698,7 @@ export class IntakePump {
             const refusal = error instanceof RelayEffectFailure ? error.cause : error;
             if (!recoveredBinding && isDefiniteBindingRefusal(refusal)) {
               recoveredBinding = true;
-              try { await packet.rebind(); continue; } catch (rebindError) { error = new RelayEffectFailure(rebindError); }
+              try { await packet.rebind(); continue; } catch (rebindError) { error = rebindError; }
             }
             if (phase === 'binary') {
               // An accepted notice is already an observed effect. Every unresolved

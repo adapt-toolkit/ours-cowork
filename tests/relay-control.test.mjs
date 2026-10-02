@@ -368,7 +368,7 @@ for(const order of ['before','after'])test(`startup ordinary error ${order} part
   if(order==='before'){const bytes=Buffer.from('file');await f.store.append(IDS[0],{...common,kind:'file',file_id:'01jz6y7n8p9q0r1s2t3v4w5xt3',source_file_id:7,source_wire_id:'F'.repeat(64),filename:'partial.txt',mime:'text/plain',size:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex'),data_base64:bytes.toString('base64')});}
   else await f.store.append(IDS[0],{...common,kind:'message',message_id:'01jz6y7n8p9q0r1s2t3v4w5xt3',category:'chat',text:'Synthetic ordinary later'});
   const events=[],logs=[];const daemon=new CoworkDaemon({config:{version:1,stateDir:f.dir,rest:{enabled:false,port:3010}},prepare:()=>({socketPath:join(f.dir,'test.sock')}),lock:()=>({release(){events.push('lock.release');}}),host:{async boot(){},close(){events.push('host.close');}},store:f.store,registry:{async unhost(id){events.push('room.unhost:'+id);},async unhostAll(){events.push('unhost');}},service:f.service,writePid(){},removePid(){events.push('pid.remove');},transports:{async start(){},async stop(){events.push('transports.stop');}},log:line=>logs.push(line)});
-  await daemon.boot();await f.started;f.release();
+  await daemon.boot();await f.started;await tick();f.release();
   await turnsUntil(()=>logs.some(line=>line.includes('startup_room_recovery_failed'))&&f.states[0].files.length===1,'partial failure actually exercised');
   assert.equal(f.states[0].sends.some(input=>input.contact===D),true,'ordinary failed recipient attempted');
   assert.equal(f.states[0].sends.some(input=>input.contact===B),true,'partial file notice accepted');

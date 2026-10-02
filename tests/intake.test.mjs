@@ -720,12 +720,18 @@ test('file crash redrive keeps archive/intents stable and retries only a result-
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 0);
 
   f.store.beforeAppend = undefined;
-  await f.pump.resumePending(ROOM_ID);
+  await assert.rejects(f.pump.resumePending(ROOM_ID), /file result fsync/,
+    'same-process result durability failure cannot trigger retransmission');
+  assert.equal(f.packet.sendFileCalls.length, 1);
+  // A stated crash loses process-local barriers. A fresh worker exercises the
+  // existing at-least-once restart policy against the retained durable archive.
+  const restarted = new IntakePump(f.store, f.registry, { now: () => AT });
+  await restarted.resumePending(ROOM_ID);
   assert.equal(f.packet.sendFileCalls.length, 2);
   assert(f.packet.sendFileCalls[0].data.equals(f.packet.sendFileCalls[1].data));
   assert.equal(f.packet.sendCalls[0].body, f.packet.sendCalls[1].body, 'notice retry keeps the stable message_id and body');
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 1);
-  await f.pump.resumePending(ROOM_ID);
+  await restarted.resumePending(ROOM_ID);
   assert.equal(f.packet.sendFileCalls.length, 2, 'terminal file result suppresses later redrive');
 });
 

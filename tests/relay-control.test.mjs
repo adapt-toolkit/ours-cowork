@@ -308,3 +308,18 @@ for(const failure of ['metadata','transport'])test(`ordinary ${failure} failure 
   assert.equal(existsSync(join(f.dir,'rooms',IDS[0],'archive.sqlite3')),true);
  }finally{await f.cleanup();}
 });
+
+
+test('startup fanout commit failure retains room host through recovery cleanup',async()=>{
+ const f=await fixture();try{
+  const append=f.store.append.bind(f.store);f.store.append=async(id,row)=>{if(id===IDS[0]&&row.kind==='relay_result')throw new Error('synthetic startup result failure');return append(id,row);};
+  const events=[],logs=[];const daemon=new CoworkDaemon({config:{version:1,stateDir:f.dir,rest:{enabled:false,port:3010}},prepare:()=>({socketPath:join(f.dir,'test.sock')}),lock:()=>({release(){events.push('lock.release');}}),host:{async boot(){},close(){events.push('host.close');}},store:f.store,registry:{async unhost(id){events.push('room.unhost:'+id);},async unhostAll(){events.push('unhost');}},service:f.service,writePid(){},removePid(){events.push('pid.remove');},transports:{async start(){},async stop(){events.push('transports.stop');}},log:line=>logs.push(line)});
+  await daemon.boot();await f.started;f.release();
+  await turnsUntil(()=>logs.some(line=>line.includes('startup_room_recovery_failed')));
+  assert.equal(f.states[1].sends.length,1,'other recovered room remains positive control');
+  assert.equal(events.some(event=>event.startsWith('room.unhost:')),false,'startup failure cannot waive observed-result ownership');
+  await assert.rejects(f.track(daemon.shutdown()));
+  assert.equal(events.includes('unhost'),false);assert.equal(events.includes('host.close'),false);assert.equal(events.includes('lock.release'),false);
+  assert.equal(f.states[0].sends.length,1);assert.equal(existsSync(join(f.dir,'rooms',IDS[0],'archive.sqlite3')),true);
+ }finally{await f.cleanup();}
+});

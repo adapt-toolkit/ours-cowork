@@ -285,7 +285,7 @@ export class IntakePump {
       // Consume already-coalesced requests; only a subsequent explicit wake
       // may resume existing at-least-once recovery, never an automatic turn.
       this.failedRelayRequests.set(roomId, { epoch: this.relayRequests.get(roomId) ?? 0, work: state.work });
-      throw error;
+      throw this.commitFailures.get(roomId) ?? error;
     } finally {
       if (this.relays.get(roomId) === state) this.relays.delete(roomId);
     }
@@ -706,7 +706,10 @@ export class IntakePump {
               const failure = error instanceof RelayDurabilityError ? error
                 : new RelayDurabilityError(error instanceof RelayEffectFailure ? error.cause : error);
               this.commitFailures.set(roomId, failure);
-              throw failure;
+              if (!(error instanceof RelayEffectFailure)) throw failure;
+              // Preserve independent-recipient progress in this tracked pass;
+              // its final rejection still surfaces the sticky typed barrier.
+              error = new RelayEffectFailure(failure);
             }
             // Storage and preparation failure must stop immediately; a send
             // failure may leave independent recipients eligible in this pass.

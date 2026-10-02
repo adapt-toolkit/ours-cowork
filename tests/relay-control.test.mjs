@@ -39,7 +39,7 @@ async function fixture({file=false,binding=false,lost=false,ackFailure=false,bin
       if(binding)return new Response(JSON.stringify({error:{code:'NOT_BOUND',message:'synthetic definite refusal'}}),{status:400,headers:{'content-type':'application/json'}});
       entered();await gate;if(lost)throw new Error('synthetic lost send response');
      }
-     if(input.contact===ordinaryFailureRecipient)throw new Error('synthetic ordinary recipient response lost');
+     if(i===0&&input.contact===ordinaryFailureRecipient)throw new Error('synthetic ordinary recipient response lost');
      out={kind:'sent',wireId:`synthetic-${i}-${state.sends.length}`,sent:true,history_stored:true};
     }else if(op==='sendFile'){state.files.push(input);if(binaryFailure==='unknown'&&(!binaryFailureRecipient||input.contact===binaryFailureRecipient))throw new Error('synthetic lost binary response');if(binaryFailure==='binding'&&(!binaryFailureRecipient||input.contact===binaryFailureRecipient))return new Response(JSON.stringify({error:{code:'NOT_BOUND',message:'synthetic definite binary refusal'}}),{status:400,headers:{'content-type':'application/json'}});out={kind:'sent',wireId:'synthetic-file',sent:true,history_stored:true,filename:input.filename,mime:input.mime,bytes:Buffer.from(input.data_base64,'base64').length};}
     else if(op==='chooseIdentity'){entered();await gate;out={cid:CID,name:`ours-cowork:Control ${i}`};}
@@ -369,7 +369,8 @@ for(const order of ['before','after'])test(`startup ordinary error ${order} part
   else await f.store.append(IDS[0],{...common,kind:'message',message_id:'01jz6y7n8p9q0r1s2t3v4w5xt3',category:'chat',text:'Synthetic ordinary later'});
   const events=[],logs=[];const daemon=new CoworkDaemon({config:{version:1,stateDir:f.dir,rest:{enabled:false,port:3010}},prepare:()=>({socketPath:join(f.dir,'test.sock')}),lock:()=>({release(){events.push('lock.release');}}),host:{async boot(){},close(){events.push('host.close');}},store:f.store,registry:{async unhost(id){events.push('room.unhost:'+id);},async unhostAll(){events.push('unhost');}},service:f.service,writePid(){},removePid(){events.push('pid.remove');},transports:{async start(){},async stop(){events.push('transports.stop');}},log:line=>logs.push(line)});
   await daemon.boot();await f.started;await tick();f.release();
-  await turnsUntil(()=>logs.some(line=>line.includes('startup_room_recovery_failed'))&&f.states[0].files.length===1,'partial failure actually exercised');
+  await turnsUntil(()=>logs.some(line=>line.includes('startup_room_recovery_failed')&&JSON.parse(line).room_id===IDS[0])&&f.states[0].files.length===1,'partial failure actually exercised');
+  assert.equal(f.states[1].sends.length,1,'other recovered room is a healthy positive control');
   assert.equal(f.states[0].sends.some(input=>input.contact===D),true,'ordinary failed recipient attempted');
   assert.equal(f.states[0].sends.some(input=>input.contact===B),true,'partial file notice accepted');
   assert.equal(events.includes('room.unhost:'+IDS[0]),false,'ordinary error never masks partial typed failure at startup');

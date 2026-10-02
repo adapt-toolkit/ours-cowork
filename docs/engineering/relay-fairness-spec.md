@@ -44,13 +44,13 @@ Operator starts with A backlogged and B ready: authenticated recovery phase visi
 1 scope/numbered criteria/threat baseline: done.
 2 simplification Critic challenge: done, serial sends/local intent completion retained.
 3 usage simulation/independent design challenge: done with limitations above.
-4 spec commit: this commit.
-5 TDD red/green/deslop/prove: pending.
+4 spec commit: ef1824b before red tests c5b6143; supplemental readiness red test45962a8.
+5 TDD: primary red regressions committed before implementation; supplemental CLI readiness red0!=3. New7/7 and focused14files512 tests:510passed/2docwording failures, corrected release gate12/12passed/0failed/0skipped exit0; Prove3faults caught6tests. Cleanup reviewed; meaningful safety metadata/lane/file tests added. Real reply/removal E2E2/2 fail in peer creation on unchanged main; BLOCKED, not waived.
 6 exact-head code/test/security Critic review: pending.
-7 scoped lifecycle/RPC docs and report reconciliation: pending.
-8 implementation commit: pending.
-9 per-criterion verification/Critic audit: pending.
-10 PR publication authorized; merge/cleanup after merge Owner-owned: pending.
+7 lifecycle/limitations docs updated; nested spec preserves package artifact boundary; RPC analysis and explicit unresolved same-room experiment documented.
+8 implementation candidate commit follows with exact-head review.
+9 per-criterion evidence in review packet; Critic audit pending, real reply/removal E2E blocked; human QA awaiting Owner.
+10 draft PR publication authorized after review packet; merge blocked on required real SDK checks and Owner authority. No merge/deploy performed.
 11 deploy: not authorized, Owner-owned.
 12 production security/canary: gated on Owner deployment.
 Human QA: awaiting Owner QA in an authorized isolated/production release environment.

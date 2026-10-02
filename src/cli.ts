@@ -635,7 +635,17 @@ async function waitForOwnedDaemon(config: CoworkConfig, timeoutMs: number): Prom
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const probe = await probeDaemon(config, Math.min(500, Math.max(1, deadline - Date.now())));
-    if (probe.kind === 'running') return probe.status;
+    if (probe.kind === 'running') {
+      try {
+        const recovery = await rpcCall(join(config.stateDir, 'management.sock'), 'daemon.recovery', {},
+          Math.min(500, Math.max(1, deadline - Date.now()))) as { version?: number; ready?: boolean };
+        if (recovery?.version === 1 && recovery.ready === true) return probe.status;
+      } catch (error) {
+        // Older workers had no separate recovery status and only opened their
+        // control socket after recovery. Their handshake already means ready.
+        if (error instanceof CliError && error.code === 'method_not_found') return probe.status;
+      }
+    }
     await sleep(200);
   }
   return null;
@@ -644,7 +654,10 @@ async function waitForOwnedDaemon(config: CoworkConfig, timeoutMs: number): Prom
 async function startCoworkDaemon(config: CoworkConfig): Promise<{ started: boolean; alreadyRunning: boolean }> {
   const socketPath = join(config.stateDir, 'management.sock');
   const existing = await probeDaemon(config);
-  if (existing.kind === 'running') return { started: false, alreadyRunning: true };
+  if (existing.kind === 'running') {
+    if (await waitForOwnedDaemon(config, START_TIMEOUT_MS)) return { started: false, alreadyRunning: true };
+    throw new CliError(EXIT.daemonUnavailable, 'daemon_unavailable', 'cowork is running but room recovery is not ready');
+  }
   if (existing.kind === 'occupied' || await socketOpen(socketPath)) {
     throw new CliError(EXIT.invalidState, 'invalid_state', 'management socket is occupied by an endpoint without cowork supervisor control');
   }

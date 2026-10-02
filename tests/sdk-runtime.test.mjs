@@ -1150,3 +1150,29 @@ test('SDK unread source barrier uses complete metadata beyond text slice and typ
   client.listIncomingFiles = async () => { throw new Error('metadata unavailable'); };
   await assert.rejects(packet.listUnreadSourceIds(), /metadata unavailable/, 'unknown read marks must fail closed');
 });
+
+test('isolated SDK HTTP trace keeps a stalled packet send single-flight without inventing cancellation retries', async () => {
+  const { OursClient } = await import('@ours.network/sdk/client');
+  let release; const responseGate = new Promise(resolve => { release = resolve; });
+  let entered; const requestStarted = new Promise(resolve => { entered = resolve; });
+  const operations = [];
+  const client = new OursClient({ url: 'http://127.0.0.1:1', leaseToken: 'isolated-trace-only', fetch: async (url) => {
+    operations.push(new URL(url).pathname); entered(); await responseGate;
+    return new Response(JSON.stringify({ kind: 'sent', wireId: MESSAGE_OUT_WIRE, wire_id: MESSAGE_OUT_WIRE,
+      sent: true, history_stored: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  } });
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  let settled = false;
+  const send = packet.send(CID, 'synthetic body');
+  void send.then(() => { settled = true; });
+  await requestStarted; await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false, 'packet send awaits the delayed HTTP operation');
+  assert.deepEqual(operations, ['/api/v1/sendMessage']);
+  release(); assert.deepEqual(await send, { status: 'queued', wire_id: MESSAGE_OUT_WIRE });
+  assert.equal(operations.length, 1);
+  const failed = new OursClient({ url: 'http://127.0.0.1:1', leaseToken: 'isolated-trace-failure', fetch: async (url) => {
+    operations.push(new URL(url).pathname); throw new Error('synthetic lost response');
+  } });
+  await assert.rejects(new SdkRoomPacket(IDENTITY, CID, failed).send(CID, 'synthetic body'), /synthetic lost response/);
+  assert.equal(operations.length, 2, 'one additional attempt, no automatic retry on unknown response');
+});

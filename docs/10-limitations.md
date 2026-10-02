@@ -21,3 +21,17 @@
 - Cowork selects room identities by the exact names stored in its local room records. That filter prevents unrelated daemon-global identities from appearing as cowork rooms, but it is bookkeeping rather than an ownership, provenance, membership, or same-user security model.
 - Pre-1.0 custom room actor state cannot be opened by the standard SDK runtime. Back it up with the old release, recreate the room, and re-invite its participants.
 - The external-history daemon storage epoch has no automatic migration from older packet-format daemon state. Upgrade requires a manual backup if desired, manual removal, a clean daemon state, and recreation/re-invitation; installers do not delete the old state.
+
+Relay scheduling limits are counts, not RPC deadlines. Recipient sends remain
+serial under the room mutex, and the relay pass and local intent completion are
+not split into time slices. A stalled send can still block that room's later
+intake, STOP delivery, invitations, removal, and other locked operations. Other
+recovered rooms and aggregate management recovery visibility can progress; this
+does not establish complete incident recovery or universally repair onboarding.
+Host initialization and structural restore/reconciliation/close phases can also
+await native RPCs; room mutations remain gated until those prerequisites finish.
+
+Result-less sends retain the existing stable-envelope retry-on-recovery behavior.
+Acceptance before a result is durably recorded can therefore produce duplicate
+wire deliveries. There is no new timeout cancellation, overlapping retry,
+exactly-once guarantee, or durable unknown-send reconciliation in this change.

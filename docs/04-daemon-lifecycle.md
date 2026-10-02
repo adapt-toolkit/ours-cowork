@@ -20,3 +20,29 @@ If the shared daemon restarts underneath a running cowork, room notification wat
 `web` uses the same safe cowork start path: an already-running cowork daemon is retained, an absent cowork daemon is started, and readiness is checked with `GET /` before a browser opens. The shared ours daemon must already be running. `web` never retries a room mutation. With `--json`, it returns the URL with `opened: false` and has no browser side effect. If HTTP is explicitly disabled, `web` exits `1` and explains how to enable it.
 
 Exit codes are stable: `0` success, `1` web console disabled, `2` CLI usage, `3` not found, `4` invalid state or parameters, `5` unauthorized, `6` daemon unavailable, and `7` internal failure. With `--json`, stdout contains exactly one JSON value and stderr stays empty. This includes foreground `serve`: supervised worker output is suppressed, and its clean or failed terminal status becomes that one JSON result.
+
+Management now opens after shared-host initialization and before room recovery.
+The authenticated `daemon.recovery` RPC (empty parameters, Unix management socket
+or the existing loopback `/rpc` transport) reports `version`, `ready`, `phase`,
+`rooms`, `failed_rooms`, and `pending_fanout`. Phases are `initializing`, `restore`,
+`lifecycle`, `reconcile`, `close`, `fanout`, `running`, and `stopping`. These are
+aggregate process-local counts; they contain no room identifiers, message bodies,
+or native error details. They do not report recipient acknowledgement or queue age.
+
+`daemon.status` and the session-bound shutdown control remain available during
+recovery. Status proves owned process liveness. `start` additionally waits for
+structural room readiness using `daemon.recovery`; older workers without that RPC
+retain their original control-handshake behavior. Public and private room RPCs
+reject while structural recovery is incomplete or shutdown has begun. Ready means
+restoration, pending lifecycle requests, reconciliation, and closing prerequisites
+have completed; it does not mean every queued message has been forwarded.
+
+After prerequisites, recovered rooms start their tracked fanout independently.
+Readiness and queued notification scheduling do not await the fanout backlog.
+Shutdown still stops intake/transports and drains tracked startup work before
+unhosting identities. Intake alternates a bounded body snapshot (up to 32 messages
+and 32 files) with forwarding, rather than waiting for the unread queue to empty.
+Leading typed commands and raced message acknowledgements each yield after 32 SDK
+reads. Unread sources and later work in their recipient lane remain deferred until
+consumption. A required full metadata barrier covers sources outside the body
+snapshot; a metadata failure prevents that relay turn.

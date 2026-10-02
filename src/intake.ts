@@ -164,9 +164,11 @@ export class IntakePump {
         const packet = this.packet(roomId);
         while (state.dirty) {
           state.dirty = false;
-          await this.drainAndRelay(roomId, packet);
+          const more = await this.drainAndRelay(roomId, packet);
+          state.dirty ||= more;
           await this.options.afterPump?.(roomId);
-          if (!this.packets.get(roomId)) break;
+          if (!this.packets.get(roomId) || !this.acceptingNotifications) break;
+          if (state.dirty) await new Promise<void>(resolve => setImmediate(resolve));
         }
       });
     } finally {
@@ -220,33 +222,35 @@ export class IntakePump {
     if (failure !== undefined) throw failure;
   }
 
-  private async drainAndRelay(roomId: string, packet: RoomPacket): Promise<void> {
-    for (;;) {
+  private async drainAndRelay(roomId: string, packet: RoomPacket): Promise<boolean> {
+    if (await this.options.shouldPause?.(roomId)) return false;
+    let more = await packet.drainRuntimeCommands?.(
+      (item) => this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false)),
+    ) === true;
+    if (await this.options.shouldPause?.(roomId)) return false;
+    const messages = await packet.listUnreadMessages(INTAKE_BATCH_SIZE);
+    const files = await packet.listUnreadFiles(INTAKE_BATCH_SIZE);
+    for (const item of messages) {
       if (await this.options.shouldPause?.(roomId)) break;
-      await packet.drainRuntimeCommands?.(
-        (item) => this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false)),
-      );
-      if (await this.options.shouldPause?.(roomId)) break;
-      const messages = await packet.listUnreadMessages(INTAKE_BATCH_SIZE);
-      const files = await packet.listUnreadFiles(INTAKE_BATCH_SIZE);
-      if (messages.length === 0 && files.length === 0) break;
-      for (const item of messages) {
-        if (await this.options.shouldPause?.(roomId)) break;
-        await this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false));
-        // SDK acknowledgement can dispatch a newly promoted typed command.
-        await packet.acknowledgeMessage(item,
-          (unexpected) => this.lock(roomId, () => this.processInboxItem(roomId, packet, unexpected, false)));
-      }
-      for (const item of files) {
-        if (await this.options.shouldPause?.(roomId)) break;
-        await this.lock(roomId, () => this.processFileInboxItem(roomId, packet, item));
-      }
+      await this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false));
+      // Unexpected read rows are archived before the next SDK consume.
+      const deferred = await packet.acknowledgeMessage(item,
+        (unexpected) => this.lock(roomId, () => this.processInboxItem(roomId, packet, unexpected, false)));
+      more ||= deferred === true;
+      if (deferred === true) break;
     }
-    if (await this.options.shouldPause?.(roomId)) return;
+    for (const item of files) {
+      if (await this.options.shouldPause?.(roomId)) break;
+      await this.lock(roomId, () => this.processFileInboxItem(roomId, packet, item));
+    }
+    if (await this.options.shouldPause?.(roomId)) return false;
+    const unread = await packet.listUnreadSourceIds();
     await this.lock(roomId, async () => {
       await this.completeSnapshotIntents(roomId);
-      await this.relayPendingUnlocked(roomId, packet);
+      await this.relayPendingUnlocked(roomId, packet, unread);
     });
+    // Do not require an empty unread queue before offering a forwarding turn.
+    return more || unread.messages.size > 0 || unread.files.size > 0;
   }
 
   private async processFileInboxItem(
@@ -451,7 +455,7 @@ export class IntakePump {
     } catch { /* refusal remains durable; the fixed private notification is best effort */ }
   }
 
-  private acknowledgeMessage(roomId: string, packet: RoomPacket, expected: InboxItem): Promise<void> {
+  private acknowledgeMessage(roomId: string, packet: RoomPacket, expected: InboxItem): Promise<boolean | void> {
     return packet.acknowledgeMessage(
       expected,
       (unexpected) => this.processInboxItem(roomId, packet, unexpected, false),
@@ -569,7 +573,10 @@ export class IntakePump {
       });
   }
 
-  private async relayPendingUnlocked(roomId: string, packet: RoomPacket): Promise<void> {
+  private async relayPendingUnlocked(
+    roomId: string, packet: RoomPacket, unread: { messages: Set<number>; files: Set<number> },
+  ): Promise<void> {
+    const deferredRecipients = new Set<string>();
     const room = await this.store.load(roomId);
     const activeCids = new Set(room.seats
       .filter((seat) => seat.state === 'active')
@@ -606,6 +613,15 @@ export class IntakePump {
       // with a network effect or a result that would claim a send was tried.
       if ((message === undefined) === (file === undefined)) continue;
       const source = message ?? file!;
+      // A crash may leave intents for a source outside this turn's snapshot.
+      // Keep its lane in journal order until the source is consumed. Other
+      // recipients with already-consumed sources can still make progress.
+      if (deferredRecipients.has(intent.recipient_identity)
+        || (message?.source_msg_id !== undefined && unread.messages.has(message.source_msg_id))
+        || (file?.source_file_id !== undefined && unread.files.has(file.source_file_id))) {
+        deferredRecipients.add(intent.recipient_identity);
+        continue;
+      }
       const replyRows = source.source_reply_to === undefined && message?.scope === undefined
         && message?.thread_root === undefined ? [] : await readReplyRows(this.store, roomId);
       const decision = selectReply(replyRows, roomId, source, intent.recipient_identity);

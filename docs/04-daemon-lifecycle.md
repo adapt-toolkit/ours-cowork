@@ -51,3 +51,14 @@ Leading typed commands and raced message acknowledgements each yield after 32 SD
 reads. Unread sources and later work in their recipient lane remain deferred until
 consumption. A required full metadata barrier covers sources outside the body
 snapshot; a metadata failure prevents that relay turn.
+
+An observed-effect result commit failure is retained after its worker exits.
+Repeated close/delete requests fail closed; shutdown reports a durability error
+before application PID removal, unhosting, host shutdown or lock release. The
+retained archive must be inspected with storage before recovery; repeating a
+mutation does not repair its result durability. Other completed transport failures
+retain existing error cleanup behavior without inventing relay results. The
+supervisor's existing 10-second watchdog can still force process exit, a separate
+crash/restart boundary with the existing at-least-once limitations. A file notice
+accepted before closure/shutdown suppresses its binary and records send_failed
+plus the accepted metadata wire, rather than claiming queued file bytes.

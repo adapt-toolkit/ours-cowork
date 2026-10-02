@@ -26,6 +26,15 @@ type IntakeStore = Pick<CoworkStore, 'mutex' | 'load' | 'save' | 'append' | 'rea
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 type FileRecord = Extract<CommunicationRecord, { kind: 'file' }>;
 type RelayIntentRecord = Extract<CommunicationRecord, { kind: 'relay_intent' }>;
+type RelayResultDraft = Omit<Extract<CommunicationRecord, { kind: 'relay_result' }>, 'seq' | 'record_id'>;
+
+/** An observed effect has no acknowledged durable result; never waive it on teardown. */
+export class RelayDurabilityError extends Error {
+  constructor(cause: unknown) {
+    super(`relay result durability unresolved: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = 'RelayDurabilityError';
+  }
+}
 
 export interface IntakePacketRegistry {
   get(roomId: string): RoomPacket | undefined;
@@ -119,6 +128,7 @@ export class IntakePump {
   private readonly relayRequests = new Map<string, number>();
   private readonly failedRelayRequests = new Map<string, { epoch: number; work: Promise<void> }>();
   private readonly quiescing = new Set<string>();
+  private readonly commitFailures = new Map<string, RelayDurabilityError>();
 
   constructor(store: IntakeStore, packets: IntakePacketRegistry, private readonly options: IntakePumpOptions = {}) {
     this.store = store;
@@ -197,6 +207,8 @@ export class IntakePump {
     this.quiescing.add(roomId);
     const relay = this.relays.get(roomId);
     if (relay) await relay.work;
+    const failure = this.commitFailures.get(roomId);
+    if (failure) throw failure;
     // Claimed notices are at-most-once; closing must not dispatch them later.
     this.notices.delete(roomId);
   }
@@ -230,6 +242,8 @@ export class IntakePump {
     while (this.notifications.size > 0 || this.pumps.size > 0 || this.relays.size > 0) {
       await Promise.allSettled([...this.notifications.values(), ...this.pumps.values(), ...this.relays.values()].map((state) => state.work));
     }
+    const failure = this.commitFailures.values().next().value;
+    if (failure) throw failure;
   }
 
   private async runNotificationWorker(roomId: string, state: NotificationState): Promise<void> {
@@ -245,6 +259,8 @@ export class IntakePump {
   }
 
   private scheduleRelay(roomId: string): Promise<void> {
+    const failure = this.commitFailures.get(roomId);
+    if (failure) return Promise.reject(failure);
     const active = this.relays.get(roomId);
     if (active) { active.dirty = true; return active.work; }
     if (!this.acceptingNotifications || this.quiescing.has(roomId) || !this.packets.get(roomId)) return Promise.resolve();
@@ -665,7 +681,7 @@ export class IntakePump {
               continue; // Fresh eligibility before dispatching actual bytes.
             }
             await this.lock(roomId, async () => {
-              const appended = await this.store.append(roomId, {
+              await this.appendRelayResult(roomId, {
                 version: 1, kind: 'relay_result', room_id: roomId, at: this.now(),
                 intent_record_id: intent.record_id, recipient_identity: intent.recipient_identity,
                 ...(prepared.file ? { file_id: prepared.file.file_id } : { message_id: intent.message_id! }),
@@ -673,7 +689,6 @@ export class IntakePump {
                 ...(outcome.wire_id ? { wire_id: outcome.wire_id } : {}),
                 ...(metadataWire ? { metadata_wire_id: metadataWire } : {}),
               });
-              if (appended.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
             });
             break;
           } catch (error) {
@@ -707,7 +722,15 @@ export class IntakePump {
   }> {
     return this.lock(roomId, async () => {
       const room = await this.store.load(roomId);
-      if (!this.acceptingNotifications || this.quiescing.has(roomId) || room.state === 'closing' || room.state === 'closed') return { kind: 'deferred' as const };
+      if (!this.acceptingNotifications || this.quiescing.has(roomId) || room.state === 'closing' || room.state === 'closed') {
+        if (phase === 'binary') {
+          // The notice was accepted, but lifecycle authority suppresses bytes.
+          // Record that partial observed phase before allowing teardown.
+          await this.skipRelay(roomId, intent, 'send_failed', metadataWire, true);
+          return { kind: 'skipped' as const };
+        }
+        return { kind: 'deferred' as const };
+      }
       if ((await queryStore(this.store, roomId, { kind: 'relay_result', intentRecordId: intent.record_id, limit: 1 })).length > 0) return { kind: 'skipped' as const };
       const [message] = intent.message_id === undefined ? [] : await queryStore(this.store, roomId, { kind: 'message', messageId: intent.message_id, limit: 1 }) as MessageRecord[];
       const [file] = intent.file_id === undefined ? [] : await queryStore(this.store, roomId, { kind: 'file', fileId: intent.file_id, limit: 1 }) as FileRecord[];
@@ -732,7 +755,7 @@ export class IntakePump {
             throw new ThreadFailure('reply_target_unavailable');
           }
           if (!threadRelayEligible(room, root.thread_root, intent.recipient_identity)) {
-            await this.skipRelay(roomId, intent, 'skipped_removed', metadataWire);
+            await this.skipRelay(roomId, intent, 'skipped_removed', metadataWire, phase === 'binary');
             return { kind: 'skipped' as const };
           }
           const metadata = publicThreadMetadata({ ...root, thread_root: root.thread_root }, room);
@@ -748,13 +771,13 @@ export class IntakePump {
         } else {
           if (!source.recipient_identities.includes(intent.recipient_identity)) return { kind: 'skipped' as const };
           if (!activeCids.has(intent.recipient_identity) && removedCids.has(intent.recipient_identity)) {
-            await this.skipRelay(roomId, intent, 'skipped_removed', metadataWire);
+            await this.skipRelay(roomId, intent, 'skipped_removed', metadataWire, phase === 'binary');
             return { kind: 'skipped' as const };
           }
         }
       } catch (error) {
         if (!(error instanceof ThreadFailure)) throw error;
-        await this.skipRelay(roomId, intent, 'skipped_reply_unavailable', metadataWire);
+        await this.skipRelay(roomId, intent, 'skipped_reply_unavailable', metadataWire, phase === 'binary');
         return { kind: 'skipped' as const };
       }
       const replyTo = decision.replyTo;
@@ -801,17 +824,29 @@ export class IntakePump {
 
   private async skipRelay(
     roomId: string, intent: RelayIntentRecord,
-    status: 'skipped_removed' | 'skipped_reply_unavailable', metadataWire?: string,
+    status: 'skipped_removed' | 'skipped_reply_unavailable' | 'send_failed', metadataWire?: string, observed = false,
   ): Promise<void> {
-    const result = await this.store.append(roomId, {
+    const draft: RelayResultDraft = {
       version: 1, kind: 'relay_result', room_id: roomId, at: this.now(),
       intent_record_id: intent.record_id,
       ...(intent.message_id === undefined ? {} : { message_id: intent.message_id }),
       ...(intent.file_id === undefined ? {} : { file_id: intent.file_id }),
       recipient_identity: intent.recipient_identity, status,
       ...(metadataWire ? { metadata_wire_id: metadataWire } : {}),
-    });
-    if (result.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
+    };
+    await this.appendRelayResult(roomId, draft, observed);
+  }
+
+  private async appendRelayResult(roomId: string, draft: RelayResultDraft, observed = true): Promise<void> {
+    try {
+      const result = await this.store.append(roomId, draft);
+      if (result.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
+    } catch (error) {
+      if (!observed) throw error;
+      const failure = new RelayDurabilityError(error);
+      this.commitFailures.set(roomId, failure);
+      throw failure;
+    }
   }
 
   private findSourceMessage(records: CommunicationRecord[], item: InboxItem): MessageRecord | undefined {

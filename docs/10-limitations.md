@@ -47,3 +47,21 @@ Result-less sends retain the existing stable-envelope retry-on-recovery behavior
 Acceptance before a result is durably recorded can therefore produce duplicate
 wire deliveries. There is no new timeout cancellation, overlapping retry,
 exactly-once guarantee, or durable unknown-send reconciliation in this change.
+
+An observed relay result whose append reports failure blocks new relay effects,
+close/delete retries and clean shutdown in that running process, even if a result
+row is visible afterward. The application does not unhost or erase the archive to
+waive that barrier; it reports the storage failure. Before-dispatch metadata errors
+and completed-but-unknown transport outcomes keep their existing error cleanup
+semantics and never fabricate a delivery result. There is no automatic result
+commit retry or recovery API: retain the journal, inspect storage and use an
+operator-reviewed recovery procedure. The barrier is process-local; crash/restart
+continues the existing at-least-once policy, not a new durable in-flight protocol.
+The supervisor's existing 10-second shutdown watchdog may force process exit;
+application fail-closed behavior does not guarantee indefinite identity/process
+lifetime across that crash boundary.
+
+If closure or shutdown follows an accepted file notice before binary dispatch,
+Cowork records send_failed with metadata_wire_id and no binary wire_id. This is an
+observed partial file outcome: the notice was accepted, and the bytes were not
+sent. Failed durability of this terminal record retains the same failure barrier.

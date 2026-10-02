@@ -91,3 +91,28 @@ Independent exact7c86bb7 review found two HIGH AC4 edges: an exited worker lost 
 When an accepted file notice is followed by lifecycle/shutdown deferral, commit existing relay_result status=send_failed with metadata_wire_id and no binary wire_id. That means the notice was accepted but the file binary was not dispatched; it never claims queued bytes. Before/after-append failure tests retain close/delete failure and archive/host state through repeated calls. Actual daemon shutdown after exited failure reports error, preserving application host/archive ownership before teardown. Forced process exit, crash and restart remain separate pre-existing recovery boundaries; there is no durable cross-process in-flight marker or new exactly-once guarantee. Operator recovery requires reviewing retained journal/storage and the existing crash/restart policy rather than blindly repeating close/delete.
 
 Additional named red map: close/delete retries retain before/after-commit result failure barrier (4); close/delete/shutdown during file notice commits partial outcome before teardown (3); daemon shutdown after exited before/after-commit failure retains host and archive (2). All9named cases fail behavior on7c86bb7,0harnesserrors/cancel/skip. Commit these tests before correction, then restore/prove/rerun and exact-head re-review.
+
+Gate6 correction implementation: appendRelayResult marks RelayDurabilityError only
+for an observed effect (including terminal file skip after an accepted notice).
+commitFailures is separate from ordinary failed request epochs; scheduleRelay,
+quiesceRelay and drain surface it after worker removal. It is not cleared by an
+external notification, visible row or restored append function. Daemon application
+cleanup distinguishes that typed barrier before ownership teardown; ordinary
+predispatch/transport error cleanup remains unchanged. Supplemental file closing/
+removed skip commit guards fail when their observed flag is deliberately omitted;
+ordinary metadata/unknown-transport cleanup controls pass. Restored control suite
+has27named cases. Process-local retention and existing10-second supervisor force
+exit are explicit limitations, not a new recovery guarantee.
+
+Self-audit follow-through: startup recoverPhase also preserves hosted ownership on
+RelayDurabilityError while still counting/logging failed recovery and excluding
+that room from further readiness work. Generic recovery failures retain existing
+unhost behavior. The actual-SDK/service/store startup regression failed its
+ownership assertion before this guard, then passed. File crash-redrive fixture now
+asserts same-instance failure/no extra metadata or binary, then creates a fresh
+IntakePump for its stated process restart simulation; all prior stable journal,
+file-byte/body and terminal-replay assertions remain. This is a worker restart
+simulation, distinct from the required real daemon restart classes. Final focused
+control28/28 and control+intake164/164 pass,0fail/cancel/skip. Prove retained close
+barrier, partial file outcome and startup ownership each fails its named guard,
+then restored control28/28 passes.

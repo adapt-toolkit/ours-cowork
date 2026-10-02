@@ -723,6 +723,7 @@ test('file crash redrive keeps archive/intents stable and retries only a result-
   await assert.rejects(f.pump.resumePending(ROOM_ID), /file result fsync/,
     'same-process result durability failure cannot trigger retransmission');
   assert.equal(f.packet.sendFileCalls.length, 1);
+  assert.equal(f.packet.sendCalls.length, 1, 'same-process retry sends no additional metadata/body');
   // A stated crash loses process-local barriers. A fresh worker exercises the
   // existing at-least-once restart policy against the retained durable archive.
   const restarted = new IntakePump(f.store, f.registry, { now: () => AT });

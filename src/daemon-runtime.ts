@@ -15,6 +15,7 @@ export { loadConfig } from './config.ts';
 import { createOursHost, type OursRuntimeClientFactory } from './ours-runtime.ts';
 import { PacketRegistry } from './packets.ts';
 import { RoomService } from './service.ts';
+import { RelayDurabilityError } from './intake.ts';
 import { CoworkStore } from './storage.ts';
 import { createPrivateServiceRoutes, createServiceRoutes, RpcDispatcher, TransportServer } from './transports.ts';
 import { createStaticWebHandler, loadWebAssets } from './web.ts';
@@ -270,7 +271,7 @@ export class CoworkDaemon {
           healthy.delete(roomId);
           this.recoveryFailures++;
           const unhost = this.registry?.unhost;
-          if (unhost) {
+          if (unhost && !(error instanceof RelayDurabilityError)) {
             await unhost.call(this.registry, roomId).catch((unhostError) => {
               this.options.log?.(JSON.stringify({
                 event: 'startup_room_unhost_failed', room_id: roomId,
@@ -371,7 +372,13 @@ export class CoworkDaemon {
     try {
       await Promise.allSettled([...this.notificationWork]);
       await this.service?.drain();
-    } catch (error) { errors.push(error); }
+    } catch (error) {
+      errors.push(error);
+      // Unlike an ordinary cleanup error, an unacknowledged observed result
+      // cannot be turned into application teardown. The supervisor's existing
+      // crash/forced-exit boundary remains independent of this guard.
+      if (error instanceof RelayDurabilityError) throw new DaemonShutdownError(errors, false);
+    }
     try {
       if (this.lockHandle || this.pidWritten || this.hostStartAttempted) {
         (this.options.removePid ?? removeDaemonPid)(this.options.config.stateDir);

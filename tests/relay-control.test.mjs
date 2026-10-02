@@ -18,7 +18,7 @@ async function turnsUntil(check,missing='required control progress'){const deadl
 function incoming(n,text='STOP synthetic fixture'){
  return {seq:n,msg_id:n,from:{id:A,name:'Member 0'},peer:{id:A,name:'Member 0'},direction:'in',occurred_at_ms:Date.parse(AT),date:AT,encryption:'e2e',inbox_state:'unread',status:'unread',message_kind:'text',wire_id:n.toString(16).padStart(64,'0'),reply_to:null,text,body:text,transport:'double_ratchet',delivery_state:null,human_read_at_ms:null};
 }
-async function fixture({file=false,binding=false,lost=false,ackFailure=false}={}){
+async function fixture({file=false,binding=false,lost=false,ackFailure=false,binaryFailure}={}){
  const dir=mkdtempSync(join(tmpdir(),'cowork-relay-control-'));const store=new CoworkStore(dir),packets=new Map(),states=[],work=[];
  let release,entered;const gate=new Promise(r=>release=r),started=new Promise(r=>entered=r);let destroys=0;
  const track=p=>{work.push(p);void p.catch(()=>{});return p;};
@@ -39,7 +39,7 @@ async function fixture({file=false,binding=false,lost=false,ackFailure=false}={}
       entered();await gate;if(lost)throw new Error('synthetic lost send response');
      }
      out={kind:'sent',wireId:`synthetic-${i}-${state.sends.length}`,sent:true,history_stored:true};
-    }else if(op==='sendFile'){state.files.push(input);out={kind:'sent',wireId:'synthetic-file',sent:true,history_stored:true,filename:input.filename,mime:input.mime,bytes:Buffer.from(input.data_base64,'base64').length};}
+    }else if(op==='sendFile'){state.files.push(input);if(binaryFailure==='unknown')throw new Error('synthetic lost binary response');if(binaryFailure==='binding')return new Response(JSON.stringify({error:{code:'NOT_BOUND',message:'synthetic definite binary refusal'}}),{status:400,headers:{'content-type':'application/json'}});out={kind:'sent',wireId:'synthetic-file',sent:true,history_stored:true,filename:input.filename,mime:input.mime,bytes:Buffer.from(input.data_base64,'base64').length};}
     else if(op==='chooseIdentity'){entered();await gate;out={cid:CID,name:`ours-cowork:Control ${i}`};}
     else if(op==='setCommandCatalog')out={published:true};
     else if(op==='sendCommandResult'){state.results.push(input);out={sent:true,wire_id:'synthetic-command-result',history_stored:true};}
@@ -321,5 +321,27 @@ test('startup fanout commit failure retains room host through recovery cleanup',
   await assert.rejects(f.track(daemon.shutdown()));
   assert.equal(events.includes('unhost'),false);assert.equal(events.includes('host.close'),false);assert.equal(events.includes('lock.release'),false);
   assert.equal(f.states[0].sends.length,1);assert.equal(existsSync(join(f.dir,'rooms',IDS[0],'archive.sqlite3')),true);
+ }finally{await f.cleanup();}
+});
+
+for(const failure of ['metadata','load','binding','unknown','unread','source_missing','recipient_changed'])test(`accepted file notice ${failure} failure retains lifecycle barrier`,async()=>{
+ const f=await fixture({file:true,binaryFailure:failure});try{
+  await start(f);const packet=f.packets.get(IDS[0]);const metadata=packet.listUnreadSourceIds.bind(packet),load=f.store.load.bind(f.store),rebind=packet.rebind.bind(packet),query=f.store.query.bind(f.store);
+  let afterNotice=false;
+  if(failure==='metadata')packet.listUnreadSourceIds=async()=>{if(afterNotice)throw new Error('synthetic postnotice metadata failure');return metadata();};
+  if(failure==='unread')packet.listUnreadSourceIds=async()=>afterNotice?{messages:new Set(),files:new Set([7])}:metadata();
+  if(['source_missing','recipient_changed'].includes(failure))f.store.query=async(id,options)=>{const rows=await query(id,options);if(id===IDS[0]&&afterNotice&&options.kind==='file')return failure==='source_missing'?[]:rows.map(row=>({...row,recipient_identities:[]}));return rows;};
+  if(failure==='load')f.store.load=async(id)=>{if(id===IDS[0]&&afterNotice)throw new Error('synthetic postnotice load failure');return load(id);};
+  if(failure==='binding')packet.rebind=async()=>{throw new Error('synthetic postnotice rebind failure');};
+  afterNotice=true;f.release();await Promise.allSettled(f.work);
+  packet.listUnreadSourceIds=metadata;f.store.load=load;packet.rebind=rebind;f.store.query=query;
+  await assert.rejects(f.track(f.service.notifyRoom(IDS[0])),/relay result durability unresolved/,'fresh wake cannot redispatch unresolved accepted file phase');
+  await assert.rejects(f.track(f.service.closeRoom(IDS[0])),/relay result durability unresolved/,'postnotice phase cannot be mistaken for predispatch failure');
+  await assert.rejects(f.track(f.service.deleteRoom(IDS[0],{confirm:true})),/relay result durability unresolved/);
+  f.service.beginShutdown();await assert.rejects(f.track(f.service.drain()),/relay result durability unresolved/);
+  assert.equal(f.destroys,0);assert.equal(existsSync(join(f.dir,'rooms',IDS[0],'archive.sqlite3')),true);
+  assert.equal(f.rows(IDS[0]).filter(row=>row.kind==='relay_result').length,0,'unknown phase never claims full-file terminal success');
+  assert.equal(f.states[0].sends.length,1,'accepted notice is not retransmitted');
+  assert.equal(f.states[0].files.length,['binding','unknown'].includes(failure)?1:0,'no extra binary retry');
  }finally{await f.cleanup();}
 });

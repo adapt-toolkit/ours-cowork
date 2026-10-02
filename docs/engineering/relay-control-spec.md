@@ -116,3 +116,7 @@ simulation, distinct from the required real daemon restart classes. Final focuse
 control28/28 and control+intake164/164 pass,0fail/cancel/skip. Prove retained close
 barrier, partial file outcome and startup ownership each fails its named guard,
 then restored control28/28 passes.
+
+### Accepted file notice: all nonterminal exits (review HIGH111)
+
+After a file notice is accepted, metadata/load failure, failed definite-refusal rebind, unknown binary outcome, renewed unread metadata, missing source, or recipient-source corruption must retain the existing process-local lifecycle barrier. A successful definite-refusal rebind still requires fresh eligibility. No unresolved binary phase may fabricate a terminal full-file result. Ordinary failures before any observed effect keep their existing behavior. AC4 maps to seven `accepted file notice <failure> failure retains lifecycle barrier` regressions: restore the injected fault, then require fresh notification, repeated close/delete, and shutdown to reject without notice/binary redispatch or host/archive destruction. Unknown binary requests remain unknown; crash/restart retains the existing at-least-once limits.

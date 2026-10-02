@@ -755,10 +755,6 @@ if (process.argv.includes('--e2e-driver')) {
         record.kind === 'membership_intent' || record.kind === 'membership_result'), false);
       assert.equal((await runCli(['room', 'show', roomId])).membership_epoch, room.membership_epoch + 1);
 
-      await joinInvite(successor, reviewerInvitation.blob);
-      await waitFor(async () => (await runCli(['room', 'participants', roomId]))
-        .some((seat) => seat.identity === successor.cid && seat.state === 'active'),
-      'successor admission after repeated removal recovery');
       const barrierHistory = await waitFor(async () => {
         const history = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
         return history.some((record) => record.kind === 'message'
@@ -795,6 +791,10 @@ if (process.argv.includes('--e2e-driver')) {
       assert.equal(afterLate.command_grants.some(grant => grant.caller_cid === charlie.cid), false);
       assert.equal(removeRequests, 1, 'no repeated native removal request');
       assert.equal(committedRemoveEffects, 1, 'restart/replay/late source never repeat removal');
+      await joinInvite(successor, reviewerInvitation.blob);
+      await waitFor(async () => (await runCli(['room', 'participants', roomId]))
+        .some((seat) => seat.identity === successor.cid && seat.state === 'active'),
+      'successor admission after repeated removal recovery');
       // A removed sender receives Cowork's existing content-free bounce. Drop
       // that peer-side warning channel before the later close-contract check.
       if ((await contacts(charlie)).some((contact) => contact.container_id === roomCid)) {

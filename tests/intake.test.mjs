@@ -1298,43 +1298,45 @@ test('resumePending after a pre-consume crash consumes before sending already-co
   assert.equal(f.packet.sendCalls.length, 1);
 });
 
-test('notify does not lose a wakeup queued in the final-drain microtask gap', async () => {
+test('notify retains a fresh source queued at the final-consume microtask gap', async () => {
   const f = fixture();
-  let calls = 0;
-  let releaseReplacement;
-  const replacementGate = new Promise((resolve) => { releaseReplacement = resolve; });
-  f.pump.pump = async () => {
-    calls += 1;
-    if (calls === 2) await replacementGate;
-  };
-  const first = f.pump.notify(ROOM_ID);
+  f.packet.inbox.push(incoming());
   let replacement;
-  queueMicrotask(() => { replacement = f.pump.notify(ROOM_ID); });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(calls, 2);
-  let firstSettled = false;
-  void first.then(() => { firstSettled = true; });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(firstSettled, false, 'the original work promise must chain the replacement');
-  releaseReplacement();
-  await first;
+  f.packet.afterConsume = async () => {
+    f.packet.afterConsume = undefined;
+    queueMicrotask(() => {
+      f.packet.inbox.push(incoming({ msg_id: 8, wire_id: 'wire-next', text: 'next source' }));
+      replacement = f.pump.notify(ROOM_ID);
+    });
+  };
+  await f.pump.notify(ROOM_ID);
   await replacement;
-  assert.equal(calls, 2);
+  const messages = byKind(await f.store.read(ROOM_ID), 'message');
+  assert.deepEqual(messages.map(row => row.source_msg_id), [7, 8]);
+  assert.deepEqual(f.packet.consumeCalls, [[7], [8]]);
+  assert.equal(f.packet.inbox.length, 0);
+  assert.equal(f.packet.sendCalls.length, 4);
+  assert.deepEqual(f.packet.sendCalls.map(call => JSON.parse(call.body).text),
+    [messages[0].text, messages[0].text, 'next source', 'next source']);
 });
 
-test('notify chains a dirty replacement after a failed worker and still reports the original failure', async () => {
+test('notify reports ingress failure and a fresh external wake consumes durable work', async () => {
   const f = fixture();
-  let calls = 0;
-  f.pump.pump = async () => {
-    calls += 1;
-    if (calls === 1) throw new Error('worker failed');
-  };
+  f.packet.inbox.push(incoming());
+  f.store.beforeAppend = () => { throw new Error('ingress append failed'); };
   const first = f.pump.notify(ROOM_ID);
-  let replacement;
-  queueMicrotask(() => { replacement = f.pump.notify(ROOM_ID); });
-  await assert.rejects(first, /worker failed/);
-  await replacement.catch(() => {});
-  assert.equal(calls, 2, 'dirty shutdown work must be handed to a replacement worker');
+  const coalesced = f.pump.notify(ROOM_ID);
+  await assert.rejects(first, /ingress append failed/);
+  await assert.rejects(coalesced, /ingress append failed/);
+  assert.equal(f.packet.inbox.length, 1);
+  assert.deepEqual(f.packet.consumeCalls, []);
+  assert.deepEqual(f.packet.sendCalls, []);
+  f.store.beforeAppend = undefined;
+  await f.pump.notify(ROOM_ID);
+  assert.equal(f.packet.inbox.length, 0);
+  assert.deepEqual(f.packet.consumeCalls, [[7]]);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'message').length, 1);
+  assert.equal(f.packet.sendCalls.length, 2);
 });
 
 // ---- Anonymous-room intake and relay privacy -------------------------------

@@ -17,7 +17,7 @@ async function turnsUntil(check,missing='required control progress'){const deadl
 function incoming(n,text='STOP synthetic fixture'){
  return {seq:n,msg_id:n,from:{id:A,name:'Member 0'},peer:{id:A,name:'Member 0'},direction:'in',occurred_at_ms:Date.parse(AT),date:AT,encryption:'e2e',inbox_state:'unread',status:'unread',message_kind:'text',wire_id:n.toString(16).padStart(64,'0'),reply_to:null,text,body:text,transport:'double_ratchet',delivery_state:null,human_read_at_ms:null};
 }
-async function fixture({file=false,binding=false,lost=false}={}){
+async function fixture({file=false,binding=false,lost=false,ackFailure=false}={}){
  const dir=mkdtempSync(join(tmpdir(),'cowork-relay-control-'));const store=new CoworkStore(dir),packets=new Map(),states=[],work=[];
  let release,entered;const gate=new Promise(r=>release=r),started=new Promise(r=>entered=r);let destroys=0;
  const track=p=>{work.push(p);void p.catch(()=>{});return p;};
@@ -30,7 +30,7 @@ async function fixture({file=false,binding=false,lost=false}={}){
     if(op==='listIncomingMessages')out=state.inbox;
     else if(op==='listIncomingFiles'||op==='listInvites')out=[];
     else if(op==='getHistoryItem')out=state.inbox.find(m=>m.wire_id===input.wire_id)??null;
-    else if(op==='getMessages'){const selected=state.inbox.splice(0,input.limit);out={messages:selected.map(m=>({...m,status:'read',inbox_state:'read'})),remaining:state.inbox.length};}
+    else if(op==='getMessages'){if(i===0&&ackFailure){ackFailure=false;throw new Error('synthetic ACK failure');}const selected=state.inbox.splice(0,input.limit);out={messages:selected.map(m=>({...m,status:'read',inbox_state:'read'})),remaining:state.inbox.length};}
     else if(op==='sendMessage'){
      state.sends.push(input);
      if(i===0&&state.sends.length===1){
@@ -39,7 +39,7 @@ async function fixture({file=false,binding=false,lost=false}={}){
      }
      out={kind:'sent',wireId:`synthetic-${i}-${state.sends.length}`,sent:true,history_stored:true};
     }else if(op==='sendFile'){state.files.push(input);out={kind:'sent',wireId:'synthetic-file',sent:true,history_stored:true,filename:input.filename,mime:input.mime,bytes:Buffer.from(input.data_base64,'base64').length};}
-    else if(op==='chooseIdentity'){entered();await gate;out={info:{cid:CID}};}
+    else if(op==='chooseIdentity'){entered();await gate;out={cid:CID,name:`ours-cowork:Control ${i}`};}
     else if(op==='setCommandCatalog')out={published:true};
     else if(op==='sendCommandResult'){state.results.push(input);out={sent:true,wire_id:'synthetic-command-result',history_stored:true};}
     else if(op==='listContacts')out={contacts:state.contacts,origins:{}};
@@ -116,9 +116,9 @@ test('close marks durable closing and waits response result before unhosting',as
   const metadata=()=>JSON.parse(readFileSync(join(f.dir,'rooms',IDS[0],'room.json'),'utf8'));
   await turnsUntil(()=>metadata().state==='closing');
   assert.equal(metadata().state,'closing','lifecycle authority is durable before outside wait');
-  assert.equal(closed,false);assert.equal(f.destroys,0);assert.equal(f.rows(IDS[0]).some(r=>r.kind==='relay_result'),false);
+  assert.equal(closed,false);await assert.rejects(f.service.updateRoom(IDS[0],{status:'too late'}),/while it is closing/i);const duplicate=f.track(f.service.closeRoom(IDS[0]));assert.equal(f.destroys,0);assert.equal(f.rows(IDS[0]).some(r=>r.kind==='relay_result'),false);
   f.release();await f.track(f.service.drain());await turnsUntil(()=>closed);assert.equal(closed,true);
-  assert.equal(f.destroys,1);assert.equal(f.rows(IDS[0]).find(r=>r.kind==='relay_result').status,'queued');
+  assert.equal(f.destroys,1);assert.deepEqual(await duplicate,await f.service.showRoom(IDS[0]));await assert.rejects(f.service.updateRoom(IDS[0],{status:'still too late'}),/while it is closed/i);assert.equal(f.rows(IDS[0]).find(r=>r.kind==='relay_result').status,'queued');
  }finally{await f.cleanup();}
 });
 
@@ -201,5 +201,23 @@ test('stale claimed bounce does not revive after removal rejoin and removal',asy
   const next=await f.store.load(IDS[0]);next.membership_epoch=4;next.seats.push({...room.seats[0],state:'active',participant_id:'01jz6y7n8p9q0r1s2t3v4w5xa3',removed_at:undefined,removed_epoch:undefined});await f.store.save(next);
   next.membership_epoch=5;next.seats[2]={...next.seats[2],state:'removed',removed_at:AT,removed_epoch:5};await f.store.save(next);
   f.release();await f.track(f.service.drain());assert.equal(f.states[0].sends.length,1,'old bounce claim cannot authorize current departed lifecycle');
+ }finally{await f.cleanup();}
+});
+
+
+test('ACK failure frees ingress while claimed rejection waits behind held relay',async()=>{
+ const f=await fixture({ackFailure:true});try{
+  await start(f);const rejected=incoming(1,'Synthetic rejected');rejected.reply_to={wire_id:'F'.repeat(64)};
+  f.states[0].inbox.push(rejected);f.track(f.service.notifyRoom(IDS[0]));
+  await turnsUntil(()=>f.states[0].operations.includes('getMessages'));
+  await tick();
+  f.states[0].inbox.push(incoming(2));f.track(f.service.notifyRoom(IDS[0]));
+  await turnsUntil(()=>f.rows(IDS[0]).some(r=>r.kind==='message'&&r.text==='STOP synthetic fixture'));
+  assert.equal(f.states[0].inbox.length,0,'fresh notify consumes replay and STOP while old response is held');
+  assert.equal(f.rows(IDS[0]).filter(r=>r.kind==='intake_rejection').length,1,'durable claim is not repeated');
+  assert.equal(f.states[0].sends.length,1,'claimed notice does not overlap held serial relay');
+  f.release();const outcomes=await Promise.allSettled(f.work);await f.track(f.service.drain());
+  assert.equal(outcomes.some(o=>o.status==='rejected'&&o.reason.message.includes('synthetic ACK failure')),true,'original ingress failure remains observable');
+  assert.equal(f.states[0].sends.filter(send=>JSON.parse(send.text).text==='reply_target_unavailable').length,1,'content-free notice attempts once after response');
  }finally{await f.cleanup();}
 });

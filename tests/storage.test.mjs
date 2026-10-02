@@ -584,7 +584,7 @@ test('SQLite durability policy is WAL with FULL synchronous commits', async (t) 
 test('relay and close recovery paths use unresolved indexes instead of archive scans', () => {
   const intake = readFileSync(new URL('../src/intake.ts', import.meta.url), 'utf8');
   const service = readFileSync(new URL('../src/service.ts', import.meta.url), 'utf8');
-  const relay = intake.slice(intake.indexOf('private async relayPendingUnlocked'), intake.indexOf('private findSourceMessage'));
+  const relay = intake.slice(intake.indexOf('private async relayPending('), intake.indexOf('private findSourceMessage'));
   const close = service.slice(service.indexOf('private async closeUnlocked'), service.indexOf('private async appendUncertainCloseResult'));
   assert.equal(relay.includes('this.store.read('), false);
   assert.equal(close.includes('this.store.read('), false);

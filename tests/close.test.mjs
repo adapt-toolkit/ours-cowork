@@ -528,7 +528,8 @@ test('close serializes duplicate close and rejects lifecycle work queued behind 
   release();
   const [one, two] = await Promise.all([first, duplicate]);
   assert.deepEqual(two, one);
-  await assert.rejects(update, /while it is closed/i);
+  await assert.rejects(update, /while it is closing/i);
+  await assert.rejects(f.service.updateRoom(ROOM_ID, { status: 'still too late' }), /while it is closed/i);
   assert.deepEqual(f.registry.destroyCalls, [ROOM_ID]);
 });
 

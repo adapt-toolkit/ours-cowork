@@ -277,3 +277,34 @@ for(const ambiguity of ['before','after'])test(`daemon shutdown after exited ${a
   assert.equal(existsSync(join(f.dir,'rooms',IDS[0],'archive.sqlite3')),true);assert.equal(f.states[0].sends.length,1);
  }finally{await f.cleanup();}
 });
+
+
+for(const authority of ['closing','removed'])test(`file ${authority} skip commit failure remains a lifecycle barrier`,async()=>{
+ const f=await fixture({file:true});try{
+  const append=f.store.append.bind(f.store);f.store.append=async(id,row)=>{if(row.kind==='relay_result')throw new Error('synthetic partial file commit failure');return append(id,row);};
+  await start(f);
+  let close;
+  if(authority==='closing'){close=f.track(f.service.closeRoom(IDS[0]));await turnsUntil(()=>JSON.parse(readFileSync(join(f.dir,'rooms',IDS[0],'room.json'),'utf8')).state==='closing');}
+  else await f.track(f.service.removeParticipant(IDS[0],{participant:B,notify:false}));
+  f.release();await Promise.allSettled(f.work);if(close)await assert.rejects(close,/synthetic partial file commit failure/);
+  f.store.append=append;
+  await assert.rejects(f.track(f.service.closeRoom(IDS[0])),/synthetic partial file commit failure/);
+  await assert.rejects(f.track(f.service.deleteRoom(IDS[0],{confirm:true})),/synthetic partial file commit failure/);
+  assert.equal(f.destroys,0);assert.equal(f.states[0].files.length,0);assert.equal(f.states[0].sends.length,1);
+  assert.equal(existsSync(join(f.dir,'rooms',IDS[0],'archive.sqlite3')),true);
+ }finally{await f.cleanup();}
+});
+
+for(const failure of ['metadata','transport'])test(`ordinary ${failure} failure permits existing daemon error cleanup`,async()=>{
+ const f=await fixture({lost:failure==='transport'});try{
+  if(failure==='metadata')f.packets.get(IDS[0]).listUnreadSourceIds=async()=>{throw new Error('synthetic metadata failure');};
+  const completion=f.track(f.service.resumePending(IDS[0]));
+  if(failure==='transport'){await f.started;f.release();}
+  await assert.rejects(completion,failure==='transport'?/synthetic lost send response/:/synthetic metadata failure/);
+  const events=[];const daemon=new CoworkDaemon({config:{version:1,stateDir:f.dir,rest:{enabled:false,port:3010}},prepare:()=>({socketPath:join(f.dir,'test.sock')}),lock:()=>({release(){events.push('lock.release');}}),host:{async boot(){},close(){events.push('host.close');}},store:{async list(){return[];}},registry:{async unhostAll(){events.push('unhost');}},service:f.service,writePid(){},removePid(){events.push('pid.remove');},transports:{async start(){},async stop(){events.push('transports.stop');}}});
+  await daemon.boot();await daemon.shutdown();
+  assert.deepEqual(events,['transports.stop','pid.remove','unhost','host.close','lock.release']);
+  assert.equal(f.rows(IDS[0]).some(row=>row.kind==='relay_result'),false,'cleanup must not invent delivery result');
+  assert.equal(existsSync(join(f.dir,'rooms',IDS[0],'archive.sqlite3')),true);
+ }finally{await f.cleanup();}
+});

@@ -297,7 +297,12 @@ if (process.argv.includes('--e2e-driver')) {
       // reproducing the canonical ambiguous recovery boundary without any
       // room-state or history rewriting.
       let loseNextRemoveResponse = false;
+      let committedRemoveEffects = 0;
+      let removeRequests = 0;
+      let lateSourceConsumed = false;
+      const lateMarker = 'late source after observed contact absence';
       oursProxy = createHttpServer((incoming, outgoing) => {
+        if (incoming.url === '/api/v1/removeContact') removeRequests += 1;
         const upstream = httpRequest({
           hostname: '127.0.0.1',
           port: oursPort,
@@ -308,6 +313,17 @@ if (process.argv.includes('--e2e-driver')) {
           const lose = loseNextRemoveResponse
             && incoming.url === '/api/v1/removeContact';
           if (!lose) {
+            if (incoming.url === '/api/v1/removeContact' && response.statusCode === 200) committedRemoveEffects += 1;
+            if (incoming.url === '/api/v1/getMessages') {
+              const observed = [];
+              response.on('data', chunk => observed.push(chunk));
+              response.on('end', () => {
+                try {
+                  const body = JSON.parse(Buffer.concat(observed).toString('utf8'));
+                  lateSourceConsumed ||= (body.messages ?? []).some(row => row.text === lateMarker || row.body === lateMarker);
+                } catch { /* The real SDK still validates the forwarded response. */ }
+              });
+            }
             outgoing.writeHead(response.statusCode ?? 500, response.headers);
             response.pipe(outgoing);
             return;
@@ -317,6 +333,7 @@ if (process.argv.includes('--e2e-driver')) {
           response.on('end', () => {
             if (response.statusCode === 200) {
               loseNextRemoveResponse = false;
+              committedRemoveEffects += 1;
               outgoing.writeHead(502, { 'content-type': 'text/plain' });
               outgoing.end('simulated lost removeContact response');
               return;
@@ -661,6 +678,8 @@ if (process.argv.includes('--e2e-driver')) {
         record.kind === 'membership_intent' || record.kind === 'membership_result'), false);
 
       const charlieSeat = room.seats.find((seat) => seat.identity === charlie.cid);
+      await runCli(['room', 'command-grant', roomId, charlie.cid, 'room.show']);
+      assert.equal((await runCli(['room', 'command-grants', roomId])).some(grant => grant.caller_cid === charlie.cid), true);
       const removeArguments = {
         participant_id: charlieSeat.participant_id,
         expected_membership_epoch: room.membership_epoch,
@@ -684,14 +703,26 @@ if (process.argv.includes('--e2e-driver')) {
       }, 'correlated ambiguous remove-member failure');
       assert.equal(ambiguousResult.reply_to.wire_id, removeRequest.wireId);
       assert.deepEqual(JSON.parse(ambiguousResult.body), { ok: false, error: 'handler_failed' });
-      assert.equal((await runCli(['room', 'participants', roomId]))
-        .find((seat) => seat.participant_id === charlieSeat.participant_id)?.state, 'active');
+      const observedRemoval = await waitFor(async () => {
+        const current = await runCli(['room', 'show', roomId]);
+        return current.seats.find(seat => seat.participant_id === charlieSeat.participant_id)?.removal_reason === 'contact_absent' ? current : undefined;
+      }, 'fresh authoritative contact absence reconciliation');
+      const removedSeat = observedRemoval.seats.find(seat => seat.participant_id === charlieSeat.participant_id);
+      assert.equal(removedSeat.state, 'removed');
+      assert.equal(removedSeat.removed_epoch, room.membership_epoch + 1);
+      assert.equal(observedRemoval.membership_epoch, room.membership_epoch + 1);
+      assert.equal(observedRemoval.command_grants.some(grant => grant.caller_cid === charlie.cid), false);
+      assert.equal(removeRequests, 1, 'no repeated native removal request');
+      assert.equal(committedRemoveEffects, 1, 'lost accepted removal is not blindly retried');
 
       await restartCoworkAfterFullExit();
       const recoveredRoom = await runCli(['room', 'show', roomId]);
-      assert.equal(recoveredRoom.membership_epoch, room.membership_epoch);
+      assert.equal(recoveredRoom.membership_epoch, room.membership_epoch + 1);
       assert.equal(recoveredRoom.seats.find((seat) =>
-        seat.participant_id === charlieSeat.participant_id).state, 'active');
+        seat.participant_id === charlieSeat.participant_id).state, 'removed');
+      assert.equal(recoveredRoom.command_grants.some(grant => grant.caller_cid === charlie.cid), false);
+      assert.equal(removeRequests, 1, 'no repeated native removal request');
+      assert.equal(committedRemoveEffects, 1, 'restart does not retry the unknown core mutation');
       let recoveryHistory = await runCli([
         'room', 'history', roomId, '--after', '0', '--limit', '1000',
       ]);
@@ -735,8 +766,35 @@ if (process.argv.includes('--e2e-driver')) {
       }, 'post-barrier sentinel archive');
       assert.equal(barrierHistory.some((record) => record.kind === 'message'
         && record.text === 'before typed removal barrier'), true);
-      assert.equal(barrierHistory.some((record) => record.kind === 'message'
-        && record.text === 'after typed removal barrier'), true);
+      // This source was queued BEFORE the authoritative disappearance was
+      // observed. Native contact reintroduction and reconciliation may race;
+      // its position after an unknown operation is not an authorization barrier.
+      // Test the deterministic boundary with a new source after observed removal.
+      await bob.client.getMessages();
+      await alice.client.getMessages();
+      await send(charlie, roomCid, lateMarker);
+      await send(alice, roomCid, 'after observed removal sentinel');
+      const lateHistory = await waitFor(async () => {
+        const history = await runCli(['room', 'history', roomId, '--after', '0', '--limit', '1000']);
+        return lateSourceConsumed && history.some(record => record.kind === 'message' && record.text === 'after observed removal sentinel') ? history : undefined;
+      }, 'late source consumed and authorized sentinel archived');
+      assert.equal(lateSourceConsumed, true, 'negative source actually passed through SDK consume');
+      assert.equal(lateHistory.some(record => record.kind === 'message' && record.text === lateMarker), false);
+      const healthyMessages = [];
+      await waitFor(async () => {
+        healthyMessages.push(...(await bob.client.getMessages()).messages);
+        return roomEnvelopes(healthyMessages).some(envelope => envelope.text === 'after observed removal sentinel');
+      }, 'authorized post-removal sentinel reaches healthy peer');
+      healthyMessages.push(...(await alice.client.getMessages()).messages);
+      assert.equal(roomEnvelopes(healthyMessages).some(envelope => envelope.text === lateMarker), false);
+      const afterLate = await runCli(['room', 'show', roomId]);
+      assert.equal(afterLate.membership_epoch, room.membership_epoch + 1);
+      assert.equal(afterLate.seats.find(seat => seat.participant_id === charlieSeat.participant_id).state, 'removed');
+      assert.equal(afterLate.seats.find(seat => seat.participant_id === charlieSeat.participant_id).removed_epoch, removedSeat.removed_epoch);
+      assert.equal(afterLate.seats.find(seat => seat.participant_id === charlieSeat.participant_id).removal_reason, 'contact_absent');
+      assert.equal(afterLate.command_grants.some(grant => grant.caller_cid === charlie.cid), false);
+      assert.equal(removeRequests, 1, 'no repeated native removal request');
+      assert.equal(committedRemoveEffects, 1, 'restart/replay/late source never repeat removal');
       // A removed sender receives Cowork's existing content-free bounce. Drop
       // that peer-side warning channel before the later close-contract check.
       if ((await contacts(charlie)).some((contact) => contact.container_id === roomCid)) {

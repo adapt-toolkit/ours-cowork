@@ -14,7 +14,7 @@ import {
   type CommunicationRecord,
   type Room,
 } from './contracts.ts';
-import type { FileInboxItem, InboxItem, RoomPacket } from './packets.ts';
+import type { FileInboxItem, InboxItem, RoomPacket, RelayDispatchOptions } from './packets.ts';
 import type { CoworkStore, RoomMutex } from './storage.ts';
 import { generateUlid } from './ulid.ts';
 import { readReplyRows, selectReply } from './reply-threading.ts';
@@ -46,6 +46,17 @@ interface NotificationState {
 const JOURNAL_WORK_BATCH_SIZE = 64;
 
 const INTAKE_BATCH_SIZE = 32;
+
+interface ClaimedNotice {
+  recipient: string;
+  body: Record<string, unknown>;
+  participantId: string;
+  epoch: number;
+  removedEpoch?: number;
+  seatState: Room['seats'][number]['state'];
+  roomState: Room['state'];
+  kind: 'rejection' | 'bounce';
+}
 
 /**
  * Produce the byte-stable JSON representation sent by room identities.
@@ -88,8 +99,9 @@ export async function sendRoomBody(
   recipientIdentity: string,
   unsigned: Record<string, unknown>,
   replyTo?: Parameters<RoomPacket['send']>[2],
+  options?: RelayDispatchOptions,
 ): Promise<Awaited<ReturnType<RoomPacket['send']>>> {
-  return packet.send(recipientIdentity, canonicalJson(unsigned), replyTo);
+  return packet.send(recipientIdentity, canonicalJson(unsigned), replyTo, options);
 }
 
 /** Archive, consume, and relay participant messages for hosted room packets. */
@@ -102,6 +114,11 @@ export class IntakePump {
   private readonly pumps = new Map<string, NotificationState>();
   private readonly notifications = new Map<string, NotificationState>();
   private acceptingNotifications = true;
+  private readonly relays = new Map<string, NotificationState>();
+  private readonly notices = new Map<string, ClaimedNotice[]>();
+  private readonly relayRequests = new Map<string, number>();
+  private readonly failedRelayRequests = new Map<string, { epoch: number; work: Promise<void> }>();
+  private readonly quiescing = new Set<string>();
 
   constructor(store: IntakeStore, packets: IntakePacketRegistry, private readonly options: IntakePumpOptions = {}) {
     this.store = store;
@@ -118,43 +135,70 @@ export class IntakePump {
    */
   notify(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
-    // The unread item remains in SDK identity state and is resumed on next boot.
     if (!this.acceptingNotifications) return Promise.resolve();
+    this.requestRelay(id);
+    // Wake the sole reader immediately even if the notification's previous
+    // forwarding completion is still awaiting an RPC response.
+    void this.ensureIngress(id).catch(() => {});
     const existing = this.notifications.get(id);
-    if (existing) {
-      existing.dirty = true;
-      return existing.work;
-    }
-
+    if (existing) { existing.dirty = true; return existing.work; }
     const state: NotificationState = { dirty: true, work: Promise.resolve() };
     this.notifications.set(id, state);
     state.work = this.runNotificationWorker(id, state);
     return state.work;
   }
 
-  /** One SDK reader per room; callback HTTP never runs under the room mutex. */
   async pump(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     if (!this.packets.get(id)) return;
-    const existing = this.pumps.get(id);
-    if (existing) {
-      existing.dirty = true;
-      const current = this.processing.getStore();
-      if (current?.active && current.roomId === id) return;
-      return existing.work;
+    this.requestRelay(id);
+    await this.pumpWork(id);
+  }
+
+  private requestRelay(roomId: string): void {
+    this.relayRequests.set(roomId, (this.relayRequests.get(roomId) ?? 0) + 1);
+  }
+
+  private async pumpWork(roomId: string): Promise<void> {
+    const current = this.processing.getStore();
+    const work = this.ensureIngress(roomId);
+    if (current?.active && current.roomId === roomId) return;
+    try { await work; } catch (error) {
+      // Notice attempts are independently tracked. Compatibility callers can
+      // await them here without occupying the sole ingress reader.
+      await this.relays.get(roomId)?.work.catch(() => {});
+      throw error;
     }
+    await this.scheduleRelay(roomId);
+  }
+
+  private ensureIngress(roomId: string): Promise<void> {
+    if (!this.acceptingNotifications || this.quiescing.has(roomId) || !this.packets.get(roomId)) return Promise.resolve();
+    const existing = this.pumps.get(roomId);
+    if (existing) { existing.dirty = true; return existing.work; }
     const state: NotificationState = { dirty: true, work: Promise.resolve() };
-    this.pumps.set(id, state);
-    state.work = this.runPump(id, state);
+    this.pumps.set(roomId, state);
+    state.work = this.runPump(roomId, state);
     return state.work;
   }
 
-  /** A callback may publish through REST: enqueue its relay without awaiting itself. */
   async resumePending(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
-    const active = this.pumps.get(id);
-    if (active) { active.dirty = true; return; }
-    await this.pump(id);
+    this.requestRelay(id);
+    const alreadyActive = this.pumps.has(id) || this.relays.has(id);
+    const ingress = this.ensureIngress(id);
+    if (alreadyActive) { void ingress.catch(() => {}); return; }
+    await ingress;
+    await this.scheduleRelay(id);
+  }
+
+  /** Called only after the service has durably marked this room closing. */
+  async quiesceRelay(roomId: string): Promise<void> {
+    this.quiescing.add(roomId);
+    const relay = this.relays.get(roomId);
+    if (relay) await relay.work;
+    // Claimed notices are at-most-once; closing must not dispatch them later.
+    this.notices.delete(roomId);
   }
 
   private async runPump(roomId: string, state: NotificationState): Promise<void> {
@@ -164,8 +208,9 @@ export class IntakePump {
         const packet = this.packet(roomId);
         while (state.dirty) {
           state.dirty = false;
-          const more = await this.drainAndRelay(roomId, packet);
+          const more = await this.drainIngress(roomId, packet);
           state.dirty ||= more;
+          void this.scheduleRelay(roomId).catch(() => {});
           await this.options.afterPump?.(roomId);
           if (!this.packets.get(roomId) || !this.acceptingNotifications) break;
           if (state.dirty) await new Promise<void>(resolve => setImmediate(resolve));
@@ -182,86 +227,90 @@ export class IntakePump {
   }
 
   async drain(): Promise<void> {
-    while (this.notifications.size > 0 || this.pumps.size > 0) {
-      await Promise.allSettled([...this.notifications.values(), ...this.pumps.values()].map((state) => state.work));
+    while (this.notifications.size > 0 || this.pumps.size > 0 || this.relays.size > 0) {
+      await Promise.allSettled([...this.notifications.values(), ...this.pumps.values(), ...this.relays.values()].map((state) => state.work));
     }
   }
 
   private async runNotificationWorker(roomId: string, state: NotificationState): Promise<void> {
-    let failure: unknown;
     try {
       while (state.dirty) {
         state.dirty = false;
-        await this.pump(roomId);
+        await this.pumpWork(roomId);
       }
-    } catch (error) {
-      failure = error;
+    } finally {
+      // Failed work ends this pass: dirty ingress backlog is not a fresh retry.
+      if (this.notifications.get(roomId) === state) this.notifications.delete(roomId);
     }
-
-    // Cleanup is deliberately inside this async worker, not Promise.finally:
-    // the map entry disappears synchronously before this work promise settles.
-    // A wakeup already marked dirty is handed to a replacement and awaited so
-    // shutdown cannot observe the original worker complete while work is lost.
-    if (this.notifications.get(roomId) === state) this.notifications.delete(roomId);
-    let replacementWork: Promise<void> | undefined;
-    if (state.dirty) {
-      replacementWork = this.notify(roomId);
-    }
-    // Give a wakeup which was already queued at the final-drain boundary one
-    // microtask to install its replacement after the synchronous deletion.
-    // The original work promise then chains that replacement before settling.
-    await Promise.resolve();
-    replacementWork ??= this.notifications.get(roomId)?.work;
-    if (replacementWork) {
-      try {
-        await replacementWork;
-      } catch (replacementFailure) {
-        if (failure === undefined) failure = replacementFailure;
-      }
-    }
-    if (failure !== undefined) throw failure;
   }
 
-  private async drainAndRelay(roomId: string, packet: RoomPacket): Promise<boolean> {
+  private scheduleRelay(roomId: string): Promise<void> {
+    const active = this.relays.get(roomId);
+    if (active) { active.dirty = true; return active.work; }
+    if (!this.acceptingNotifications || this.quiescing.has(roomId) || !this.packets.get(roomId)) return Promise.resolve();
+    const failed = this.failedRelayRequests.get(roomId);
+    if (failed && failed.epoch >= (this.relayRequests.get(roomId) ?? 0)) return failed.work;
+    const state: NotificationState = { dirty: true, work: Promise.resolve() };
+    this.relays.set(roomId, state);
+    state.work = this.runRelay(roomId, state);
+    void state.work.catch(() => {});
+    return state.work;
+  }
+
+  private async runRelay(roomId: string, state: NotificationState): Promise<void> {
+    try {
+      const packet = this.packet(roomId);
+      while (state.dirty && this.acceptingNotifications && !this.quiescing.has(roomId)) {
+        state.dirty = false;
+        await this.relayPending(roomId, packet);
+      }
+      this.failedRelayRequests.delete(roomId);
+    } catch (error) {
+      // Consume already-coalesced requests; only a subsequent explicit wake
+      // may resume existing at-least-once recovery, never an automatic turn.
+      this.failedRelayRequests.set(roomId, { epoch: this.relayRequests.get(roomId) ?? 0, work: state.work });
+      throw error;
+    } finally {
+      if (this.relays.get(roomId) === state) this.relays.delete(roomId);
+    }
+  }
+
+  private async drainIngress(roomId: string, packet: RoomPacket): Promise<boolean> {
     if (await this.options.shouldPause?.(roomId)) return false;
     let more = await packet.drainRuntimeCommands?.(
-      (item) => this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false)),
+      (item) => this.lock(roomId, () => this.processInboxItem(roomId, item)),
     ) === true;
     if (await this.options.shouldPause?.(roomId)) return false;
     const messages = await packet.listUnreadMessages(INTAKE_BATCH_SIZE);
     const files = await packet.listUnreadFiles(INTAKE_BATCH_SIZE);
     for (const item of messages) {
       if (await this.options.shouldPause?.(roomId)) break;
-      await this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false));
+      await this.lock(roomId, () => this.processInboxItem(roomId, item));
       // Unexpected read rows are archived before the next SDK consume.
       const deferred = await packet.acknowledgeMessage(item,
-        (unexpected) => this.lock(roomId, () => this.processInboxItem(roomId, packet, unexpected, false)));
+        (unexpected) => this.lock(roomId, () => this.processInboxItem(roomId, unexpected)));
       more ||= deferred === true;
       if (deferred === true) break;
     }
     for (const item of files) {
       if (await this.options.shouldPause?.(roomId)) break;
-      await this.lock(roomId, () => this.processFileInboxItem(roomId, packet, item));
+      await this.lock(roomId, () => this.processFileInboxItem(roomId, item));
+      await packet.acknowledgeFile(item);
     }
     if (await this.options.shouldPause?.(roomId)) return false;
     const unread = await packet.listUnreadSourceIds();
-    await this.lock(roomId, async () => {
-      await this.completeSnapshotIntents(roomId);
-      await this.relayPendingUnlocked(roomId, packet, unread);
-    });
+    await this.lock(roomId, () => this.completeSnapshotIntents(roomId));
     // Do not require an empty unread queue before offering a forwarding turn.
     return more || unread.messages.size > 0 || unread.files.size > 0;
   }
 
   private async processFileInboxItem(
     roomId: string,
-    packet: RoomPacket,
     item: FileInboxItem,
   ): Promise<void> {
     const room = await this.store.load(roomId);
     const [stored] = await queryStore(this.store, roomId, { sourceFileId: item.file_id, limit: 1 });
     if (this.isRejectedReplay(stored, item)) {
-      await packet.acknowledgeFile(item);
       return;
     }
     let file = this.findSourceFile(stored === undefined ? [] : [stored], item);
@@ -269,13 +318,11 @@ export class IntakePump {
       const seat = room.seats.find(candidate => candidate.identity === item.sender_id && candidate.state === 'active');
       const known = room.seats.some(candidate => candidate.identity === item.sender_id);
       if (!known || (item.reply_to == null && (room.state !== 'active' || !seat))) {
-        if (room.state === 'active') await this.bounceRemovedSender(roomId, room, packet, item);
-        await packet.acknowledgeFile(item);
+        if (room.state === 'active') await this.bounceRemovedSender(roomId, room, item);
         return;
       }
       const disposition = await this.freshScopeUnlocked(room, item);
       if (!disposition) {
-        await packet.acknowledgeFile(item);
         return;
       }
       if (!seat) throw new Error('authorized file sender has no active seat');
@@ -283,7 +330,6 @@ export class IntakePump {
       const parsedMime = FileMimeSchema.safeParse(item.mime);
       // Drain legacy poison metadata after checking saved-source integrity and scope.
       if (!parsedName.success || !parsedMime.success) {
-        await packet.acknowledgeFile(item);
         return;
       }
       if (item.data.length > MAX_FILE_BYTES) {
@@ -315,19 +361,15 @@ export class IntakePump {
     }
 
     await this.completeFileIntents(roomId, file);
-    await packet.acknowledgeFile(item);
   }
 
   private async processInboxItem(
     roomId: string,
-    packet: RoomPacket,
     item: InboxItem,
-    acknowledge = true,
   ): Promise<void> {
     const room = await this.store.load(roomId);
     const [stored] = await queryStore(this.store, roomId, { sourceMsgId: item.msg_id, limit: 1 });
     if (this.isRejectedReplay(stored, item)) {
-      if (acknowledge) await this.acknowledgeMessage(roomId, packet, item);
       return;
     }
     let message = this.findSourceMessage(stored === undefined ? [] : [stored], item);
@@ -336,13 +378,11 @@ export class IntakePump {
       const known = room.seats.some(candidate => candidate.identity === item.sender_id);
       if (!known || (item.reply_to == null && (room.state !== 'active' || !seat))) {
         // A wholly unknown sender has no room seat to bind a rejection to.
-        if (room.state === 'active') await this.bounceRemovedSender(roomId, room, packet, item);
-        if (acknowledge) await this.acknowledgeMessage(roomId, packet, item);
+        if (room.state === 'active') await this.bounceRemovedSender(roomId, room, item);
         return;
       }
       const disposition = await this.freshScopeUnlocked(room, item);
       if (!disposition) {
-        if (acknowledge) await this.acknowledgeMessage(roomId, packet, item);
         return;
       }
       if (!seat) throw new Error('authorized message sender has no active seat');
@@ -376,13 +416,6 @@ export class IntakePump {
 
     await this.completeMessageIntents(roomId, message);
 
-    // This is the irreversible SDK read mark. Every preceding append resolves
-    // only after its file fsync, so both the message and the complete fan-out
-    // exist durably first. If an older row became unread after the snapshot,
-    // the SDK returns that row first; archive it through this same path before
-    // retrying the expected row. The promoted row is already read and must not
-    // be acknowledged a second time.
-    if (acknowledge) await this.acknowledgeMessage(roomId, packet, item);
   }
 
   private async freshScopeUnlocked(room: Room, item: InboxItem | FileInboxItem) {
@@ -444,22 +477,12 @@ export class IntakePump {
       source_wire_id: item.wire_id, sender_identity: item.sender_id, sender_participant_id: seat.participant_id,
       fingerprint: inputFingerprint(item), error: error.code, notification_attempt_claimed: true,
     });
-    // The durable refusal is also the one-time claim. A crash may lose the notice;
-    // replay never repeats it, even when transport failed after accepting a send.
-    try {
-      await sendRoomBody(this.packet(room.room_id), item.sender_id, {
-        version: 1, kind: 'room_msg', room_id: room.room_id, room_name: room.room_name,
-        message_id: this.nextMessageId(), at: this.now(), text: error.code,
-        author: { identity: room.identity_cid, display_name: room.identity_name, role: ROOM_ROLE },
-      });
-    } catch { /* refusal remains durable; the fixed private notification is best effort */ }
-  }
-
-  private acknowledgeMessage(roomId: string, packet: RoomPacket, expected: InboxItem): Promise<boolean | void> {
-    return packet.acknowledgeMessage(
-      expected,
-      (unexpected) => this.processInboxItem(roomId, packet, unexpected, false),
-    );
+    // Claim and enqueue atomically before the SDK reader acknowledges it.
+    this.enqueueNotice(room, seat, item.sender_id, 'rejection', {
+      version: 1, kind: 'room_msg', room_id: room.room_id, room_name: room.room_name,
+      message_id: this.nextMessageId(), at: this.now(), text: error.code,
+      author: { identity: room.identity_cid, display_name: room.identity_name, role: ROOM_ROLE },
+    });
   }
 
   /**
@@ -470,7 +493,6 @@ export class IntakePump {
   private async bounceRemovedSender(
     roomId: string,
     room: Room,
-    packet: RoomPacket,
     item: Pick<InboxItem | FileInboxItem, 'sender_id'>,
   ): Promise<void> {
     const removed = room.seats.find(
@@ -485,15 +507,47 @@ export class IntakePump {
         ? { ...candidate, bounced_at: this.now() }
         : candidate);
     await this.store.save(RoomSchema.parse({ ...room, seats }));
-    try {
-      const unsigned = {
-        version: 1 as const,
-        kind: 'room_not_member' as const,
-        room_id: roomId,
-        room_name: room.room_name,
-      };
-      await sendRoomBody(packet, item.sender_id, unsigned);
-    } catch { /* best effort — the channel is severed or severing */ }
+    this.enqueueNotice(room, removed, item.sender_id, 'bounce', {
+      version: 1, kind: 'room_not_member', room_id: roomId, room_name: room.room_name,
+    });
+  }
+
+  private enqueueNotice(
+    room: Room, seat: Room['seats'][number], recipient: string,
+    kind: ClaimedNotice['kind'], body: Record<string, unknown>,
+  ): void {
+    const queue = this.notices.get(room.room_id) ?? [];
+    queue.push({ recipient, kind, body: structuredClone(body), participantId: seat.participant_id,
+      epoch: room.membership_epoch, seatState: seat.state, roomState: room.state,
+      ...(seat.removed_epoch === undefined ? {} : { removedEpoch: seat.removed_epoch }) });
+    this.notices.set(room.room_id, queue);
+    void this.scheduleRelay(room.room_id).catch(() => {});
+  }
+
+  private async relayNotice(roomId: string, packet: RoomPacket): Promise<void> {
+    const notice = this.notices.get(roomId)?.shift();
+    if (!notice) return;
+    for (let bindingRecovery = 0; ; bindingRecovery++) {
+      const dispatched = await this.lock(roomId, async () => {
+        const room = await this.store.load(roomId);
+        const seat = room.seats.find(seat => seat.participant_id === notice.participantId && seat.identity === notice.recipient);
+        if (!this.acceptingNotifications || this.quiescing.has(roomId) || room.state === 'closing' || room.state !== notice.roomState || room.membership_epoch !== notice.epoch || !seat
+          || (notice.kind === 'rejection' ? seat.state !== notice.seatState
+            : seat.state !== 'removed' || seat.removed_epoch !== notice.removedEpoch
+              || room.seats.some(other => other.identity === notice.recipient && other.state === 'active'))) return undefined;
+        const work = sendRoomBody(packet, notice.recipient, notice.body, undefined, { recoverBinding: false });
+        void work.catch(() => {});
+        return { work };
+      });
+      if (!dispatched) return;
+      try { await dispatched.work; return; } catch (error) {
+        if (bindingRecovery === 0 && isDefiniteBindingRefusal(error)) {
+          try { await packet.rebind(); } catch { return; }
+          continue;
+        }
+        return; // Durable one-time claim forbids replay of ambiguous notice.
+      }
+    }
   }
 
   private async completeSnapshotIntents(roomId: string): Promise<void> {
@@ -573,55 +627,96 @@ export class IntakePump {
       });
   }
 
-  private async relayPendingUnlocked(
-    roomId: string, packet: RoomPacket, unread: { messages: Set<number>; files: Set<number> },
-  ): Promise<void> {
+  private async relayPending(roomId: string, packet: RoomPacket): Promise<void> {
     const deferredRecipients = new Set<string>();
-    const room = await this.store.load(roomId);
-    const activeCids = new Set(room.seats
-      .filter((seat) => seat.state === 'active')
-      .map((seat) => seat.identity));
-    const removedCids = new Set(room.seats
-      .filter((seat) => seat.state === 'removed')
-      .map((seat) => seat.identity));
-    let firstDeliveryError: unknown;
-    let deliveryFailed = false;
-    // Preserve result-less ambiguous sends for recovery, but attempt independent
-    // recipients before surfacing the error. Storage failures still stop the pump.
-    const attempt = async <T>(send: () => Promise<T>): Promise<T | undefined> => {
-      try { return await send(); } catch (error) {
-        if (!deliveryFailed) firstDeliveryError = error;
-        deliveryFailed = true;
-        return undefined;
-      }
-    };
+    let firstError: unknown;
+    let failed = false;
     let after = 0;
     for (;;) {
+      if (!this.acceptingNotifications || this.quiescing.has(roomId)) break;
+      await this.relayNotice(roomId, packet);
       const pending = await queryStore(this.store, roomId, {
-        kind: 'relay_intent', unresolvedResultKind: 'relay_result', after,
-        limit: JOURNAL_WORK_BATCH_SIZE,
+        kind: 'relay_intent', unresolvedResultKind: 'relay_result', after, limit: JOURNAL_WORK_BATCH_SIZE,
       }) as RelayIntentRecord[];
       if (pending.length === 0) {
-        if (deliveryFailed) throw firstDeliveryError;
-        return;
+        if ((this.notices.get(roomId)?.length ?? 0) > 0) continue;
+        break;
       }
       for (const intent of pending) {
         after = intent.seq;
+        if (!this.acceptingNotifications || this.quiescing.has(roomId)) break;
+        if (deferredRecipients.has(intent.recipient_identity)) continue;
+        let metadataWire: string | undefined;
+        let phase: 'first' | 'binary' = 'first';
+        let recoveredBinding = false;
+        for (;;) {
+          try {
+            // Read marks outside the room mutex. A stale positive unread mark
+            // delays safely; failed metadata is never interpreted as consumed.
+            const unread = await packet.listUnreadSourceIds();
+            const prepared = await this.prepareEffect(roomId, packet, intent, unread, phase, metadataWire);
+            if (prepared.kind === 'deferred') { deferredRecipients.add(intent.recipient_identity); break; }
+            if (prepared.kind === 'skipped') break;
+            const outcome = await prepared.work;
+            if (prepared.file && phase === 'first' && outcome.status === 'queued') {
+              metadataWire = outcome.wire_id;
+              phase = 'binary';
+              recoveredBinding = false;
+              continue; // Fresh eligibility before dispatching actual bytes.
+            }
+            await this.lock(roomId, async () => {
+              const appended = await this.store.append(roomId, {
+                version: 1, kind: 'relay_result', room_id: roomId, at: this.now(),
+                intent_record_id: intent.record_id, recipient_identity: intent.recipient_identity,
+                ...(prepared.file ? { file_id: prepared.file.file_id } : { message_id: intent.message_id! }),
+                status: outcome.status,
+                ...(outcome.wire_id ? { wire_id: outcome.wire_id } : {}),
+                ...(metadataWire ? { metadata_wire_id: metadataWire } : {}),
+              });
+              if (appended.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
+            });
+            break;
+          } catch (error) {
+            const refusal = error instanceof RelayEffectFailure ? error.cause : error;
+            if (!recoveredBinding && isDefiniteBindingRefusal(refusal)) {
+              recoveredBinding = true;
+              try { await packet.rebind(); continue; } catch (rebindError) { error = new RelayEffectFailure(rebindError); }
+            }
+            // Storage and preparation failure must stop immediately; a send
+            // failure may leave independent recipients eligible in this pass.
+            if (!(error instanceof RelayEffectFailure)) throw error;
+            deferredRecipients.add(intent.recipient_identity);
+            if (!failed) firstError = error.cause;
+            failed = true;
+            break;
+          }
+        }
+        await this.relayNotice(roomId, packet);
+      }
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    if (failed) throw firstError;
+  }
+
+  private async prepareEffect(
+    roomId: string, packet: RoomPacket, intent: RelayIntentRecord,
+    unread: { messages: Set<number>; files: Set<number> }, phase: 'first' | 'binary', metadataWire?: string,
+  ): Promise<{ kind: 'skipped' } | { kind: 'deferred' } | {
+    kind: 'effect'; work: Promise<{ status: 'queued' | 'send_failed'; wire_id?: string }>;
+    file?: FileRecord;
+  }> {
+    return this.lock(roomId, async () => {
+      const room = await this.store.load(roomId);
+      if (!this.acceptingNotifications || this.quiescing.has(roomId) || room.state === 'closing' || room.state === 'closed') return { kind: 'deferred' as const };
+      if ((await queryStore(this.store, roomId, { kind: 'relay_result', intentRecordId: intent.record_id, limit: 1 })).length > 0) return { kind: 'skipped' as const };
       const [message] = intent.message_id === undefined ? [] : await queryStore(this.store, roomId, { kind: 'message', messageId: intent.message_id, limit: 1 }) as MessageRecord[];
       const [file] = intent.file_id === undefined ? [] : await queryStore(this.store, roomId, { kind: 'file', fileId: intent.file_id, limit: 1 }) as FileRecord[];
-      // A dangling intent is invalid cross-record state. Do not compound it
-      // with a network effect or a result that would claim a send was tried.
-      if ((message === undefined) === (file === undefined)) continue;
+      if ((message === undefined) === (file === undefined)) return { kind: 'skipped' as const };
       const source = message ?? file!;
-      // A crash may leave intents for a source outside this turn's snapshot.
-      // Keep its lane in journal order until the source is consumed. Other
-      // recipients with already-consumed sources can still make progress.
-      if (deferredRecipients.has(intent.recipient_identity)
-        || (message?.source_msg_id !== undefined && unread.messages.has(message.source_msg_id))
-        || (file?.source_file_id !== undefined && unread.files.has(file.source_file_id))) {
-        deferredRecipients.add(intent.recipient_identity);
-        continue;
-      }
+      if ((message?.source_msg_id !== undefined && unread.messages.has(message.source_msg_id))
+        || (file?.source_file_id !== undefined && unread.files.has(file.source_file_id))) return { kind: 'deferred' as const };
+      const activeCids = new Set(room.seats.filter(seat => seat.state === 'active').map(seat => seat.identity));
+      const removedCids = new Set(room.seats.filter(seat => seat.state === 'removed').map(seat => seat.identity));
       const replyRows = source.source_reply_to === undefined && message?.scope === undefined
         && message?.thread_root === undefined ? [] : await readReplyRows(this.store, roomId);
       const decision = selectReply(replyRows, roomId, source, intent.recipient_identity);
@@ -637,8 +732,8 @@ export class IntakePump {
             throw new ThreadFailure('reply_target_unavailable');
           }
           if (!threadRelayEligible(room, root.thread_root, intent.recipient_identity)) {
-            await this.skipRelay(roomId, intent, 'skipped_removed');
-            continue;
+            await this.skipRelay(roomId, intent, 'skipped_removed', metadataWire);
+            return { kind: 'skipped' as const };
           }
           const metadata = publicThreadMetadata({ ...root, thread_root: root.thread_root }, room);
           scopedAuthor = publicThreadAuthor(message, root.thread_root, room);
@@ -651,117 +746,62 @@ export class IntakePump {
             publicThread = { thread: { schema_version: 1, thread_id: root.message_id } };
           }
         } else {
-          if (!source.recipient_identities.includes(intent.recipient_identity)) continue;
+          if (!source.recipient_identities.includes(intent.recipient_identity)) return { kind: 'skipped' as const };
           if (!activeCids.has(intent.recipient_identity) && removedCids.has(intent.recipient_identity)) {
-            await this.skipRelay(roomId, intent, 'skipped_removed');
-            continue;
+            await this.skipRelay(roomId, intent, 'skipped_removed', metadataWire);
+            return { kind: 'skipped' as const };
           }
         }
       } catch (error) {
         if (!(error instanceof ThreadFailure)) throw error;
-        await this.skipRelay(roomId, intent, 'skipped_reply_unavailable');
-        continue;
+        await this.skipRelay(roomId, intent, 'skipped_reply_unavailable', metadataWire);
+        return { kind: 'skipped' as const };
       }
       const replyTo = decision.replyTo;
-
-      if (file !== undefined) {
-        const uploader = file.author_alias?.alias ?? file.author.display_name;
-        const notice = await attempt(() => sendRoomBody(packet, intent.recipient_identity, {
+      let dispatched: Promise<{ status: 'queued' | 'send_failed'; wire_id?: string }>;
+      if (file) {
+        dispatched = phase === 'binary' ? packet.sendFile(
+          intent.recipient_identity, file.filename, file.mime, Buffer.from(file.data_base64, 'base64'), replyTo,
+          { recoverBinding: false },
+        ) : sendRoomBody(packet, intent.recipient_identity, {
+          version: 1, kind: 'room_msg', room_id: roomId, room_name: room.room_name, message_id: file.file_id,
+          author: { identity: room.identity_cid, display_name: room.identity_name, role: ROOM_ROLE },
+          text: `${file.author_alias?.alias ?? file.author.display_name} sent a file`, at: file.at,
+        }, replyTo, { recoverBinding: false });
+      } else {
+        const unsigned = {
           version: 1 as const,
-          kind: 'room_msg' as const,
+          kind: wireKind(message!.category),
           room_id: roomId,
           room_name: room.room_name,
-          message_id: file.file_id,
-          author: {
-            identity: room.identity_cid,
-            display_name: room.identity_name,
-            role: ROOM_ROLE,
-          },
-          text: `${uploader} sent a file`,
-          at: file.at,
-        }, replyTo));
-        if (notice === undefined) continue;
-        if (notice.status === 'send_failed') {
-          const failed = await this.store.append(roomId, {
-            version: 1,
-            kind: 'relay_result',
-            room_id: roomId,
-            at: this.now(),
-            intent_record_id: intent.record_id,
-            file_id: file.file_id,
-            recipient_identity: intent.recipient_identity,
-            status: 'send_failed',
-          });
-          if (failed.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
-          continue;
-        }
-        const outcome = await attempt(() => packet.sendFile(
-          intent.recipient_identity,
-          file.filename,
-          file.mime,
-          Buffer.from(file.data_base64, 'base64'),
-          replyTo,
-        ));
-        if (outcome === undefined) continue;
-        const appended = await this.store.append(roomId, {
-          version: 1,
-          kind: 'relay_result',
-          room_id: roomId,
-          at: this.now(),
-          intent_record_id: intent.record_id,
-          file_id: file.file_id,
-          recipient_identity: intent.recipient_identity,
-          status: outcome.status,
-          ...(outcome.wire_id === undefined || outcome.wire_id === '' ? {} : { wire_id: outcome.wire_id }),
-          ...(notice.wire_id === undefined || notice.wire_id === '' ? {} : { metadata_wire_id: notice.wire_id }),
-        });
-        if (appended.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
-        continue;
-      }
+          message_id: message!.message_id,
+          // An anonymous author leaves the archive only in alias form.
+          author: scopedAuthor ?? (message!.author_alias === undefined ? message!.author : {
+            identity: message!.author_alias.participant_id,
+            display_name: message!.author_alias.alias,
+            role: message!.author.role,
+          }),
+          ...publicThread,
+          text: message!.text,
+          at: message!.at,
+          ...(message!.briefing_role === undefined ? {} : { briefing_role: message!.briefing_role }),
+          ...(message!.briefing_version === undefined ? {} : { briefing_version: message!.briefing_version }),
+          ...(message!.membership === undefined ? {} : { membership: message!.membership }),
+        };
 
-      const unsigned = {
-        version: 1 as const,
-        kind: wireKind(message!.category),
-        room_id: roomId,
-        room_name: room.room_name,
-        message_id: message!.message_id,
-        // An anonymous author leaves the archive only in alias form.
-        author: scopedAuthor ?? (message!.author_alias === undefined ? message!.author : {
-          identity: message!.author_alias.participant_id,
-          display_name: message!.author_alias.alias,
-          role: message!.author.role,
-        }),
-        ...publicThread,
-        text: message!.text,
-        at: message!.at,
-        ...(message!.briefing_role === undefined ? {} : { briefing_role: message!.briefing_role }),
-        ...(message!.briefing_version === undefined ? {} : { briefing_version: message!.briefing_version }),
-        ...(message!.membership === undefined ? {} : { membership: message!.membership }),
-      };
-      // RoomPacket.send returns only an observed queued/refused outcome. A
-      // thrown call remains result-less because its acceptance is unknown and
-      // will deliberately be retried on restart with the stable message ID.
-      const outcome = await attempt(() => sendRoomBody(packet, intent.recipient_identity, unsigned, replyTo));
-      if (outcome === undefined) continue;
-      const appended = await this.store.append(roomId, {
-        version: 1,
-        kind: 'relay_result',
-        room_id: roomId,
-        at: this.now(),
-        intent_record_id: intent.record_id,
-        message_id: intent.message_id!,
-        recipient_identity: intent.recipient_identity,
-        status: outcome.status,
-        ...(outcome.wire_id === undefined || outcome.wire_id === '' ? {} : { wire_id: outcome.wire_id }),
-      });
-      if (appended.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
+        dispatched = sendRoomBody(packet, intent.recipient_identity, unsigned, replyTo, { recoverBinding: false });
       }
-    }
+      // Invoke the real effect under current authorization, then BOX its promise
+      // so the async room mutex releases before waiting for the response.
+      const work = dispatched.catch(error => { throw new RelayEffectFailure(error); });
+      void work.catch(() => {});
+      return { kind: 'effect' as const, work, ...(file ? { file } : {}) };
+    });
   }
 
   private async skipRelay(
     roomId: string, intent: RelayIntentRecord,
-    status: 'skipped_removed' | 'skipped_reply_unavailable',
+    status: 'skipped_removed' | 'skipped_reply_unavailable', metadataWire?: string,
   ): Promise<void> {
     const result = await this.store.append(roomId, {
       version: 1, kind: 'relay_result', room_id: roomId, at: this.now(),
@@ -769,6 +809,7 @@ export class IntakePump {
       ...(intent.message_id === undefined ? {} : { message_id: intent.message_id }),
       ...(intent.file_id === undefined ? {} : { file_id: intent.file_id }),
       recipient_identity: intent.recipient_identity, status,
+      ...(metadataWire ? { metadata_wire_id: metadataWire } : {}),
     });
     if (result.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
   }
@@ -857,6 +898,7 @@ async function queryStore(
       && (options.fileId === undefined || value.file_id === options.fileId)
       && (options.sourceMsgId === undefined || value.source_msg_id === options.sourceMsgId)
       && (options.sourceFileId === undefined || value.source_file_id === options.sourceFileId)
+      && (options.intentRecordId === undefined || value.intent_record_id === options.intentRecordId)
       && (options.recipientIdentity === undefined || value.recipient_identity === options.recipientIdentity);
   });
   if (options.unresolvedResultKind) {
@@ -901,4 +943,13 @@ function wireKind(
     case 'membership': return 'room_membership';
     default: return 'room_msg';
   }
+}
+
+class RelayEffectFailure extends Error {
+  constructor(cause: unknown) { super('room relay effect failed', { cause }); }
+}
+
+function isDefiniteBindingRefusal(error: unknown): boolean {
+  return error !== null && typeof error === 'object' && 'code' in error
+    && (error.code === 'NOT_BOUND' || error.code === 'BINDING_REASSIGNED');
 }

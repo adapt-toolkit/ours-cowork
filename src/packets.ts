@@ -19,6 +19,7 @@ import type { OursRuntimeClientFactory } from './ours-runtime.ts';
 
 export type InviteMode = 'one_time' | 'public';
 export type RelayStatus = 'queued' | 'send_failed';
+export interface RelayDispatchOptions { recoverBinding?: boolean; }
 type IncomingFileMeta = Awaited<ReturnType<OursClient['listIncomingFiles']>>[number];
 type HistoryMessage = NonNullable<Awaited<ReturnType<OursClient['getHistoryItem']>>>;
 type ReceivedFile = Awaited<ReturnType<OursClient['getFiles']>>['files'][number];
@@ -100,8 +101,8 @@ export interface RoomPacket {
   listUnreadSourceIds(): Promise<{ messages: Set<number>; files: Set<number> }>;
   listUnreadFiles(limit: number): Promise<FileInboxItem[]>;
   acknowledgeFile(expected: FileInboxItem): Promise<void>;
-  send(contactCid: string, body: string, replyTo?: ReplyReference): Promise<{ status: RelayStatus; wire_id?: string }>;
-  sendFile(contactCid: string, filename: string, mime: string, data: Buffer, replyTo?: ReplyReference): Promise<{ status: RelayStatus; wire_id?: string }>;
+  send(contactCid: string, body: string, replyTo?: ReplyReference, options?: RelayDispatchOptions): Promise<{ status: RelayStatus; wire_id?: string }>;
+  sendFile(contactCid: string, filename: string, mime: string, data: Buffer, replyTo?: ReplyReference, options?: RelayDispatchOptions): Promise<{ status: RelayStatus; wire_id?: string }>;
   removeContact(contactCid: string): Promise<{
     status: RelayStatus;
     notified: boolean;
@@ -427,7 +428,8 @@ export class SdkRoomPacket implements RoomPacket {
     throw lastError;
   }
 
-  private async runBound<T>(operation: () => Promise<T>): Promise<T> {
+  private async runBound<T>(operation: () => Promise<T>, recoverBinding = true): Promise<T> {
+    if (!recoverBinding) return operation();
     try {
       return await operation();
     } catch (error) {
@@ -669,7 +671,7 @@ export class SdkRoomPacket implements RoomPacket {
     assertReceivedFile(expected, pulled.files[0]!);
   }
 
-  async send(contactCid: string, body: string, replyTo?: ReplyReference): Promise<{ status: RelayStatus; wire_id?: string }> {
+  async send(contactCid: string, body: string, replyTo?: ReplyReference, options?: RelayDispatchOptions): Promise<{ status: RelayStatus; wire_id?: string }> {
     return sendResult(await this.runBound(() => this.client.sendMessage({
       contact: contactCid,
       text: body,
@@ -677,10 +679,10 @@ export class SdkRoomPacket implements RoomPacket {
         reply_to_wire_id: replyTo.wire_id,
         ...(replyTo.sentence === undefined ? {} : { reply_to_sentence: replyTo.sentence }),
       }),
-    })));
+    }), options?.recoverBinding));
   }
 
-  async sendFile(contactCid: string, filename: string, mime: string, data: Buffer, replyTo?: ReplyReference): Promise<{ status: RelayStatus; wire_id?: string }> {
+  async sendFile(contactCid: string, filename: string, mime: string, data: Buffer, replyTo?: ReplyReference, options?: RelayDispatchOptions): Promise<{ status: RelayStatus; wire_id?: string }> {
     const validName = FileNameSchema.parse(filename);
     const validMime = FileMimeSchema.parse(mime);
     if (data.length > MAX_FILE_BYTES) throw new RangeError(`room files must be at most ${MAX_FILE_BYTES} bytes (2 MiB)`);
@@ -693,7 +695,7 @@ export class SdkRoomPacket implements RoomPacket {
         reply_to_wire_id: replyTo.wire_id,
         ...(replyTo.sentence === undefined ? {} : { reply_to_sentence: replyTo.sentence }),
       }),
-    })));
+    }), options?.recoverBinding));
   }
 
   async removeContact(contactCid: string): Promise<{ status: RelayStatus; notified: boolean; key_material_retained: true }> {

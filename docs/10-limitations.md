@@ -22,14 +22,26 @@
 - Pre-1.0 custom room actor state cannot be opened by the standard SDK runtime. Back it up with the old release, recreate the room, and re-invite its participants.
 - The external-history daemon storage epoch has no automatic migration from older packet-format daemon state. Upgrade requires a manual backup if desired, manual removal, a clean daemon state, and recreation/re-invitation; installers do not delete the old state.
 
-Relay scheduling limits are counts, not RPC deadlines. Recipient sends remain
-serial under the room mutex, and the relay pass and local intent completion are
-not split into time slices. A stalled send can still block that room's later
-intake, STOP delivery, invitations, removal, and other locked operations. Other
-recovered rooms and aggregate management recovery visibility can progress; this
-does not establish complete incident recovery or universally repair onboarding.
-Host initialization and structural restore/reconciliation/close phases can also
-await native RPCs; room mutations remain gated until those prerequisites finish.
+Relay scheduling limits are counts, not RPC deadlines. Each room retains one
+serial outbound relay worker, so a stalled recipient can still delay that room's
+later outbound messages, including STOP forwarding. Archiving and consuming later
+sources use a separate reader; waiting for an outbound response does not hold the
+room mutex. Invitations and membership changes can therefore commit while an
+older relay response is pending. Their own native RPCs, unread metadata/body reads,
+and typed-command result sends can still stall; no universal wall-clock bound or
+transport repair is claimed. Other recovered rooms and aggregate recovery status
+can progress independently. This does not establish complete incident recovery or
+universally repair onboarding. Host initialization and structural recovery still
+await required native RPCs; mutations remain gated until those prerequisites finish.
+
+Closing marks the room durably closing before waiting for already-dispatched
+relay/notice work and its result commit. Closing, deletion and shutdown do not
+cancel, time out or unhost an unknown operation to fabricate success. Later effects
+remain queued; updates reject while closing, and management state determines when
+closure completes. A participant removed while a file notice or binding recovery
+is pending receives no newly prepared binary or message effect afterward. Already
+dispatched effects cannot be recalled. Content-free rejection/bounce notices keep
+their durable one-time claims; a crash can lose a claimed notice without replay.
 
 Result-less sends retain the existing stable-envelope retry-on-recovery behavior.
 Acceptance before a result is durably recorded can therefore produce duplicate

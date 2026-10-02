@@ -42,8 +42,11 @@ have completed; it does not mean every queued message has been forwarded.
 After prerequisites, recovered rooms start their tracked fanout independently.
 Readiness and queued notification scheduling do not await the fanout backlog.
 Shutdown still stops intake/transports and drains tracked startup work before
-unhosting identities. Intake alternates a bounded body snapshot (up to 32 messages
-and 32 files) with forwarding, rather than waiting for the unread queue to empty.
+unhosting identities. Intake reads bounded body snapshots (up to 32 messages and 32 files) and offers
+a separate tracked serial forwarding worker a turn without waiting for the unread
+queue to empty. Waiting for a send response releases the room mutex and does not
+occupy the sole reader. Closing is saved durably before waiting outside that mutex
+for dispatched relay/notice work and its result commit; deletion follows closure.
 Leading typed commands and raced message acknowledgements each yield after 32 SDK
 reads. Unread sources and later work in their recipient lane remain deferred until
 consumption. A required full metadata barrier covers sources outside the body

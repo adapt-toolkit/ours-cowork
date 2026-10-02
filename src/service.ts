@@ -200,6 +200,7 @@ export class RoomService {
   private readonly provisioningCheckpoint: NonNullable<RoomServiceOptions['provisioningCheckpoint']>;
   private eventsStopping = false;
   private readonly identityNameTails = new Map<string, Promise<void>>();
+  private readonly lifecycleTails = new Map<string, Promise<unknown>>();
 
   constructor(store: Store, packets: RoomPacketRegistry, options: RoomServiceOptions = {}) {
     this.store = store;
@@ -212,7 +213,7 @@ export class RoomService {
     this.intake = new IntakePump(store, packets, {
       now: this.nowValue,
       messageId: this.nextMessageId,
-      shouldPause: async (roomId) => (await this.store.load(roomId)).lifecycle_request?.state === 'pending',
+      shouldPause: async (roomId) => { const room = await this.store.load(roomId); return room.lifecycle_request?.state === 'pending' || room.state === 'closing' || room.state === 'closed'; },
       afterPump: async (roomId) => { await this.resumeLifecycleRequest(roomId); },
     });
   }
@@ -1204,8 +1205,9 @@ export class RoomService {
     this.intake.beginShutdown();
   }
 
-  drain(): Promise<void> {
-    return this.intake.drain();
+  async drain(): Promise<void> {
+    await this.intake.drain();
+    await Promise.allSettled([...this.lifecycleTails.values()]);
   }
 
   async listRooms(): Promise<Room[]> {
@@ -1533,19 +1535,35 @@ export class RoomService {
     return true;
   }
 
+  private enqueueLifecycle<T>(roomId: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.lifecycleTails.get(roomId) ?? Promise.resolve();
+    const result = previous.catch(() => {}).then(work);
+    this.lifecycleTails.set(roomId, result);
+    void result.then(() => {
+      if (this.lifecycleTails.get(roomId) === result) this.lifecycleTails.delete(roomId);
+    }, () => {
+      if (this.lifecycleTails.get(roomId) === result) this.lifecycleTails.delete(roomId);
+    });
+    return result;
+  }
+
   async closeRoom(roomId: string): Promise<Room> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
-    return this.lock(id, async () => {
+    return this.enqueueLifecycle(id, () => this.closeAndDrain(id));
+  }
+
+  private async closeAndDrain(id: string): Promise<Room> {
+    const marked = await this.lock(id, async () => {
       let room = await this.store.load(id);
       if (room.state === 'closed') {
         // A previous atomic rename may have committed closed metadata while
         // its directory fsync failed. Replacing the exact snapshot repeats
         // that durability barrier before close reports success.
-        return this.store.save(RoomSchema.parse({ ...room,
+        return { room: await this.store.save(RoomSchema.parse({ ...room,
           ...(room.lifecycle_request?.command === 'room.close' ? { lifecycle_request: {
             ...room.lifecycle_request, state: 'completed', error: undefined,
           } } : {}),
-        }));
+        })), closed: true };
       }
       if (this.isPacketPending(room)) {
         throw new RoomServiceError(
@@ -1561,31 +1579,27 @@ export class RoomService {
       } else {
         room = await this.store.save(RoomSchema.parse({ ...room, state: 'closing' }));
       }
-      return this.closeUnlocked(room);
+      return { room, closed: false };
     });
+    if (marked.closed) return marked.room;
+    // The closing mark is durable. Awaiting a response/commit here must not
+    // own the room mutex which that completion needs.
+    await this.intake.quiesceRelay(id);
+    return this.lock(id, async () => this.closeUnlocked(await this.store.load(id)));
   }
 
-  /** Delete only retained state belonging to this host after explicit consent. */
   async deleteRoom(roomId: string, input: unknown): Promise<DeleteRoomReceipt> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     DeleteRoomInputSchema.parse(input);
-    return this.lock(id, async () => {
-      let room: Room | undefined;
-      try {
-        room = await this.store.load(id);
-      } catch (error) {
-        // CoworkStore.delete is itself fail-closed and recognizes only the
-        // archive-first partial stages produced by an earlier confirmed call.
-        // Let it distinguish such a resumable stage from malformed live data.
-        try {
-          await this.store.delete(id);
-        } catch {
-          throw error;
-        }
+    return this.enqueueLifecycle(id, async () => {
+      let room: Room;
+      try { room = await this.store.load(id); } catch (error) {
+        // Preserve existing fail-closed, resumable archive-first deletion.
+        try { await this.lock(id, () => this.store.delete(id)); } catch { throw error; }
         return this.deleteReceipt(id);
       }
-      if (room.state !== 'closed') await this.closeRoom(id);
-      await this.store.delete(id);
+      if (room.state !== 'closed') await this.closeAndDrain(id);
+      await this.lock(id, () => this.store.delete(id));
       return this.deleteReceipt(id);
     });
   }

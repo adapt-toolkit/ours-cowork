@@ -927,6 +927,7 @@ test('thread file refusal survives SQLite restart with no blob, fanout, or repea
   const files = [item], sends = [], fileSends = [];
   let crashAtAck = true;
   const packet = {
+    listUnreadSourceIds: async () => ({ messages: new Set(), files: new Set(files.map(item => item.file_id)) }),
     listUnreadMessages: async () => [], listUnreadFiles: async () => files,
     acknowledgeFile: async () => { if (crashAtAck) throw new Error('crash before ACK'); files.length = 0; },
     send: async (recipient, body) => { sends.push({ recipient, body }); return { status: 'queued', wire_id: 'private-error' }; },
@@ -993,6 +994,7 @@ async function ancestryFixture(t, { anonymous = false, depth = 1 } = {}) {
   const inbox = [], files = [], sends = [], fileSends = [];
   let serial = 0, messageIndex = 101, beforeAck;
   const packet = {
+    listUnreadSourceIds: async () => ({ messages: new Set(inbox.map(item => item.msg_id)), files: new Set(files.map(item => item.file_id)) }),
     listUnreadMessages: async () => [...inbox], listUnreadFiles: async () => [...files],
     acknowledgeMessage: async () => { await beforeAck?.(); inbox.shift(); },
     acknowledgeFile: async () => { await beforeAck?.(); files.shift(); },

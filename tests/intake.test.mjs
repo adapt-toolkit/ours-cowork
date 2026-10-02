@@ -93,6 +93,8 @@ class FakePacket {
     if (this.onDrain) await this.onDrain(onUnexpected);
   }
 
+  async listUnreadSourceIds() { return { messages: new Set(this.inbox.map(item => item.msg_id)), files: new Set(this.fileInbox.map(item => item.file_id)) }; }
+
   async listUnreadMessages(limit) {
     this.listCalls.push(['messages', limit]);
     return structuredClone(this.inbox.slice(0, limit));
@@ -2378,4 +2380,78 @@ test('deferred acknowledgement blocks its unread source and later recipient lane
   await f.pump.pump(ROOM_ID);
   assert.equal(turns, 2);
   assert.equal(f.packet.sendCalls.length, 2);
+});
+
+test('pre-consume recovery beyond one body snapshot does not forward unread text sources', async () => {
+  const records = [];
+  const rows = Array.from({ length: 40 }, (_, i) => incoming({ msg_id: i + 1, wire_id: `recovery-${i + 1}` }));
+  for (const item of rows) {
+    const message_id = String(item.msg_id).padStart(26, '0');
+    const seq = records.length + 1;
+    records.push({ version: 1, kind: 'message', room_id: ROOM_ID, seq, record_id: `${ROOM_ID}:${seq}`, at: item.date,
+      message_id, author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' }, category: 'chat', text: item.text,
+      source_msg_id: item.msg_id, source_wire_id: item.wire_id, recipient_identities: ['cid-bob'] });
+    records.push({ version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: seq + 1, record_id: `${ROOM_ID}:${seq + 1}`,
+      at: AT, message_id, recipient_identity: 'cid-bob' });
+  }
+  const f = fixture({ records, room: { seats: room().seats.slice(0, 2) } });
+  f.packet.inbox.push(...rows);
+  let unreadAtFirstSend;
+  f.packet.beforeSend = (_recipient, body) => {
+    unreadAtFirstSend ??= f.packet.inbox.length;
+    const id = Number(JSON.parse(body).message_id);
+    assert.equal(f.packet.inbox.some(item => item.msg_id === id), false, 'saved intents outside snapshot must wait source consumption');
+  };
+  await f.pump.resumePending(ROOM_ID);
+  assert.equal(unreadAtFirstSend, 8);
+  assert.equal(f.packet.sendCalls.length, 40);
+  assert.equal(f.packet.consumeCalls.length, 40);
+});
+
+test('unread earlier source defers later work in its lane while another consumed lane progresses', async () => {
+  const records = [7, 8].map((msg_id, index) => ({ version: 1, kind: 'message', room_id: ROOM_ID,
+    seq: index + 1, record_id: `${ROOM_ID}:${index + 1}`, at: incoming().date, message_id: MESSAGE_IDS[index],
+    author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' }, category: 'chat', text: incoming().text,
+    source_msg_id: msg_id, source_wire_id: `wire-in-${msg_id}`, recipient_identities: index === 0 ? ['cid-bob'] : ['cid-bob', 'cid-cara'] }));
+  const f = fixture({ records });
+  f.packet.inbox.push(incoming());
+  const ack = f.packet.acknowledgeMessage.bind(f.packet);
+  let acknowledgements = 0;
+  f.packet.acknowledgeMessage = async (...args) => {
+    if (++acknowledgements === 1) return true;
+    assert.deepEqual(f.packet.sendCalls.map(call => call.recipient), ['cid-cara'], 'unrelated consumed lane progresses before expected source consumption');
+    return ack(...args);
+  };
+  await f.pump.pump(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls.map(call => [call.recipient, JSON.parse(call.body).message_id]),
+    [['cid-cara', MESSAGE_IDS[1]], ['cid-bob', MESSAGE_IDS[0]], ['cid-bob', MESSAGE_IDS[1]]]);
+});
+
+
+test('pre-consume recovery beyond one file snapshot keeps metadata and binary behind consumption', async () => {
+  const records = [];
+  const rows = Array.from({ length: 40 }, (_, i) => incomingFile({ file_id: i + 1, wire_id: `recovery-file-${i + 1}` }));
+  for (const item of rows) {
+    const file_id = String(item.file_id).padStart(26, '0'); const seq = records.length + 1;
+    records.push({ version: 1, kind: 'file', room_id: ROOM_ID, seq, record_id: `${ROOM_ID}:${seq}`, at: item.date,
+      file_id, author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' },
+      filename: item.filename, mime: item.mime, size: item.data.length,
+      sha256: '0'.repeat(64), data_base64: item.data.toString('base64'),
+      source_file_id: item.file_id, source_wire_id: item.wire_id, recipient_identities: ['cid-bob'] });
+    records.push({ version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: seq + 1, record_id: `${ROOM_ID}:${seq + 1}`,
+      at: AT, file_id, recipient_identity: 'cid-bob' });
+  }
+  const f = fixture({ records, room: { seats: room().seats.slice(0, 2) } });
+  f.packet.fileInbox.push(...rows);
+  let unreadAtFirstNotice;
+  f.packet.beforeSend = (_recipient, body) => {
+    unreadAtFirstNotice ??= f.packet.fileInbox.length;
+    const id = Number(JSON.parse(body).message_id);
+    assert.equal(f.packet.fileInbox.some(item => item.file_id === id), false, 'file notice must wait consumption outside snapshot');
+  };
+  await f.pump.resumePending(ROOM_ID);
+  assert.equal(unreadAtFirstNotice, 8);
+  assert.equal(f.packet.sendCalls.length, 40);
+  assert.equal(f.packet.sendFileCalls.length, 40);
+  assert.equal(f.packet.consumeFileCalls.length, 40);
 });

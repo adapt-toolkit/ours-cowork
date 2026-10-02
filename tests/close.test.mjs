@@ -115,6 +115,7 @@ class FakePacket {
   mintInvite() { throw new Error('not used'); }
   revokeInvite() { throw new Error('not used'); }
   listInvites() { return []; }
+  async listUnreadSourceIds() { return { messages: new Set(), files: new Set() }; }
   listUnreadMessages() { return Promise.resolve([]); }
   listUnreadFiles() { return Promise.resolve([]); }
   acknowledgeFile() { return Promise.resolve(); }

@@ -1134,3 +1134,19 @@ test('SDK acknowledgement defers its expected unread source after bounded raced 
   assert.equal(promoted.length, 39);
   assert.equal(client.messages[39].status, 'read');
 });
+
+test('SDK unread source barrier uses complete metadata beyond text slice and typed ordering barrier', async () => {
+  const client = blankClient();
+  client.messages = Array.from({ length: 70 }, (_, i) => ({ msg_id: i + 1, seq: i + 1, status: i === 0 ? 'read' : 'unread', wire_id: `metadata-${i}`, message_kind: i === 32 ? 'command' : 'text' }));
+  client.files = Array.from({ length: 70 }, (_, i) => ({ file_id: i + 1, status: i === 0 ? 'read' : 'unread' }));
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  const unread = await packet.listUnreadSourceIds();
+  assert.equal(unread.messages.size, 69);
+  assert.equal(unread.files.size, 69);
+  assert.equal(unread.messages.has(70), true);
+  assert.equal(unread.files.has(70), true);
+  assert.equal(unread.messages.has(1), false);
+  assert.equal(client.calls.some(([name]) => name === 'getHistoryItem' || name === 'getMessages' || name === 'fetchFile'), false, 'barrier must not fetch or consume bodies');
+  client.listIncomingFiles = async () => { throw new Error('metadata unavailable'); };
+  await assert.rejects(packet.listUnreadSourceIds(), /metadata unavailable/, 'unknown read marks must fail closed');
+});

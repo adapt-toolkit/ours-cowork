@@ -11,7 +11,7 @@ import {RpcDispatcher,TransportServer} from '../src/transports.ts';
 
 async function fixture(){
  const root=await mkdtemp(join(tmpdir(),'cowork-rest-')),store=new CoworkStore(root),sent=[];
- const packet={name:'room',cid:'A'.repeat(64),listContacts:()=>[],listInvites:()=>[],supportsInviteProvenance:true,registerRuntimeCommands:async()=>{},listUnreadMessages:async()=>[],listUnreadFiles:async()=>[],send:async()=>({status:'queued',wire_id:'metadata-wire'}),sendFile:async(cid,name,mime,bytes)=>{sent.push({cid,name,mime,bytes});return {status:'queued',wire_id:'file-wire'};}};
+ const packet={name:'room',cid:'A'.repeat(64),listContacts:()=>[],listInvites:()=>[],supportsInviteProvenance:true,registerRuntimeCommands:async()=>{},listUnreadSourceIds:async()=>({messages:new Set(),files:new Set()}),listUnreadMessages:async()=>[],listUnreadFiles:async()=>[],send:async()=>({status:'queued',wire_id:'metadata-wire'}),sendFile:async(cid,name,mime,bytes)=>{sent.push({cid,name,mime,bytes});return {status:'queued',wire_id:'file-wire'};}};
  const packets={preflightCreate:async()=>{},create:async()=>packet,get:()=>packet};
  const service=new RoomService(store,packets);
  const room=await service.createRoom({name:'rest-test',goal:'test',briefing:'test',activate_empty:true});

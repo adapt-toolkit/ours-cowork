@@ -159,6 +159,7 @@ class FakePacket {
   listContacts() { return structuredClone(this.contacts); }
   async registerRuntimeCommands(handlers) { this.runtimeCommands = handlers; }
   async rebind() { return { name: this.name, cid: this.cid, status: 'rebound' }; }
+  async listUnreadSourceIds() { return { messages: new Set(), files: new Set() }; }
   listUnreadMessages() { return Promise.resolve([]); }
   listUnreadFiles() { return Promise.resolve([]); }
   acknowledgeFile() { return Promise.resolve(); }

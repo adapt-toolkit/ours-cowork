@@ -22,8 +22,10 @@ If the shared daemon restarts underneath a running cowork, room notification wat
 Exit codes are stable: `0` success, `1` web console disabled, `2` CLI usage, `3` not found, `4` invalid state or parameters, `5` unauthorized, `6` daemon unavailable, and `7` internal failure. With `--json`, stdout contains exactly one JSON value and stderr stays empty. This includes foreground `serve`: supervised worker output is suppressed, and its clean or failed terminal status becomes that one JSON result.
 
 Management now opens after shared-host initialization and before room recovery.
-The authenticated `daemon.recovery` RPC (empty parameters, Unix management socket
-or the existing loopback `/rpc` transport) reports `version`, `ready`, `phase`,
+The `daemon.recovery` RPC (empty parameters) uses the private owner-only Unix
+management socket or existing loopback `/rpc` transport. HTTP RPC has no
+credential authentication; its existing local Host/Origin restrictions apply.
+The `auth: true` route declaration does not add request authentication. It reports `version`, `ready`, `phase`,
 `rooms`, `failed_rooms`, and `pending_fanout`. Phases are `initializing`, `restore`,
 `lifecycle`, `reconcile`, `close`, `fanout`, `running`, and `stopping`. These are
 aggregate process-local counts; they contain no room identifiers, message bodies,

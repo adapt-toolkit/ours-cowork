@@ -8,6 +8,7 @@ import test from 'node:test';
 import {OursClient} from '@ours.network/sdk/client';
 import {CoworkStore} from '../src/storage.ts';
 import {RoomService} from '../src/service.ts';
+import {CoworkDaemon} from '../src/daemon-runtime.ts';
 import {SdkRoomPacket} from '../src/packets.ts';
 
 const IDS=['01jz6y7n8p9q0r1s2t3v4w5x6y','01jz6y7n8p9q0r1s2t3v4w5x70'];
@@ -219,5 +220,60 @@ test('ACK failure frees ingress while claimed rejection waits behind held relay'
   f.release();const outcomes=await Promise.allSettled(f.work);await f.track(f.service.drain());
   assert.equal(outcomes.some(o=>o.status==='rejected'&&o.reason.message.includes('synthetic ACK failure')),true,'original ingress failure remains observable');
   assert.equal(f.states[0].sends.filter(send=>JSON.parse(send.text).text==='reply_target_unavailable').length,1,'content-free notice attempts once after response');
+ }finally{await f.cleanup();}
+});
+
+
+for(const ambiguity of ['before','after'])for(const lifecycle of ['close','delete'])test(`${lifecycle} retries retain ${ambiguity}-commit result failure barrier`,async()=>{
+ const f=await fixture();try{
+  const append=f.store.append.bind(f.store);let failed=false;
+  f.store.append=async(id,row)=>{
+   if(row.kind==='relay_result'&&!failed){failed=true;if(ambiguity==='after')await append(id,row);throw new Error('synthetic result commit ambiguity');}
+   return append(id,row);
+  };
+  await start(f);
+  const first=f.track(lifecycle==='close'?f.service.closeRoom(IDS[0]):f.service.deleteRoom(IDS[0],{confirm:true}));
+  await turnsUntil(()=>JSON.parse(readFileSync(join(f.dir,'rooms',IDS[0],'room.json'),'utf8')).state==='closing');
+  f.release();await assert.rejects(first,/synthetic result commit ambiguity/);
+  f.store.append=append;
+  for(const retry of ['close','delete'])await assert.rejects(f.track(retry==='close'?f.service.closeRoom(IDS[0]):f.service.deleteRoom(IDS[0],{confirm:true})),/synthetic result commit ambiguity/,'a later lifecycle request cannot infer durable completion');
+  assert.equal(f.destroys,0);assert.equal(existsSync(join(f.dir,'rooms',IDS[0],'archive.sqlite3')),true);
+  assert.equal(f.states[0].sends.length,1,'retained failure never redispatches an observed operation');
+  assert.equal((await f.store.load(IDS[0])).state,'closing');
+  assert.equal(f.rows(IDS[0]).filter(row=>row.kind==='relay_result').length,ambiguity==='after'?1:0,'visible row does not waive failed durability acknowledgment');
+ }finally{await f.cleanup();}
+});
+
+for(const lifecycle of ['close','delete','shutdown'])test(`${lifecycle} during file notice commits partial outcome before teardown`,async()=>{
+ const f=await fixture({file:true});try{
+  await start(f);let completed=false;
+  const original=f.store.delete.bind(f.store);let erasedResults;
+  f.store.delete=async(id)=>{erasedResults=f.rows(id).filter(row=>row.kind==='relay_result');return original(id);};
+  let completion;
+  if(lifecycle==='shutdown'){f.service.beginShutdown();completion=f.track(f.service.drain().then(()=>{completed=true;}));}
+  else {completion=f.track((lifecycle==='close'?f.service.closeRoom(IDS[0]):f.service.deleteRoom(IDS[0],{confirm:true})).then(()=>{completed=true;}));await turnsUntil(()=>JSON.parse(readFileSync(join(f.dir,'rooms',IDS[0],'room.json'),'utf8')).state==='closing');}
+  assert.equal(completed,false);assert.equal(f.destroys,0);f.release();await completion;
+  const results=erasedResults??f.rows(IDS[0]).filter(row=>row.kind==='relay_result');
+  assert.equal(f.states[0].files.length,0,'no binary dispatch after lifecycle authority');
+  assert.equal(results.length,1,'observed notice phase is durable before teardown');
+  assert.equal(results[0].metadata_wire_id,'synthetic-0-1');
+  assert.equal(results[0].status,'send_failed','a suppressed binary must never be claimed queued');
+  assert.equal(results[0].wire_id,undefined);
+  assert.equal(f.states[0].sends.length,1);
+ }finally{await f.cleanup();}
+});
+
+
+for(const ambiguity of ['before','after'])test(`daemon shutdown after exited ${ambiguity}-commit failure retains host and archive`,async()=>{
+ const f=await fixture();try{
+  const append=f.store.append.bind(f.store);f.store.append=async(id,row)=>{if(row.kind==='relay_result'){if(ambiguity==='after')await append(id,row);throw new Error('synthetic shutdown commit failure');}return append(id,row);};
+  const completion=f.track(f.service.resumePending(IDS[0]));await f.started;f.release();await assert.rejects(completion,/synthetic shutdown commit failure/);
+  const events=[];const daemon=new CoworkDaemon({config:{version:1,stateDir:f.dir,rest:{enabled:false,port:3010}},prepare:()=>({socketPath:join(f.dir,'test.sock')}),lock:()=>({release(){events.push('lock.release');}}),host:{async boot(){},close(){events.push('host.close');}},store:{async list(){return[];}},registry:{async unhostAll(){events.push('unhost');}},service:f.service,writePid(){},removePid(){events.push('pid.remove');},transports:{async start(){},async stop(){events.push('transports.stop');}}});
+  await daemon.boot();
+  await assert.rejects(f.track(daemon.shutdown()),error=>error instanceof AggregateError&&error.errors.some(cause=>cause.message.includes('synthetic shutdown commit failure')));
+  await assert.rejects(f.track(daemon.shutdown()));
+  assert.equal(events.includes('transports.stop'),true,'notification transport stops as positive control');
+  assert.equal(events.includes('unhost'),false);assert.equal(events.includes('host.close'),false);assert.equal(events.includes('lock.release'),false);assert.equal(events.includes('pid.remove'),false);
+  assert.equal(existsSync(join(f.dir,'rooms',IDS[0],'archive.sqlite3')),true);assert.equal(f.states[0].sends.length,1);
  }finally{await f.cleanup();}
 });

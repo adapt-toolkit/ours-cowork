@@ -21,3 +21,51 @@
 - Cowork selects room identities by the exact names stored in its local room records. That filter prevents unrelated daemon-global identities from appearing as cowork rooms, but it is bookkeeping rather than an ownership, provenance, membership, or same-user security model.
 - Pre-1.0 custom room actor state cannot be opened by the standard SDK runtime. Back it up with the old release, recreate the room, and re-invite its participants.
 - The external-history daemon storage epoch has no automatic migration from older packet-format daemon state. Upgrade requires a manual backup if desired, manual removal, a clean daemon state, and recreation/re-invitation; installers do not delete the old state.
+
+Relay scheduling limits are counts, not RPC deadlines. Each room retains one
+serial outbound relay worker, so a stalled recipient can still delay that room's
+later outbound messages, including STOP forwarding. Archiving and consuming later
+sources use a separate reader; waiting for an outbound response does not hold the
+room mutex. Invitations and membership changes can therefore commit while an
+older relay response is pending. Their own native RPCs, unread metadata/body reads,
+and typed-command result sends can still stall; no universal wall-clock bound or
+transport repair is claimed. Other recovered rooms and aggregate recovery status
+can progress independently. This does not establish complete incident recovery or
+universally repair onboarding. Host initialization and structural recovery still
+await required native RPCs; mutations remain gated until those prerequisites finish.
+
+Closing marks the room durably closing before waiting for already-dispatched
+relay/notice work and its result commit. Closing, deletion and shutdown do not
+cancel, time out or unhost an unknown operation to fabricate success. Later effects
+remain queued; updates reject while closing, and management state determines when
+closure completes. A participant removed while a file notice or binding recovery
+is pending receives no newly prepared binary or message effect afterward. Already
+dispatched effects cannot be recalled. Content-free rejection/bounce notices keep
+their durable one-time claims; a crash can lose a claimed notice without replay.
+
+Result-less sends retain the existing stable-envelope retry-on-recovery behavior.
+Acceptance before a result is durably recorded can therefore produce duplicate
+wire deliveries. There is no new timeout cancellation, overlapping retry,
+exactly-once guarantee, or durable unknown-send reconciliation in this change.
+
+An observed relay result whose append reports failure blocks new relay effects,
+close/delete retries and clean shutdown in that running process, even if a result
+row is visible afterward. The application does not unhost or erase the archive to
+waive that barrier; it reports the durability failure. An accepted file notice also
+retains that barrier on subsequent preparation failure, unread deferral, missing
+or corrupt source, failed rebind, or unknown binary response. No full-file terminal
+result is fabricated for an unresolved phase. Before-notice metadata errors and
+ordinary message unknown outcomes retain their existing error cleanup semantics. There is no automatic result
+commit retry or recovery API: retain the journal, inspect storage and use an
+operator-reviewed recovery procedure. The barrier is process-local; crash/restart
+continues the existing at-least-once policy, not a new durable in-flight protocol.
+The supervisor's existing 10-second shutdown watchdog may force process exit;
+application fail-closed behavior does not guarantee indefinite identity/process
+lifetime across that crash boundary.
+
+If closure or shutdown follows an accepted file notice before binary dispatch,
+Cowork records send_failed with metadata_wire_id and no binary wire_id. This is an
+observed partial file outcome: the notice was accepted, and the bytes were not
+sent. Failed durability of this terminal record retains the same failure barrier.
+
+A binary transport failure after an accepted file notice permits independently eligible recipients in the current serial pass, while deferring the failed recipient. It blocks subsequent passes and lifecycle cleanup; its typed failure takes precedence over ordinary errors at startup. Preparation, failed binding recovery (including identity mismatch), or observed-result append failures stop the pass immediately.

@@ -558,12 +558,12 @@ test('daemon boot uses phased recovery order and shutdown drains before unhostin
   try {
     await daemon.boot();
     assert.deepEqual(events.slice(0, 10), [
-      'wrapper', 'rooms.list',
+      'wrapper', 'transports.start', 'rooms.list',
       `restore:${rooms[0].room_id}`, `restore:${rooms[1].room_id}`,
       `reconcile:${rooms[0].room_id}`,
       `close:${rooms[1].room_id}`,
+      'pid.write',
       `pending:${rooms[0].room_id}`,
-      'transports.start', 'pid.write',
     ].slice(0, 10));
     await Promise.all([daemon.shutdown(), daemon.shutdown()]);
     assert.deepEqual(events.slice(-7), [

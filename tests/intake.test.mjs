@@ -93,6 +93,8 @@ class FakePacket {
     if (this.onDrain) await this.onDrain(onUnexpected);
   }
 
+  async listUnreadSourceIds() { return { messages: new Set(this.inbox.map(item => item.msg_id)), files: new Set(this.fileInbox.map(item => item.file_id)) }; }
+
   async listUnreadMessages(limit) {
     this.listCalls.push(['messages', limit]);
     return structuredClone(this.inbox.slice(0, limit));
@@ -718,12 +720,19 @@ test('file crash redrive keeps archive/intents stable and retries only a result-
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 0);
 
   f.store.beforeAppend = undefined;
-  await f.pump.resumePending(ROOM_ID);
+  await assert.rejects(f.pump.resumePending(ROOM_ID), /file result fsync/,
+    'same-process result durability failure cannot trigger retransmission');
+  assert.equal(f.packet.sendFileCalls.length, 1);
+  assert.equal(f.packet.sendCalls.length, 1, 'same-process retry sends no additional metadata/body');
+  // A stated crash loses process-local barriers. A fresh worker exercises the
+  // existing at-least-once restart policy against the retained durable archive.
+  const restarted = new IntakePump(f.store, f.registry, { now: () => AT });
+  await restarted.resumePending(ROOM_ID);
   assert.equal(f.packet.sendFileCalls.length, 2);
   assert(f.packet.sendFileCalls[0].data.equals(f.packet.sendFileCalls[1].data));
   assert.equal(f.packet.sendCalls[0].body, f.packet.sendCalls[1].body, 'notice retry keeps the stable message_id and body');
   assert.equal(byKind(await f.store.read(ROOM_ID), 'relay_result').length, 1);
-  await f.pump.resumePending(ROOM_ID);
+  await restarted.resumePending(ROOM_ID);
   assert.equal(f.packet.sendFileCalls.length, 2, 'terminal file result suppresses later redrive');
 });
 
@@ -1296,43 +1305,45 @@ test('resumePending after a pre-consume crash consumes before sending already-co
   assert.equal(f.packet.sendCalls.length, 1);
 });
 
-test('notify does not lose a wakeup queued in the final-drain microtask gap', async () => {
+test('notify retains a fresh source queued at the final-consume microtask gap', async () => {
   const f = fixture();
-  let calls = 0;
-  let releaseReplacement;
-  const replacementGate = new Promise((resolve) => { releaseReplacement = resolve; });
-  f.pump.pump = async () => {
-    calls += 1;
-    if (calls === 2) await replacementGate;
-  };
-  const first = f.pump.notify(ROOM_ID);
+  f.packet.inbox.push(incoming());
   let replacement;
-  queueMicrotask(() => { replacement = f.pump.notify(ROOM_ID); });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(calls, 2);
-  let firstSettled = false;
-  void first.then(() => { firstSettled = true; });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(firstSettled, false, 'the original work promise must chain the replacement');
-  releaseReplacement();
-  await first;
+  f.packet.afterConsume = async () => {
+    f.packet.afterConsume = undefined;
+    queueMicrotask(() => {
+      f.packet.inbox.push(incoming({ msg_id: 8, wire_id: 'wire-next', text: 'next source' }));
+      replacement = f.pump.notify(ROOM_ID);
+    });
+  };
+  await f.pump.notify(ROOM_ID);
   await replacement;
-  assert.equal(calls, 2);
+  const messages = byKind(await f.store.read(ROOM_ID), 'message');
+  assert.deepEqual(messages.map(row => row.source_msg_id), [7, 8]);
+  assert.deepEqual(f.packet.consumeCalls, [[7], [8]]);
+  assert.equal(f.packet.inbox.length, 0);
+  assert.equal(f.packet.sendCalls.length, 4);
+  assert.deepEqual(f.packet.sendCalls.map(call => JSON.parse(call.body).text),
+    [messages[0].text, messages[0].text, 'next source', 'next source']);
 });
 
-test('notify chains a dirty replacement after a failed worker and still reports the original failure', async () => {
+test('notify reports ingress failure and a fresh external wake consumes durable work', async () => {
   const f = fixture();
-  let calls = 0;
-  f.pump.pump = async () => {
-    calls += 1;
-    if (calls === 1) throw new Error('worker failed');
-  };
+  f.packet.inbox.push(incoming());
+  f.store.beforeAppend = () => { throw new Error('ingress append failed'); };
   const first = f.pump.notify(ROOM_ID);
-  let replacement;
-  queueMicrotask(() => { replacement = f.pump.notify(ROOM_ID); });
-  await assert.rejects(first, /worker failed/);
-  await replacement.catch(() => {});
-  assert.equal(calls, 2, 'dirty shutdown work must be handed to a replacement worker');
+  const coalesced = f.pump.notify(ROOM_ID);
+  await assert.rejects(first, /ingress append failed/);
+  await assert.rejects(coalesced, /ingress append failed/);
+  assert.equal(f.packet.inbox.length, 1);
+  assert.deepEqual(f.packet.consumeCalls, []);
+  assert.deepEqual(f.packet.sendCalls, []);
+  f.store.beforeAppend = undefined;
+  await f.pump.notify(ROOM_ID);
+  assert.equal(f.packet.inbox.length, 0);
+  assert.deepEqual(f.packet.consumeCalls, [[7]]);
+  assert.equal(byKind(await f.store.read(ROOM_ID), 'message').length, 1);
+  assert.equal(f.packet.sendCalls.length, 2);
 });
 
 // ---- Anonymous-room intake and relay privacy -------------------------------
@@ -2345,4 +2356,111 @@ test('delivery isolation reaches recipients beyond the journal batch, storage fa
   g.store.beforeAppend = draft => { if (draft.kind === 'relay_result') throw new Error('storage unavailable'); };
   await assert.rejects(g.pump.pump(ROOM_ID), /storage unavailable/);
   assert.equal(g.packet.sendCalls.length, 1);
+});
+
+
+test('continued arrivals forward consumed sources before the inbox reaches empty', async () => {
+  const f = fixture();
+  const rows = [7, 8, 9].map(msg_id => incoming({ msg_id, wire_id: `wire-in-${msg_id}` }));
+  f.packet.inbox.push(...rows);
+  f.packet.listUnreadMessages = async () => structuredClone(f.packet.inbox.slice(0, 1));
+  let unreadAtFirstSend;
+  f.packet.beforeSend = () => { unreadAtFirstSend ??= f.packet.inbox.length; };
+  await f.pump.pump(ROOM_ID);
+  assert.equal(unreadAtFirstSend, 2, 'forwarding must run after a bounded snapshot, before later arrivals drain');
+  assert.equal(f.packet.sendCalls.length, 6);
+  assert.deepEqual(f.packet.consumeCalls, [[7], [8], [9]]);
+});
+
+test('deferred acknowledgement blocks its unread source and later recipient lane until consumed', async () => {
+  const f = fixture();
+  f.packet.inbox.push(incoming());
+  const ack = f.packet.acknowledgeMessage.bind(f.packet);
+  let turns = 0;
+  f.packet.acknowledgeMessage = async (...args) => {
+    if (++turns === 1) return true;
+    return ack(...args);
+  };
+  f.packet.listUnreadSourceIds = async () => ({
+    messages: new Set(f.packet.inbox.map(item => item.msg_id)),
+    files: new Set(f.packet.fileInbox.map(item => item.file_id)),
+  });
+  f.packet.beforeSend = () => assert.equal(f.packet.inbox.length, 0, 'deferred source must be consumed before its relay');
+  await f.pump.pump(ROOM_ID);
+  assert.equal(turns, 2);
+  assert.equal(f.packet.sendCalls.length, 2);
+});
+
+test('pre-consume recovery beyond one body snapshot does not forward unread text sources', async () => {
+  const records = [];
+  const rows = Array.from({ length: 40 }, (_, i) => incoming({ msg_id: i + 1, wire_id: `recovery-${i + 1}` }));
+  for (const item of rows) {
+    const message_id = String(item.msg_id).padStart(26, '0');
+    const seq = records.length + 1;
+    records.push({ version: 1, kind: 'message', room_id: ROOM_ID, seq, record_id: `${ROOM_ID}:${seq}`, at: item.date,
+      message_id, author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' }, category: 'chat', text: item.text,
+      source_msg_id: item.msg_id, source_wire_id: item.wire_id, recipient_identities: ['cid-bob'] });
+    records.push({ version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: seq + 1, record_id: `${ROOM_ID}:${seq + 1}`,
+      at: AT, message_id, recipient_identity: 'cid-bob' });
+  }
+  const f = fixture({ records, room: { seats: room().seats.slice(0, 2) } });
+  f.packet.inbox.push(...rows);
+  let unreadAtFirstSend;
+  f.packet.beforeSend = (_recipient, body) => {
+    unreadAtFirstSend ??= f.packet.inbox.length;
+    const id = Number(JSON.parse(body).message_id);
+    assert.equal(f.packet.inbox.some(item => item.msg_id === id), false, 'saved intents outside snapshot must wait source consumption');
+  };
+  await f.pump.resumePending(ROOM_ID);
+  assert.equal(unreadAtFirstSend, 8);
+  assert.equal(f.packet.sendCalls.length, 40);
+  assert.equal(f.packet.consumeCalls.length, 40);
+});
+
+test('unread earlier source defers later work in its lane while another consumed lane progresses', async () => {
+  const records = [7, 8].map((msg_id, index) => ({ version: 1, kind: 'message', room_id: ROOM_ID,
+    seq: index + 1, record_id: `${ROOM_ID}:${index + 1}`, at: incoming().date, message_id: MESSAGE_IDS[index],
+    author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' }, category: 'chat', text: incoming().text,
+    source_msg_id: msg_id, source_wire_id: `wire-in-${msg_id}`, recipient_identities: index === 0 ? ['cid-bob'] : ['cid-bob', 'cid-cara'] }));
+  const f = fixture({ records });
+  f.packet.inbox.push(incoming());
+  const ack = f.packet.acknowledgeMessage.bind(f.packet);
+  let acknowledgements = 0;
+  f.packet.acknowledgeMessage = async (...args) => {
+    if (++acknowledgements === 1) return true;
+    assert.deepEqual(f.packet.sendCalls.map(call => call.recipient), ['cid-cara'], 'unrelated consumed lane progresses before expected source consumption');
+    return ack(...args);
+  };
+  await f.pump.pump(ROOM_ID);
+  assert.deepEqual(f.packet.sendCalls.map(call => [call.recipient, JSON.parse(call.body).message_id]),
+    [['cid-cara', MESSAGE_IDS[1]], ['cid-bob', MESSAGE_IDS[0]], ['cid-bob', MESSAGE_IDS[1]]]);
+});
+
+
+test('pre-consume recovery beyond one file snapshot keeps metadata and binary behind consumption', async () => {
+  const records = [];
+  const rows = Array.from({ length: 40 }, (_, i) => incomingFile({ file_id: i + 1, wire_id: `recovery-file-${i + 1}` }));
+  for (const item of rows) {
+    const file_id = String(item.file_id).padStart(26, '0'); const seq = records.length + 1;
+    records.push({ version: 1, kind: 'file', room_id: ROOM_ID, seq, record_id: `${ROOM_ID}:${seq}`, at: item.date,
+      file_id, author: { identity: 'cid-alice', display_name: 'Alice', role: 'builder' },
+      filename: item.filename, mime: item.mime, size: item.data.length,
+      sha256: '0'.repeat(64), data_base64: item.data.toString('base64'),
+      source_file_id: item.file_id, source_wire_id: item.wire_id, recipient_identities: ['cid-bob'] });
+    records.push({ version: 1, kind: 'relay_intent', room_id: ROOM_ID, seq: seq + 1, record_id: `${ROOM_ID}:${seq + 1}`,
+      at: AT, file_id, recipient_identity: 'cid-bob' });
+  }
+  const f = fixture({ records, room: { seats: room().seats.slice(0, 2) } });
+  f.packet.fileInbox.push(...rows);
+  let unreadAtFirstNotice;
+  f.packet.beforeSend = (_recipient, body) => {
+    unreadAtFirstNotice ??= f.packet.fileInbox.length;
+    const id = Number(JSON.parse(body).message_id);
+    assert.equal(f.packet.fileInbox.some(item => item.file_id === id), false, 'file notice must wait consumption outside snapshot');
+  };
+  await f.pump.resumePending(ROOM_ID);
+  assert.equal(unreadAtFirstNotice, 8);
+  assert.equal(f.packet.sendCalls.length, 40);
+  assert.equal(f.packet.sendFileCalls.length, 40);
+  assert.equal(f.packet.consumeFileCalls.length, 40);
 });

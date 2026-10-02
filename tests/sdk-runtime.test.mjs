@@ -1100,3 +1100,79 @@ test('mintInvite waits for stale in-flight snapshot then refreshes the generated
   await minted;
   assert.deepEqual(packet.listInvites(), [{invite_id:'new-invite',mode:'one_time'}]);
 });
+
+
+test('SDK command drain yields after one bounded slice of continual typed traffic', async () => {
+  const client = blankClient();
+  let handled = 0;
+  client.listIncomingMessages = async () => handled < 40 ? [{ seq: handled + 1, status: 'unread', wire_id: `typed-${handled}`, message_kind: 'command' }] : [];
+  client.getMessages = async () => { handled++; return { messages: [], commands_handled: 1, command_results: [] }; };
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  assert.equal(await packet.drainRuntimeCommands(async () => assert.fail('typed is not chat')), true, 'yield must request another tracked turn');
+  assert.equal(handled, 32);
+  await packet.drainRuntimeCommands(async () => assert.fail('typed is not chat'));
+  assert.equal(handled, 40);
+});
+
+test('SDK acknowledgement defers its expected unread source after bounded raced promotions', async () => {
+  const client = blankClient();
+  client.messages = Array.from({ length: 40 }, (_, i) => ({
+    seq: i + 1, msg_id: i + 1, from: { id: CID, name: 'Peer' },
+    occurred_at_ms: Date.parse('2026-08-15T08:00:00Z'), date: '2026-08-15T08:00:00Z',
+    inbox_state: 'unread', status: 'unread', wire_id: `raced-${i}`, reply_to: null,
+  }));
+  for (const row of client.messages) client.messageHistory.set(row.wire_id, {
+    ...row, peer: row.from, direction: 'in', text: 'raced text', body: 'raced text', transport: 'double_ratchet',
+  });
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  const expected = { msg_id: 40, sender_id: CID, sender_name: 'Peer', text: 'raced text', date: '2026-08-15T08:00:00.000Z', wire_id: 'raced-39', reply_to: null };
+  const promoted = [];
+  assert.equal(await packet.acknowledgeMessage(expected, async item => promoted.push(item)), true);
+  assert.equal(promoted.length, 32);
+  assert.equal(client.messages[39].status, 'unread');
+  assert.equal(await packet.acknowledgeMessage(expected, async item => promoted.push(item)), false);
+  assert.equal(promoted.length, 39);
+  assert.equal(client.messages[39].status, 'read');
+});
+
+test('SDK unread source barrier uses complete metadata beyond text slice and typed ordering barrier', async () => {
+  const client = blankClient();
+  client.messages = Array.from({ length: 70 }, (_, i) => ({ msg_id: i + 1, seq: i + 1, status: i === 0 ? 'read' : 'unread', wire_id: `metadata-${i}`, message_kind: i === 32 ? 'command' : 'text' }));
+  client.files = Array.from({ length: 70 }, (_, i) => ({ file_id: i + 1, status: i === 0 ? 'read' : 'unread' }));
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  const unread = await packet.listUnreadSourceIds();
+  assert.equal(unread.messages.size, 69);
+  assert.equal(unread.files.size, 69);
+  assert.equal(unread.messages.has(70), true);
+  assert.equal(unread.files.has(70), true);
+  assert.equal(unread.messages.has(1), false);
+  assert.equal(client.calls.some(([name]) => name === 'getHistoryItem' || name === 'getMessages' || name === 'fetchFile'), false, 'barrier must not fetch or consume bodies');
+  client.listIncomingFiles = async () => { throw new Error('metadata unavailable'); };
+  await assert.rejects(packet.listUnreadSourceIds(), /metadata unavailable/, 'unknown read marks must fail closed');
+});
+
+test('isolated SDK HTTP trace keeps a stalled packet send single-flight without inventing cancellation retries', async () => {
+  const { OursClient } = await import('@ours.network/sdk/client');
+  let release; const responseGate = new Promise(resolve => { release = resolve; });
+  let entered; const requestStarted = new Promise(resolve => { entered = resolve; });
+  const operations = [];
+  const client = new OursClient({ url: 'http://127.0.0.1:1', leaseToken: 'isolated-trace-only', fetch: async (url) => {
+    operations.push(new URL(url).pathname); entered(); await responseGate;
+    return new Response(JSON.stringify({ kind: 'sent', wireId: MESSAGE_OUT_WIRE, wire_id: MESSAGE_OUT_WIRE,
+      sent: true, history_stored: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  } });
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  let settled = false;
+  const send = packet.send(CID, 'synthetic body');
+  void send.then(() => { settled = true; });
+  await requestStarted; await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false, 'packet send awaits the delayed HTTP operation');
+  assert.deepEqual(operations, ['/api/v1/sendMessage']);
+  release(); assert.deepEqual(await send, { status: 'queued', wire_id: MESSAGE_OUT_WIRE });
+  assert.equal(operations.length, 1);
+  const failed = new OursClient({ url: 'http://127.0.0.1:1', leaseToken: 'isolated-trace-failure', fetch: async (url) => {
+    operations.push(new URL(url).pathname); throw new Error('synthetic lost response');
+  } });
+  await assert.rejects(new SdkRoomPacket(IDENTITY, CID, failed).send(CID, 'synthetic body'), /synthetic lost response/);
+  assert.equal(operations.length, 2, 'one additional attempt, no automatic retry on unknown response');
+});

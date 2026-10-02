@@ -15,6 +15,7 @@ export { loadConfig } from './config.ts';
 import { createOursHost, type OursRuntimeClientFactory } from './ours-runtime.ts';
 import { PacketRegistry } from './packets.ts';
 import { RoomService } from './service.ts';
+import { RelayDurabilityError } from './intake.ts';
 import { CoworkStore } from './storage.ts';
 import { createPrivateServiceRoutes, createServiceRoutes, RpcDispatcher, TransportServer } from './transports.ts';
 import { createStaticWebHandler, loadWebAssets } from './web.ts';
@@ -163,6 +164,10 @@ export class CoworkDaemon {
   private transportStartAttempted = false;
   private pidWritten = false;
   private ready = false;
+  private recoveryPhase = 'initializing';
+  private recoveryRooms = 0;
+  private recoveryFailures = 0;
+  private pendingFanout = 0;
   private stopping = false;
   private cleanupComplete = false;
   private cleanupWork?: Promise<DaemonShutdownResult>;
@@ -220,19 +225,53 @@ export class CoworkDaemon {
       this.options.onStage?.('post-host');
       this.checkpoint();
 
+      const realService = this.service as RoomService;
+      const serviceRoutes = this.gateServiceRoutes(createServiceRoutes(realService));
+      const privateRoutes = this.gateServiceRoutes(createPrivateServiceRoutes(realService));
+      const recoveryRoutes = {
+        'daemon.recovery': { auth: true as const, run: (params: Record<string, unknown>) => {
+          if (Object.keys(params).length !== 0) throw new TypeError('invalid recovery status parameters');
+          return this.recoveryStatus();
+        } },
+      };
+      const unixRoutes = this.options.control
+        ? { ...serviceRoutes, ...privateRoutes, ...recoveryRoutes, ...createDaemonControlRoutes(this.options.control) }
+        : { ...serviceRoutes, ...privateRoutes, ...recoveryRoutes };
+      const unixDispatcher = new RpcDispatcher(unixRoutes);
+      const restDispatcher = new RpcDispatcher({ ...serviceRoutes, ...recoveryRoutes });
+      const staticHandler = createStaticWebHandler(loadWebAssets(
+        fileURLToPath(new URL('./web/', import.meta.url)),
+      ));
+      this.transports = this.options.transports ?? new TransportServer({
+        socketPath: runtime.socketPath,
+        rest: config.rest,
+        unixDispatcher,
+        restDispatcher,
+        staticHandler,
+        log: this.options.log,
+      });
+      this.transportStartAttempted = true;
+      await this.transports.start();
+      this.transportsStarted = true;
+      this.checkpoint();
+
+      this.recoveryPhase = 'restore';
       const rooms = await this.store.list();
       this.checkpoint();
       const recoverable = rooms.filter((room) => room.state !== 'closed');
       const healthy = new Set(recoverable.map((room) => room.room_id));
+      this.recoveryRooms = recoverable.length;
       const recoverPhase = async (roomId: string, phase: string, work: () => Promise<unknown>): Promise<void> => {
         if (!healthy.has(roomId)) return;
         try {
           await work();
           this.checkpoint();
         } catch (error) {
+          this.checkpoint();
           healthy.delete(roomId);
+          this.recoveryFailures++;
           const unhost = this.registry?.unhost;
-          if (unhost) {
+          if (unhost && !(error instanceof RelayDurabilityError)) {
             await unhost.call(this.registry, roomId).catch((unhostError) => {
               this.options.log?.(JSON.stringify({
                 event: 'startup_room_unhost_failed', room_id: roomId,
@@ -253,55 +292,44 @@ export class CoworkDaemon {
       for (const room of recoverable) {
         await recoverPhase(room.room_id, 'restore', () => this.service!.recoverPacket(room.room_id));
       }
+      this.recoveryPhase = 'lifecycle';
       // Pending close/delete requests survive a crash after acknowledgement.
       // Closed rooms need no identity restoration to finish deleting their data.
       for (const room of rooms) {
         if (room.state !== 'closed' && !healthy.has(room.room_id)) continue;
         if (await this.service!.resumeLifecycleRequest?.(room.room_id)) healthy.delete(room.room_id);
       }
+      this.recoveryPhase = 'reconcile';
       for (const room of recoverable.filter((candidate) => candidate.state !== 'closing')) {
         await recoverPhase(room.room_id, 'reconcile', () => this.service!.reconcileRoom(room.room_id));
       }
+      this.recoveryPhase = 'close';
       // Closing is forward-only and precedes every inbox/send recovery.
       for (const room of recoverable.filter((candidate) => candidate.state === 'closing')) {
         await recoverPhase(room.room_id, 'close', () => this.service!.closeRoom(room.room_id));
       }
-      // resumePending itself performs inbox snapshot -> complete all
-      // intents -> atomic consume -> pending sends, in that exact order.
-      for (const room of recoverable.filter((candidate) => candidate.state !== 'closing')) {
-        await recoverPhase(room.room_id, 'fanout', () => this.service!.resumePending(room.room_id));
-      }
-
-      const realService = this.service as RoomService;
-      const serviceRoutes = createServiceRoutes(realService);
-      const unixRoutes = this.options.control
-        ? { ...serviceRoutes, ...createPrivateServiceRoutes(realService), ...createDaemonControlRoutes(this.options.control) }
-        : { ...serviceRoutes, ...createPrivateServiceRoutes(realService) };
-      const unixDispatcher = new RpcDispatcher(unixRoutes);
-      const restDispatcher = new RpcDispatcher(serviceRoutes);
-      const staticHandler = createStaticWebHandler(loadWebAssets(
-        fileURLToPath(new URL('./web/', import.meta.url)),
-      ));
-      this.transports = this.options.transports ?? new TransportServer({
-        socketPath: runtime.socketPath,
-        rest: config.rest,
-        unixDispatcher,
-        restDispatcher,
-        staticHandler,
-        log: this.options.log,
-      });
-      this.transportStartAttempted = true;
-      await this.transports.start();
-      this.transportsStarted = true;
+      // Structural recovery is complete. Fanout is independently tracked per
+      // room; a slow send must not hide management or another room's startup.
       this.checkpoint();
-
+      const fanoutRooms = recoverable.filter(room => room.state !== 'closing' && healthy.has(room.room_id));
+      this.pendingFanout = fanoutRooms.length;
+      this.recoveryPhase = this.pendingFanout > 0 ? 'fanout' : 'running';
       this.ready = true;
-      await this.flushQueuedNotifications();
       this.checkpoint();
       this.options.onStage?.('pre-pid');
       (this.options.writePid ?? writeDaemonPid)(config.stateDir);
       this.pidWritten = true;
       this.options.onStage?.('ready');
+      this.checkpoint();
+      for (const room of fanoutRooms) {
+        const work = recoverPhase(room.room_id, 'fanout', () => this.service!.resumePending(room.room_id))
+          .finally(() => {
+            this.pendingFanout--;
+            if (this.pendingFanout === 0 && !this.stopping) this.recoveryPhase = 'running';
+          });
+        this.trackBackground(work);
+      }
+      this.flushQueuedNotifications();
     } catch (error) {
       this.cancelled = true;
       let cleanupError: unknown;
@@ -332,6 +360,7 @@ export class CoworkDaemon {
   private async cleanupUnlocked(): Promise<DaemonShutdownResult> {
     this.stopping = true;
     this.ready = false;
+    this.recoveryPhase = 'stopping';
     const errors: unknown[] = [];
     let requiresProcessExit = false;
     try { this.service?.beginShutdown(); } catch (error) { errors.push(error); }
@@ -343,7 +372,13 @@ export class CoworkDaemon {
     try {
       await Promise.allSettled([...this.notificationWork]);
       await this.service?.drain();
-    } catch (error) { errors.push(error); }
+    } catch (error) {
+      errors.push(error);
+      // Unlike an ordinary cleanup error, an unacknowledged observed result
+      // cannot be turned into application teardown. The supervisor's existing
+      // crash/forced-exit boundary remains independent of this guard.
+      if (error instanceof RelayDurabilityError) throw new DaemonShutdownError(errors, false);
+    }
     try {
       if (this.lockHandle || this.pidWritten || this.hostStartAttempted) {
         (this.options.removePid ?? removeDaemonPid)(this.options.config.stateDir);
@@ -393,13 +428,38 @@ export class CoworkDaemon {
     );
   }
 
-  private async flushQueuedNotifications(): Promise<void> {
-    while (this.queuedNotifications.size > 0 && !this.stopping) {
-      const rooms = [...this.queuedNotifications];
-      this.queuedNotifications.clear();
-      for (const roomId of rooms) this.handleNotification(roomId);
-      await Promise.allSettled([...this.notificationWork]);
-    }
+  private flushQueuedNotifications(): void {
+    const rooms = [...this.queuedNotifications];
+    this.queuedNotifications.clear();
+    for (const roomId of rooms) this.handleNotification(roomId);
+  }
+
+  private trackBackground(work: Promise<void>): void {
+    this.notificationWork.add(work);
+    void work.then(
+      () => this.notificationWork.delete(work),
+      () => this.notificationWork.delete(work),
+    );
+  }
+
+  private recoveryStatus() {
+    return {
+      version: 1, ready: this.ready && !this.cancelled && !this.stopping,
+      phase: this.recoveryPhase, rooms: this.recoveryRooms,
+      failed_rooms: this.recoveryFailures, pending_fanout: this.pendingFanout,
+    };
+  }
+
+  private gateServiceRoutes(routes: ReturnType<typeof createServiceRoutes>) {
+    return Object.fromEntries(Object.entries(routes).map(([method, route]) => [method, {
+      auth: route.auth,
+      run: (params: Record<string, unknown>) => {
+        if (!this.ready || this.cancelled || this.stopping) {
+          throw new Error('cowork room service is recovering or shutting down');
+        }
+        return route.run(params);
+      },
+    }]));
   }
 
 }

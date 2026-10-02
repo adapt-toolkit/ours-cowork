@@ -584,7 +584,7 @@ test('SQLite durability policy is WAL with FULL synchronous commits', async (t) 
 test('relay and close recovery paths use unresolved indexes instead of archive scans', () => {
   const intake = readFileSync(new URL('../src/intake.ts', import.meta.url), 'utf8');
   const service = readFileSync(new URL('../src/service.ts', import.meta.url), 'utf8');
-  const relay = intake.slice(intake.indexOf('private async relayPendingUnlocked'), intake.indexOf('private findSourceMessage'));
+  const relay = intake.slice(intake.indexOf('private async relayPending('), intake.indexOf('private findSourceMessage'));
   const close = service.slice(service.indexOf('private async closeUnlocked'), service.indexOf('private async appendUncertainCloseResult'));
   assert.equal(relay.includes('this.store.read('), false);
   assert.equal(close.includes('this.store.read('), false);
@@ -927,6 +927,7 @@ test('thread file refusal survives SQLite restart with no blob, fanout, or repea
   const files = [item], sends = [], fileSends = [];
   let crashAtAck = true;
   const packet = {
+    listUnreadSourceIds: async () => ({ messages: new Set(), files: new Set(files.map(item => item.file_id)) }),
     listUnreadMessages: async () => [], listUnreadFiles: async () => files,
     acknowledgeFile: async () => { if (crashAtAck) throw new Error('crash before ACK'); files.length = 0; },
     send: async (recipient, body) => { sends.push({ recipient, body }); return { status: 'queued', wire_id: 'private-error' }; },
@@ -993,6 +994,7 @@ async function ancestryFixture(t, { anonymous = false, depth = 1 } = {}) {
   const inbox = [], files = [], sends = [], fileSends = [];
   let serial = 0, messageIndex = 101, beforeAck;
   const packet = {
+    listUnreadSourceIds: async () => ({ messages: new Set(inbox.map(item => item.msg_id)), files: new Set(files.map(item => item.file_id)) }),
     listUnreadMessages: async () => [...inbox], listUnreadFiles: async () => [...files],
     acknowledgeMessage: async () => { await beforeAck?.(); inbox.shift(); },
     acknowledgeFile: async () => { await beforeAck?.(); files.shift(); },

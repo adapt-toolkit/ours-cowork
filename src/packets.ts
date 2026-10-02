@@ -19,6 +19,7 @@ import type { OursRuntimeClientFactory } from './ours-runtime.ts';
 
 export type InviteMode = 'one_time' | 'public';
 export type RelayStatus = 'queued' | 'send_failed';
+export interface RelayDispatchOptions { recoverBinding?: boolean; }
 type IncomingFileMeta = Awaited<ReturnType<OursClient['listIncomingFiles']>>[number];
 type HistoryMessage = NonNullable<Awaited<ReturnType<OursClient['getHistoryItem']>>>;
 type ReceivedFile = Awaited<ReturnType<OursClient['getFiles']>>['files'][number];
@@ -93,13 +94,15 @@ export interface RoomPacket {
   /** Replace the room identity's public catalog with the bounded cowork command set. */
   registerRuntimeCommands?(handlers: RoomRuntimeCommandHandlers): Promise<void>;
   /** Consume leading typed rows with one SDK reader; handlers acquire their own room locks. */
-  drainRuntimeCommands?(onUnexpected: (item: InboxItem) => Promise<void>): Promise<void>;
+  drainRuntimeCommands?(onUnexpected: (item: InboxItem) => Promise<void>): Promise<boolean | void>;
   listUnreadMessages(limit: number): Promise<InboxItem[]>;
-  acknowledgeMessage(expected: InboxItem, onUnexpected: (item: InboxItem) => Promise<void>): Promise<void>;
+  acknowledgeMessage(expected: InboxItem, onUnexpected: (item: InboxItem) => Promise<void>): Promise<boolean | void>;
+  /** Full unread metadata, including sources beyond the bounded body snapshot. */
+  listUnreadSourceIds(): Promise<{ messages: Set<number>; files: Set<number> }>;
   listUnreadFiles(limit: number): Promise<FileInboxItem[]>;
   acknowledgeFile(expected: FileInboxItem): Promise<void>;
-  send(contactCid: string, body: string, replyTo?: ReplyReference): Promise<{ status: RelayStatus; wire_id?: string }>;
-  sendFile(contactCid: string, filename: string, mime: string, data: Buffer, replyTo?: ReplyReference): Promise<{ status: RelayStatus; wire_id?: string }>;
+  send(contactCid: string, body: string, replyTo?: ReplyReference, options?: RelayDispatchOptions): Promise<{ status: RelayStatus; wire_id?: string }>;
+  sendFile(contactCid: string, filename: string, mime: string, data: Buffer, replyTo?: ReplyReference, options?: RelayDispatchOptions): Promise<{ status: RelayStatus; wire_id?: string }>;
   removeContact(contactCid: string): Promise<{
     status: RelayStatus;
     notified: boolean;
@@ -346,6 +349,8 @@ async function isTypedNameRefusal(error: unknown): Promise<boolean> {
   return code === 'NAME_INVALID' || code === 'NAME_TAKEN';
 }
 
+const SDK_READ_TURN_SIZE = 32;
+
 export class SdkRoomPacket implements RoomPacket {
   readonly name: string;
   readonly cid: string;
@@ -423,7 +428,8 @@ export class SdkRoomPacket implements RoomPacket {
     throw lastError;
   }
 
-  private async runBound<T>(operation: () => Promise<T>): Promise<T> {
+  private async runBound<T>(operation: () => Promise<T>, recoverBinding = true): Promise<T> {
+    if (!recoverBinding) return operation();
     try {
       return await operation();
     } catch (error) {
@@ -580,13 +586,13 @@ export class SdkRoomPacket implements RoomPacket {
     ]));
   }
 
-  async drainRuntimeCommands(onUnexpected: (item: InboxItem) => Promise<void>): Promise<void> {
-    for (;;) {
-      if (await this.runtimeHandlers?.shouldPause?.()) return;
+  async drainRuntimeCommands(onUnexpected: (item: InboxItem) => Promise<void>): Promise<boolean> {
+    for (let consumed = 0; consumed < SDK_READ_TURN_SIZE; consumed++) {
+      if (await this.runtimeHandlers?.shouldPause?.()) return false;
       const [oldest] = (await this.runBound(() => this.client.listIncomingMessages()))
         .filter((message) => message.status === 'unread')
         .sort((left, right) => left.seq - right.seq);
-      if (oldest === undefined || oldest.message_kind === undefined || oldest.message_kind === 'text') return;
+      if (oldest === undefined || oldest.message_kind === undefined || oldest.message_kind === 'text') return false;
       const pulled = await this.runBound(() => this.client.getMessages({ limit: 1 }));
       if (pulled.messages.length > 1) throw new Error('SDK returned more than one message for limit 1');
       for (const history of pulled.messages) await onUnexpected(messageItem(history, 'read'));
@@ -596,6 +602,7 @@ export class SdkRoomPacket implements RoomPacket {
         throw new Error(`SDK did not consume leading typed message ${oldest.wire_id}`);
       }
     }
+    return true; // Continued typed traffic gets another tracked intake turn.
   }
 
   async listUnreadMessages(limit: number): Promise<InboxItem[]> {
@@ -619,20 +626,32 @@ export class SdkRoomPacket implements RoomPacket {
   async acknowledgeMessage(
     expected: InboxItem,
     onUnexpected: (item: InboxItem) => Promise<void>,
-  ): Promise<void> {
-    for (;;) {
-      if (await this.runtimeHandlers?.shouldPause?.()) return;
+  ): Promise<boolean> {
+    for (let consumed = 0; consumed < SDK_READ_TURN_SIZE; consumed++) {
+      if (await this.runtimeHandlers?.shouldPause?.()) return false;
       const pulled = await this.runBound(() => this.client.getMessages({ limit: 1 }));
       if (pulled.messages.length > 1) throw new Error('SDK returned more than one message for limit 1');
       const [history] = pulled.messages;
-      if (history === undefined) return;
+      if (history === undefined) return false;
       const item = messageItem(history, 'read');
       if (sameMessageSource(item, expected)) {
         assertSameMessage(item, expected);
-        return;
+        return false;
       }
       await onUnexpected(item);
     }
+    return true; // Expected source is still unread; fanout must defer it.
+  }
+
+  async listUnreadSourceIds(): Promise<{ messages: Set<number>; files: Set<number> }> {
+    // SDK metadata APIs return the complete incoming set (no pagination).
+    // Failure propagates: never send an archived source on an unknown read mark.
+    const messages = await this.runBound(() => this.client.listIncomingMessages());
+    const files = await this.runBound(() => this.client.listIncomingFiles());
+    return {
+      messages: new Set(messages.filter(item => item.status === 'unread').map(item => item.msg_id)),
+      files: new Set(files.filter(item => item.status === 'unread').map(item => item.file_id)),
+    };
   }
 
   async listUnreadFiles(limit: number): Promise<FileInboxItem[]> {
@@ -652,7 +671,7 @@ export class SdkRoomPacket implements RoomPacket {
     assertReceivedFile(expected, pulled.files[0]!);
   }
 
-  async send(contactCid: string, body: string, replyTo?: ReplyReference): Promise<{ status: RelayStatus; wire_id?: string }> {
+  async send(contactCid: string, body: string, replyTo?: ReplyReference, options?: RelayDispatchOptions): Promise<{ status: RelayStatus; wire_id?: string }> {
     return sendResult(await this.runBound(() => this.client.sendMessage({
       contact: contactCid,
       text: body,
@@ -660,10 +679,10 @@ export class SdkRoomPacket implements RoomPacket {
         reply_to_wire_id: replyTo.wire_id,
         ...(replyTo.sentence === undefined ? {} : { reply_to_sentence: replyTo.sentence }),
       }),
-    })));
+    }), options?.recoverBinding));
   }
 
-  async sendFile(contactCid: string, filename: string, mime: string, data: Buffer, replyTo?: ReplyReference): Promise<{ status: RelayStatus; wire_id?: string }> {
+  async sendFile(contactCid: string, filename: string, mime: string, data: Buffer, replyTo?: ReplyReference, options?: RelayDispatchOptions): Promise<{ status: RelayStatus; wire_id?: string }> {
     const validName = FileNameSchema.parse(filename);
     const validMime = FileMimeSchema.parse(mime);
     if (data.length > MAX_FILE_BYTES) throw new RangeError(`room files must be at most ${MAX_FILE_BYTES} bytes (2 MiB)`);
@@ -676,7 +695,7 @@ export class SdkRoomPacket implements RoomPacket {
         reply_to_wire_id: replyTo.wire_id,
         ...(replyTo.sentence === undefined ? {} : { reply_to_sentence: replyTo.sentence }),
       }),
-    })));
+    }), options?.recoverBinding));
   }
 
   async removeContact(contactCid: string): Promise<{ status: RelayStatus; notified: boolean; key_material_retained: true }> {

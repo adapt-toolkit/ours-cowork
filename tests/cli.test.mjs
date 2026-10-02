@@ -1185,3 +1185,51 @@ test('service install identifies an unsafe Node executable and preserves the exi
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test('start waits for structural readiness on a running recovery management endpoint', async () => {
+  const session = 'ab'.repeat(16);
+  let readinessProbes = 0;
+  await withRpc(request => {
+    if (request.method === 'daemon.status') return { result: { version: 1, protocol: 'cowork-supervisor-control', running: true, session } };
+    if (request.method === 'daemon.recovery') return { result: { version: 1, ready: ++readinessProbes >= 3, phase: 'restore', rooms: 1, failed_rooms: 0, pending_fanout: 0 } };
+    return { error: { code: 'method_not_found', message: 'unsupported' } };
+  }, async rpc => {
+    const result = await runCli(['start', '--json'], { env: rpc.env });
+    assert.equal(result.code, 0, result.stdout);
+    assert.equal(readinessProbes, 3, 'start must wait readiness rather than just socket ownership');
+  });
+});
+
+test('start supports an older worker only when recovery method is explicitly absent', async () => {
+  const session = 'ab'.repeat(16);
+  const methods = [];
+  await withRpc(request => {
+    methods.push(request.method);
+    return request.method === 'daemon.status'
+      ? { result: { version: 1, protocol: 'cowork-supervisor-control', running: true, session } }
+      : { error: { code: 'method_not_found', message: 'unsupported' } };
+  }, async rpc => {
+    const result = await runCli(['start', '--json'], { env: rpc.env });
+    assert.equal(result.code, 0);
+    assert.equal(methods.includes('daemon.recovery'), true);
+  });
+});
+
+test('start does not mistake a failed or malformed recovery probe for readiness', async () => {
+  const session = 'ab'.repeat(16);
+  let probes = 0;
+  await withRpc(request => {
+    if (request.method === 'daemon.status') return { result: { version: 1, protocol: 'cowork-supervisor-control', running: true, session } };
+    if (request.method === 'daemon.recovery') {
+      ++probes;
+      if (probes === 1) return { error: { code: 'unauthorized', message: 'denied' } };
+      if (probes === 2) return { result: { version: 1, phase: 'restore' } };
+      return { result: { version: 1, ready: true } };
+    }
+    return { error: { code: 'method_not_found', message: 'unsupported' } };
+  }, async rpc => {
+    const result = await runCli(['start', '--json'], { env: rpc.env });
+    assert.equal(result.code, 0, result.stdout);
+    assert.equal(probes, 3);
+  });
+});

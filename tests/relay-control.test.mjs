@@ -18,7 +18,7 @@ async function turnsUntil(check,missing='required control progress'){const deadl
 function incoming(n,text='STOP synthetic fixture'){
  return {seq:n,msg_id:n,from:{id:A,name:'Member 0'},peer:{id:A,name:'Member 0'},direction:'in',occurred_at_ms:Date.parse(AT),date:AT,encryption:'e2e',inbox_state:'unread',status:'unread',message_kind:'text',wire_id:n.toString(16).padStart(64,'0'),reply_to:null,text,body:text,transport:'double_ratchet',delivery_state:null,human_read_at_ms:null};
 }
-async function fixture({file=false,binding=false,lost=false,ackFailure=false,binaryFailure,binaryFailureRecipient,ordinaryFailureRecipient,extraRecipient=false,recipients=[B]}={}){
+async function fixture({file=false,binding=false,lost=false,ackFailure=false,binaryFailure,binaryFailureRecipient,ordinaryFailureRecipient,extraRecipient=false,recipients=[B],rebindMismatch=false}={}){
  const dir=mkdtempSync(join(tmpdir(),'cowork-relay-control-'));const store=new CoworkStore(dir),packets=new Map(),states=[],work=[];
  const members=extraRecipient?[A,B,D]:[A,B];
  let release,entered;const gate=new Promise(r=>release=r),started=new Promise(r=>entered=r);let destroys=0;
@@ -42,7 +42,7 @@ async function fixture({file=false,binding=false,lost=false,ackFailure=false,bin
      if(i===0&&input.contact===ordinaryFailureRecipient)throw new Error('synthetic ordinary recipient response lost');
      out={kind:'sent',wireId:`synthetic-${i}-${state.sends.length}`,sent:true,history_stored:true};
     }else if(op==='sendFile'){state.files.push(input);if(binaryFailure==='unknown'&&(!binaryFailureRecipient||input.contact===binaryFailureRecipient))throw new Error('synthetic lost binary response');if(binaryFailure==='binding'&&(!binaryFailureRecipient||input.contact===binaryFailureRecipient))return new Response(JSON.stringify({error:{code:'NOT_BOUND',message:'synthetic definite binary refusal'}}),{status:400,headers:{'content-type':'application/json'}});out={kind:'sent',wireId:'synthetic-file',sent:true,history_stored:true,filename:input.filename,mime:input.mime,bytes:Buffer.from(input.data_base64,'base64').length};}
-    else if(op==='chooseIdentity'){entered();await gate;out={cid:CID,name:`ours-cowork:Control ${i}`};}
+    else if(op==='chooseIdentity'){entered();await gate;out={cid:rebindMismatch?'F'.repeat(64):CID,name:`ours-cowork:Control ${i}`};}
     else if(op==='setCommandCatalog')out={published:true};
     else if(op==='sendCommandResult'){state.results.push(input);out={sent:true,wire_id:'synthetic-command-result',history_stored:true};}
     else if(op==='listContacts')out={contacts:state.contacts,origins:{}};
@@ -378,5 +378,23 @@ for(const order of ['before','after'])test(`startup ordinary error ${order} part
   assert.equal(events.includes('unhost'),false);assert.equal(events.includes('host.close'),false);assert.equal(events.includes('lock.release'),false);
   assert.equal(existsSync(join(f.dir,'rooms',IDS[0],'archive.sqlite3')),true);
   assert.equal(f.rows(IDS[0]).some(row=>row.kind==='relay_result'&&row.recipient_identity===B),false);
+ }finally{await f.cleanup();}
+});
+
+
+for(const recovery of ['mismatch','failed'])test(`binary refusal ${recovery} recovery stops before independent recipient dispatch`,async()=>{
+ const f=await fixture({file:true,binaryFailure:'binding',binaryFailureRecipient:B,extraRecipient:true,recipients:[B,D],rebindMismatch:recovery==='mismatch'});try{
+  let rebindCalls=0;const packet=f.packets.get(IDS[0]),rebind=packet.rebind.bind(packet);
+  packet.rebind=async()=>{rebindCalls++;if(recovery==='failed')throw new Error('synthetic binding recovery failed');return rebind();};
+  await start(f);f.release();await Promise.allSettled(f.work);
+  assert.equal(rebindCalls,1,'no failed authority recovery retry');
+  if(recovery==='mismatch')assert.equal(f.states[0].operations.filter(op=>op==='chooseIdentity').length,1,'actual SDK identity validation exercised');
+  assert.equal(f.states[0].sends.filter(input=>input.contact===D).length,0,'failed authority recovery stops later body dispatch');
+  assert.deepEqual(f.states[0].files.map(input=>input.contact),[B],'only definite refused binary request, no later bytes');
+  assert.equal(f.rows(IDS[0]).some(row=>row.kind==='relay_result'),false,'no fabricated terminal phase');
+  await assert.rejects(f.track(f.service.notifyRoom(IDS[0])),/relay result durability unresolved/);
+  await assert.rejects(f.track(f.service.closeRoom(IDS[0])),/relay result durability unresolved/);
+  await assert.rejects(f.track(f.service.deleteRoom(IDS[0],{confirm:true})),/relay result durability unresolved/);
+  assert.equal(f.destroys,0);assert.equal(existsSync(join(f.dir,'rooms',IDS[0],'archive.sqlite3')),true);
  }finally{await f.cleanup();}
 });

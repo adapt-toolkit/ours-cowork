@@ -51,9 +51,11 @@ exactly-once guarantee, or durable unknown-send reconciliation in this change.
 An observed relay result whose append reports failure blocks new relay effects,
 close/delete retries and clean shutdown in that running process, even if a result
 row is visible afterward. The application does not unhost or erase the archive to
-waive that barrier; it reports the storage failure. Before-dispatch metadata errors
-and completed-but-unknown transport outcomes keep their existing error cleanup
-semantics and never fabricate a delivery result. There is no automatic result
+waive that barrier; it reports the durability failure. An accepted file notice also
+retains that barrier on subsequent preparation failure, unread deferral, missing
+or corrupt source, failed rebind, or unknown binary response. No full-file terminal
+result is fabricated for an unresolved phase. Before-notice metadata errors and
+ordinary message unknown outcomes retain their existing error cleanup semantics. There is no automatic result
 commit retry or recovery API: retain the journal, inspect storage and use an
 operator-reviewed recovery procedure. The barrier is process-local; crash/restart
 continues the existing at-least-once policy, not a new durable in-flight protocol.

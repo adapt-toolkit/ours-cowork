@@ -56,7 +56,8 @@ An observed-effect result commit failure is retained after its worker exits.
 Repeated close/delete requests fail closed; shutdown reports a durability error
 before application PID removal, unhosting, host shutdown or lock release. The
 retained archive must be inspected with storage before recovery; repeating a
-mutation does not repair its result durability. Other completed transport failures
+mutation does not repair its result durability. Unresolved phases after an accepted file notice retain the same barrier, including
+preparation failure and unknown binary outcomes. Ordinary message transport failures
 retain existing error cleanup behavior without inventing relay results. The
 supervisor's existing 10-second watchdog can still force process exit, a separate
 crash/restart boundary with the existing at-least-once limitations. A file notice

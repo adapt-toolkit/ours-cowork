@@ -671,7 +671,10 @@ export class IntakePump {
             // delays safely; failed metadata is never interpreted as consumed.
             const unread = await packet.listUnreadSourceIds();
             const prepared = await this.prepareEffect(roomId, packet, intent, unread, phase, metadataWire);
-            if (prepared.kind === 'deferred') { deferredRecipients.add(intent.recipient_identity); break; }
+            if (prepared.kind === 'deferred') {
+              if (phase === 'binary') throw new Error('accepted file notice has unresolved binary eligibility');
+              deferredRecipients.add(intent.recipient_identity); break;
+            }
             if (prepared.kind === 'skipped') break;
             const outcome = await prepared.work;
             if (prepared.file && phase === 'first' && outcome.status === 'queued') {
@@ -696,6 +699,14 @@ export class IntakePump {
             if (!recoveredBinding && isDefiniteBindingRefusal(refusal)) {
               recoveredBinding = true;
               try { await packet.rebind(); continue; } catch (rebindError) { error = new RelayEffectFailure(rebindError); }
+            }
+            if (phase === 'binary') {
+              // An accepted notice is already an observed effect. Every unresolved
+              // exit must retain ownership, including unknown binary outcomes.
+              const failure = error instanceof RelayDurabilityError ? error
+                : new RelayDurabilityError(error instanceof RelayEffectFailure ? error.cause : error);
+              this.commitFailures.set(roomId, failure);
+              throw failure;
             }
             // Storage and preparation failure must stop immediately; a send
             // failure may leave independent recipients eligible in this pass.
@@ -734,7 +745,10 @@ export class IntakePump {
       if ((await queryStore(this.store, roomId, { kind: 'relay_result', intentRecordId: intent.record_id, limit: 1 })).length > 0) return { kind: 'skipped' as const };
       const [message] = intent.message_id === undefined ? [] : await queryStore(this.store, roomId, { kind: 'message', messageId: intent.message_id, limit: 1 }) as MessageRecord[];
       const [file] = intent.file_id === undefined ? [] : await queryStore(this.store, roomId, { kind: 'file', fileId: intent.file_id, limit: 1 }) as FileRecord[];
-      if ((message === undefined) === (file === undefined)) return { kind: 'skipped' as const };
+      if ((message === undefined) === (file === undefined)) {
+        if (phase === 'binary') throw new Error('accepted file notice source is unavailable');
+        return { kind: 'skipped' as const };
+      }
       const source = message ?? file!;
       if ((message?.source_msg_id !== undefined && unread.messages.has(message.source_msg_id))
         || (file?.source_file_id !== undefined && unread.files.has(file.source_file_id))) return { kind: 'deferred' as const };
@@ -769,7 +783,10 @@ export class IntakePump {
             publicThread = { thread: { schema_version: 1, thread_id: root.message_id } };
           }
         } else {
-          if (!source.recipient_identities.includes(intent.recipient_identity)) return { kind: 'skipped' as const };
+          if (!source.recipient_identities.includes(intent.recipient_identity)) {
+            if (phase === 'binary') throw new Error('accepted file notice source recipient changed');
+            return { kind: 'skipped' as const };
+          }
           if (!activeCids.has(intent.recipient_identity) && removedCids.has(intent.recipient_identity)) {
             await this.skipRelay(roomId, intent, 'skipped_removed', metadataWire, phase === 'binary');
             return { kind: 'skipped' as const };

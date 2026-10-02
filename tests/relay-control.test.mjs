@@ -12,20 +12,21 @@ import {CoworkDaemon} from '../src/daemon-runtime.ts';
 import {SdkRoomPacket} from '../src/packets.ts';
 
 const IDS=['01jz6y7n8p9q0r1s2t3v4w5x6y','01jz6y7n8p9q0r1s2t3v4w5x70'];
-const A='A'.repeat(64),B='B'.repeat(64),CID='C'.repeat(64),AT='2026-08-02T10:11:12.000Z';
+const A='A'.repeat(64),B='B'.repeat(64),CID='C'.repeat(64),D='D'.repeat(64),AT='2026-08-02T10:11:12.000Z';
 const tick=()=>new Promise(r=>setImmediate(r));
 async function turnsUntil(check,missing='required control progress'){const deadline=Date.now()+1500;while(Date.now()<deadline){if(check())return;await tick();}assert.fail(missing+' did not become observable before the assertion deadline');}
 function incoming(n,text='STOP synthetic fixture'){
  return {seq:n,msg_id:n,from:{id:A,name:'Member 0'},peer:{id:A,name:'Member 0'},direction:'in',occurred_at_ms:Date.parse(AT),date:AT,encryption:'e2e',inbox_state:'unread',status:'unread',message_kind:'text',wire_id:n.toString(16).padStart(64,'0'),reply_to:null,text,body:text,transport:'double_ratchet',delivery_state:null,human_read_at_ms:null};
 }
-async function fixture({file=false,binding=false,lost=false,ackFailure=false,binaryFailure}={}){
+async function fixture({file=false,binding=false,lost=false,ackFailure=false,binaryFailure,binaryFailureRecipient,ordinaryFailureRecipient,extraRecipient=false,recipients=[B]}={}){
  const dir=mkdtempSync(join(tmpdir(),'cowork-relay-control-'));const store=new CoworkStore(dir),packets=new Map(),states=[],work=[];
+ const members=extraRecipient?[A,B,D]:[A,B];
  let release,entered;const gate=new Promise(r=>release=r),started=new Promise(r=>entered=r);let destroys=0;
  const track=p=>{work.push(p);void p.catch(()=>{});return p;};
  const rows=id=>{const db=new DatabaseSync(join(dir,'rooms',id,'archive.sqlite3'),{readOnly:true});try{return db.prepare('SELECT payload_json FROM records').all().map(r=>JSON.parse(r.payload_json));}finally{db.close();}};
  try{
   for(const [i,id] of IDS.entries()){
-   const state={inbox:[],sends:[],files:[],results:[],operations:[],contacts:[A,B].map(container_id=>({container_id,name:'Synthetic'}))};states.push(state);
+   const state={inbox:[],sends:[],files:[],results:[],operations:[],contacts:members.map(container_id=>({container_id,name:'Synthetic'}))};states.push(state);
    const client=new OursClient({url:'http://127.0.0.1:1',leaseToken:`isolated-control-${i}`,fetch:async(url,options)=>{
     const op=new URL(url).pathname.split('/').at(-1),input=JSON.parse(options.body);state.operations.push(op);let out;
     if(op==='listIncomingMessages')out=state.inbox;
@@ -38,8 +39,9 @@ async function fixture({file=false,binding=false,lost=false,ackFailure=false,bin
       if(binding)return new Response(JSON.stringify({error:{code:'NOT_BOUND',message:'synthetic definite refusal'}}),{status:400,headers:{'content-type':'application/json'}});
       entered();await gate;if(lost)throw new Error('synthetic lost send response');
      }
+     if(input.contact===ordinaryFailureRecipient)throw new Error('synthetic ordinary recipient response lost');
      out={kind:'sent',wireId:`synthetic-${i}-${state.sends.length}`,sent:true,history_stored:true};
-    }else if(op==='sendFile'){state.files.push(input);if(binaryFailure==='unknown')throw new Error('synthetic lost binary response');if(binaryFailure==='binding')return new Response(JSON.stringify({error:{code:'NOT_BOUND',message:'synthetic definite binary refusal'}}),{status:400,headers:{'content-type':'application/json'}});out={kind:'sent',wireId:'synthetic-file',sent:true,history_stored:true,filename:input.filename,mime:input.mime,bytes:Buffer.from(input.data_base64,'base64').length};}
+    }else if(op==='sendFile'){state.files.push(input);if(binaryFailure==='unknown'&&(!binaryFailureRecipient||input.contact===binaryFailureRecipient))throw new Error('synthetic lost binary response');if(binaryFailure==='binding'&&(!binaryFailureRecipient||input.contact===binaryFailureRecipient))return new Response(JSON.stringify({error:{code:'NOT_BOUND',message:'synthetic definite binary refusal'}}),{status:400,headers:{'content-type':'application/json'}});out={kind:'sent',wireId:'synthetic-file',sent:true,history_stored:true,filename:input.filename,mime:input.mime,bytes:Buffer.from(input.data_base64,'base64').length};}
     else if(op==='chooseIdentity'){entered();await gate;out={cid:CID,name:`ours-cowork:Control ${i}`};}
     else if(op==='setCommandCatalog')out={published:true};
     else if(op==='sendCommandResult'){state.results.push(input);out={sent:true,wire_id:'synthetic-command-result',history_stored:true};}
@@ -50,8 +52,8 @@ async function fixture({file=false,binding=false,lost=false,ackFailure=false,bin
     return new Response(JSON.stringify(out),{status:200,headers:{'content-type':'application/json'}});
    }});
    const packet=new SdkRoomPacket(`ours-cowork:Control ${i}`,CID,client);packets.set(id,packet);await packet.refresh();
-   await store.create({version:2,room_id:id,room_name:`Control ${i}`,identity_name:packet.name,identity_cid:CID,mission:{goal:'Synthetic',briefing:'Synthetic',briefing_version:1},role_briefings:{},state:'active',invites:[],created_at:AT,activated_at:AT,anonymous:false,quiet_membership:true,membership_epoch:2,command_grants:[{caller_cid:A,command:'room.close'},{caller_cid:A,command:'room.delete'}],seats:[A,B].map((identity,j)=>({identity,display_name:`Member ${j}`,role:'builder',invite_id:'synthetic-existing',accepted_at:AT,state:'active',participant_id:`01jz6y7n8p9q0r1s2t3v4w5xa${j+1}`}))});
-   const common={version:1,room_id:id,at:AT,author:{identity:A,display_name:'Member 0',role:'builder'},recipient_identities:[B]};
+   await store.create({version:2,room_id:id,room_name:`Control ${i}`,identity_name:packet.name,identity_cid:CID,mission:{goal:'Synthetic',briefing:'Synthetic',briefing_version:1},role_briefings:{},state:'active',invites:[],created_at:AT,activated_at:AT,anonymous:false,quiet_membership:true,membership_epoch:2,command_grants:[{caller_cid:A,command:'room.close'},{caller_cid:A,command:'room.delete'}],seats:members.map((identity,j)=>({identity,display_name:`Member ${j}`,role:'builder',invite_id:'synthetic-existing',accepted_at:AT,state:'active',participant_id:`01jz6y7n8p9q0r1s2t3v4w5xa${j+1}`}))});
+   const common={version:1,room_id:id,at:AT,author:{identity:A,display_name:'Member 0',role:'builder'},recipient_identities:recipients};
    if(file&&i===0){const bytes=Buffer.from('file');await store.append(id,{...common,kind:'file',file_id:'01jz6y7n8p9q0r1s2t3v4w5xt1',source_file_id:7,source_wire_id:'E'.repeat(64),filename:'synthetic.txt',mime:'text/plain',size:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex'),data_base64:bytes.toString('base64')});}
    else await store.append(id,{...common,kind:'message',message_id:`01jz6y7n8p9q0r1s2t3v4w5xt${i+1}`,category:'chat',text:'Synthetic parent'});
   }
@@ -343,5 +345,37 @@ for(const failure of ['metadata','load','binding','unknown','unread','source_mis
   assert.equal(f.rows(IDS[0]).filter(row=>row.kind==='relay_result').length,0,'unknown phase never claims full-file terminal success');
   assert.equal(f.states[0].sends.length,1,'accepted notice is not retransmitted');
   assert.equal(f.states[0].files.length,['binding','unknown'].includes(failure)?1:0,'no extra binary retry');
+ }finally{await f.cleanup();}
+});
+
+
+test('partial binary unknown preserves independently eligible recipient in current serial pass',async()=>{
+ const f=await fixture({file:true,binaryFailure:'unknown',binaryFailureRecipient:B,extraRecipient:true,recipients:[B,D]});try{
+  await start(f);f.release();await Promise.allSettled(f.work);
+  const results=f.rows(IDS[0]).filter(row=>row.kind==='relay_result');
+  assert.equal(results.some(row=>row.recipient_identity===B),false);
+  assert.equal(results.find(row=>row.recipient_identity===D)?.status,'queued','independent recipient completes in current pass');
+  assert.deepEqual(f.states[0].files.map(input=>input.contact),[B,D],'one serial binary attempt per recipient');
+  await assert.rejects(f.track(f.service.notifyRoom(IDS[0])),/relay result durability unresolved/);
+  await assert.rejects(f.track(f.service.closeRoom(IDS[0])),/relay result durability unresolved/);
+  assert.equal(f.destroys,0);assert.equal(f.states[0].files.length,2);
+ }finally{await f.cleanup();}
+});
+
+for(const order of ['before','after'])test(`startup ordinary error ${order} partial file failure retains typed ownership`,async()=>{
+ const f=await fixture({file:order==='after',binaryFailure:'unknown',binaryFailureRecipient:B,ordinaryFailureRecipient:D,extraRecipient:true,recipients:order==='before'?[D]:[B]});try{
+  const common={version:1,room_id:IDS[0],at:AT,author:{identity:A,display_name:'Synthetic',role:'builder'},recipient_identities:order==='before'?[B]:[D]};
+  if(order==='before'){const bytes=Buffer.from('file');await f.store.append(IDS[0],{...common,kind:'file',file_id:'01jz6y7n8p9q0r1s2t3v4w5xt3',source_file_id:7,source_wire_id:'F'.repeat(64),filename:'partial.txt',mime:'text/plain',size:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex'),data_base64:bytes.toString('base64')});}
+  else await f.store.append(IDS[0],{...common,kind:'message',message_id:'01jz6y7n8p9q0r1s2t3v4w5xt3',category:'chat',text:'Synthetic ordinary later'});
+  const events=[],logs=[];const daemon=new CoworkDaemon({config:{version:1,stateDir:f.dir,rest:{enabled:false,port:3010}},prepare:()=>({socketPath:join(f.dir,'test.sock')}),lock:()=>({release(){events.push('lock.release');}}),host:{async boot(){},close(){events.push('host.close');}},store:f.store,registry:{async unhost(id){events.push('room.unhost:'+id);},async unhostAll(){events.push('unhost');}},service:f.service,writePid(){},removePid(){events.push('pid.remove');},transports:{async start(){},async stop(){events.push('transports.stop');}},log:line=>logs.push(line)});
+  await daemon.boot();await f.started;f.release();
+  await turnsUntil(()=>logs.some(line=>line.includes('startup_room_recovery_failed'))&&f.states[0].files.length===1,'partial failure actually exercised');
+  assert.equal(f.states[0].sends.some(input=>input.contact===D),true,'ordinary failed recipient attempted');
+  assert.equal(f.states[0].sends.some(input=>input.contact===B),true,'partial file notice accepted');
+  assert.equal(events.includes('room.unhost:'+IDS[0]),false,'ordinary error never masks partial typed failure at startup');
+  await assert.rejects(f.track(daemon.shutdown()));
+  assert.equal(events.includes('unhost'),false);assert.equal(events.includes('host.close'),false);assert.equal(events.includes('lock.release'),false);
+  assert.equal(existsSync(join(f.dir,'rooms',IDS[0],'archive.sqlite3')),true);
+  assert.equal(f.rows(IDS[0]).some(row=>row.kind==='relay_result'&&row.recipient_identity===B),false);
  }finally{await f.cleanup();}
 });

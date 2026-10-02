@@ -2346,3 +2346,36 @@ test('delivery isolation reaches recipients beyond the journal batch, storage fa
   await assert.rejects(g.pump.pump(ROOM_ID), /storage unavailable/);
   assert.equal(g.packet.sendCalls.length, 1);
 });
+
+
+test('continued arrivals forward consumed sources before the inbox reaches empty', async () => {
+  const f = fixture();
+  const rows = [7, 8, 9].map(msg_id => incoming({ msg_id, wire_id: `wire-in-${msg_id}` }));
+  f.packet.inbox.push(...rows);
+  f.packet.listUnreadMessages = async () => structuredClone(f.packet.inbox.slice(0, 1));
+  let unreadAtFirstSend;
+  f.packet.beforeSend = () => { unreadAtFirstSend ??= f.packet.inbox.length; };
+  await f.pump.pump(ROOM_ID);
+  assert.equal(unreadAtFirstSend, 2, 'forwarding must run after a bounded snapshot, before later arrivals drain');
+  assert.equal(f.packet.sendCalls.length, 6);
+  assert.deepEqual(f.packet.consumeCalls, [[7], [8], [9]]);
+});
+
+test('deferred acknowledgement blocks its unread source and later recipient lane until consumed', async () => {
+  const f = fixture();
+  f.packet.inbox.push(incoming());
+  const ack = f.packet.acknowledgeMessage.bind(f.packet);
+  let turns = 0;
+  f.packet.acknowledgeMessage = async (...args) => {
+    if (++turns === 1) return true;
+    return ack(...args);
+  };
+  f.packet.listUnreadSourceIds = async () => ({
+    messages: new Set(f.packet.inbox.map(item => item.msg_id)),
+    files: new Set(f.packet.fileInbox.map(item => item.file_id)),
+  });
+  f.packet.beforeSend = () => assert.equal(f.packet.inbox.length, 0, 'deferred source must be consumed before its relay');
+  await f.pump.pump(ROOM_ID);
+  assert.equal(turns, 2);
+  assert.equal(f.packet.sendCalls.length, 2);
+});

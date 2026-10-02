@@ -1100,3 +1100,37 @@ test('mintInvite waits for stale in-flight snapshot then refreshes the generated
   await minted;
   assert.deepEqual(packet.listInvites(), [{invite_id:'new-invite',mode:'one_time'}]);
 });
+
+
+test('SDK command drain yields after one bounded slice of continual typed traffic', async () => {
+  const client = blankClient();
+  let handled = 0;
+  client.listIncomingMessages = async () => handled < 40 ? [{ seq: handled + 1, status: 'unread', wire_id: `typed-${handled}`, message_kind: 'command' }] : [];
+  client.getMessages = async () => { handled++; return { messages: [], commands_handled: 1, command_results: [] }; };
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  assert.equal(await packet.drainRuntimeCommands(async () => assert.fail('typed is not chat')), true, 'yield must request another tracked turn');
+  assert.equal(handled, 32);
+  await packet.drainRuntimeCommands(async () => assert.fail('typed is not chat'));
+  assert.equal(handled, 40);
+});
+
+test('SDK acknowledgement defers its expected unread source after bounded raced promotions', async () => {
+  const client = blankClient();
+  client.messages = Array.from({ length: 40 }, (_, i) => ({
+    seq: i + 1, msg_id: i + 1, from: { id: CID, name: 'Peer' },
+    occurred_at_ms: Date.parse('2026-08-15T08:00:00Z'), date: '2026-08-15T08:00:00Z',
+    inbox_state: 'unread', status: 'unread', wire_id: `raced-${i}`, reply_to: null,
+  }));
+  for (const row of client.messages) client.messageHistory.set(row.wire_id, {
+    ...row, peer: row.from, direction: 'in', text: 'raced text', body: 'raced text', transport: 'double_ratchet',
+  });
+  const packet = new SdkRoomPacket(IDENTITY, CID, client);
+  const expected = { msg_id: 40, sender_id: CID, sender_name: 'Peer', text: 'raced text', date: '2026-08-15T08:00:00.000Z', wire_id: 'raced-39', reply_to: null };
+  const promoted = [];
+  assert.equal(await packet.acknowledgeMessage(expected, async item => promoted.push(item)), true);
+  assert.equal(promoted.length, 32);
+  assert.equal(client.messages[39].status, 'unread');
+  assert.equal(await packet.acknowledgeMessage(expected, async item => promoted.push(item)), false);
+  assert.equal(promoted.length, 39);
+  assert.equal(client.messages[39].status, 'read');
+});

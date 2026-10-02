@@ -398,3 +398,17 @@ for(const recovery of ['mismatch','failed'])test(`binary refusal ${recovery} rec
   assert.equal(f.destroys,0);assert.equal(existsSync(join(f.dir,'rooms',IDS[0],'archive.sqlite3')),true);
  }finally{await f.cleanup();}
 });
+
+
+for(const phase of ['message','file-notice','private-notice'])test(`${phase} identity mismatch stops later recipient dispatch`,async()=>{
+ const f=await fixture({file:phase==='file-notice',binding:true,rebindMismatch:true,extraRecipient:true,recipients:[B,D]});try{
+  if(phase==='private-notice'){const row=incoming(1,'Synthetic private rejection');row.reply_to={wire_id:'F'.repeat(64)};f.states[0].inbox.push(row);}
+  await start(f);f.release();const outcomes=await Promise.allSettled(f.work);
+  assert.equal(f.states[0].operations.filter(op=>op==='chooseIdentity').length,1,'actual SDK mismatch rejects once');
+  assert.equal(f.states[0].sends.length,1,'no later body dispatch after identity mismatch');
+  assert.equal(f.states[0].files.length,0,'no bytes after failed authority recovery');
+  assert.equal(outcomes.some(outcome=>outcome.status==='rejected'&&outcome.reason.name==='RoomIdentityMismatchError'),true,'authority error remains observable');
+  assert.equal(f.rows(IDS[0]).some(row=>row.kind==='relay_result'),false);
+  if(phase==='private-notice')assert.equal(f.rows(IDS[0]).find(row=>row.kind==='intake_rejection')?.notification_attempt_claimed,true,'one-time claim preserved');
+ }finally{await f.cleanup();}
+});

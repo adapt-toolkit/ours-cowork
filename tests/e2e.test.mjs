@@ -203,6 +203,7 @@ if (process.argv.includes('--e2e-driver')) {
         env: oursEnv,
         leaseToken: `cowork-e2e-${name.toLowerCase()}`,
       });
+      peerClients.push(client);
       const created = await client.createIdentity({
         name,
         bio: `cowork E2E participant ${name}`,
@@ -338,13 +339,12 @@ if (process.argv.includes('--e2e-driver')) {
 
       const { attachOursClient } = await import('@ours.network/sdk');
       observer = await attachOursClient({ env: oursEnv, leaseToken: 'cowork-e2e-observer' });
-      const [alice, bob, charlie, successor] = await Promise.all([
-        createPeer(attachOursClient, 'Alice'),
-        createPeer(attachOursClient, 'Bob'),
-        createPeer(attachOursClient, 'Charlie'),
-        createPeer(attachOursClient, 'Successor'),
-      ]);
-      peerClients.push(alice.client, bob.client, charlie.client, successor.client);
+      // The pinned SDK resets connections during concurrent identity provisioning.
+      // Provision fixture identities serially; exercise concurrency below as before.
+      const alice = await createPeer(attachOursClient, 'Alice');
+      const bob = await createPeer(attachOursClient, 'Bob');
+      const charlie = await createPeer(attachOursClient, 'Charlie');
+      const successor = await createPeer(attachOursClient, 'Successor');
       stage('participants-ready');
 
       const restPort = await unusedPort();
@@ -619,7 +619,6 @@ if (process.argv.includes('--e2e-driver')) {
       assert.equal(rebound.result.identity_cid, roomCid);
       assert.equal((await sharedCall('room.show', {})).ok, true);
       const external = await createPeer(attachOursClient, 'ExternalInviter');
-      peerClients.push(external.client);
       const invitation = await external.client.generateInvite({ mode: 'one_time' });
       await runCli(['room', 'command-grant', roomId, alice.cid, 'room.accept']);
       const accepted = await sharedCall('room.accept', { role: 'external-reviewer', invite: invitation.blob, expected_cid: external.cid });

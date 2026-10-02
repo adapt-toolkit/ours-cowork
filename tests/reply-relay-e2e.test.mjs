@@ -208,12 +208,13 @@ if (process.argv.includes('--reply-relay-driver')) {
     async function createPeer(attachOursClient, label, suffix) {
       const name = `Reply ${label} ${suffix}`;
       const client = await attachOursClient({ env: oursEnv, leaseToken: `cowork-reply-${label}-${suffix}` });
+      const peer = { label, name, client, leased: true, roomCid: undefined };
+      peers.push(peer);
       const created = await client.createIdentity({
         name, bio: `isolated Cowork reply participant ${label}`,
         exposeLocal: false, localAutoAccept: true,
       });
-      const peer = { label, name, cid: created.info.cid, client, leased: true, roomCid: undefined };
-      peers.push(peer);
+      peer.cid = created.info.cid;
       return peer;
     }
 
@@ -406,11 +407,11 @@ if (process.argv.includes('--reply-relay-driver')) {
 
       const { attachOursClient } = await import('@ours.network/sdk');
       const suffix = `${process.pid}-${Date.now().toString(36)}`;
-      const [a, b, c] = await Promise.all([
-        createPeer(attachOursClient, 'A', suffix),
-        createPeer(attachOursClient, 'B', suffix),
-        createPeer(attachOursClient, 'C', suffix),
-      ]);
+      // Concurrent createIdentity resets fixture transport on the pinned SDK.
+      // Serial setup preserves the concurrent messaging/admission checks below.
+      const a = await createPeer(attachOursClient, 'A', suffix);
+      const b = await createPeer(attachOursClient, 'B', suffix);
+      const c = await createPeer(attachOursClient, 'C', suffix);
       evidence.versions.ours_daemon = await a.client.version();
       stage('identities-ready');
 

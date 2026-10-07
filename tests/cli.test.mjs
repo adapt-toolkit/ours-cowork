@@ -745,7 +745,7 @@ test('real daemon start, status, and stop use the management control session', {
   t.after(async () => {
     const pidPath = join(stateDir, 'daemon.pid');
     try {
-      const pid = Number((await readFile(pidPath, 'utf8')).trim());
+      const pid = Number((await readFile(pidPath, 'utf8')).split('\n')[0]);
       if (Number.isSafeInteger(pid)) process.kill(pid, 'SIGKILL');
     } catch { /* daemon stopped or never started */ }
     await new Promise((closed) => shared.close(closed));

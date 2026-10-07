@@ -2,6 +2,7 @@
 // only after installing its IPC shutdown/disconnect handlers.
 
 import * as nodeFs from 'node:fs';
+import { flockSync } from 'fs-ext';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -37,6 +38,7 @@ export interface LockOptions {
   fs?: typeof nodeFs;
   pid?: number;
   isProcessAlive?: (pid: number) => boolean;
+  processIdentity?: (pid: number) => ProcessIdentity | undefined;
 }
 
 export interface DaemonHostShutdownResult {
@@ -404,11 +406,58 @@ export class CoworkDaemon {
 
 }
 
-/** Acquire an exclusive owner file, replacing it only after proving its PID stale. */
+export interface ProcessIdentity {
+  version: 1;
+  bootId: string;
+  pidNamespace: string;
+  startTime: string;
+}
+
+interface ProcessOwner {
+  pid: number;
+  identity?: ProcessIdentity;
+}
+
+/** Acquire an exclusive owner file, replacing it only after proving its owner stale. */
 export function acquireDaemonLock(stateDir: string, options: LockOptions = {}): DaemonLock {
+  const fs = options.fs ?? nodeFs;
+  // This inode is permanent. Unlinking it would let contenders lock different
+  // inodes and would destroy the OS lifetime guarantee during stale recovery.
+  const path = join(stateDir, 'daemon.owner');
+  const fd = fs.openSync(path, nodeFs.constants.O_CREAT | nodeFs.constants.O_RDWR | NO_FOLLOW, FILE_MODE);
+  try {
+    const opened = fs.fstatSync(fd);
+    validateOwnerFile(opened, 'daemon lifetime lock');
+    const current = fs.lstatSync(path);
+    if (current.dev !== opened.dev || current.ino !== opened.ino) throw new Error('daemon lifetime lock changed while opening');
+    try { flockSync(fd, 'exnb'); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EAGAIN' || (error as NodeJS.ErrnoException).code === 'EWOULDBLOCK') {
+        throw new Error('cowork daemon is already running (state ownership is locked)');
+      }
+      throw error; // Unsupported filesystems/platforms fail closed.
+    }
+    fsyncDirectory(fs, stateDir);
+    const bookkeeping = acquireBookkeepingLock(stateDir, options);
+    let released = false;
+    return {
+      release(): void {
+        if (released) return;
+        released = true;
+        try { bookkeeping.release(); } finally { fs.closeSync(fd); }
+      },
+    };
+  } catch (error) {
+    fs.closeSync(fd); // Closing the descriptor releases flock even after errors.
+    throw error;
+  }
+}
+
+function acquireBookkeepingLock(stateDir: string, options: LockOptions): DaemonLock {
   const fs = options.fs ?? nodeFs;
   const pid = options.pid ?? process.pid;
   const alive = options.isProcessAlive ?? isProcessAlive;
+  const identity = options.processIdentity ?? readProcessIdentity;
+  const ownerRecord = { pid, identity: identity(pid) };
   const path = join(stateDir, 'daemon.lock');
   for (let attempt = 0; attempt < 3; attempt += 1) {
     let fd: number | undefined;
@@ -417,7 +466,7 @@ export function acquireDaemonLock(stateDir: string, options: LockOptions = {}): 
       fd = fs.openSync(path, nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL | nodeFs.constants.O_WRONLY | NO_FOLLOW, FILE_MODE);
       created = true;
       fs.fchmodSync(fd, FILE_MODE);
-      writeAll(fs, fd, Buffer.from(`${pid}\n`, 'ascii'));
+      writeAll(fs, fd, encodeOwner(ownerRecord));
       fs.fsyncSync(fd);
       const owned = fs.fstatSync(fd);
       fs.closeSync(fd);
@@ -425,11 +474,11 @@ export function acquireDaemonLock(stateDir: string, options: LockOptions = {}): 
       fsyncDirectory(fs, stateDir);
       const pidPath = join(stateDir, 'daemon.pid');
       if (lstatIfPresent(fs, pidPath)) {
-        const pidOwner = readSecurePid(fs, pidPath, 'daemon PID');
-        if (alive(pidOwner)) {
+        const pidOwner = readSecureOwner(fs, pidPath, 'daemon PID');
+        if (isOwnerAlive(pidOwner, alive, identity)) {
           fs.unlinkSync(path);
           fsyncDirectory(fs, stateDir);
-          throw new Error(`cowork daemon is already running with PID ${pidOwner}`);
+          throw new Error(`cowork daemon is already running with PID ${pidOwner.pid}`);
         }
       }
       let released = false;
@@ -439,8 +488,8 @@ export function acquireDaemonLock(stateDir: string, options: LockOptions = {}): 
           released = true;
           const current = lstatIfPresent(fs, path);
           if (!current || current.dev !== owned.dev || current.ino !== owned.ino) return;
-          const content = readSecurePid(fs, path, 'daemon lock');
-          if (content !== pid) return;
+          const content = readSecureOwner(fs, path, 'daemon lock');
+          if (!sameOwner(content, ownerRecord)) return;
           fs.unlinkSync(path);
           fsyncDirectory(fs, stateDir);
         },
@@ -454,8 +503,8 @@ export function acquireDaemonLock(stateDir: string, options: LockOptions = {}): 
         throw error;
       }
       const observed = fs.lstatSync(path);
-      const owner = readSecurePid(fs, path, 'daemon lock');
-      if (alive(owner)) throw new Error(`cowork daemon is already running with PID ${owner}`);
+      const owner = readSecureOwner(fs, path, 'daemon lock');
+      if (isOwnerAlive(owner, alive, identity)) throw new Error(`cowork daemon is already running with PID ${owner.pid}`);
       const current = fs.lstatSync(path);
       if (current.dev !== observed.dev || current.ino !== observed.ino) continue;
       fs.unlinkSync(path);
@@ -466,11 +515,12 @@ export function acquireDaemonLock(stateDir: string, options: LockOptions = {}): 
 }
 
 export function writeDaemonPid(stateDir: string, fs: typeof nodeFs = nodeFs, pid = process.pid): void {
+  const ownerRecord = { pid, identity: readProcessIdentity(pid) };
   const path = join(stateDir, 'daemon.pid');
   const existing = lstatIfPresent(fs, path);
   if (existing) {
-    const owner = readSecurePid(fs, path, 'daemon PID');
-    if (isProcessAlive(owner) && owner !== pid) throw new Error(`cowork daemon PID file belongs to live PID ${owner}`);
+    const owner = readSecureOwner(fs, path, 'daemon PID');
+    if (isOwnerAlive(owner) && !sameOwner(owner, ownerRecord)) throw new Error(`cowork daemon PID file belongs to live PID ${owner.pid}`);
     const current = fs.lstatSync(path);
     if (current.dev !== existing.dev || current.ino !== existing.ino) throw new Error('daemon PID file changed during stale-owner check');
     fs.unlinkSync(path);
@@ -481,7 +531,7 @@ export function writeDaemonPid(stateDir: string, fs: typeof nodeFs = nodeFs, pid
     fd = fs.openSync(path, nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL | nodeFs.constants.O_WRONLY | NO_FOLLOW, FILE_MODE);
     created = true;
     fs.fchmodSync(fd, FILE_MODE);
-    writeAll(fs, fd, Buffer.from(`${pid}\n`, 'ascii'));
+    writeAll(fs, fd, encodeOwner(ownerRecord));
     fs.fsyncSync(fd);
   } catch (error) {
     if (fd !== undefined) {
@@ -500,22 +550,26 @@ export function removeDaemonPid(stateDir: string, fs: typeof nodeFs = nodeFs, pi
   const path = join(stateDir, 'daemon.pid');
   const observed = lstatIfPresent(fs, path);
   if (!observed) return;
-  const owner = readSecurePid(fs, path, 'daemon PID');
-  if (owner !== pid) return;
+  const owner = readSecureOwner(fs, path, 'daemon PID');
+  if (!sameOwner(owner, { pid, identity: readProcessIdentity(pid) })) return;
   const current = fs.lstatSync(path);
   if (current.dev !== observed.dev || current.ino !== observed.ino) return;
   fs.unlinkSync(path);
   fsyncDirectory(fs, stateDir);
 }
 
-function readSecurePid(fs: typeof nodeFs, path: string, label: string): number {
-  const stat = fs.lstatSync(path);
-  if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== FILE_MODE) {
+function validateOwnerFile(stat: nodeFs.Stats, label: string): void {
+  if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== FILE_MODE) {
     throw new Error(`${label} must be a 0600 single-link regular file`);
   }
   if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
     throw new Error(`${label} must be owned by the current user`);
   }
+}
+
+function readSecureOwner(fs: typeof nodeFs, path: string, label: string): ProcessOwner {
+  const stat = fs.lstatSync(path);
+  validateOwnerFile(stat, label);
   let fd: number | undefined;
   let text: string;
   try {
@@ -530,10 +584,67 @@ function readSecurePid(fs: typeof nodeFs, path: string, label: string): number {
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
   }
-  if (!/^[1-9][0-9]*\n$/.test(text)) throw new Error(`${label} contains an invalid PID`);
-  const pid = Number(text.trim());
+  const lines = text.split('\n');
+  if (!/^[1-9][0-9]*$/.test(lines[0]) || lines.at(-1) !== '' || (lines.length !== 2 && lines.length !== 3)) {
+    throw new Error(`${label} contains an invalid ownership record`);
+  }
+  const pid = Number(lines[0]);
   if (!Number.isSafeInteger(pid)) throw new Error(`${label} contains an invalid PID`);
-  return pid;
+  if (lines.length === 2) return { pid }; // Legacy ownership is deliberately conservative.
+  let identity: unknown;
+  try { identity = JSON.parse(lines[1]); } catch { throw new Error(`${label} contains an invalid process identity`); }
+  if (!validIdentity(identity)) throw new Error(`${label} contains an invalid process identity`);
+  return { pid, identity };
+}
+
+function validIdentity(value: unknown): value is ProcessIdentity {
+  if (!value || typeof value !== 'object') return false;
+  const identity = value as ProcessIdentity;
+  return Object.keys(value).length === 4 && identity.version === 1
+    && typeof identity.bootId === 'string' && /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(identity.bootId)
+    && typeof identity.pidNamespace === 'string' && /^pid:\[[0-9]+\]$/.test(identity.pidNamespace)
+    && typeof identity.startTime === 'string' && /^[0-9]+$/.test(identity.startTime);
+}
+
+function encodeOwner(owner: ProcessOwner): Buffer {
+  return Buffer.from(`${owner.pid}\n${owner.identity ? `${JSON.stringify(owner.identity)}\n` : ''}`, 'utf8');
+}
+
+function sameOwner(left: ProcessOwner, right: ProcessOwner): boolean {
+  return left.pid === right.pid && ((!left.identity && !right.identity)
+    || (!!left.identity && !!right.identity && left.identity.version === right.identity.version
+      && left.identity.bootId === right.identity.bootId && left.identity.pidNamespace === right.identity.pidNamespace
+      && left.identity.startTime === right.identity.startTime));
+}
+
+function isOwnerAlive(owner: ProcessOwner, alive = isProcessAlive, identity = readProcessIdentity): boolean {
+  if (!alive(owner.pid)) return false;
+  if (!owner.identity) return true;
+  try {
+    const current = identity(owner.pid);
+    // Unknown/unavailable identity is not proof of death.
+    return current === undefined || sameOwner(owner, { pid: owner.pid, identity: current });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ESRCH') return alive(owner.pid);
+    return true;
+  }
+}
+
+/** Linux identity survives PID reuse and changes across host/container lifetimes. */
+function readProcessIdentity(pid: number): ProcessIdentity | undefined {
+  if (process.platform !== 'linux') return undefined;
+  const bootId = nodeFs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+  const startTime = (): string => {
+    const stat = nodeFs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // comm (field 2) may itself contain spaces and closing parentheses.
+    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+  };
+  const before = startTime();
+  const pidNamespace = nodeFs.readlinkSync(`/proc/${pid}/ns/pid`);
+  const after = startTime();
+  const identity = { version: 1 as const, bootId, pidNamespace, startTime: after };
+  if (before !== after || !validIdentity(identity)) throw new Error(`cannot establish process identity for PID ${pid}`);
+  return identity;
 }
 
 function isProcessAlive(pid: number): boolean {

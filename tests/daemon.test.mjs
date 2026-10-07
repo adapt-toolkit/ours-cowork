@@ -486,18 +486,18 @@ test('single-instance lock refuses live owners, recovers stale owners, and is ow
   const dir = mkdtempSync(join(tmpdir(), 'cowork-lock-'));
   try {
     chmodSync(dir, 0o700);
-    const live = acquireDaemonLock(dir, { pid: 111, isProcessAlive: (pid) => pid === 111 });
-    assert.throws(() => acquireDaemonLock(dir, { pid: 222, isProcessAlive: (pid) => pid === 111 }), /already running/);
+    const live = acquireDaemonLock(dir, { pid: 111, processIdentity: () => undefined, isProcessAlive: (pid) => pid === 111 });
+    assert.throws(() => acquireDaemonLock(dir, { pid: 222, processIdentity: () => undefined, isProcessAlive: (pid) => pid === 111 }), /already running/);
     live.release();
     writeFileSync(join(dir, 'daemon.lock'), '333\n', { mode: 0o600 });
-    const recovered = acquireDaemonLock(dir, { pid: 444, isProcessAlive: () => false });
+    const recovered = acquireDaemonLock(dir, { pid: 444, processIdentity: () => undefined, isProcessAlive: () => false });
     assert.equal(readFileSync(join(dir, 'daemon.lock'), 'utf8'), '444\n');
     recovered.release();
     assert.equal(existsSync(join(dir, 'daemon.lock')), false);
 
     writeFileSync(join(dir, 'daemon.pid'), '555\n', { mode: 0o600 });
     assert.throws(
-      () => acquireDaemonLock(dir, { pid: 666, isProcessAlive: (owner) => owner === 555 }),
+      () => acquireDaemonLock(dir, { pid: 666, processIdentity: () => undefined, isProcessAlive: (owner) => owner === 555 }),
       /already running.*555/,
     );
     assert.equal(existsSync(join(dir, 'daemon.lock')), false);

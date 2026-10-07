@@ -18,7 +18,7 @@ const shared = {
   target: 'node20',
   format: 'esm',
   banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
-  external: ['@ours.network/sdk', '@ours.network/sdk/*', 'better-sqlite3'],
+  external: ['@ours.network/sdk', '@ours.network/sdk/*', 'better-sqlite3', 'fs-ext'],
   logLevel: 'info',
 };
 

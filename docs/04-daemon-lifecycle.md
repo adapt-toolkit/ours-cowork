@@ -62,13 +62,17 @@ ID as terminally retired (`BINDING_REASSIGNED`); any other refusal, including a
 live competing owner, keeps the record and leaves the room unhosted.
 
 Because a supervisor can still retire the owners it holds after its worker is
-gone, each supervisor holds `supervisor.lock` in the cowork state directory from
+gone, each supervisor holds a supervisor lock in the cowork state directory from
 before it replays terminal events until its own terminal delivery has finished.
 A replacement launch is refused for that whole interval, including a boot in
 which rooms are already attached but `daemon.pid` does not exist yet. The lock
-records the supervisor's PID with its boot and process-start identity where the
-platform provides them; it is replaced only on positive evidence that this exact
-process is gone, so a reused PID after a reboot does not block startup.
+is a chain of `supervisor.lock.<n>` generations: a generation is created only by
+an exclusive link and is never removed or reused by a contender, so concurrent
+launches cannot both take over a dead supervisor. Each records the supervisor's
+PID with its boot and process-start identity where the platform provides them
+and is superseded only on positive evidence that this exact process is gone, so
+a reused PID after a reboot does not block startup. A clean stop leaves one small
+released generation behind so numbering never restarts.
 
 A room whose owner was never recorded (hosted by a release without the ledger and
 then lost abruptly) cannot be recovered this way: its lease must be released

@@ -49,10 +49,34 @@ pending events before admitting replacement room owners, using each saved target
 even if the new launch configuration differs. Failed delivery retains the event
 and blocks replacement admission; it does not authorize takeover.
 
-If all trustworthy live participants disappear before a terminal event is
-published, ownership remains unknown. This recovery does not infer death from a
-saved PID, a missing file or elapsed time, and it makes no OS reboot/power-loss
-guarantee.
+Each V1 room owner ID is also recorded privately under `room-owners/` in the
+cowork state directory before its first attachment, bound to the room and to the
+selected daemon UUID. If the supervisor and worker disappear together (power
+loss, host reset, a killed process tree), no terminal event exists and the shared
+daemon keeps that owner's lease. The next worker reconnects as the same recorded
+owner with `force:false` and verifies the durable room CID; it is the same
+logical owner returning, so nothing is inferred from a saved PID, a missing file
+or elapsed time. The record is removed only after an acknowledged terminal
+release. A replacement owner is minted only when the daemon reports the recorded
+ID as terminally retired (`BINDING_REASSIGNED`); any other refusal, including a
+live competing owner, keeps the record and leaves the room unhosted.
+
+Because a supervisor can still retire the owners it holds after its worker is
+gone, each supervisor holds a supervisor lock in the cowork state directory from
+before it replays terminal events until its own terminal delivery has finished.
+A replacement launch is refused for that whole interval, including a boot in
+which rooms are already attached but `daemon.pid` does not exist yet. The lock
+is a chain of `supervisor.lock.<n>` generations: a generation is created only by
+an exclusive link and is never removed or reused by a contender, so concurrent
+launches cannot both take over a dead supervisor. Each records the supervisor's
+PID with its boot and process-start identity where the platform provides them
+and is superseded only on positive evidence that this exact process is gone, so
+a reused PID after a reboot does not block startup. A clean stop leaves one small
+released generation behind so numbering never restarts.
+
+A room whose owner was never recorded (hosted by a release without the ledger and
+then lost abruptly) cannot be recovered this way: its lease must be released
+through the shared daemon's operator tooling before `ours-cowork room rebind`.
 
 `web` uses the same safe cowork start path: an already-running cowork daemon is retained, an absent cowork daemon is started, and readiness is checked with `GET /` before a browser opens. The shared ours daemon must already be running. `web` never retries a room mutation. With `--json`, it returns the URL with `opened: false` and has no browser side effect. If HTTP is explicitly disabled, `web` exits `1` and explains how to enable it.
 

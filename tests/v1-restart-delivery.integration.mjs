@@ -12,7 +12,8 @@ import { fileURLToPath } from 'node:url';
 import { attachOursClient } from '@ours.network/sdk';
 import { command, sleep, startProcess, stopProcess, unusedPort, waitFor, waitForPort } from './fixtures/v1-runtime.mjs';
 
-const SCENARIOS = ['cowork-graceful', 'daemon-kill', 'worker-kill', 'worker-kill-supervisor-delayed', 'cowork-kill', 'system-kill', 'system-kill-cowork-first',
+const SCENARIOS = ['cowork-graceful', 'daemon-kill', 'worker-kill', 'worker-kill-supervisor-delayed',
+  'boot-window-supervisor-delayed', 'cowork-kill', 'system-kill', 'system-kill-cowork-first',
   'system-term', 'system-term-daemon-first', 'foreign-owner'];
 const selected = process.argv.slice(2).length ? process.argv.slice(2) : SCENARIOS;
 for (const name of selected) assert(SCENARIOS.includes(name), `Unknown restart scenario ${name}`);
@@ -165,6 +166,28 @@ function hostState() {
   return {room_owner_present: Boolean(row?.token)};
 }
 
+async function delayedSupervisor(bootWindow) {
+    const [supervisor, ...workers] = coworkPids();
+    process.kill(supervisor, 'SIGSTOP');
+    if (bootWindow) rmSync(join(coworkState, 'daemon.pid'));
+    try {
+      for (const pid of workers) process.kill(pid, 'SIGKILL');
+      await waitFor(() => workers.every(pid => !alive(pid) || /^\S+ \(.*\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8'))), 'worker killed under a stopped supervisor');
+      const ownerHeld = lease(room.identity_name);
+      const logged = readFileSync(join(coworkState, 'daemon.log'), 'utf8').length;
+      await assert.rejects(cli(['start']), 'a replacement must be refused while the predecessor supervisor lives');
+      const refusal = /cowork (supervisor|daemon) is already running with PID [0-9]+/.exec(readFileSync(join(coworkState, 'daemon.log'), 'utf8').slice(logged));
+      note(`  replacement refused by: ${refusal?.[0].replace(/[0-9]+$/, '<pid>') ?? 'unidentified guard'}`);
+      // The supervisor-lifetime lock must refuse before any worker is forked.
+      if (!process.env.COWORK_RESTART_LEGACY_GUARD) assert.equal(refusal?.[1], 'supervisor');
+      assert.equal(lease(room.identity_name), ownerHeld, 'refused replacement must not touch the predecessor owner');
+      assert(!existsSync(join(coworkState, 'owner-terminal')) || !readdirSync(join(coworkState, 'owner-terminal')).some(name => name.endsWith('.json')),
+        'the stopped supervisor has not yet published a terminal event');
+    } finally { process.kill(supervisor, 'SIGCONT'); }
+    await waitFor(() => !alive(supervisor), 'resumed supervisor finished terminal delivery', 45000);
+    coworkStarted = false;
+    await cli(['start']); coworkStarted = true;
+  }
 const restarts = {
   async 'cowork-graceful'() {
     await cli(['stop']); coworkStarted = false;
@@ -185,23 +208,12 @@ const restarts = {
   },
   // The worker is dead but its supervisor has not yet reported that: no
   // replacement host may be admitted until the predecessor's terminal delivery.
-  async 'worker-kill-supervisor-delayed'() {
-    const [supervisor, ...workers] = coworkPids();
-    process.kill(supervisor, 'SIGSTOP');
-    try {
-      for (const pid of workers) process.kill(pid, 'SIGKILL');
-      await waitFor(() => workers.every(pid => !alive(pid) || /^\S+ \(.*\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8'))), 'worker killed under a stopped supervisor');
-      const ownerHeld = lease(room.identity_name);
-      await assert.rejects(cli(['start']), 'a replacement must be refused while the predecessor supervisor lives');
-      assert.equal(lease(room.identity_name), ownerHeld, 'refused replacement must not touch the predecessor owner');
-      assert(!existsSync(join(coworkState, 'owner-terminal')) || !readdirSync(join(coworkState, 'owner-terminal')).some(name => name.endsWith('.json')),
-        'the stopped supervisor has not yet published a terminal event');
-    } finally { process.kill(supervisor, 'SIGCONT'); }
-    await waitFor(() => !alive(supervisor), 'resumed supervisor finished terminal delivery', 45000);
-    coworkStarted = false;
-    await cli(['start']); coworkStarted = true;
-  },
+  async 'worker-kill-supervisor-delayed'() { await delayedSupervisor(false); },
+  // Same loss inside the boot window: rooms are attached but daemon.pid, the
+  // worker lock's only supervisor evidence, has not been written yet.
+  async 'boot-window-supervisor-delayed'() { await delayedSupervisor(true); },
   async 'cowork-kill'() {
+
     await killCowork();
     await cli(['start']); coworkStarted = true;
   },
@@ -261,7 +273,7 @@ async function foreignOwner() {
 const watchdog = setTimeout(() => {
   daemon?.child.kill('SIGKILL'); broker?.child.kill('SIGKILL');
   console.error('FAIL cowork restart delivery watchdog'); process.exit(124);
-}, 600000);
+}, 1500000);
 try {
   broker = startProcess([join(ROOT, 'node_modules/.bin/adapt-broker'), '--host', '127.0.0.1', '--port', String(brokerPort), '--test_mode'], cleanEnv, ROOT);
   await waitForPort(brokerPort);

@@ -7,6 +7,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureRuntimeState, loadConfig } from './config.ts';
 import { OwnerCleanup, ownerSelection, type OwnerCleanupOptions, type OwnerContext } from './owner-cleanup.ts';
+import { acquireSupervisorLock } from './supervisor-lock.ts';
 
 export const WORKER_STAGES = [
   'pre-lock', 'post-lock', 'during-host-init', 'post-host', 'pre-pid', 'ready',
@@ -257,37 +258,42 @@ export async function runSupervisor(options: {
   const config = loadConfig(workerEnv);
   // Replay saved targets even if the new launch selects another daemon or legacy mode.
   ensureRuntimeState(config);
-  const replay = new OwnerCleanup({ stateDir: config.stateDir,
-    selection: selection ?? { endpoint: '', expectedInstanceId: '', credentialPath: '' } });
-  let cancelled = false;
-  const cancelStartup = (): void => { cancelled = true; };
-  process.on('SIGINT', cancelStartup);
-  process.on('SIGTERM', cancelStartup);
+  // Held until this supervisor's own terminal delivery is finished, so a
+  // predecessor can never retire owners under an admitted replacement.
+  const lock = acquireSupervisorLock(config.stateDir);
   try {
-    await replay.replay();
-    // Deliver a signal queued by the caller before replacing startup listeners.
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
-  finally { process.off('SIGINT', cancelStartup); process.off('SIGTERM', cancelStartup); }
-  if (cancelled) return 0;
-  const child = fork(fileURLToPath(import.meta.url), [], {
-    env: workerEnv,
-    stdio: options.quiet
-      ? ['ignore', 'ignore', 'ignore', 'ipc']
-      : ['inherit', 'inherit', 'inherit', 'ipc'],
-    execArgv: [],
-    // A terminal-generated signal must reach only the SDK-free supervisor.
-    // The worker is controlled exclusively over IPC and shuts down if that
-    // channel disappears.
-    detached: process.platform !== 'win32',
-  }) as ChildProcess & SupervisorChild;
-  const supervisor = new DaemonSupervisor({ child, onStage: options.onStage, log: options.quiet ? () => {} : console.error,
-    ...(selection ? { ownerCleanup: { stateDir: config.stateDir, selection } } : {}) });
-  supervisor.start();
-  const result = await supervisor.done;
-  if (result.error) return 1;
-  if (result.signal !== null) return 1;
-  return result.code ?? 1;
+    const replay = new OwnerCleanup({ stateDir: config.stateDir,
+      selection: selection ?? { endpoint: '', expectedInstanceId: '', credentialPath: '' } });
+    let cancelled = false;
+    const cancelStartup = (): void => { cancelled = true; };
+    process.on('SIGINT', cancelStartup);
+    process.on('SIGTERM', cancelStartup);
+    try {
+      await replay.replay();
+      // Deliver a signal queued by the caller before replacing startup listeners.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    finally { process.off('SIGINT', cancelStartup); process.off('SIGTERM', cancelStartup); }
+    if (cancelled) return 0;
+    const child = fork(fileURLToPath(import.meta.url), [], {
+      env: workerEnv,
+      stdio: options.quiet
+        ? ['ignore', 'ignore', 'ignore', 'ipc']
+        : ['inherit', 'inherit', 'inherit', 'ipc'],
+      execArgv: [],
+      // A terminal-generated signal must reach only the SDK-free supervisor.
+      // The worker is controlled exclusively over IPC and shuts down if that
+      // channel disappears.
+      detached: process.platform !== 'win32',
+    }) as ChildProcess & SupervisorChild;
+    const supervisor = new DaemonSupervisor({ child, onStage: options.onStage, log: options.quiet ? () => {} : console.error,
+      ...(selection ? { ownerCleanup: { stateDir: config.stateDir, selection } } : {}) });
+    supervisor.start();
+    const result = await supervisor.done;
+    if (result.error) return 1;
+    if (result.signal !== null) return 1;
+    return result.code ?? 1;
+  } finally { lock.release(); }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

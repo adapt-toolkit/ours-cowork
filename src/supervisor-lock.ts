@@ -5,6 +5,7 @@ import { join } from 'node:path';
 const FILE_MODE = 0o600;
 const NO_FOLLOW = nodeFs.constants.O_NOFOLLOW ?? 0;
 const LOCK_NAME = 'supervisor.lock';
+const TEMPORARY_NAME = /^\.supervisor\.lock-[0-9a-f]{32}\.tmp$/;
 
 export interface SupervisorLock {
   release(): void;
@@ -53,6 +54,7 @@ export function acquireSupervisorLock(stateDir: string, options: SupervisorLockO
       fs.closeSync(fd); fd = undefined;
       // Publish a complete record; an existing holder is never overwritten.
       fs.linkSync(temporary, path);
+      fs.unlinkSync(temporary);
       fsyncDirectory(fs, stateDir);
       let released = false;
       return {
@@ -70,6 +72,7 @@ export function acquireSupervisorLock(stateDir: string, options: SupervisorLockO
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       const observed = fs.lstatSync(path);
+      dropPublishedAliases(fs, stateDir, observed);
       const holder = readHolder(fs, path);
       if (holderAlive(holder, inspect)) throw new SupervisorAlreadyRunningError(holder.pid);
       const current = fs.lstatSync(path);
@@ -98,23 +101,59 @@ function holderAlive(holder: SupervisorIncarnation, inspect: (pid: number) => Su
   return holder.boot_id === current.boot_id && holder.start_id === current.start_id;
 }
 
-/** Undefined when the PID does not exist; boot/start identity where procfs offers it. */
-function inspectProcess(pid: number): SupervisorIncarnation | undefined {
-  try { process.kill(pid, 0); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return undefined;
+/**
+ * A holder that died between publishing the lock and removing its temporary
+ * name leaves the lock with a second link. Remove exactly those aliases of the
+ * observed lock file so the holder record can be validated as a single link.
+ */
+function dropPublishedAliases(fs: typeof nodeFs, stateDir: string, lock: nodeFs.Stats): void {
+  if (lock.nlink < 2) return;
+  for (const name of fs.readdirSync(stateDir)) {
+    if (!TEMPORARY_NAME.test(name)) continue;
+    const alias = join(stateDir, name);
+    const stat = lstatIfPresent(fs, alias);
+    if (!stat || !stat.isFile() || stat.dev !== lock.dev || stat.ino !== lock.ino) continue;
+    try { fs.unlinkSync(alias); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
   }
-  if (process.platform !== 'linux') return { pid };
-  try {
-    const stat = nodeFs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
-    const start_id = fields[19];
-    if (fields[0] === 'Z' || fields[0] === 'X') return undefined;
-    if (!/^[0-9]+$/.test(start_id ?? '')) return { pid };
-    return { pid, boot_id: nodeFs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(), start_id };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    return { pid };
+  fsyncDirectory(fs, stateDir);
+}
+
+export interface ProcessProbe {
+  platform?: NodeJS.Platform;
+  kill?: (pid: number, signal: 0) => unknown;
+  readFile?: (path: string) => string;
+}
+
+/**
+ * Undefined only when the PID provably does not exist (or is an unreaped
+ * corpse). Missing or unreadable incarnation metadata is uncertainty: the
+ * process is reported present without boot/start identity.
+ */
+export function inspectProcess(pid: number, probe: ProcessProbe = {}): SupervisorIncarnation | undefined {
+  const kill = probe.kill ?? ((target, signal) => process.kill(target, signal));
+  const readFile = probe.readFile ?? ((path) => nodeFs.readFileSync(path, 'utf8'));
+  const exists = (): boolean => {
+    try { kill(pid, 0); return true; } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+    }
+  };
+  if (!exists()) return undefined;
+  if ((probe.platform ?? process.platform) !== 'linux') return { pid };
+  let stat: string;
+  try { stat = readFile(`/proc/${pid}/stat`); } catch {
+    // Without procfs evidence only the signal probe may declare the PID gone.
+    return exists() ? { pid } : undefined;
   }
+  const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+  if (fields[0] === 'Z' || fields[0] === 'X') return undefined;
+  const start_id = fields[19];
+  if (!/^[0-9]+$/.test(start_id ?? '')) return { pid };
+  let boot_id: string;
+  try { boot_id = readFile('/proc/sys/kernel/random/boot_id').trim(); } catch { return { pid }; }
+  if (boot_id.length === 0) return { pid };
+  return { pid, boot_id, start_id };
 }
 
 function readHolder(fs: typeof nodeFs, path: string): SupervisorIncarnation {

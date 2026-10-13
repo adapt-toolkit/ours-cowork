@@ -15,6 +15,7 @@ import {
 export { loadConfig } from './config.ts';
 import { createOursHost, type OursRuntimeClientFactory } from './ours-runtime.ts';
 import { PacketRegistry } from './packets.ts';
+import { RoomOwnerLedger } from './room-owners.ts';
 import { RoomService } from './service.ts';
 import { CoworkStore } from './storage.ts';
 import { createPrivateServiceRoutes, createServiceRoutes, RpcDispatcher, TransportServer } from './transports.ts';
@@ -204,6 +205,8 @@ export class CoworkDaemon {
         config.stateDir,
         {
           log: this.options.log,
+          // V1 external owners only; legacy local-PID leases end with their process.
+          ...(process.env.OURS_DAEMON_ID ? { owners: new RoomOwnerLedger(config.stateDir, process.env.OURS_DAEMON_ID) } : {}),
           onNotify: (roomId, event) => {
             if (isIntakeNotification(event)) {
               this.handleNotification(roomId, event, serviceRef);

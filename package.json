@@ -24,7 +24,8 @@
     "test:web": "vitest run",
     "test:browser": "node --test tests/browser-smoke.test.mjs",
     "test:release": "node --test tests/static-gates.test.mjs",
-    "test:v1-lifecycle": "node tests/v1-lifecycle.integration.mjs"
+    "test:v1-lifecycle": "node tests/v1-lifecycle.integration.mjs",
+    "test:v1-restart-delivery": "node tests/v1-restart-delivery.integration.mjs"
   },
   "dependencies": {
     "@ours.network/sdk": "3.8.1-nightly.17",

@@ -16,6 +16,7 @@ import {
 import { SHARED_ROOM_COMMANDS } from './command-names.ts';
 import { ROOM_RPC_METHODS, PRIVATE_ROOM_RPC_METHODS } from './openapi.ts';
 import type { OursRuntimeClientFactory } from './ours-runtime.ts';
+import type { RoomOwnerLedger } from './room-owners.ts';
 
 export type InviteMode = 'one_time' | 'public';
 export type RelayStatus = 'queued' | 'send_failed';
@@ -113,6 +114,8 @@ export interface PacketRegistryOptions {
   onNotify?: (roomId: string, event: string) => void;
   rebindSleep?: (ms: number) => Promise<void>;
   rebindRandom?: () => number;
+  /** Durable V1 owner IDs; absent for legacy local-PID daemon selection. */
+  owners?: RoomOwnerLedger;
 }
 
 export class LegacyCoworkStateError extends Error {
@@ -161,6 +164,7 @@ export class PacketRegistry {
   private readonly onNotify: (roomId: string, event: string) => void;
   private readonly rebindSleep: (ms: number) => Promise<void>;
   private readonly rebindRandom: () => number;
+  private readonly owners?: RoomOwnerLedger;
   private readonly unsubscribe: () => void;
 
   constructor(host: OursRuntimeClientFactory, stateDir: string, options: PacketRegistryOptions = {}) {
@@ -171,6 +175,7 @@ export class PacketRegistry {
     this.onNotify = options.onNotify ?? (() => {});
     this.rebindSleep = options.rebindSleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.rebindRandom = options.rebindRandom ?? Math.random;
+    this.owners = options.owners;
     this.unsubscribe = host.onIdentityNotify((name, event) => {
       const found = [...this.packets.entries()].find(([, packet]) => packet.name === name);
       if (!found) return;
@@ -205,7 +210,8 @@ export class PacketRegistry {
 
   async create(roomId: string, identityName: string, bio = `ours-cowork mission room ${roomId}`): Promise<RoomPacket> {
     await this.preflightCreate(roomId, identityName);
-    const client = await this.host.createClient();
+    const owner = this.owners?.mint(roomId);
+    const client = await this.host.createClient(owner);
     try {
       const created = await client.createIdentity({
         name: identityName,
@@ -216,13 +222,14 @@ export class PacketRegistry {
       const cid = created.info.cid;
       const packet = new SdkRoomPacket(identityName, cid, client, {
         roomId, log: this.log, sleep: this.rebindSleep, random: this.rebindRandom,
+        onReleased: () => this.forgetOwner(roomId, owner),
       });
       await packet.refresh();
       this.packets.set(roomId, packet);
       this.track(roomId, identityName);
       return packet;
     } catch (error) {
-      await client.releaseLease().catch(() => {});
+      await this.discard(roomId, client, owner);
       if (await isTypedNameRefusal(error)) {
         throw error;
       }
@@ -242,7 +249,31 @@ export class PacketRegistry {
     if (!available.has(identityName)) {
       throw new Error(`shared ours daemon does not contain the established room identity "${identityName}"`);
     }
-    const client = await this.host.createClient();
+    // Reconnect as this room's recorded owner: after an abrupt loss of the
+    // whole cowork process tree the daemon still holds that exact lease.
+    const recorded = this.owners?.recorded(roomId);
+    if (recorded !== undefined) {
+      try {
+        return await this.restoreAs(roomId, expectedCid, identityName, recorded, true);
+      } catch (error) {
+        // For an external owner the daemon raises BINDING_REASSIGNED only once
+        // that exact ID is in its retired set ("use a new owner instance
+        // token"). Every other refusal keeps the record and fails the restore.
+        if (sdkErrorCode(error) !== 'BINDING_REASSIGNED') throw error;
+        this.owners!.forget(roomId, recorded);
+      }
+    }
+    return this.restoreAs(roomId, expectedCid, identityName, this.owners?.mint(roomId), false);
+  }
+
+  private async restoreAs(
+    roomId: string,
+    expectedCid: string,
+    identityName: string,
+    owner: string | undefined,
+    reconnect: boolean,
+  ): Promise<RoomPacket> {
+    const client = await this.host.createClient(owner);
     try {
       const bound = await client.chooseIdentity({ name: identityName, force: false });
       if (expectedCid !== undefined && bound.cid !== expectedCid) {
@@ -250,15 +281,29 @@ export class PacketRegistry {
       }
       const packet = new SdkRoomPacket(identityName, bound.cid, client, {
         roomId, log: this.log, sleep: this.rebindSleep, random: this.rebindRandom,
+        onReleased: () => this.forgetOwner(roomId, owner),
       });
       await packet.refresh();
+      if (reconnect) this.log(JSON.stringify({ event: 'room_owner_reconnected', room_id: roomId, identity_cid: bound.cid }));
       this.packets.set(roomId, packet);
       this.track(roomId, identityName);
       return packet;
     } catch (error) {
-      await client.releaseLease().catch(() => {});
+      // A refused reconnect must not release the recorded owner's own lease.
+      if (reconnect) await client.close().catch(() => {});
+      else await this.discard(roomId, client, owner);
       throw error;
     }
+  }
+
+  private forgetOwner(roomId: string, owner: string | undefined): void {
+    if (owner !== undefined) this.owners?.forget(roomId, owner);
+  }
+
+  /** Release a never-hosted fresh owner and its record. */
+  private async discard(roomId: string, client: OursClient, owner: string | undefined): Promise<void> {
+    const released = await client.releaseLease().then((result) => !(result.failed > 0), () => false);
+    if (released) this.forgetOwner(roomId, owner);
   }
 
   async rebind(roomId: string): Promise<{ name: string; cid: string; status: 'rebound' }> {
@@ -361,6 +406,7 @@ export class SdkRoomPacket implements RoomPacket {
   private readonly log: (...parts: unknown[]) => void;
   private readonly rebindSleep: (ms: number) => Promise<void>;
   private readonly rebindRandom: () => number;
+  private readonly onReleased: () => void;
   private rebindWork?: Promise<{ name: string; cid: string; status: 'rebound' }>;
   private contacts: Array<{
     name: string;
@@ -381,6 +427,7 @@ export class SdkRoomPacket implements RoomPacket {
       log?: (...parts: unknown[]) => void;
       sleep?: (ms: number) => Promise<void>;
       random?: () => number;
+      onReleased?: () => void;
     } = {},
   ) {
     this.roomId = recovery.roomId ?? name;
@@ -390,6 +437,7 @@ export class SdkRoomPacket implements RoomPacket {
     this.log = recovery.log ?? (() => {});
     this.rebindSleep = recovery.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.rebindRandom = recovery.random ?? Math.random;
+    this.onReleased = recovery.onReleased ?? (() => {});
   }
 
   rebind(): Promise<{ name: string; cid: string; status: 'rebound' }> {
@@ -712,6 +760,7 @@ export class SdkRoomPacket implements RoomPacket {
     try {
       const result = await this.client.releaseLease();
       if (result.failed > 0) throw new Error('room lease cleanup incomplete');
+      this.onReleased();
     } finally { await this.client.close(); }
   }
 

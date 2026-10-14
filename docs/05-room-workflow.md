@@ -129,6 +129,7 @@ In the web console, both Create room and Room settings have a collapsed **Advanc
 
 - the room is still eligible and in the same generation;
 - the recipient still holds the exact seat (participant ID) captured at emission;
+- the recipient is still an SDK contact, refreshed immediately before its claim (if the refresh fails, the send stays unclaimed for a later pass);
 - no newer heartbeat exists;
 - no discussion was archived after the heartbeat;
 - the heartbeat is younger than one interval.

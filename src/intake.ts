@@ -760,6 +760,23 @@ export class IntakePump {
           await this.skipRelay(roomId, intent, disposition === 'removed' ? 'skipped_removed' : 'skipped_cancelled');
           continue;
         }
+        // Membership can change between emission and dispatch without a
+        // processed notification. Prove the recipient is still a contact just
+        // before the claim; if the SDK cannot answer, leave the intent
+        // unclaimed for a later pass (its staleness cut-off still applies).
+        let contactPresent: boolean;
+        try {
+          await packet.refreshContacts();
+          contactPresent = packet.listContacts().some((contact) => contact.container_id === intent.recipient_identity);
+        } catch {
+          deliveryFailed ||= true;
+          firstDeliveryError ??= new Error('heartbeat recipient contact refresh failed');
+          continue;
+        }
+        if (!contactPresent) {
+          await this.skipRelay(roomId, intent, 'skipped_removed');
+          continue;
+        }
         // At-most-once: the terminal claim is durable before the single send
         // attempt. A throw or crash after it is never retried, so a heartbeat
         // can never wake a recipient twice. The transport outcome stays unknown.

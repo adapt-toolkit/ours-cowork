@@ -865,3 +865,32 @@ test('C9: a missed contact removal is reconciled before the recipient snapshot',
   assert.equal(bob.state, 'removed');
   assert.equal(bob.removal_reason, 'contact_absent');
 });
+
+test('C10: a contact lost between emission and dispatch is skipped without a notification', async (t) => {
+  const f = await fixture(t);
+  await f.start();
+  f.holdRelayAfterEmission();
+  await f.advance(20 * MINUTE);
+  assert.equal((await f.heartbeats()).length, 1);
+  f.packet.contacts = [ALICE, CARA];
+  await f.service.resumePending(ROOM_ID);
+  assert.deepEqual(f.heartbeatSends().map((call) => call.recipient).sort(), [ALICE, CARA]);
+  assert.deepEqual(await f.relayStatuses(), ['A:dispatch_claimed', 'B:skipped_removed', 'C:dispatch_claimed']);
+});
+
+test('C10: a failed contact refresh before dispatch claims nothing and a later pass still sends', async (t) => {
+  const f = await fixture(t);
+  await f.start();
+  f.holdRelayAfterEmission();
+  await f.advance(20 * MINUTE);
+  const refresh = f.packet.refreshContacts.bind(f.packet);
+  let failures = 1;
+  f.packet.refreshContacts = async () => { if (failures-- > 0) throw new Error('contacts unavailable'); return refresh(); };
+  await assert.rejects(f.service.resumePending(ROOM_ID));
+  // Only the first recipient's refresh failed: it stays unclaimed and unsent.
+  assert.deepEqual(f.heartbeatSends().map((call) => call.recipient).sort(), [BOB, CARA]);
+  assert.deepEqual(await f.relayStatuses(), ['B:dispatch_claimed', 'C:dispatch_claimed']);
+  await f.service.resumePending(ROOM_ID);
+  assert.deepEqual(f.heartbeatSends().map((call) => call.recipient).sort(), [ALICE, BOB, CARA]);
+  assert.deepEqual(await f.relayStatuses(), ['A:dispatch_claimed', 'B:dispatch_claimed', 'C:dispatch_claimed']);
+});

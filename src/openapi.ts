@@ -5,7 +5,7 @@ import { RUNTIME_COMMAND_NAMES } from './command-names.ts';
  *
  * The daemon exposes exactly one REST route — `POST /rpc` — carrying the
  * versioned RPC envelope, so the document models that route once and
- * discriminates the twenty room-management methods through the envelope's
+ * discriminates the room-management methods through the envelope's
  * `method` field. Nothing here may advertise an operation the REST dispatcher
  * does not actually serve: `room.accept` is deliberately absent because it is
  * reachable only over the private Unix socket.
@@ -49,6 +49,13 @@ export interface RpcMethodDocumentation {
 }
 
 const EXAMPLE_ROOM_ID = '01jd7q4h9m2v8xk3znbc5regty';
+
+const heartbeatIntervalProperty: JsonSchema = {
+  type: 'integer',
+  minimum: 1,
+  maximum: 1440,
+  description: 'Minutes without participant discussion before a heartbeat (1–1440).',
+};
 
 const roomIdProperty: JsonSchema = {
   type: 'string',
@@ -157,6 +164,16 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
         type: 'boolean',
         description: 'Suppress membership announcements for this room by default.',
       },
+      heartbeat: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['enabled'],
+        properties: {
+          enabled: { type: 'boolean', description: 'Send inactivity heartbeats while the room status is in_progress.' },
+          interval_minutes: heartbeatIntervalProperty,
+        },
+        description: 'Optional inactivity heartbeat policy. Omitted: disabled with a 20-minute interval.',
+      },
     }, ['goal', 'briefing']),
     result: 'The created room record, including `room_id`, `room_name`, `state`, mission, '
       + 'invites, and seats.',
@@ -180,6 +197,22 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     }, ['room_id']),
     result: 'The updated room record.',
     example: { room_id: EXAMPLE_ROOM_ID, name: 'Release cut' },
+  },
+  {
+    method: 'room.heartbeat.set',
+    summary: 'Set the inactivity heartbeat policy',
+    description: 'Enables or disables the room inactivity heartbeat and sets its interval. While enabled and the '
+      + 'room status is exactly `in_progress`, the room sends one neutral heartbeat notice to every active '
+      + 'participant after each interval without participant discussion. Heartbeats never change room status. '
+      + 'Any effective change restarts the inactivity window and cancels queued heartbeats. At least one '
+      + 'setting is required.',
+    params: params({
+      room_id: roomIdProperty,
+      enabled: { type: 'boolean', description: 'Turn heartbeats on or off.' },
+      interval_minutes: heartbeatIntervalProperty,
+    }, ['room_id']),
+    result: 'The updated room record, including `heartbeat`.',
+    example: { room_id: EXAMPLE_ROOM_ID, enabled: true, interval_minutes: 20 },
   },
   {
     method: 'room.briefing.role.set',

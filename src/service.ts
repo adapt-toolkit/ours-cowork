@@ -1,4 +1,4 @@
-import { AsyncLocalStorage } from 'node:async_hooks';
+import { AsyncLocalStorage, AsyncResource } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 
 import { z } from 'zod';
@@ -9,6 +9,8 @@ import {
   ContainerIdSchema,
   roomIdentityName,
   CreateRoomInputSchema,
+  HEARTBEAT_DEFAULT_INTERVAL_MINUTES,
+  HeartbeatSettingsInputSchema,
   FileNameSchema, FileMimeSchema, MAX_FILE_BYTES,
   DEFAULT_ROLE,
   defaultRoomName,
@@ -59,6 +61,17 @@ import {
 } from './thread-contracts.ts';
 import { ParticipantHistoryPageSchema, projectParticipantHistory, publicHistoryMessage, type HostParticipantHistoryRecord, type ParticipantHistoryRecord } from './thread-history.ts';
 import { publicThreadMetadata, selectThreadMembers, threadFingerprint } from './threads.ts';
+import {
+  crossesMonitoringBoundary,
+  effectiveHeartbeatPolicy,
+  heartbeatBasis,
+  heartbeatEligible,
+  heartbeatIntervalMs,
+  heartbeatText,
+  isDiscussionRecord,
+  restartHeartbeatWindow,
+  type HeartbeatPolicy,
+} from './heartbeat.ts';
 
 const MAX_ROOM_MESSAGE_BYTES = 262_144;
 type StartThreadCommandResult =
@@ -133,8 +146,29 @@ export interface RoomPacketRegistry {
   destroy(roomId: string): Promise<string[]>;
 }
 
+/** Injectable one-shot timer so heartbeat tests drive a deterministic clock. */
+export interface HeartbeatTimer {
+  set(callback: () => void, delayMs: number): unknown;
+  clear(handle: unknown): void;
+}
+
+const defaultHeartbeatTimer: HeartbeatTimer = {
+  set(callback, delayMs) {
+    const handle = setTimeout(callback, delayMs);
+    handle.unref?.();
+    return handle;
+  },
+  clear(handle) { clearTimeout(handle as ReturnType<typeof setTimeout>); },
+};
+
+/** Recent chat rows inspected to skip whitespace-only text when locating the latest discussion. */
+const DISCUSSION_SCAN_LIMIT = 64;
+
+export type HeartbeatDisposition = 'send' | 'cancel' | 'removed';
+
 export interface RoomServiceOptions {
   consumerCommands?: ConsumerConfiguration;
+  heartbeatTimer?: HeartbeatTimer;
   now?: () => string;
   roomId?: () => string;
   messageId?: () => string;
@@ -200,6 +234,23 @@ export class RoomService {
   private readonly provisioningCheckpoint: NonNullable<RoomServiceOptions['provisioningCheckpoint']>;
   private eventsStopping = false;
   private readonly identityNameTails = new Map<string, Promise<void>>();
+  private readonly heartbeatTimer: HeartbeatTimer;
+  /** Heartbeat timers arm only after daemon startup recovery has finished. */
+  private heartbeatsStarted = false;
+  private readonly heartbeatTimers = new Map<string, unknown>();
+  private readonly heartbeatWork = new Set<Promise<void>>();
+  /**
+   * First host observation of a value the durable basis cannot date reliably:
+   * a basis lying in the future (clock rewind) or discussion archived without
+   * its observation being recorded (crash window). Keyed per room and kind.
+   */
+  private readonly heartbeatObservations = new Map<string, { key: string; at: number }>();
+  /**
+   * Captured outside any command or room-lock context. Scheduling runs in it,
+   * so a request that changes policy while holding the room mutex never turns
+   * heartbeat work into nested work of its own lock.
+   */
+  private readonly heartbeatScope = new AsyncResource('cowork-heartbeat');
 
   constructor(store: Store, packets: RoomPacketRegistry, options: RoomServiceOptions = {}) {
     this.store = store;
@@ -209,9 +260,12 @@ export class RoomService {
     this.nextRoomId = options.roomId ?? generateUlid;
     this.nextMessageId = options.messageId ?? generateUlid;
     this.provisioningCheckpoint = options.provisioningCheckpoint ?? (() => {});
+    this.heartbeatTimer = options.heartbeatTimer ?? defaultHeartbeatTimer;
     this.intake = new IntakePump(store, packets, {
       now: this.nowValue,
       messageId: this.nextMessageId,
+      onDiscussion: (roomId, record) => this.noteDiscussionUnlocked(roomId, record),
+      heartbeatDisposition: (roomId, message, recipient) => this.heartbeatDispositionUnlocked(roomId, message, recipient),
       shouldPause: async (roomId) => (await this.store.load(roomId)).lifecycle_request?.state === 'pending',
       afterPump: async (roomId) => { await this.resumeLifecycleRequest(roomId); },
     });
@@ -240,6 +294,15 @@ export class RoomService {
         rest_roles: [],
         anonymous: settings.anonymous ?? false,
         quiet_membership: settings.quiet_membership ?? false,
+        // New rooms always persist an explicit policy: opt-in, default 20 minutes.
+        heartbeat: {
+          enabled: settings.heartbeat?.enabled ?? false,
+          interval_minutes: settings.heartbeat?.interval_minutes ?? HEARTBEAT_DEFAULT_INTERVAL_MINUTES,
+          generation: 1,
+          updated_at: this.now(),
+          anchor_at: this.now(),
+          observed_seq: 0,
+        },
         membership_epoch: 0,
         state: 'provisioning',
         status: 'packet_pending',
@@ -499,6 +562,7 @@ export class RoomService {
     }
     const appended = await this.store.append(roomId, root);
     if (appended.kind !== 'message') throw new Error('storage returned the wrong thread root kind');
+    await this.noteDiscussionUnlocked(roomId, appended);
     return { ok: true, thread_id: appended.message_id, status: 'accepted' };
   }
 
@@ -553,6 +617,7 @@ export class RoomService {
               room_id: room.room_id, room_name: room.room_name, state: room.state,
               mission: { goal: room.mission.goal, briefing: room.mission.briefing, briefing_version: room.mission.briefing_version },
               anonymous: room.anonymous, quiet_membership: room.quiet_membership, membership_epoch: room.membership_epoch,
+              heartbeat: effectiveHeartbeatPolicy(room),
             } : room.seats.map(({ participant_id, role, state }) => ({ participant_id, role, state }));
             return { ok: true, result: JSON.parse(JSON.stringify(result)) as JsonValue };
           }
@@ -655,13 +720,15 @@ export class RoomService {
         briefing: settings.briefing ?? room.mission.briefing,
         briefing_version: briefingChanged ? room.mission.briefing_version + 1 : room.mission.briefing_version,
       };
-      const next = await this.store.save(RoomSchema.parse({
+      let candidate = RoomSchema.parse({
         ...room,
         room_name: settings.name ?? room.room_name,
         mission,
         ...(settings.quiet_membership === undefined ? {} : { quiet_membership: settings.quiet_membership }),
         ...(settings.status === undefined ? {} : { status: settings.status }),
-      }));
+      });
+      candidate = await this.withHeartbeatBoundaryUnlocked(room, candidate);
+      const next = await this.store.save(candidate);
       if (briefingChanged && next.state === 'active') {
         await this.redeliverCommonBriefing(next);
         return { room: next, redelivered: true };
@@ -669,6 +736,34 @@ export class RoomService {
       return { room: next, redelivered: false };
     });
     if (redelivered) await this.intake.resumePending(id);
+    this.scheduleHeartbeat(id);
+    return updated;
+  }
+
+  /**
+   * Set the room's inactivity heartbeat policy. Operators call this directly;
+   * an active seat reaches it as the `room.heartbeat.set` runtime command only
+   * through an explicit CID or role grant. Any effective change starts a new
+   * generation, so queued heartbeats from the old policy are cancelled.
+   */
+  async setHeartbeat(roomId: string, input: unknown): Promise<Room> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    const request = HeartbeatSettingsInputSchema.parse(input);
+    const updated = await this.lock(id, async () => {
+      const room = await this.store.load(id);
+      this.assertMutable(room, 'set the heartbeat policy of');
+      const current = room.heartbeat;
+      const enabled = request.enabled ?? current?.enabled ?? false;
+      const intervalMinutes = request.interval_minutes ?? current?.interval_minutes ?? HEARTBEAT_DEFAULT_INTERVAL_MINUTES;
+      if (current && current.enabled === enabled && current.interval_minutes === intervalMinutes) return room;
+      const at = this.now();
+      const tail = await this.archiveTailSeq(id);
+      const policy: HeartbeatPolicy = current
+        ? restartHeartbeatWindow({ ...current, enabled, interval_minutes: intervalMinutes, updated_at: at }, at, tail)
+        : { enabled, interval_minutes: intervalMinutes, generation: 1, updated_at: at, anchor_at: at, observed_seq: tail };
+      return this.store.save(RoomSchema.parse({ ...room, heartbeat: policy }));
+    });
+    this.scheduleHeartbeat(id);
     return updated;
   }
 
@@ -1191,6 +1286,8 @@ export class RoomService {
       const room = await this.store.load(id);
       await this.reconcileUnlocked(room, this.packet(id));
     });
+    // Admission can make a quiet in_progress room monitorable.
+    if (!this.heartbeatTimers.has(id)) this.scheduleHeartbeat(id);
     await this.intake.notify(id);
   }
 
@@ -1200,11 +1297,14 @@ export class RoomService {
 
   beginShutdown(): void {
     this.eventsStopping = true;
+    this.heartbeatsStarted = false;
+    for (const roomId of [...this.heartbeatTimers.keys()]) this.clearHeartbeatTimer(roomId);
     this.store.wakeArchiveReaders?.();
     this.intake.beginShutdown();
   }
 
-  drain(): Promise<void> {
+  async drain(): Promise<void> {
+    await Promise.allSettled([...this.heartbeatWork]);
     return this.intake.drain();
   }
 
@@ -1473,12 +1573,14 @@ export class RoomService {
         if (previous.sha256 !== sha256 || previous.filename !== request.filename || previous.mime !== request.mime || previous.author.role !== request.role) throw new RoomServiceError('upload idempotency conflict');
         return previous;
       }
-      return this.store.append(id,{
+      const uploaded = await this.store.append(id,{
         version:1,kind:'file',room_id:id,at:this.now(),file_id:generateUlid(),upload_id:request.upload_id,
         author:{identity:room.identity_cid,display_name:request.role,role:request.role},
         filename:request.filename,mime:request.mime,size:bytes.length,sha256,data_base64:request.data_base64,
         recipient_identities:uniqueIdentities(activeSeats(room).map(seat=>seat.identity)),
       });
+      await this.noteDiscussionUnlocked(id, uploaded);
+      return uploaded;
     });
     // The archive commit already includes durable relay work; a later pump can
     // resume it. A failed delivery must not invalidate the accepted upload.
@@ -1535,6 +1637,7 @@ export class RoomService {
 
   async closeRoom(roomId: string): Promise<Room> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
+    this.clearHeartbeatTimer(id);
     return this.lock(id, async () => {
       let room = await this.store.load(id);
       if (room.state === 'closed') {
@@ -1569,6 +1672,7 @@ export class RoomService {
   async deleteRoom(roomId: string, input: unknown): Promise<DeleteRoomReceipt> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     DeleteRoomInputSchema.parse(input);
+    this.clearHeartbeatTimer(id);
     return this.lock(id, async () => {
       let room: Room | undefined;
       try {
@@ -1711,6 +1815,7 @@ export class RoomService {
       recipient_identities: uniqueIdentities(activeSeats(room).map((seat) => seat.identity)),
     });
     if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong room message kind');
+    await this.noteDiscussionUnlocked(id, appended);
     for (const recipientIdentity of appended.recipient_identities) {
       await this.store.append(id, {
         version: 1,
@@ -1856,7 +1961,8 @@ export class RoomService {
     const admitted = [...activatedPending, ...newSeats];
     if (next.state === 'provisioning' && activeSeats(next).length > 0 && requirementsMet) {
       const activationAt = await this.ensureActivationBriefing(next, activeSeats(next));
-      next = RoomSchema.parse({ ...next, state: 'active', activated_at: activationAt });
+      next = await this.withHeartbeatBoundaryUnlocked(next,
+        RoomSchema.parse({ ...next, state: 'active', activated_at: activationAt }));
     } else if (next.state === 'active' && admitted.length > 0) {
       await this.ensureActivationBriefing(next, admitted);
     }
@@ -2121,6 +2227,203 @@ export class RoomService {
       });
     }
     return appended.at;
+  }
+
+  /**
+   * Arm heartbeat timers once startup recovery is complete. Before this call
+   * no heartbeat is scheduled, so recovery never races a tick.
+   */
+  startHeartbeats(roomIds: Iterable<string>): void {
+    if (this.eventsStopping) return;
+    this.heartbeatsStarted = true;
+    for (const roomId of roomIds) this.scheduleHeartbeat(roomId);
+  }
+
+  /** Recompute and (re)arm one room's single timer; disarms an ineligible room. */
+  private scheduleHeartbeat(roomId: string): void {
+    if (!this.heartbeatsStarted) return;
+    this.heartbeatScope.runInAsyncScope(() => this.trackHeartbeatWork(this.armHeartbeat(roomId)));
+  }
+
+  private trackHeartbeatWork(work: Promise<void>): void {
+    const tracked = work.catch(() => { /* the next arm or startup recomputes from durable state */ })
+      .finally(() => { this.heartbeatWork.delete(tracked); });
+    this.heartbeatWork.add(tracked);
+  }
+
+  private clearHeartbeatTimer(roomId: string): void {
+    const handle = this.heartbeatTimers.get(roomId);
+    if (handle === undefined) return;
+    this.heartbeatTimers.delete(roomId);
+    this.heartbeatTimer.clear(handle);
+  }
+
+  private async armHeartbeat(roomId: string, minimumDelayMs = 0): Promise<void> {
+    const computed = await this.lock(roomId, async () => {
+      let room: Room;
+      try { room = await this.store.load(roomId); } catch { return undefined; }
+      return this.heartbeatDelayUnlocked(room);
+    });
+    this.clearHeartbeatTimer(roomId);
+    if (computed === undefined || !this.heartbeatsStarted) return;
+    const delay = Math.max(computed, minimumDelayMs);
+    const handle = this.heartbeatTimer.set(() => {
+      if (this.heartbeatTimers.get(roomId) !== handle) return;
+      this.heartbeatTimers.delete(roomId);
+      this.trackHeartbeatWork(this.runHeartbeat(roomId));
+    }, delay);
+    this.heartbeatTimers.set(roomId, handle);
+  }
+
+  /**
+   * One tick. Drain the SDK inbox first, so discussion that already reached
+   * the daemon is archived before the emission decision (the ordering
+   * boundary). Then recheck everything under the room mutex and append at most
+   * one heartbeat. Its durable record anchors the next deadline.
+   */
+  private async runHeartbeat(roomId: string): Promise<void> {
+    if (!this.heartbeatsStarted) return;
+    try { await this.intake.settle(roomId); } catch { /* delivery errors do not hide inactivity */ }
+    if (!this.heartbeatsStarted) return;
+    const emittedInterval = await this.lock(roomId, async () => {
+      let room: Room;
+      try { room = await this.store.load(roomId); } catch { return undefined; }
+      const delay = await this.heartbeatDelayUnlocked(room);
+      if (delay === undefined || delay > 0) return undefined;
+      await this.appendHeartbeatUnlocked(room as Room & { heartbeat: HeartbeatPolicy });
+      return heartbeatIntervalMs(room.heartbeat!);
+    });
+    if (emittedInterval !== undefined) {
+      try { await this.intake.resumePending(roomId); } catch { /* claimed sends are never retried */ }
+    }
+    // Defence in depth against a self-trigger loop: a tick that emitted never
+    // re-arms sooner than one full interval.
+    await this.armHeartbeat(roomId, emittedInterval ?? 0);
+  }
+
+  /** Milliseconds until the next heartbeat is due, or undefined when unmonitored. */
+  private async heartbeatDelayUnlocked(room: Room): Promise<number | undefined> {
+    if (!heartbeatEligible(room) || activeSeats(room).length === 0) return undefined;
+    const nowMs = Date.parse(this.now());
+    const policy = room.heartbeat;
+    const roomId = room.room_id;
+    const [latest] = await queryStore(this.store, roomId, {
+      kind: 'message', category: 'heartbeat', descending: true, limit: 1,
+    }) as MessageRecord[];
+    // A heartbeat from an earlier generation never anchors the current window.
+    const lastHeartbeatAt = latest?.heartbeat?.generation === policy.generation ? latest.at : undefined;
+    const discussionSeq = await this.latestDiscussionSeq(roomId);
+    const unrecordedDiscussionAt = discussionSeq > policy.observed_seq
+      ? new Date(this.firstObservation(roomId, 'discussion', `${policy.generation}:${discussionSeq}`, nowMs)).toISOString()
+      : undefined;
+    // Clock rewind: a component in the future is measured from when it was
+    // first seen, so the delay is at most one interval and never reads as discussion.
+    const basis = heartbeatBasis({ policy, lastHeartbeatAt, unrecordedDiscussionAt }, (component, ms) =>
+      ms > nowMs ? this.firstObservation(roomId, `future:${component}`, `${policy.generation}:${ms}`, nowMs) : ms);
+    return Math.max(0, basis + heartbeatIntervalMs(policy) - nowMs);
+  }
+
+  private firstObservation(roomId: string, kind: string, key: string, nowMs: number): number {
+    const slot = `${roomId}:${kind}`;
+    const seen = this.heartbeatObservations.get(slot);
+    if (seen?.key === key) return seen.at;
+    this.heartbeatObservations.set(slot, { key, at: nowMs });
+    return nowMs;
+  }
+
+  private async latestDiscussionSeq(roomId: string): Promise<number> {
+    const chats = await queryStore(this.store, roomId, {
+      kind: 'message', category: 'chat', descending: true, limit: DISCUSSION_SCAN_LIMIT,
+    });
+    const chat = chats.find(isDiscussionRecord);
+    const [file] = await queryStore(this.store, roomId, { kind: 'file', descending: true, limit: 1 });
+    return Math.max(chat?.seq ?? 0, file?.seq ?? 0);
+  }
+
+  private async archiveTailSeq(roomId: string): Promise<number> {
+    const [last] = await queryStore(this.store, roomId, { descending: true, limit: 1 });
+    return last?.seq ?? 0;
+  }
+
+  private async appendHeartbeatUnlocked(room: Room & { heartbeat: HeartbeatPolicy }): Promise<void> {
+    const seats = activeSeats(room);
+    const appended = await this.store.append(room.room_id, {
+      version: 1,
+      kind: 'message',
+      room_id: room.room_id,
+      at: this.now(),
+      message_id: LowerCrockfordUlidSchema.parse(this.nextMessageId()),
+      author: { identity: room.identity_cid, display_name: room.identity_name, role: ROOM_ROLE },
+      category: 'heartbeat',
+      text: heartbeatText(room.heartbeat.interval_minutes),
+      heartbeat: {
+        generation: room.heartbeat.generation,
+        interval_minutes: room.heartbeat.interval_minutes,
+        participant_ids: seats.map((seat) => seat.participant_id),
+      },
+      recipient_identities: uniqueIdentities(seats.map((seat) => seat.identity)),
+    });
+    if (appended.kind !== 'message') throw new RoomServiceError('storage returned the wrong heartbeat kind');
+    for (const recipientIdentity of appended.recipient_identities) {
+      await this.store.append(room.room_id, {
+        version: 1,
+        kind: 'relay_intent',
+        room_id: room.room_id,
+        at: this.now(),
+        message_id: appended.message_id,
+        recipient_identity: recipientIdentity,
+      });
+    }
+  }
+
+  /**
+   * Record the host-observed time of archived discussion so restart keeps the
+   * same basis without trusting sender dates. Caller holds the room mutex.
+   */
+  private async noteDiscussionUnlocked(roomId: string, record: CommunicationRecord): Promise<void> {
+    if (!isDiscussionRecord(record)) return;
+    const room = await this.store.load(roomId);
+    const policy = room.heartbeat;
+    if (!policy?.enabled || record.seq <= policy.observed_seq) return;
+    await this.store.save(RoomSchema.parse({
+      ...room,
+      heartbeat: { ...policy, observed_seq: record.seq, activity_at: this.now() },
+    }));
+  }
+
+  /**
+   * Per-recipient recheck made by the relay pump under the room mutex, just
+   * before the one claimed send. Anything that changed since emission cancels.
+   */
+  private async heartbeatDispositionUnlocked(
+    roomId: string,
+    message: MessageRecord,
+    recipientIdentity: string,
+  ): Promise<HeartbeatDisposition> {
+    const snapshot = message.heartbeat;
+    if (snapshot === undefined) return 'cancel';
+    const room = await this.store.load(roomId);
+    if (!heartbeatEligible(room) || room.heartbeat.generation !== snapshot.generation) return 'cancel';
+    const seat = room.seats.find((candidate) => candidate.state === 'active' && candidate.identity === recipientIdentity);
+    if (!seat || !snapshot.participant_ids.includes(seat.participant_id)) return 'removed';
+    // After downtime an old pending heartbeat is stale; the fresh timer decides.
+    if (Date.parse(this.now()) - Date.parse(message.at) >= heartbeatIntervalMs(snapshot)) return 'cancel';
+    const [latest] = await queryStore(this.store, roomId, {
+      kind: 'message', category: 'heartbeat', descending: true, limit: 1,
+    });
+    if (latest !== undefined && latest.seq > message.seq) return 'cancel';
+    if (await this.latestDiscussionSeq(roomId) > message.seq) return 'cancel';
+    return 'send';
+  }
+
+  /** Crossing into or out of active in_progress starts a new heartbeat generation. */
+  private async withHeartbeatBoundaryUnlocked(before: Room, after: Room): Promise<Room> {
+    if (after.heartbeat === undefined || !crossesMonitoringBoundary(before, after)) return after;
+    const at = this.now();
+    return RoomSchema.parse({
+      ...after,
+      heartbeat: restartHeartbeatWindow(after.heartbeat, at, await this.archiveTailSeq(after.room_id)),
+    });
   }
 
   private lock<T>(roomId: string, work: () => T | Promise<T>): Promise<T> {

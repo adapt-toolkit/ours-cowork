@@ -104,9 +104,46 @@ Use `ours-cowork room rebind <room-id>` for explicit recovery. This canonical op
 
 Every web action has an equivalent CLI fallback in the room commands above and in the invites and messaging topics.
 
+## Inactivity heartbeat
+
+A room can optionally remind its participants to check in when discussion goes quiet. The policy is per room: `enabled` and `interval_minutes` (a whole number from 1 to 1440). New rooms store an explicit policy that is **disabled** with a 20-minute interval unless the creator opts in. Rooms created before this feature have no stored policy and stay disabled; loading or upgrading never enables them.
+
+```sh
+ours-cowork room create --goal "Ship" --briefing "Brief" --heartbeat --heartbeat-interval 20
+ours-cowork room heartbeat <room-id> --enable --interval 30
+ours-cowork room heartbeat <room-id> --disable
+ours-cowork room settings <room-id> --status in_progress
+```
+
+In the web console, both Create room and Room settings have a collapsed **Advanced settings** section with the same two controls.
+
+**When it runs.** A room is monitored only while it is `active`, its `status` is exactly `in_progress`, its policy is enabled, it has at least one active participant, and no close/delete request is pending. Rooms with any other status, including `todo`, `done`, `review` or none, are never monitored. A disabled in-progress room produces no heartbeat messages and no heartbeat-driven wakes.
+
+**What counts as discussion.** A `chat` message with non-blank text, or a file. That includes native participant messages and files, `start_thread` roots, operator `room.message`, registered-role `room.say` and REST uploads. Room-generated traffic never counts: briefings, role briefings, membership notices, heartbeats, intake-rejection notices and close notices. Discussion time is the host clock when Cowork archived the record, never the sender's claimed date.
+
+**What it sends.** After one full interval without discussion, the room appends one `heartbeat` message authored by the room voice and fans it out to every active participant through the normal relay journal. Its wire kind is `room_heartbeat` with `heartbeat.interval_minutes`. The text asks participants for progress, blockers or a next action. It asks the moderator or coordinator to assess the actual work and, only if completion is established, set the status to `done` with `room.settings`; otherwise to post a useful status. A heartbeat is not evidence that the room is stuck. It never changes room status and does not touch any Fleet task.
+
+**Cadence.** While the room stays quiet, at most one heartbeat is sent per interval. The next deadline is the latest of the window start, the latest discussion, and the latest heartbeat of the current generation, plus the interval. Real discussion resets the timer; a heartbeat only moves it by one interval and is never discussion. One unreferenced timer exists per monitored room inside the daemon. There is no polling and no per-agent loop.
+
+**Generations and cancellation.** Every effective policy change (enable, disable, interval) and every status transition into or out of `in_progress`, including activation of an in-progress room, starts a new *generation* and a fresh window. Before each recipient's send, the relay rechecks:
+
+- the room is still eligible and in the same generation;
+- the recipient still holds the exact seat (participant ID) captured at emission;
+- no newer heartbeat exists;
+- no discussion was archived after the heartbeat;
+- the heartbeat is younger than one interval.
+
+Otherwise that send ends as `skipped_cancelled`, or `skipped_removed` for a departed or re-admitted seat. A disable→enable or done→reopen therefore never revives an older pending heartbeat. Before deciding to emit, the timer first drains the SDK inbox, so discussion that already reached the daemon cancels the emission.
+
+**At-most-once dispatch.** For each heartbeat recipient, the relay durably records a terminal `dispatch_claimed` result *before* its single send attempt. A send that throws, or a crash after the claim, is never retried, so a heartbeat cannot wake a recipient twice. The transport outcome of a claimed send is not recorded and must be treated as unknown. A crash before the claim drops that delivery.
+
+**Restart.** Timers are armed only after startup recovery. Each room computes a single deadline from durable state, so downtime never replays missed intervals: an overdue room sends at most one heartbeat promptly, then one per interval. Queued heartbeats older than one interval are cancelled rather than sent late. If a discussion record was archived but its observation was not yet recorded (crash window), its first observation after restart is used. A timestamp in the future (clock moved backwards) is measured from when it was first observed, which delays by at most one interval and is never treated as discussion.
+
+**Moderator tool.** `room.heartbeat.set` takes `{enabled?, interval_minutes?}` (at least one) and returns the updated room. Over ours command transport, it is available only to an active seat granted `room.heartbeat.set` through an exact CID grant, a role policy, or a covering pattern (`room.*`, `*`). No new role is introduced, and a `room.settings` grant does not include it. The receiving room fixes the target; a `room_id` argument is refused. `room.show` includes the effective `heartbeat` `{enabled, interval_minutes}`. Heartbeat control does not grant any other room privilege.
+
 ## Shared ours command calls
 
-Room-scoped operations also appear in the room identity's ours catalog with their RPC names: `room.settings`, `room.briefing.role.set`, `room.briefing.role.delete`, `room.invite`, `room.participant.remove`, `room.revoke`, `room.recover`, `room.recover.confirm`, `room.show`, `room.participants`, `room.command.grants`, `room.command.role.grants`, `room.command.role.set`, `room.command.grant`, `room.command.revoke`, `room.history`, `room.message`, `room.say`, `room.role.rest.add`, `room.role.rest.remove`, `room.accept`, `room.rebind`, `room.close`, and `room.delete`.
+Room-scoped operations also appear in the room identity's ours catalog with their RPC names: `room.settings`, `room.heartbeat.set`, `room.briefing.role.set`, `room.briefing.role.delete`, `room.invite`, `room.participant.remove`, `room.revoke`, `room.recover`, `room.recover.confirm`, `room.show`, `room.participants`, `room.command.grants`, `room.command.role.grants`, `room.command.role.set`, `room.command.grant`, `room.command.revoke`, `room.history`, `room.message`, `room.say`, `room.role.rest.add`, `room.role.rest.remove`, `room.accept`, `room.rebind`, `room.close`, and `room.delete`.
 
 Use the RPC arguments without `room_id`; the receiving room fixes the target. For example, an operator grants `ours-cowork room command-grant <room-id> <caller-cid> room.settings`, then that active member calls `room.settings` with `{"status":"review"}` using ours command transport. An exact-name grant grants none of the other names. The SDK returns a correlated result containing `{ok:true,result:<service value>}` or `{ok:false,error:<code>}`. History returns one page; follow `seq` with `after` to fetch more.
 

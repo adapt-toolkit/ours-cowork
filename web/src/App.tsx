@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RpcError, rpcCall } from './api/rpc';
 import { isCommunicationRecordDto, isDeleteRoomReceiptDto, isHistoryDto, isParticipantListDto, isRoomDto, isRoomListDto, validateConfirmedRecoveryInvite, validateCreatedInviteReceipt, validateRecoveryInviteReceipts, type CommunicationRecordDto, type InviteMode, type InviteReceiptDto, type ParticipantDto, type RoomDto } from './api/types';
 import { InviteReceiptDialog, type InviteReceiptVault } from './components/InviteManager';
-import { CloseRoomDialog, CreateRoomDialog, DeleteRoomDialog, SettingsDialog } from './components/RoomDialogs';
+import { CloseRoomDialog, CreateRoomDialog, DeleteRoomDialog, SettingsDialog, type RoomSettingsChanges } from './components/RoomDialogs';
 import { RoomContext, type ContextTab } from './components/RoomContext';
 import type { RoomComposerState } from './components/RoomComposer';
 import { RoomRail } from './components/RoomRail';
@@ -270,10 +270,10 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
     void selectedPoller.current?.refresh();
   }, []);
 
-  const createRoom = useCallback(async (name: string, goal: string, briefing: string) => {
+  const createRoom = useCallback(async (name: string, goal: string, briefing: string, heartbeat?: { enabled: boolean; interval_minutes: number }) => {
     if (connectedRef.current !== true) throw new Error('The daemon is disconnected. Your fields are retained.');
     try {
-      const result = await rpc.call('room.create', { name, goal: goal.trim(), briefing: briefing.trim() });
+      const result = await rpc.call('room.create', { name, goal: goal.trim(), briefing: briefing.trim(), ...(heartbeat === undefined ? {} : { heartbeat }) });
       if (!isRoomDto(result)) throw new Error('daemon returned invalid created room details');
       setCreateOpen(false);
       setContextTab('invite');
@@ -286,14 +286,21 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
     }
   }, [refreshAfterMutation, reportFailure, rpc, selectRoom]);
 
-  const saveSettings = useCallback(async (roomId: string, changes: { name?: string; goal?: string; briefing?: string; status?: string }) => {
-    if (Object.keys(changes).length === 0) return;
+  const saveSettings = useCallback(async (roomId: string, { heartbeat, ...changes }: RoomSettingsChanges) => {
+    if (Object.keys(changes).length === 0 && heartbeat === undefined) return;
     const requestedRoom = roomsRef.current.find((room) => room.room_id === roomId);
     if (connectedRef.current !== true) throw new Error('The daemon is disconnected. Your fields are retained.');
     if (!requestedRoom || !roomCapabilities(requestedRoom.state, true).canEditSettings) throw new Error('Room settings are unavailable in the current lifecycle. Your fields are retained.');
     try {
-      const result = await rpc.call('room.settings', { room_id: roomId, ...changes });
-      if (!isRoomDto(result) || result.room_id !== roomId) throw new Error('daemon returned invalid updated room details');
+      // Two independent requests: room settings first, then the heartbeat policy.
+      if (Object.keys(changes).length > 0) {
+        const result = await rpc.call('room.settings', { room_id: roomId, ...changes });
+        if (!isRoomDto(result) || result.room_id !== roomId) throw new Error('daemon returned invalid updated room details');
+      }
+      if (heartbeat !== undefined) {
+        const result = await rpc.call('room.heartbeat.set', { room_id: roomId, ...heartbeat });
+        if (!isRoomDto(result) || result.room_id !== roomId) throw new Error('daemon returned invalid updated room details');
+      }
       setSettingsOpen(false);
       refreshAfterMutation();
     } catch (failure) {

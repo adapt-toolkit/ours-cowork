@@ -122,7 +122,8 @@ Usage:
   ours-cowork [--json] docs [topic]
 
 Room commands:
-  create [--name <display-name>] --goal <text> --briefing <text> [--anonymous] [--quiet-membership]
+  create [--name <display-name>] --goal <text> --briefing <text> [--anonymous] [--quiet-membership] [--heartbeat [--heartbeat-interval <minutes>]]
+  heartbeat <room-id> [--enable|--disable] [--interval <minutes>]
   settings <room-id> [--name <display-name>] [--goal <text>] [--briefing <text>] [--status <text>] [--quiet-membership true|false]
   role-briefing <room-id> --role <label> (--text <text> | --delete)
   invite <room-id> [--role <label>] [--mode one_time|public] [--min-accepts <n>]
@@ -235,15 +236,35 @@ async function roomRequest(command: string | undefined, args: string[]): Promise
   if (!command) usageError('room requires a command');
   switch (command) {
     case 'create': {
-      const parsed = parseOptions(args, ['--name', '--goal', '--briefing'], ['--anonymous', '--quiet-membership']);
+      const parsed = parseOptions(args, ['--name', '--goal', '--briefing', '--heartbeat-interval'], ['--anonymous', '--quiet-membership', '--heartbeat']);
       exactPositionals(parsed, 0, 'room create');
+      if (parsed.values['--heartbeat-interval'] !== undefined && !parsed.booleans.has('--heartbeat')) {
+        usageError('--heartbeat-interval requires --heartbeat');
+      }
       return { method: 'room.create', params: {
         ...(parsed.values['--name'] === undefined ? {} : { name: parsed.values['--name'] }),
         goal: requiredFlag(parsed, '--goal', 'room create'),
         briefing: requiredFlag(parsed, '--briefing', 'room create'),
         ...(parsed.booleans.has('--anonymous') ? { anonymous: true } : {}),
         ...(parsed.booleans.has('--quiet-membership') ? { quiet_membership: true } : {}),
+        ...(parsed.booleans.has('--heartbeat') ? { heartbeat: {
+          enabled: true,
+          ...(parsed.values['--heartbeat-interval'] === undefined ? {} : {
+            interval_minutes: parseInteger(parsed.values['--heartbeat-interval'], '--heartbeat-interval', 1),
+          }),
+        } } : {}),
       } };
+    }
+    case 'heartbeat': {
+      const parsed = parseOptions(args, ['--interval'], ['--enable', '--disable']);
+      const [roomId] = exactPositionals(parsed, 1, 'room heartbeat');
+      if (parsed.booleans.has('--enable') && parsed.booleans.has('--disable')) usageError('room heartbeat takes either --enable or --disable');
+      const params: Record<string, unknown> = { room_id: roomId };
+      if (parsed.booleans.has('--enable')) params.enabled = true;
+      if (parsed.booleans.has('--disable')) params.enabled = false;
+      if (parsed.values['--interval'] !== undefined) params.interval_minutes = parseInteger(parsed.values['--interval'], '--interval', 1);
+      if (Object.keys(params).length === 1) usageError('room heartbeat requires --enable, --disable or --interval');
+      return { method: 'room.heartbeat.set', params };
     }
     case 'settings': {
       const parsed = parseOptions(args, ['--name', '--goal', '--briefing', '--status', '--quiet-membership']);

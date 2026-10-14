@@ -526,6 +526,7 @@ class FakeService {
   async reconcileRoom(id) { this.events.push(`reconcile:${id}`); }
   async closeRoom(id) { this.events.push(`close:${id}`); }
   async resumePending(id) { this.events.push(`pending:${id}`); }
+  startHeartbeats(ids) { this.events.push(`heartbeats:${[...ids].join(',')}`); }
   beginShutdown() { this.events.push('service.reject'); }
   async drain() { this.events.push('service.drain'); }
 }
@@ -563,6 +564,8 @@ test('daemon boot uses phased recovery order and shutdown drains before unhostin
       `reconcile:${rooms[0].room_id}`,
       `close:${rooms[1].room_id}`,
       `pending:${rooms[0].room_id}`,
+      // Heartbeat timers start only after every recovery phase, for healthy non-closing rooms.
+      `heartbeats:${rooms[0].room_id}`,
       'transports.start', 'pid.write',
     ].slice(0, 10));
     await Promise.all([daemon.shutdown(), daemon.shutdown()]);

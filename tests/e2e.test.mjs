@@ -505,9 +505,9 @@ if (process.argv.includes('--e2e-driver')) {
       room = await runCli(['room', 'show', roomId]);
       const catalog = await waitFor(async () => {
         const commands = await alice.client.listContactCommands({ contact: roomCid });
-        return commands.length === 27 ? commands : undefined;
+        return commands.length === 28 ? commands : undefined;
       }, 'bounded room command catalog');
-      assert.equal(catalog.length, 27);
+      assert.equal(catalog.length, 28);
       assert.deepEqual(catalog.slice(0, 3).map((command) => command.name), [
         'start_thread', 'list-members', 'remove-member',
       ]);
@@ -556,11 +556,21 @@ if (process.argv.includes('--e2e-driver')) {
         return outcome.result;
       }
       assert.deepEqual(await sharedCall('room.show', {}), { ok: false, error: 'unauthorized' });
-      for (const name of ['room.settings', 'room.message', 'room.say', 'room.show']) {
+      assert.deepEqual(await sharedCall('room.heartbeat.set', { interval_minutes: 30 }), { ok: false, error: 'unauthorized' });
+      for (const name of ['room.settings', 'room.message', 'room.say', 'room.show', 'room.heartbeat.set']) {
         await runCli(['room', 'command-grant', roomId, alice.cid, name]);
       }
       const updated = await sharedCall('room.settings', { status: 'shared-command-verified' });
       assert.equal(updated.ok, true);
+      // The moderator tool over real SDK command transport. The status is not
+      // in_progress, so no heartbeat timer is armed by this check.
+      const heartbeatSet = await sharedCall('room.heartbeat.set', { enabled: true, interval_minutes: 30 });
+      assert.equal(heartbeatSet.ok, true);
+      // The advertised schema bounds the interval; the SDK refuses it before sending.
+      await assert.rejects(sharedCall('room.heartbeat.set', { interval_minutes: 0 }), /validation_failed/);
+      const persistedHeartbeat = (await runCli(['room', 'show', roomId])).heartbeat;
+      assert.equal(persistedHeartbeat.enabled, true);
+      assert.equal(persistedHeartbeat.interval_minutes, 30);
       assert.equal((await runCli(['room', 'show', roomId])).status, 'shared-command-verified');
       assert.deepEqual(await sharedCall('room.say', { role: 'Unregistered role', text: 'Refused.' }),
         { ok: false, error: 'invalid_state' });
@@ -584,6 +594,7 @@ if (process.argv.includes('--e2e-driver')) {
         anonymous: false,
         quiet_membership: false,
         membership_epoch: room.membership_epoch,
+        heartbeat: { enabled: true, interval_minutes: 30 },
       });
       assert.equal('status' in shown.result, false);
       stage('consumer-callback-reentry');

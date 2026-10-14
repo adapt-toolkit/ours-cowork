@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import {
   AuthorAliasSchema, AuthorSnapshotSchema, LowerCrockfordUlidSchema, MAX_HISTORY_PAGE_BYTES,
-  MembershipNoticeSchema, MessageTextSchema, Rfc3339Schema, RoleSchema,
+  MembershipNoticeSchema, MessageCategorySchema, MessageTextSchema, Rfc3339Schema, RoleSchema,
   type CommunicationRecord, type Room,
 } from './contracts.ts';
 import type { Row } from './reply-threading.ts';
@@ -16,7 +16,7 @@ const PublicThreadMetadataSchema = PublicThreadSchema.extend({
 const PublicMessageShape = {
   version: z.literal(1), room_id: LowerCrockfordUlidSchema, seq: z.number().int().positive().safe(),
   record_id: z.string(), at: Rfc3339Schema, kind: z.literal('message'), message_id: LowerCrockfordUlidSchema,
-  author: AuthorSnapshotSchema, category: z.enum(['briefing', 'role_briefing', 'chat', 'membership']),
+  author: AuthorSnapshotSchema, category: MessageCategorySchema,
   briefing_role: RoleSchema.optional(), briefing_version: z.number().int().positive().safe().optional(),
   membership: MembershipNoticeSchema.optional(), text: MessageTextSchema,
 };

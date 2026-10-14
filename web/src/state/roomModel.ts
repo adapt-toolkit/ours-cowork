@@ -46,7 +46,8 @@ export type ChatRow =
   }
   | {
     type: 'message';
-    speaker: 'room' | 'participant';
+    /** `heartbeat` is the room's inactivity check-in, distinct from an operator post in the room voice. */
+    speaker: 'room' | 'participant' | 'heartbeat';
     seq: number;
     recordId: string;
     at: string;
@@ -91,7 +92,7 @@ export function projectChat(records: readonly CommunicationRecordDto[]): ChatRow
         }
       : {
           type: 'message',
-          speaker: record.author.role === 'room' ? 'room' : 'participant',
+          speaker: record.category === 'heartbeat' ? 'heartbeat' : record.author.role === 'room' ? 'room' : 'participant',
           seq: record.seq,
           recordId: record.record_id,
           at: record.at,

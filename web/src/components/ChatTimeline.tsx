@@ -59,7 +59,7 @@ export function ChatTimeline({ roomId, records, historyReady, visible }: {
           </li>
         ) : (
           <li className={`chat-row chat-row--${row.speaker}`} key={row.recordId}>
-            <div className="chat-row__meta"><strong>{row.author.display_name}</strong><span>{row.speaker === 'room' ? 'Room voice' : row.author.role}</span><RecordMeta seq={row.seq} at={row.at} /></div>
+            <div className="chat-row__meta"><strong>{row.author.display_name}</strong><span>{row.speaker === 'heartbeat' ? 'Inactivity heartbeat' : row.speaker === 'room' ? 'Room voice' : row.author.role}</span><RecordMeta seq={row.seq} at={row.at} /></div>
             <p className="chat-row__text">{row.text}</p>
           </li>
         ))}

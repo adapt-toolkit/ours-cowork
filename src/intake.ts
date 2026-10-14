@@ -12,6 +12,7 @@ import {
   RoomSchema,
   ROOM_ROLE,
   type CommunicationRecord,
+  type MessageCategory,
   type Room,
 } from './contracts.ts';
 import type { FileInboxItem, InboxItem, RoomPacket } from './packets.ts';
@@ -36,6 +37,10 @@ export interface IntakePumpOptions {
   messageId?: () => string;
   shouldPause?: (roomId: string) => Promise<boolean>;
   afterPump?: (roomId: string) => Promise<void>;
+  /** Called under the room mutex after a participant message or file is archived. */
+  onDiscussion?: (roomId: string, record: CommunicationRecord) => Promise<void>;
+  /** Per-recipient heartbeat recheck under the room mutex, immediately before the claimed send. */
+  heartbeatDisposition?: (roomId: string, message: MessageRecord, recipientIdentity: string) => Promise<'send' | 'cancel' | 'removed'>;
 }
 
 interface NotificationState {
@@ -155,6 +160,15 @@ export class IntakePump {
     const active = this.pumps.get(id);
     if (active) { active.dirty = true; return; }
     await this.pump(id);
+  }
+
+  /**
+   * Archive everything the SDK inbox already holds for this room. Unlike
+   * resumePending, this waits for an already-running pump, which re-reads the
+   * inbox because it is marked dirty.
+   */
+  settle(roomId: string): Promise<void> {
+    return this.pump(roomId);
   }
 
   private async runPump(roomId: string, state: NotificationState): Promise<void> {
@@ -307,6 +321,7 @@ export class IntakePump {
         ...(item.reply_to == null ? {} : { source_reply_to: item.reply_to }),
       });
       if (appended.kind !== 'file') throw new Error('storage returned the wrong participant file kind');
+      await this.options.onDiscussion?.(roomId, appended);
       file = appended;
     }
 
@@ -367,6 +382,7 @@ export class IntakePump {
         ...(item.reply_to == null ? {} : { source_reply_to: item.reply_to }),
       });
       if (appended.kind !== 'message') throw new Error('storage returned the wrong participant message kind');
+      await this.options.onDiscussion?.(roomId, appended);
       message = appended;
     }
 
@@ -721,7 +737,34 @@ export class IntakePump {
         ...(message!.briefing_role === undefined ? {} : { briefing_role: message!.briefing_role }),
         ...(message!.briefing_version === undefined ? {} : { briefing_version: message!.briefing_version }),
         ...(message!.membership === undefined ? {} : { membership: message!.membership }),
+        // The participant-id snapshot stays in the archive; the wire carries only the interval.
+        ...(message!.heartbeat === undefined ? {} : { heartbeat: { interval_minutes: message!.heartbeat.interval_minutes } }),
       };
+      if (message!.category === 'heartbeat') {
+        const disposition = this.options.heartbeatDisposition === undefined
+          ? 'cancel'
+          : await this.options.heartbeatDisposition(roomId, message!, intent.recipient_identity);
+        if (disposition !== 'send') {
+          await this.skipRelay(roomId, intent, disposition === 'removed' ? 'skipped_removed' : 'skipped_cancelled');
+          continue;
+        }
+        // At-most-once: the terminal claim is durable before the single send
+        // attempt. A throw or crash after it is never retried, so a heartbeat
+        // can never wake a recipient twice. The transport outcome stays unknown.
+        const claimed = await this.store.append(roomId, {
+          version: 1,
+          kind: 'relay_result',
+          room_id: roomId,
+          at: this.now(),
+          intent_record_id: intent.record_id,
+          message_id: message!.message_id,
+          recipient_identity: intent.recipient_identity,
+          status: 'dispatch_claimed',
+        });
+        if (claimed.kind !== 'relay_result') throw new Error('storage returned the wrong relay result kind');
+        try { await sendRoomBody(packet, intent.recipient_identity, unsigned, replyTo); } catch { /* claimed; never retried */ }
+        continue;
+      }
       // RoomPacket.send returns only an observed queued/refused outcome. A
       // thrown call remains result-less because its acceptance is unknown and
       // will deliberately be retried on restart with the stable message ID.
@@ -745,7 +788,7 @@ export class IntakePump {
 
   private async skipRelay(
     roomId: string, intent: RelayIntentRecord,
-    status: 'skipped_removed' | 'skipped_reply_unavailable',
+    status: 'skipped_removed' | 'skipped_reply_unavailable' | 'skipped_cancelled',
   ): Promise<void> {
     const result = await this.store.append(roomId, {
       version: 1, kind: 'relay_result', room_id: roomId, at: this.now(),
@@ -877,12 +920,13 @@ export function inputFingerprint(item: InboxItem | FileInboxItem): string {
 }
 
 function wireKind(
-  category: 'briefing' | 'role_briefing' | 'chat' | 'membership',
-): 'room_briefing' | 'room_role_briefing' | 'room_msg' | 'room_membership' {
+  category: MessageCategory,
+): 'room_briefing' | 'room_role_briefing' | 'room_msg' | 'room_membership' | 'room_heartbeat' {
   switch (category) {
     case 'briefing': return 'room_briefing';
     case 'role_briefing': return 'room_role_briefing';
     case 'membership': return 'room_membership';
+    case 'heartbeat': return 'room_heartbeat';
     default: return 'room_msg';
   }
 }

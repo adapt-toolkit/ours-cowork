@@ -440,6 +440,48 @@ function refineRoomLineage(room: RoomLineageView, context: z.RefinementCtx): voi
   }
 }
 
+export const HEARTBEAT_MIN_INTERVAL_MINUTES = 1;
+export const HEARTBEAT_MAX_INTERVAL_MINUTES = 1440;
+export const HEARTBEAT_DEFAULT_INTERVAL_MINUTES = 20;
+/** The only room status that participates in inactivity heartbeats. */
+export const HEARTBEAT_ACTIVE_STATUS = 'in_progress';
+
+export const HeartbeatIntervalSchema = z.number().int()
+  .min(HEARTBEAT_MIN_INTERVAL_MINUTES)
+  .max(HEARTBEAT_MAX_INTERVAL_MINUTES);
+
+/**
+ * Room-level inactivity heartbeat policy. A room without this field predates
+ * the feature and is treated as disabled; loading never enables it.
+ * `anchor_at` is the earliest instant inactivity is measured from: it moves on
+ * every policy change and whenever the room status enters in_progress.
+ */
+export const HeartbeatPolicySchema = z.object({
+  enabled: z.boolean(),
+  interval_minutes: HeartbeatIntervalSchema,
+  /**
+   * Bumped on every policy change, every status transition into or out of
+   * in_progress, and activation. Queued heartbeat sends from an older
+   * generation are cancelled even if the room later returns to an equal policy.
+   */
+  generation: PositiveSafeIntegerSchema,
+  updated_at: Rfc3339Schema,
+  anchor_at: Rfc3339Schema,
+  /**
+   * Highest archive seq whose discussion is accounted for: the archive tail
+   * when the window (re)started, or the latest discussion record observed since.
+   * Discussion beyond it was archived but not recorded (crash window).
+   */
+  observed_seq: z.number().int().nonnegative().safe(),
+  /** Host clock when that latest discussion was archived (never a sender date). */
+  activity_at: Rfc3339Schema.optional(),
+}).strict();
+
+export const HeartbeatSettingsInputSchema = z.object({
+  enabled: z.boolean().optional(),
+  interval_minutes: HeartbeatIntervalSchema.optional(),
+}).strict().refine((input) => Object.keys(input).length > 0, 'at least one heartbeat setting is required');
+
 const RoomCommonShape = {
   room_id: LowerCrockfordUlidSchema,
   identity_name: NonEmptyStringSchema,
@@ -521,6 +563,7 @@ const CurrentRoomSchema = z.object({
   }),
   anonymous: z.boolean(),
   quiet_membership: z.boolean(),
+  heartbeat: HeartbeatPolicySchema.optional(),
   membership_epoch: z.number().int().nonnegative().safe(),
   seats: z.array(SeatSchema),
 }).strict().superRefine((room, context) => {
@@ -661,6 +704,10 @@ export const CreateRoomInputSchema = z.object({
   briefing: MissionTextSchema,
   anonymous: z.boolean().optional(),
   quiet_membership: z.boolean().optional(),
+  heartbeat: z.object({
+    enabled: z.boolean(),
+    interval_minutes: HeartbeatIntervalSchema.optional(),
+  }).strict().optional(),
 }).strict();
 
 export const UpdateRoomInputSchema = z.object({
@@ -740,6 +787,13 @@ export const RuntimeCommandAuditSchema = z.object({
   expected_membership_epoch: z.number().int().nonnegative().safe(),
 }).strict();
 
+/**
+ * `heartbeat` is the room's own inactivity check-in. It is room-authored status
+ * traffic, never participant discussion, and never resets the inactivity timer.
+ */
+export const MessageCategorySchema = z.enum(['briefing', 'role_briefing', 'chat', 'membership', 'heartbeat']);
+export type MessageCategory = z.infer<typeof MessageCategorySchema>;
+
 export const AuthorSnapshotSchema = z.object({
   identity: NonEmptyStringSchema,
   display_name: NonEmptyStringSchema,
@@ -776,6 +830,13 @@ export const AuthorAliasSchema = z.object({
   alias: NonEmptyStringSchema,
 }).strict();
 
+/** Emission snapshot carried by a heartbeat message; never relayed on the wire. */
+export const HeartbeatSnapshotSchema = z.object({
+  generation: PositiveSafeIntegerSchema,
+  interval_minutes: HeartbeatIntervalSchema,
+  participant_ids: z.array(LowerCrockfordUlidSchema),
+}).strict();
+
 export const ReplyReferenceSchema = z.object({
   wire_id: NonEmptyStringSchema,
   sentence: PositiveSafeIntegerSchema.optional(),
@@ -786,10 +847,11 @@ const MessageShape = {
   message_id: LowerCrockfordUlidSchema,
   author: AuthorSnapshotSchema,
   author_alias: AuthorAliasSchema.optional(),
-  category: z.enum(['briefing', 'role_briefing', 'chat', 'membership']),
+  category: MessageCategorySchema,
   briefing_role: RoleSchema.optional(),
   briefing_version: PositiveSafeIntegerSchema.optional(),
   membership: MembershipNoticeSchema.optional(),
+  heartbeat: HeartbeatSnapshotSchema.optional(),
   text: MessageTextSchema,
   recipient_identities: z.array(NonEmptyStringSchema).superRefine((identities, context) => {
     const seen = new Set<string>();
@@ -824,6 +886,12 @@ export const RelayResultStatusSchema = z.enum([
   'send_failed',
   'skipped_removed',
   'skipped_reply_unavailable',
+  // A queued heartbeat superseded before its send: discussion resumed, the
+  // policy was disabled, or the room left in_progress.
+  'skipped_cancelled',
+  // Heartbeats are at-most-once: this terminal claim is written before the one
+  // send attempt, whose transport outcome is deliberately not retried.
+  'dispatch_claimed',
 ]);
 
 const RelayResultShape = {
@@ -941,17 +1009,18 @@ const RawCommunicationRecordSchema = z.discriminatedUnion('kind', [
 ]);
 
 interface MessageCategoryView {
-  category: 'briefing' | 'role_briefing' | 'chat' | 'membership';
+  category: MessageCategory;
   briefing_role?: string;
   briefing_version?: number;
   membership?: z.infer<typeof MembershipNoticeSchema>;
+  heartbeat?: z.infer<typeof HeartbeatSnapshotSchema>;
 }
 
 interface MessageThreadView {
   message_id: string;
   author: { identity: string };
   author_alias?: z.infer<typeof AuthorAliasSchema>;
-  category: 'briefing' | 'role_briefing' | 'chat' | 'membership';
+  category: MessageCategory;
   text: string;
   source_msg_id?: number;
   source_wire_id?: string;
@@ -1013,7 +1082,7 @@ function refineFileRecord(
 }
 
 function refineMessageCategory(message: MessageCategoryView, context: z.RefinementCtx): void {
-  const requires = (field: 'briefing_role' | 'briefing_version' | 'membership', present: boolean): void => {
+  const requires = (field: 'briefing_role' | 'briefing_version' | 'membership' | 'heartbeat', present: boolean): void => {
     if (present && message[field] === undefined) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -1031,6 +1100,7 @@ function refineMessageCategory(message: MessageCategoryView, context: z.Refineme
   };
   requires('briefing_role', message.category === 'role_briefing');
   requires('membership', message.category === 'membership');
+  requires('heartbeat', message.category === 'heartbeat');
   if (message.category === 'role_briefing' && message.briefing_version === undefined) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
@@ -1039,7 +1109,7 @@ function refineMessageCategory(message: MessageCategoryView, context: z.Refineme
     });
   }
   // Common briefings may carry briefing_version (absent on pre-evolution records).
-  if (message.category === 'chat' || message.category === 'membership') {
+  if (message.category === 'chat' || message.category === 'membership' || message.category === 'heartbeat') {
     if (message.briefing_version !== undefined) {
       context.addIssue({
         code: z.ZodIssueCode.custom,

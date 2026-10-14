@@ -2594,6 +2594,7 @@ test('shared commands preserve management effects with deliberate participant re
   }
   const cases = [
     ['room.settings', { goal: 'Revised', briefing: 'Updated common.' }],
+    ['room.heartbeat.set', { enabled: true, interval_minutes: 30 }],
     ['room.briefing.role.set', { role: 'builder', text: 'Build carefully.' }],
     ['room.briefing.role.delete', { role: 'builder' }],
     ['room.invite', { mode: 'one_time', role: 'reviewer', min_accepts: 1 }],
@@ -2626,8 +2627,10 @@ test('shared commands preserve management effects with deliberate participant re
     try { expected = { ok: true, result: await routes[name].run({ ...input, room_id: ROOM_ID }) }; }
     catch (error) { expected = { ok: false, error: classifyServiceError(error) }; }
     if (expected.ok && name === 'room.show') {
-      const { room_id, room_name, state, mission, anonymous, quiet_membership, membership_epoch } = expected.result;
-      expected.result = { room_id, room_name, state, mission, anonymous, quiet_membership, membership_epoch };
+      const { room_id, room_name, state, mission, anonymous, quiet_membership, membership_epoch, heartbeat } = expected.result;
+      expected.result = { room_id, room_name, state, mission, anonymous, quiet_membership, membership_epoch,
+        heartbeat: heartbeat === undefined ? { enabled: false, interval_minutes: 20 }
+          : { enabled: heartbeat.enabled, interval_minutes: heartbeat.interval_minutes } };
     } else if (expected.ok && name === 'room.participants') {
       expected.result = expected.result.map(({ participant_id, role, state }) => ({ participant_id, role, state }));
     } else if (expected.ok && name === 'room.history') {
@@ -2857,7 +2860,7 @@ test('runtime history cannot escalate or select another viewer, and commands exp
   for(const row of out.result) { assert.equal(row.kind,'message'); assert.equal(row.recipient_identities,undefined); assert.equal(row.source_wire_id,undefined); assert.match(row.record_id,/:participant:/); }
  }
  const show=await call('room.show',{},sharedContext);
- assert.deepEqual(Object.keys(show.result).sort(),['anonymous','membership_epoch','mission','quiet_membership','room_id','room_name','state']);
+ assert.deepEqual(Object.keys(show.result).sort(),['anonymous','heartbeat','membership_epoch','mission','quiet_membership','room_id','room_name','state']);
  const roster=await call('room.participants',{},sharedContext);
  roster.result.forEach(seat=>assert.deepEqual(Object.keys(seat).sort(),['participant_id','role','state']));
  await f.service.addRestRole(ROOM_ID,{role:'Reporter'});

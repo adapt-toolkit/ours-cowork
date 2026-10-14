@@ -22,6 +22,7 @@ import {
   RoleBriefingSetInputSchema,
   RuntimeRoleCommandGrantInputSchema,
   UpdateRoomInputSchema,
+  HeartbeatSettingsInputSchema,
 } from '../src/contracts.ts';
 import {
   RpcDispatcher,
@@ -278,6 +279,7 @@ test('documented examples satisfy the contract schemas the service enforces', ()
   const contracts = {
     'room.create': CreateRoomInputSchema,
     'room.settings': UpdateRoomInputSchema,
+    'room.heartbeat.set': HeartbeatSettingsInputSchema,
     'room.briefing.role.set': RoleBriefingSetInputSchema,
     'room.briefing.role.delete': RoleBriefingDeleteInputSchema,
     'room.command.role.set': RuntimeRoleCommandGrantInputSchema,

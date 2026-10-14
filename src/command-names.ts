@@ -1,6 +1,7 @@
 /** Fixed built-ins; registered consumer commands are managed separately. */
 export const SHARED_ROOM_COMMANDS = [
   'room.settings',
+  'room.heartbeat.set',
   'room.briefing.role.set',
   'room.briefing.role.delete',
   'room.invite',

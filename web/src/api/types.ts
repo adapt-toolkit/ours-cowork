@@ -3,7 +3,28 @@ import { isNormalizedRoomName } from '../roomName';
 export type RoomState = 'provisioning' | 'active' | 'closing' | 'closed';
 export type InviteMode = 'one_time' | 'public';
 export type InviteState = 'live' | 'consumed' | 'revoked' | 'replacement_required' | 'receipt_pending';
-export type RelayStatus = 'queued' | 'send_failed' | 'skipped_removed' | 'skipped_reply_unavailable';
+export type RelayStatus = 'queued' | 'send_failed' | 'skipped_removed' | 'skipped_reply_unavailable' | 'skipped_cancelled' | 'dispatch_claimed';
+export type MessageCategory = 'briefing' | 'role_briefing' | 'chat' | 'membership' | 'heartbeat';
+
+export const HEARTBEAT_DEFAULT_INTERVAL_MINUTES = 20;
+export const HEARTBEAT_MIN_INTERVAL_MINUTES = 1;
+export const HEARTBEAT_MAX_INTERVAL_MINUTES = 1440;
+
+export interface HeartbeatPolicyDto {
+  enabled: boolean;
+  interval_minutes: number;
+  generation: number;
+  updated_at: string;
+  anchor_at: string;
+  observed_seq: number;
+  activity_at?: string;
+}
+
+export interface HeartbeatSnapshotDto {
+  generation: number;
+  interval_minutes: number;
+  participant_ids: string[];
+}
 
 export interface MissionDto {
   goal: string;
@@ -68,6 +89,7 @@ export interface RoomDto {
   role_command_grants?: RuntimeRoleCommandGrantDto[];
   anonymous?: boolean;
   quiet_membership?: boolean;
+  heartbeat?: HeartbeatPolicyDto;
   membership_epoch?: number;
   state: RoomState;
   status?: string;
@@ -150,10 +172,11 @@ export interface MessageRecordDto extends RecordCommonDto {
   message_id: string;
   author: AuthorDto;
   author_alias?: AuthorAliasDto;
-  category: 'briefing' | 'role_briefing' | 'chat' | 'membership';
+  category: MessageCategory;
   briefing_role?: string;
   briefing_version?: number;
   membership?: MembershipNoticeDto;
+  heartbeat?: HeartbeatSnapshotDto;
   text: string;
   recipient_identities: string[];
   source_msg_id?: number;
@@ -246,7 +269,7 @@ export type CommunicationRecordDto = MessageRecordDto | OperationalRecordDto;
 const ROOM_STATES = new Set<unknown>(['provisioning', 'active', 'closing', 'closed']);
 const INVITE_MODES = new Set<unknown>(['one_time', 'public']);
 const INVITE_STATES = new Set<unknown>(['live', 'consumed', 'revoked', 'replacement_required', 'receipt_pending']);
-const RELAY_STATUSES = new Set<unknown>(['queued', 'send_failed', 'skipped_removed', 'skipped_reply_unavailable']);
+const RELAY_STATUSES = new Set<unknown>(['queued', 'send_failed', 'skipped_removed', 'skipped_reply_unavailable', 'skipped_cancelled', 'dispatch_claimed']);
 const DELIVERY_STATUSES = new Set<unknown>(['queued', 'send_failed']);
 const LOWER_CROCKFORD_ULID = /^[0-7][0-9a-hjkmnp-tv-z]{25}$/;
 const CANONICAL_CONTAINER_ID = /^[0-9A-F]{64}$/;
@@ -262,7 +285,7 @@ const ROOM_V2_KEYS = [...ROOM_V1_KEYS, 'role_briefings', 'rest_roles', 'command_
 export function isRoomDto(value: unknown): value is RoomDto {
   if (!isRecord(value) || (value.version !== 1 && value.version !== 2)) return false;
   const v2 = value.version === 2;
-  if (!hasExactKeys(value, v2 ? ROOM_V2_KEYS : ROOM_V1_KEYS, ['status', 'activated_at', 'closed_at'])
+  if (!hasExactKeys(value, v2 ? ROOM_V2_KEYS : ROOM_V1_KEYS, v2 ? ['status', 'activated_at', 'closed_at', 'heartbeat'] : ['status', 'activated_at', 'closed_at'])
     || !isLowerCrockfordUlid(value.room_id)
     || !isNormalizedRoomName(value.room_name)
     || !isString(value.identity_name)
@@ -270,6 +293,7 @@ export function isRoomDto(value: unknown): value is RoomDto {
     || !isMission(value.mission, v2)
     || !ROOM_STATES.has(value.state)
     || !optionalString(value.status)
+    || (value.heartbeat !== undefined && !isHeartbeatPolicy(value.heartbeat))
     || !Array.isArray(value.invites)
     || !value.invites.every(isRoomInvite)
     || !Array.isArray(value.seats)
@@ -510,7 +534,7 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
       return hasExactKeys(
         value,
         [...RECORD_COMMON_KEYS, 'message_id', 'author', 'category', 'text', 'recipient_identities'],
-        ['author_alias', 'briefing_role', 'briefing_version', 'membership', 'source_msg_id', 'source_wire_id', 'source_reply_to', 'scope', 'thread_root'],
+        ['author_alias', 'briefing_role', 'briefing_version', 'membership', 'heartbeat', 'source_msg_id', 'source_wire_id', 'source_reply_to', 'scope', 'thread_root'],
       )
         && isLowerCrockfordUlid(value.message_id)
         && isAuthor(value.author)
@@ -781,14 +805,47 @@ function isMessageCategory(value: Record<string, unknown>): boolean {
     case 'chat':
       return value.briefing_role === undefined
         && value.briefing_version === undefined
-        && value.membership === undefined;
+        && value.membership === undefined
+        && value.heartbeat === undefined;
     case 'membership':
       return value.briefing_role === undefined
         && value.briefing_version === undefined
-        && isMembershipNotice(value.membership);
+        && isMembershipNotice(value.membership)
+        && value.heartbeat === undefined;
+    case 'heartbeat':
+      return value.briefing_role === undefined
+        && value.briefing_version === undefined
+        && value.membership === undefined
+        && isHeartbeatSnapshot(value.heartbeat);
     default:
       return false;
   }
+}
+
+export function isHeartbeatInterval(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value)
+    && value >= HEARTBEAT_MIN_INTERVAL_MINUTES && value <= HEARTBEAT_MAX_INTERVAL_MINUTES;
+}
+
+function isHeartbeatPolicy(value: unknown): value is HeartbeatPolicyDto {
+  return isRecord(value)
+    && hasExactKeys(value, ['enabled', 'interval_minutes', 'generation', 'updated_at', 'anchor_at', 'observed_seq'], ['activity_at'])
+    && typeof value.enabled === 'boolean'
+    && isHeartbeatInterval(value.interval_minutes)
+    && isPositiveSafeInteger(value.generation)
+    && isStrictRfc3339(value.updated_at)
+    && isStrictRfc3339(value.anchor_at)
+    && isNonNegativeSafeInteger(value.observed_seq)
+    && optionalStrictRfc3339(value.activity_at);
+}
+
+function isHeartbeatSnapshot(value: unknown): value is HeartbeatSnapshotDto {
+  return isRecord(value)
+    && hasExactKeys(value, ['generation', 'interval_minutes', 'participant_ids'])
+    && isPositiveSafeInteger(value.generation)
+    && isHeartbeatInterval(value.interval_minutes)
+    && Array.isArray(value.participant_ids)
+    && value.participant_ids.every(isLowerCrockfordUlid);
 }
 
 function hasExactlyOneRelaySubject(value: Record<string, unknown>): boolean {

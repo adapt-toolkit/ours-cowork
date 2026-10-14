@@ -70,7 +70,8 @@ describe('create and settings dialogs', () => {
     expect(screen.getByLabelText('Name')).toHaveFocus();
     invoker.focus();
     fireEvent.keyDown(document, { key: 'Tab', shiftKey: true });
-    expect(screen.getByLabelText('Briefing')).toHaveFocus();
+    // The collapsed advanced settings summary is the last reachable control.
+    expect(screen.getByText('Advanced settings')).toHaveFocus();
 
     pending.resolve(createdRoom());
     await act(async () => pending.promise);

@@ -54,10 +54,11 @@
 .chat-row { width: min(82%, 610px); padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
 .chat-row--room { justify-self: end; border-color: var(--mint-dim); background: rgb(124 231 176 / 5%); }
 .chat-row--briefing { width: 100%; border-left: 2px solid var(--mint); background: var(--panel-soft); }
+.chat-row--heartbeat { width: 100%; border-left: 2px dashed var(--mint-dim); background: var(--panel-soft); }
 .chat-row--file { width: min(92%, 680px); }
 .chat-row__meta { display: flex; align-items: baseline; gap: 8px; color: var(--text-faint); font-size: 9px; }
 .chat-row__meta strong { color: var(--text); font-size: 11px; }
-.chat-row--room .chat-row__meta strong, .chat-row--briefing .chat-row__meta strong { color: var(--mint); }
+.chat-row--room .chat-row__meta strong, .chat-row--briefing .chat-row__meta strong, .chat-row--heartbeat .chat-row__meta strong { color: var(--mint); }
 .chat-row__meta code { margin-left: auto; }
 .chat-row__text { margin: 8px 0 0; color: #d2d9d7; font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; }
 .file-attachment { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; margin-top: 10px; padding: 12px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--panel-soft); }
@@ -121,3 +122,11 @@
   .file-version__details strong { grid-row: auto; }
   .file-group__latest { overflow-wrap: anywhere; }
 }
+.advanced-settings { display: grid; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.advanced-settings[open] { padding-bottom: 12px; }
+.advanced-settings > summary { cursor: pointer; font-size: 11px; font-weight: 650; }
+.advanced-settings > summary:focus-visible { outline: 2px solid var(--mint); outline-offset: 2px; }
+.advanced-settings[open] > summary { margin-bottom: 4px; }
+.field--check { grid-template-columns: auto 1fr; align-items: center; gap: 9px; }
+.field--check input { width: auto; }
+.advanced-settings .field-hint { color: var(--text-faint); font-size: 10px; line-height: 1.45; }

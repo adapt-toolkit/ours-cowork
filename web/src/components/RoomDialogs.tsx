@@ -2,11 +2,29 @@ import { type FormEvent, type ReactNode, useEffect, useId, useRef, useState } fr
 import { createPortal } from 'react-dom';
 
 import { RpcError } from '../api/rpc';
-import type { RoomDto } from '../api/types';
+import {
+  HEARTBEAT_DEFAULT_INTERVAL_MINUTES,
+  HEARTBEAT_MAX_INTERVAL_MINUTES,
+  HEARTBEAT_MIN_INTERVAL_MINUTES,
+  type RoomDto,
+} from '../api/types';
 import { normalizeRoomName, roomNameError } from '../roomName';
 import { roomTitle } from './RoomRail';
 
 const MAX_MISSION_BYTES = 262_144;
+
+export interface HeartbeatChange {
+  enabled?: boolean;
+  interval_minutes?: number;
+}
+
+export interface RoomSettingsChanges {
+  name?: string;
+  goal?: string;
+  briefing?: string;
+  status?: string;
+  heartbeat?: HeartbeatChange;
+}
 
 export function CreateRoomDialog({ open, connected, restoreFocus, fallbackFocus, onClose, onCreate }: {
   open: boolean;
@@ -14,11 +32,13 @@ export function CreateRoomDialog({ open, connected, restoreFocus, fallbackFocus,
   restoreFocus?: HTMLElement;
   fallbackFocus?(): HTMLElement | undefined;
   onClose(): void;
-  onCreate(name: string, goal: string, briefing: string): Promise<void>;
+  onCreate(name: string, goal: string, briefing: string, heartbeat?: { enabled: boolean; interval_minutes: number }): Promise<void>;
 }) {
   const [name, setName] = useState('');
   const [goal, setGoal] = useState('');
   const [briefing, setBriefing] = useState('');
+  const [heartbeatEnabled, setHeartbeatEnabled] = useState(false);
+  const [heartbeatInterval, setHeartbeatInterval] = useState(String(HEARTBEAT_DEFAULT_INTERVAL_MINUTES));
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string>();
   const submittingRef = useRef(false);
@@ -27,18 +47,26 @@ export function CreateRoomDialog({ open, connected, restoreFocus, fallbackFocus,
   const nameError = roomNameError(name);
   const goalError = missionError('Goal', goal);
   const briefingError = missionError('Briefing', briefing);
+  const intervalError = heartbeatIntervalError(heartbeatInterval);
+  const invalid = Boolean(nameError || goalError || briefingError || intervalError);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (!connected || nameError || goalError || briefingError || submittingRef.current) return;
+    if (!connected || invalid || submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
     setError(undefined);
     try {
-      await onCreate(normalizeRoomName(name), goal.trim(), briefing.trim());
+      const interval = Number(heartbeatInterval);
+      // Omitted policy means the daemon default: disabled, 20 minutes.
+      await onCreate(normalizeRoomName(name), goal.trim(), briefing.trim(),
+        heartbeatEnabled || interval !== HEARTBEAT_DEFAULT_INTERVAL_MINUTES
+          ? { enabled: heartbeatEnabled, interval_minutes: interval } : undefined);
       setName('');
       setGoal('');
       setBriefing('');
+      setHeartbeatEnabled(false);
+      setHeartbeatInterval(String(HEARTBEAT_DEFAULT_INTERVAL_MINUTES));
     } catch (failure) {
       setError(failure instanceof RpcError && failure.outcomeUnknown
         ? `The create request did not receive a confirmation, so its outcome is unknown. Your fields are retained. ${failure.message}`
@@ -56,11 +84,12 @@ export function CreateRoomDialog({ open, connected, restoreFocus, fallbackFocus,
         <TextField label="Name" value={name} onChange={setName} error={nameError} autoFocus />
         <MissionField label="Goal" value={goal} onChange={setGoal} error={goalError} rows={3} trimForBytes />
         <MissionField label="Briefing" value={briefing} onChange={setBriefing} error={briefingError} rows={6} trimForBytes />
+        <HeartbeatFields enabled={heartbeatEnabled} onEnabled={setHeartbeatEnabled} interval={heartbeatInterval} onInterval={setHeartbeatInterval} error={intervalError} />
         {!connected && <p className="form-error" role="status">Create is unavailable because the daemon disconnected. Your fields are retained and no request was sent.</p>}
         {error && <p className="form-error" role="alert">{error}</p>}
         <div className="dialog-actions">
           <button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>Cancel</button>
-          <button className="primary-button" type="submit" disabled={!connected || submitting || Boolean(nameError || goalError || briefingError)}>{submitting ? 'Creating room…' : 'Create mission room'}</button>
+          <button className="primary-button" type="submit" disabled={!connected || submitting || invalid}>{submitting ? 'Creating room…' : 'Create mission room'}</button>
         </div>
       </form>
     </Modal>
@@ -74,12 +103,15 @@ export function SettingsDialog({ room, open, connected, capable, restoreFocus, o
   capable: boolean;
   restoreFocus?: HTMLElement;
   onClose(): void;
-  onSave(changes: { name?: string; goal?: string; briefing?: string; status?: string }): Promise<void>;
+  onSave(changes: RoomSettingsChanges): Promise<void>;
 }) {
+  const savedHeartbeat = room.heartbeat ?? { enabled: false, interval_minutes: HEARTBEAT_DEFAULT_INTERVAL_MINUTES };
   const [name, setName] = useState(room.room_name);
   const [goal, setGoal] = useState(room.mission.goal);
   const [briefing, setBriefing] = useState(room.mission.briefing);
   const [status, setStatus] = useState(room.status ?? '');
+  const [heartbeatEnabled, setHeartbeatEnabled] = useState(savedHeartbeat.enabled);
+  const [heartbeatInterval, setHeartbeatInterval] = useState(String(savedHeartbeat.interval_minutes));
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string>();
   const submittingRef = useRef(false);
@@ -89,25 +121,35 @@ export function SettingsDialog({ room, open, connected, capable, restoreFocus, o
     setGoal(room.mission.goal);
     setBriefing(room.mission.briefing);
     setStatus(room.status ?? '');
+    setHeartbeatEnabled(savedHeartbeat.enabled);
+    setHeartbeatInterval(String(savedHeartbeat.interval_minutes));
     setError(undefined);
-  }, [open, room.mission.briefing, room.mission.goal, room.room_id, room.room_name, room.status]);
+  }, [open, room.mission.briefing, room.mission.goal, room.room_id, room.room_name, room.status, savedHeartbeat.enabled, savedHeartbeat.interval_minutes]);
   if (!open) return null;
 
   const nameError = roomNameError(name);
   const goalError = exactMissionError('Goal', goal);
   const briefingError = exactMissionError('Briefing', briefing);
   const statusError = room.status && !status ? 'An existing status cannot be cleared.' : undefined;
-  const changes: { name?: string; goal?: string; briefing?: string; status?: string } = {};
+  const intervalError = heartbeatIntervalError(heartbeatInterval);
+  const changes: RoomSettingsChanges = {};
   const normalizedName = normalizeRoomName(name);
   if (normalizedName !== room.room_name) changes.name = normalizedName;
   if (goal !== room.mission.goal) changes.goal = goal;
   if (briefing !== room.mission.briefing) changes.briefing = briefing;
   if (status !== (room.status ?? '')) changes.status = status;
+  if (!intervalError) {
+    const heartbeat: HeartbeatChange = {};
+    if (heartbeatEnabled !== savedHeartbeat.enabled) heartbeat.enabled = heartbeatEnabled;
+    if (Number(heartbeatInterval) !== savedHeartbeat.interval_minutes) heartbeat.interval_minutes = Number(heartbeatInterval);
+    if (Object.keys(heartbeat).length > 0) changes.heartbeat = heartbeat;
+  }
   const dirty = Object.keys(changes).length > 0;
+  const invalid = Boolean(nameError || goalError || briefingError || statusError || intervalError);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (!connected || !capable || !dirty || nameError || goalError || briefingError || statusError || submittingRef.current) return;
+    if (!connected || !capable || !dirty || invalid || submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
     setError(undefined);
@@ -127,11 +169,12 @@ export function SettingsDialog({ room, open, connected, capable, restoreFocus, o
         <MissionField label="Goal" value={goal} onChange={setGoal} error={goalError} rows={3} />
         <MissionField label="Briefing" value={briefing} onChange={setBriefing} error={briefingError} rows={5} />
         <TextField label="Status (optional)" value={status} onChange={setStatus} error={statusError} />
+        <HeartbeatFields enabled={heartbeatEnabled} onEnabled={setHeartbeatEnabled} interval={heartbeatInterval} onInterval={setHeartbeatInterval} error={intervalError} />
         {(!connected || !capable) && <p className="form-error" role="status">Settings are unavailable because the connection or room lifecycle changed. Your fields are retained and no request was sent.</p>}
         {error && <p className="form-error" role="alert">{error}</p>}
         <div className="dialog-actions">
           <button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>Cancel</button>
-          <button className="primary-button" type="submit" disabled={!connected || !capable || submitting || !dirty || Boolean(nameError || goalError || briefingError || statusError)}>{submitting ? 'Saving…' : 'Save settings'}</button>
+          <button className="primary-button" type="submit" disabled={!connected || !capable || submitting || !dirty || invalid}>{submitting ? 'Saving…' : 'Save settings'}</button>
         </div>
       </form>
     </Modal>
@@ -223,6 +266,43 @@ export function DeleteRoomDialog({ room, open, connected, capable, restoreFocus,
   );
 }
 
+/**
+ * Advanced, collapsed by default. Native details/summary, checkbox and number
+ * input keep keyboard operation and accessible names without custom widgets.
+ */
+function HeartbeatFields({ enabled, onEnabled, interval, onInterval, error }: {
+  enabled: boolean; onEnabled(value: boolean): void; interval: string; onInterval(value: string): void; error?: string;
+}) {
+  const id = useId();
+  const hintId = `${id}-hint`;
+  const errorId = `${id}-error`;
+  return (
+    <details className="advanced-settings" open={Boolean(error) || undefined}>
+      {/* Explicit tabIndex matches native summary focusability for tooling that omits it. */}
+      <summary tabIndex={0}>Advanced settings</summary>
+      <div className="field field--check">
+        <input id={`${id}-enabled`} type="checkbox" checked={enabled} onChange={(event) => onEnabled(event.target.checked)} aria-describedby={hintId} />
+        <label htmlFor={`${id}-enabled`}>Send inactivity heartbeats</label>
+      </div>
+      <div className="field">
+        <label htmlFor={`${id}-interval`}>Heartbeat interval (minutes)</label>
+        <input id={`${id}-interval`} type="number" inputMode="numeric" min={HEARTBEAT_MIN_INTERVAL_MINUTES} max={HEARTBEAT_MAX_INTERVAL_MINUTES} step={1} value={interval} onChange={(event) => onInterval(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? `${errorId} ${hintId}` : hintId} />
+        {error && <small id={errorId} className="field-error">{error}</small>}
+      </div>
+      <small id={hintId} className="field-hint">While the room status is in_progress, the room checks in with every participant after this many minutes without discussion. It never marks the room done.</small>
+    </details>
+  );
+}
+
+function heartbeatIntervalError(value: string): string | undefined {
+  if (!/^[0-9]+$/.test(value.trim())) return 'Enter a whole number of minutes.';
+  const minutes = Number(value);
+  if (minutes < HEARTBEAT_MIN_INTERVAL_MINUTES || minutes > HEARTBEAT_MAX_INTERVAL_MINUTES) {
+    return `Use ${HEARTBEAT_MIN_INTERVAL_MINUTES}–${HEARTBEAT_MAX_INTERVAL_MINUTES} minutes.`;
+  }
+  return undefined;
+}
+
 function MissionField({ label, value, onChange, error, rows, autoFocus = false, trimForBytes = false }: {
   label: string; value: string; onChange(value: string): void; error?: string; rows: number; autoFocus?: boolean; trimForBytes?: boolean;
 }) {
@@ -248,7 +328,12 @@ export function Modal({ title, open, restoreFocus, fallbackFocus, onClose, locke
     if (!open) return;
     const previous = restoreFocus ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
     const panel = panelRef.current;
-    const focusable = () => [...(panel?.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])') ?? [])];
+    // A closed <details> hides its content from the tab order; only its summary remains reachable.
+    const focusable = () => [...(panel?.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])') ?? [])]
+      .filter((element) => {
+        const details = element.parentElement?.closest('details');
+        return !details || details.open || (element.tagName === 'SUMMARY' && element.parentElement === details);
+      });
     (focusable().find((element) => element.dataset.autofocus === 'true') ?? focusable()[0])?.focus();
     const keydown = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && !lockedRef.current) { event.preventDefault(); onCloseRef.current(); return; }

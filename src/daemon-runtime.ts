@@ -67,6 +67,7 @@ export interface DaemonService {
   closeRoom(roomId: string): Promise<unknown>;
   resumePending(roomId: string): Promise<void>;
   notifyRoom?(roomId: string, event?: string): Promise<void>;
+  startHeartbeats?(roomIds: Iterable<string>): void;
   beginShutdown(): void;
   drain(): Promise<void>;
 }
@@ -273,6 +274,11 @@ export class CoworkDaemon {
       for (const room of recoverable.filter((candidate) => candidate.state !== 'closing')) {
         await recoverPhase(room.room_id, 'fanout', () => this.service!.resumePending(room.room_id));
       }
+      // Heartbeat timers start only after recovery. Each room computes one
+      // deadline from durable state, so missed intervals never replay.
+      this.service.startHeartbeats?.(recoverable
+        .filter((room) => room.state !== 'closing' && healthy.has(room.room_id))
+        .map((room) => room.room_id));
 
       const realService = this.service as RoomService;
       const serviceRoutes = createServiceRoutes(realService);

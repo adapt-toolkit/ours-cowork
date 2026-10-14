@@ -78,6 +78,7 @@ function fakeService() {
         fileRecord(room, 5, 'evidence.html', 'QQ==', SHA_A),
         fileRecord(room, 6, 'evidence.html', 'Qg==', SHA_B),
         fileRecord(room, 7, 'Evidence.html', 'QQ==', SHA_A),
+        heartbeatRecord(room, 8),
       );
       return room;
     },
@@ -147,6 +148,17 @@ function messageRecord(room, seq, text, roomVoice = false) {
   };
 }
 
+function heartbeatRecord(room, seq) {
+  return {
+    version: 1, room_id: room.room_id, seq, record_id: `${room.room_id}:${seq}`, at: CREATED_AT,
+    kind: 'message', message_id: '01jz6y7n8p9q0r1s2t3v4w5x7z',
+    author: { identity: room.identity_cid, display_name: room.identity_name, role: 'room' },
+    category: 'heartbeat', text: 'Room heartbeat: no participant discussion for 45 minutes while this room is in progress.',
+    heartbeat: { generation: 1, interval_minutes: 45, participant_ids: ['01jz6y7n8p9q0r1s2t3v4w5x7y'] },
+    recipient_identities: ['browser-participant-cid'],
+  };
+}
+
 function fileRecord(room, seq, filename, dataBase64, sha256) {
   return {
     version: 1, room_id: room.room_id, seq, record_id: `${room.room_id}:${seq}`, at: CREATED_AT,
@@ -192,6 +204,23 @@ test('shipped web console creates, selects, invites, and sends through the real 
   await page.getByLabel('Name').fill('Browser room');
   await page.getByLabel('Goal').fill('Browser release proof');
   await page.getByLabel('Briefing').fill('Exercise the shipped console.');
+  // Advanced heartbeat settings are collapsed and operable entirely by keyboard.
+  const heartbeatToggle = page.getByLabel('Send inactivity heartbeats');
+  assert.equal(await heartbeatToggle.isVisible(), false);
+  await page.getByLabel('Briefing').focus();
+  await page.keyboard.press('Tab');
+  assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'Advanced settings');
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('Tab');
+  assert.equal(await heartbeatToggle.evaluate((element) => element === document.activeElement), true);
+  await page.keyboard.press('Space');
+  assert.equal(await heartbeatToggle.isChecked(), true);
+  await page.keyboard.press('Tab');
+  const heartbeatInterval = page.getByLabel('Heartbeat interval (minutes)');
+  assert.equal(await heartbeatInterval.evaluate((element) => element === document.activeElement), true);
+  assert.equal(await heartbeatInterval.inputValue(), '20');
+  await page.keyboard.press('ControlOrMeta+A');
+  await page.keyboard.type('45');
   await page.getByRole('button', { name: 'Create mission room', exact: true }).click();
 
   await assertProjection(page, async () => {
@@ -215,6 +244,7 @@ test('shipped web console creates, selects, invites, and sends through the real 
     assert.match(timelineRows[1], /evidence\.html/);
     assert.match(timelineRows[2], /After attachment/);
     assert.equal(timelineRows.some((text) => text.includes('relay_intent')), false);
+    assert.match(timelineRows.at(-1), /Inactivity heartbeat/);
   }, runtimeErrors);
 
   await page.getByRole('tab', { name: 'Communication' }).focus();
@@ -261,7 +291,8 @@ test('shipped web console creates, selects, invites, and sends through the real 
   assert.equal(service.calls.filter(([method]) => method === 'room.message').length, 1);
   assert.deepEqual(service.calls.find(([method]) => method === 'room.create'), [
     'room.create',
-    { name: 'Browser room', goal: 'Browser release proof', briefing: 'Exercise the shipped console.' },
+    { name: 'Browser room', goal: 'Browser release proof', briefing: 'Exercise the shipped console.',
+      heartbeat: { enabled: true, interval_minutes: 45 } },
   ]);
   assert.deepEqual(service.calls.find(([method]) => method === 'room.invite'), [
     'room.invite',

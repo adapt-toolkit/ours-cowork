@@ -10,6 +10,7 @@ export interface RoomServiceApi {
   reloadConsumerCommands(roomId: string): Promise<unknown>;
   createRoom(input: unknown): Promise<unknown>;
   updateRoom(roomId: string, input: unknown): Promise<unknown>;
+  setHeartbeat(roomId: string, input: unknown): Promise<unknown>;
   setRoleBriefing(roomId: string, input: unknown): Promise<unknown>;
   deleteRoleBriefing(roomId: string, input: unknown): Promise<unknown>;
   createInvite(roomId: string, input: unknown): Promise<unknown>;
@@ -98,6 +99,14 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
         quiet_membership: z.unknown().optional(),
       }).strict().parse(params);
       return service.updateRoom(room_id, input);
+    } },
+    'room.heartbeat.set': { auth: true, run: (params) => {
+      const { room_id, ...input } = z.object({
+        room_id: z.string(),
+        enabled: z.unknown().optional(),
+        interval_minutes: z.unknown().optional(),
+      }).strict().parse(params);
+      return service.setHeartbeat(room_id, input);
     } },
     'room.briefing.role.set': { auth: true, run: (params) => {
       const { room_id, ...input } = RoleBriefingSetParams.parse(params);

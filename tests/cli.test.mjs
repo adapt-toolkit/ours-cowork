@@ -179,6 +179,11 @@ test('usage errors exit 2 before touching the daemon', async () => {
     ['room', 'command-grant', 'room1', 'A'.repeat(64), 'room*'],
     ['room', 'command-revoke', 'room1', 'A'.repeat(64), '*.show'],
     ['room', 'role-command-set', 'room1', '--role', 'builder', '--commands', 'room.*.show'],
+    ['room', 'heartbeat', 'room1'],
+    ['room', 'heartbeat', 'room1', '--enable', '--disable'],
+    ['room', 'heartbeat', 'room1', '--interval', 'twenty'],
+    ['room', 'heartbeat', 'room1', '--interval', '0'],
+    ['room', 'create', '--goal', 'g', '--briefing', 'b', '--heartbeat-interval', '20'],
   ]) {
     const result = await runCli(args, { env: { OURS_COWORK_STATE_DIR: join(tmpdir(), 'absent-cowork-cli') } });
     assert.equal(result.code, 2, args.join(' '));
@@ -319,6 +324,11 @@ test('room commands send exactly one JSONL request over management.sock', async 
   const cases = [
     { args: ['room', 'create', '--goal', 'Ship', '--briefing', 'Stay focused'], method: 'room.create', params: { goal: 'Ship', briefing: 'Stay focused' } },
     { args: ['room', 'create', '--name', 'Launch room', '--goal', 'Ship', '--briefing', 'Stay focused'], method: 'room.create', params: { name: 'Launch room', goal: 'Ship', briefing: 'Stay focused' } },
+    { args: ['room', 'create', '--goal', 'Ship', '--briefing', 'Stay focused', '--heartbeat'], method: 'room.create', params: { goal: 'Ship', briefing: 'Stay focused', heartbeat: { enabled: true } } },
+    { args: ['room', 'create', '--goal', 'Ship', '--briefing', 'Stay focused', '--heartbeat', '--heartbeat-interval', '45'], method: 'room.create', params: { goal: 'Ship', briefing: 'Stay focused', heartbeat: { enabled: true, interval_minutes: 45 } } },
+    { args: ['room', 'heartbeat', 'room1', '--enable', '--interval', '20'], method: 'room.heartbeat.set', params: { room_id: 'room1', enabled: true, interval_minutes: 20 } },
+    { args: ['room', 'heartbeat', 'room1', '--disable'], method: 'room.heartbeat.set', params: { room_id: 'room1', enabled: false } },
+    { args: ['room', 'heartbeat', 'room1', '--interval', '5'], method: 'room.heartbeat.set', params: { room_id: 'room1', interval_minutes: 5 } },
     { args: ['room', 'settings', 'room1', '--goal', 'G', '--status', 'ready'], method: 'room.settings', params: { room_id: 'room1', goal: 'G', status: 'ready' } },
     { args: ['room', 'settings', 'room1', '--name', 'Renamed room'], method: 'room.settings', params: { room_id: 'room1', name: 'Renamed room' } },
     { args: ['room', 'invite', 'room1', '--mode', 'public', '--role', 'reviewer', '--min-accepts', '2'], method: 'room.invite', params: { room_id: 'room1', mode: 'public', role: 'reviewer', min_accepts: 2 } },

@@ -28,7 +28,7 @@
     "test:v1-restart-delivery": "node tests/v1-restart-delivery.integration.mjs"
   },
   "dependencies": {
-    "@ours.network/sdk": "3.8.1-nightly.18",
+    "@ours.network/sdk": "4.0.0",
     "ajv": "8.20.0",
     "better-sqlite3": "13.0.3",
     "fs-ext": "2.1.1",
@@ -38,7 +38,7 @@
   },
   "devDependencies": {
     "@adapt-toolkit/broker": "0.10.12",
-    "@ours.network/cli": "2.8.1-nightly.16",
+    "@ours.network/cli": "3.0.0",
     "@testing-library/jest-dom": "6.6.3",
     "@testing-library/react": "16.1.0",
     "@testing-library/user-event": "14.5.2",
@@ -55,6 +55,6 @@
     "typescript": "^5.5.4",
     "vite": "6.4.3",
     "vitest": "3.2.6",
-    "@ours.network/daemon": "3.8.1-nightly.10"
+    "@ours.network/daemon": "4.0.0"
   }
 }

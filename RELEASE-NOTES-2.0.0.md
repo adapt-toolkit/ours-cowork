@@ -10,9 +10,10 @@ hand.
 
 ## Breaking changes
 
-- Requires the SDK 4 line (standalone `@ours.network/daemon`, external host
-  history storage with no migration of old daemon state, explicit shared-gateway
-  client selection). See ours-sdk `RELEASE-NOTES-4.0.0.md`.
+- Requires the SDK 4 line: default client attach goes through a saved shared
+  gateway client profile, legacy environment daemon selection is rejected, and
+  the daemon runtime ships separately as `@ours.network/daemon`. See ours-sdk
+  `RELEASE-NOTES-4.0.0.md`.
 - Cowork runs against an external `@ours.network/daemon` deployment (#45)
   rather than a daemon embedded in the SDK.
 - Main-only 1.3.2/1.3.3 changes (#50 REST file uploads and resumable room

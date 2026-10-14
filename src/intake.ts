@@ -333,10 +333,12 @@ export class IntakePump {
         ...(item.reply_to == null ? {} : { source_reply_to: item.reply_to }),
       });
       if (appended.kind !== 'file') throw new Error('storage returned the wrong participant file kind');
-      await this.options.onDiscussion?.(roomId, appended);
       file = appended;
     }
 
+    // Also on a replay of an already-archived item, so an observation whose
+    // save failed after the durable append is repaired before acknowledgement.
+    await this.options.onDiscussion?.(roomId, file);
     await this.completeFileIntents(roomId, file);
     await packet.acknowledgeFile(item);
   }
@@ -394,10 +396,11 @@ export class IntakePump {
         ...(item.reply_to == null ? {} : { source_reply_to: item.reply_to }),
       });
       if (appended.kind !== 'message') throw new Error('storage returned the wrong participant message kind');
-      await this.options.onDiscussion?.(roomId, appended);
       message = appended;
     }
 
+    // Also on a replay of an already-archived item (see processFileInboxItem).
+    await this.options.onDiscussion?.(roomId, message);
     await this.completeMessageIntents(roomId, message);
 
     // This is the irreversible SDK read mark. Every preceding append resolves

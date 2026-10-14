@@ -894,3 +894,54 @@ test('C10: a failed contact refresh before dispatch claims nothing and a later p
   assert.deepEqual(f.heartbeatSends().map((call) => call.recipient).sort(), [ALICE, BOB, CARA]);
   assert.deepEqual(await f.relayStatuses(), ['A:dispatch_claimed', 'B:dispatch_claimed', 'C:dispatch_claimed']);
 });
+
+// ---- Critic C11 regressions --------------------------------------------------------
+
+async function discussionWithObservationFailure(f, text) {
+  const save = f.store.save.bind(f.store);
+  f.store.save = async (room) => {
+    if (room.heartbeat?.activity_at !== undefined) throw new Error('observation save failed after durable append');
+    return save(room);
+  };
+  f.incoming({ text });
+  await assert.rejects(f.service.resumePending(ROOM_ID), /observation save failed/);
+  f.store.save = save;
+}
+
+test('C11: a failed observation save is repaired when intake replays the archived message', async (t) => {
+  const f = await fixture(t);
+  await f.start();
+  await f.advance(5 * MINUTE);
+  await discussionWithObservationFailure(f, 'Real progress');
+  assert.equal((await f.store.load(ROOM_ID)).heartbeat.activity_at, undefined);
+  f.clock.now += 1 * MINUTE;
+  await f.service.resumePending(ROOM_ID);
+  const policy = (await f.store.load(ROOM_ID)).heartbeat;
+  assert.equal(policy.activity_at, new Date(START + 6 * MINUTE).toISOString());
+  assert.equal((await f.records('message')).filter((record) => record.text === 'Real progress').length, 1);
+  await f.advance(20 * MINUTE);
+  assert.deepEqual((await f.heartbeats()).map((record) => (Date.parse(record.at) - START) / MINUTE), [26]);
+});
+
+test('C11: later unrecorded discussion moves an already observed crash-gap window', async (t) => {
+  const f = await fixture(t);
+  await f.start();
+  await f.advance(5 * MINUTE);
+  await discussionWithObservationFailure(f, 'First real discussion');
+  await f.advance(15 * MINUTE);
+  // The tick first-observed the unrecorded discussion at 20 minutes.
+  assert.equal((await f.heartbeats()).length, 0);
+  assert.deepEqual(f.clock.pendingDeadlines(), [START + 40 * MINUTE]);
+  // A second message also misses its observation; its replay is not run.
+  await f.advance(19 * MINUTE);
+  const chat = {
+    version: 1, kind: 'message', room_id: ROOM_ID, at: f.clock.iso(), message_id: nextMessageId(),
+    author: { identity: ALICE, display_name: 'Alice', role: 'builder' }, category: 'chat', text: 'Second real discussion',
+    recipient_identities: [], source_msg_id: 900, source_wire_id: 'wire-900',
+  };
+  f.packet.inbox.length = 0;
+  await f.store.append(ROOM_ID, chat);
+  await f.advance(1 * MINUTE);
+  assert.equal((await f.heartbeats()).length, 0, 'later discussion must reset the window');
+  assert.deepEqual(f.clock.pendingDeadlines(), [START + 60 * MINUTE]);
+});

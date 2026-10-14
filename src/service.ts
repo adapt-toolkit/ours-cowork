@@ -2322,7 +2322,9 @@ export class RoomService {
     }) as MessageRecord[];
     // A heartbeat from an earlier generation never anchors the current window.
     const lastHeartbeatAt = latest?.heartbeat?.generation === policy.generation ? latest.at : undefined;
-    const unrecordedSeq = await this.firstDiscussionAfter(roomId, policy.observed_seq);
+    // Keyed by the latest unrecorded discussion, so later activity that also
+    // missed its observation still moves the window forward when first seen.
+    const unrecordedSeq = await this.lastDiscussionAfter(roomId, policy.observed_seq);
     const unrecordedDiscussionAt = unrecordedSeq !== undefined
       ? new Date(this.firstObservation(roomId, 'discussion', `${policy.generation}:${unrecordedSeq}`, nowMs)).toISOString()
       : undefined;
@@ -2339,6 +2341,21 @@ export class RoomService {
     if (seen?.key === key) return seen.at;
     this.heartbeatObservations.set(slot, { key, at: nowMs });
     return nowMs;
+  }
+
+  /** Seq of the latest discussion record after `afterSeq`, scanning every page; undefined if none. */
+  private async lastDiscussionAfter(roomId: string, afterSeq: number): Promise<number | undefined> {
+    const [file] = await queryStore(this.store, roomId, { kind: 'file', after: afterSeq, descending: true, limit: 1 });
+    let latest = file?.seq;
+    let after = afterSeq;
+    for (;;) {
+      const chats = await queryStore(this.store, roomId, {
+        kind: 'message', category: 'chat', after, limit: DISCUSSION_SCAN_PAGE,
+      });
+      for (const chat of chats) if (isDiscussionRecord(chat) && (latest === undefined || chat.seq > latest)) latest = chat.seq;
+      if (chats.length < DISCUSSION_SCAN_PAGE) return latest;
+      after = chats[chats.length - 1]!.seq;
+    }
   }
 
   /** Seq of the first discussion record after `afterSeq`, scanning every page; undefined if none. */

@@ -106,6 +106,8 @@ export class IntakePump {
   private readonly nextMessageId: () => string;
   private readonly pumps = new Map<string, NotificationState>();
   private readonly notifications = new Map<string, NotificationState>();
+  /** Per room: how many passes have observed an empty SDK inbox. */
+  private readonly emptyInboxPasses = new Map<string, number>();
   private acceptingNotifications = true;
 
   constructor(store: IntakeStore, packets: IntakePacketRegistry, private readonly options: IntakePumpOptions = {}) {
@@ -163,12 +165,19 @@ export class IntakePump {
   }
 
   /**
-   * Archive everything the SDK inbox already holds for this room. Unlike
-   * resumePending, this waits for an already-running pump, which re-reads the
-   * inbox because it is marked dirty.
+   * Archive everything the SDK inbox already holds for this room, waiting for
+   * any running pump. Resolves true only when a pass that started after this
+   * call read the inbox to empty; false when intake failed or paused.
    */
-  settle(roomId: string): Promise<void> {
-    return this.pump(roomId);
+  async settle(roomId: string): Promise<boolean> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    // A pass that began before this call cannot prove the inbox is empty now.
+    for (let active = this.pumps.get(id); active; active = this.pumps.get(id)) {
+      await active.work.catch(() => undefined);
+    }
+    const before = this.emptyInboxPasses.get(id) ?? 0;
+    try { await this.pump(id); } catch { /* relay failures are reported elsewhere; only the inbox proof matters */ }
+    return (this.emptyInboxPasses.get(id) ?? 0) > before;
   }
 
   private async runPump(roomId: string, state: NotificationState): Promise<void> {
@@ -243,7 +252,10 @@ export class IntakePump {
       if (await this.options.shouldPause?.(roomId)) break;
       const messages = await packet.listUnreadMessages(INTAKE_BATCH_SIZE);
       const files = await packet.listUnreadFiles(INTAKE_BATCH_SIZE);
-      if (messages.length === 0 && files.length === 0) break;
+      if (messages.length === 0 && files.length === 0) {
+        this.emptyInboxPasses.set(roomId, (this.emptyInboxPasses.get(roomId) ?? 0) + 1);
+        break;
+      }
       for (const item of messages) {
         if (await this.options.shouldPause?.(roomId)) break;
         await this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false));

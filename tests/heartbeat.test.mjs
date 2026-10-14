@@ -46,7 +46,11 @@ class FakePacket {
   beforeSend;
   sendFailure;
   constructor(contacts) { this.contacts = contacts; }
-  async listUnreadMessages(limit) { return structuredClone(this.inbox.slice(0, limit)); }
+  listFailures = 0;
+  async listUnreadMessages(limit) {
+    if (this.listFailures > 0) { this.listFailures -= 1; throw new Error('temporary inbox read failure'); }
+    return structuredClone(this.inbox.slice(0, limit));
+  }
   async listUnreadFiles(limit) { return structuredClone(this.fileInbox.slice(0, limit)); }
   async acknowledgeMessage(expected, onUnexpected) {
     for (;;) {
@@ -124,8 +128,6 @@ async function fixture(t, { room = baseRoom(), records = [], stateDir } = {}) {
 
 function build(t, dir, store, clock = new FakeClock(), packet) {
   const fakePacket = packet ?? new FakePacket([ALICE, BOB, CARA]);
-  // `hosted = false` models the gap between durable emission and a relay pass:
-  // the pump does nothing while the packet is not hosted.
   const registry = {
     hosted: true,
     get(id) { return id === ROOM_ID && this.hosted ? fakePacket : undefined; },
@@ -156,6 +158,22 @@ function build(t, dir, store, clock = new FakeClock(), packet) {
       clock.now = target;
     },
     async start() { service.startHeartbeats([ROOM_ID]); await f.settle(); },
+    /**
+     * Model the gap between durable emission and its relay pass: the pass
+     * right after the next heartbeat append fails on its inbox read, so the
+     * heartbeat stays queued until a later resumePending.
+     */
+    holdRelayAfterEmission() {
+      const append = store.append.bind(store);
+      store.append = async (roomId, draft) => {
+        const record = await append(roomId, draft);
+        if (draft.kind === 'message' && draft.category === 'heartbeat') {
+          fakePacket.listFailures += 1;
+          store.append = append;
+        }
+        return record;
+      };
+    },
     async records(kind) { return (await store.read(ROOM_ID)).filter((record) => kind === undefined || record.kind === kind); },
     async heartbeats() { return (await f.records('message')).filter((record) => record.category === 'heartbeat'); },
     heartbeatSends() { return fakePacket.sendCalls.filter((call) => call.body.kind === 'room_heartbeat'); },
@@ -303,10 +321,9 @@ test('discussion already in the SDK inbox at the deadline is archived before the
 test('discussion archived between emission and the relay pass cancels every pending send', async (t) => {
   const f = await fixture(t);
   await f.start();
-  f.registry.hosted = false;
+  f.holdRelayAfterEmission();
   await f.advance(20 * MINUTE);
   assert.equal((await f.heartbeats()).length, 1);
-  f.registry.hosted = true;
   // The relay pass archives inbox discussion before it reaches the pending sends.
   f.incoming({ text: 'Back at work' });
   await f.service.resumePending(ROOM_ID);
@@ -341,11 +358,10 @@ test('a partially dispatched heartbeat is cancelled for the rest after discussio
 test('interval change restarts the window and cancels queued heartbeats of the old generation', async (t) => {
   const f = await fixture(t);
   await f.start();
-  f.registry.hosted = false;
+  f.holdRelayAfterEmission();
   await f.advance(20 * MINUTE);
   await f.service.setHeartbeat(ROOM_ID, { interval_minutes: 5 });
   await f.settle();
-  f.registry.hosted = true;
   await f.service.resumePending(ROOM_ID);
   const policy = (await f.store.load(ROOM_ID)).heartbeat;
   assert.equal(policy.generation, 2);
@@ -363,12 +379,11 @@ test('interval change restarts the window and cancels queued heartbeats of the o
 test('disable then re-enable never revives an old pending heartbeat', async (t) => {
   const f = await fixture(t);
   await f.start();
-  f.registry.hosted = false;
+  f.holdRelayAfterEmission();
   await f.advance(20 * MINUTE);
   await f.service.setHeartbeat(ROOM_ID, { enabled: false });
   await f.service.setHeartbeat(ROOM_ID, { enabled: true });
   await f.settle();
-  f.registry.hosted = true;
   await f.service.resumePending(ROOM_ID);
   assert.equal(f.heartbeatSends().length, 0);
   assert.deepEqual(await f.relayStatuses(), ['A:skipped_cancelled', 'B:skipped_cancelled', 'C:skipped_cancelled']);
@@ -395,12 +410,11 @@ test('done stops monitoring, reopening starts a fresh window, and an old pending
 test('status change to done between emission and send cancels every pending send', async (t) => {
   const f = await fixture(t);
   await f.start();
-  f.registry.hosted = false;
+  f.holdRelayAfterEmission();
   await f.advance(20 * MINUTE);
   await f.service.updateRoom(ROOM_ID, { status: 'done' });
   await f.service.updateRoom(ROOM_ID, { status: 'in_progress' });
   await f.settle();
-  f.registry.hosted = true;
   await f.service.resumePending(ROOM_ID);
   assert.equal((await f.heartbeats()).length, 1);
   assert.equal(f.heartbeatSends().length, 0);
@@ -771,4 +785,83 @@ test('a moderator interval change made under the command lock re-arms the timer 
   assert.equal((await f.call({ enabled: false })).ok, true);
   await f.settle();
   assert.deepEqual(f.clock.pendingDeadlines(), []);
+});
+
+// ---- Critic C7–C9 regressions ---------------------------------------------------
+
+test('C7: real discussion behind more than a page of blank chats cancels a pending heartbeat', async (t) => {
+  const f = await fixture(t);
+  await f.start();
+  f.holdRelayAfterEmission();
+  await f.advance(20 * MINUTE);
+  assert.equal((await f.heartbeats()).length, 1);
+  await f.service.postMessage(ROOM_ID, { text: 'Actual progress after emission' });
+  for (let n = 0; n < 65; n += 1) await f.service.postMessage(ROOM_ID, { text: ' ' });
+  await f.service.resumePending(ROOM_ID);
+  assert.equal(f.heartbeatSends().length, 0);
+});
+
+test('C7: unrecorded discussion behind more than a page of blank chats is found by the paged scan', async (t) => {
+  const f = await fixture(t);
+  await f.start();
+  f.holdRelayAfterEmission();
+  await f.advance(20 * MINUTE);
+  const chat = (text, n) => ({
+    version: 1, kind: 'message', room_id: ROOM_ID, at: f.clock.iso(), message_id: nextMessageId(),
+    author: { identity: ALICE, display_name: 'Alice', role: 'builder' }, category: 'chat', text,
+    recipient_identities: [], source_msg_id: 500 + n, source_wire_id: `wire-raw-${n}`,
+  });
+  // Appended directly: the crash window where the observation was never recorded.
+  await f.store.append(ROOM_ID, chat('Unrecorded real discussion', 0));
+  for (let n = 1; n <= 130; n += 1) await f.store.append(ROOM_ID, chat('\t ', n));
+  await f.service.resumePending(ROOM_ID);
+  assert.equal(f.heartbeatSends().length, 0);
+  assert.deepEqual(await f.relayStatuses(), ['A:skipped_cancelled', 'B:skipped_cancelled', 'C:skipped_cancelled']);
+});
+
+test('C8: a failed inbox read at expiry never emits; the retry archives the discussion and resets the window', async (t) => {
+  const f = await fixture(t);
+  await f.start();
+  f.incoming({ text: 'Actual participant progress before expiry' });
+  f.packet.listFailures = 1;
+  await f.advance(20 * MINUTE);
+  assert.equal((await f.heartbeats()).length, 0);
+  // Fail closed, then retry after a bounded delay rather than spinning.
+  assert.deepEqual(f.clock.pendingDeadlines(), [START + 21 * MINUTE]);
+  await f.advance(1 * MINUTE);
+  assert.equal((await f.heartbeats()).length, 0);
+  assert.equal((await f.records('message')).filter((record) => record.text === 'Actual participant progress before expiry').length, 1);
+  assert.deepEqual(f.clock.pendingDeadlines(), [START + 41 * MINUTE]);
+  await f.advance(20 * MINUTE);
+  assert.equal((await f.heartbeats()).length, 1);
+});
+
+test('C8: a persistently failing inbox retries once per minute and never emits', async (t) => {
+  const f = await fixture(t);
+  await f.start();
+  f.packet.listFailures = Number.POSITIVE_INFINITY;
+  await f.advance(60 * MINUTE);
+  assert.equal((await f.heartbeats()).length, 0);
+  assert.deepEqual(f.clock.pendingDeadlines(), [START + 61 * MINUTE]);
+});
+
+test('C8: an unhosted packet cannot prove membership or inbox state, so nothing is emitted', async (t) => {
+  const f = await fixture(t);
+  await f.start();
+  f.registry.hosted = false;
+  await f.advance(45 * MINUTE);
+  assert.equal((await f.heartbeats()).length, 0);
+});
+
+test('C9: a missed contact removal is reconciled before the recipient snapshot', async (t) => {
+  const f = await fixture(t);
+  await f.start();
+  f.packet.contacts = [ALICE, CARA];
+  await f.advance(20 * MINUTE);
+  assert.equal(f.heartbeatSends().filter((call) => call.recipient === BOB).length, 0);
+  const [heartbeat] = await f.heartbeats();
+  assert.deepEqual(heartbeat.recipient_identities.sort(), [ALICE, CARA]);
+  const bob = (await f.store.load(ROOM_ID)).seats.find((candidate) => candidate.identity === BOB);
+  assert.equal(bob.state, 'removed');
+  assert.equal(bob.removal_reason, 'contact_absent');
 });

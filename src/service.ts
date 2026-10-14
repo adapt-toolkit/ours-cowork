@@ -161,8 +161,10 @@ const defaultHeartbeatTimer: HeartbeatTimer = {
   clear(handle) { clearTimeout(handle as ReturnType<typeof setTimeout>); },
 };
 
-/** Recent chat rows inspected to skip whitespace-only text when locating the latest discussion. */
-const DISCUSSION_SCAN_LIMIT = 64;
+/** Page size for complete scans of archived discussion after a sequence. */
+const DISCUSSION_SCAN_PAGE = 64;
+/** Retry delay when a tick cannot prove membership or inbox state. */
+const HEARTBEAT_RETRY_MS = 60_000;
 
 export type HeartbeatDisposition = 'send' | 'cancel' | 'removed';
 
@@ -2283,8 +2285,16 @@ export class RoomService {
    */
   private async runHeartbeat(roomId: string): Promise<void> {
     if (!this.heartbeatsStarted) return;
-    try { await this.intake.settle(roomId); } catch { /* delivery errors do not hide inactivity */ }
+    // Uncertainty never establishes inactivity: refresh membership from the
+    // SDK contacts and read the inbox to empty, or retry later without emitting.
+    let certain = true;
+    try { await this.reconcileRoom(roomId); } catch { certain = false; }
+    if (certain) certain = await this.intake.settle(roomId);
     if (!this.heartbeatsStarted) return;
+    if (!certain) {
+      await this.armHeartbeat(roomId, HEARTBEAT_RETRY_MS);
+      return;
+    }
     const emittedInterval = await this.lock(roomId, async () => {
       let room: Room;
       try { room = await this.store.load(roomId); } catch { return undefined; }
@@ -2312,9 +2322,9 @@ export class RoomService {
     }) as MessageRecord[];
     // A heartbeat from an earlier generation never anchors the current window.
     const lastHeartbeatAt = latest?.heartbeat?.generation === policy.generation ? latest.at : undefined;
-    const discussionSeq = await this.latestDiscussionSeq(roomId);
-    const unrecordedDiscussionAt = discussionSeq > policy.observed_seq
-      ? new Date(this.firstObservation(roomId, 'discussion', `${policy.generation}:${discussionSeq}`, nowMs)).toISOString()
+    const unrecordedSeq = await this.firstDiscussionAfter(roomId, policy.observed_seq);
+    const unrecordedDiscussionAt = unrecordedSeq !== undefined
+      ? new Date(this.firstObservation(roomId, 'discussion', `${policy.generation}:${unrecordedSeq}`, nowMs)).toISOString()
       : undefined;
     // Clock rewind: a component in the future is measured from when it was
     // first seen, so the delay is at most one interval and never reads as discussion.
@@ -2331,13 +2341,21 @@ export class RoomService {
     return nowMs;
   }
 
-  private async latestDiscussionSeq(roomId: string): Promise<number> {
-    const chats = await queryStore(this.store, roomId, {
-      kind: 'message', category: 'chat', descending: true, limit: DISCUSSION_SCAN_LIMIT,
-    });
-    const chat = chats.find(isDiscussionRecord);
-    const [file] = await queryStore(this.store, roomId, { kind: 'file', descending: true, limit: 1 });
-    return Math.max(chat?.seq ?? 0, file?.seq ?? 0);
+  /** Seq of the first discussion record after `afterSeq`, scanning every page; undefined if none. */
+  private async firstDiscussionAfter(roomId: string, afterSeq: number): Promise<number | undefined> {
+    const [file] = await queryStore(this.store, roomId, { kind: 'file', after: afterSeq, limit: 1 });
+    let after = afterSeq;
+    for (;;) {
+      const chats = await queryStore(this.store, roomId, {
+        kind: 'message', category: 'chat', after, limit: DISCUSSION_SCAN_PAGE,
+      });
+      const chat = chats.find(isDiscussionRecord);
+      if (chat !== undefined || chats.length < DISCUSSION_SCAN_PAGE) {
+        const seqs = [chat?.seq, file?.seq].filter((seq): seq is number => seq !== undefined);
+        return seqs.length === 0 ? undefined : Math.min(...seqs);
+      }
+      after = chats[chats.length - 1]!.seq;
+    }
   }
 
   private async archiveTailSeq(roomId: string): Promise<number> {
@@ -2412,7 +2430,10 @@ export class RoomService {
       kind: 'message', category: 'heartbeat', descending: true, limit: 1,
     });
     if (latest !== undefined && latest.seq > message.seq) return 'cancel';
-    if (await this.latestDiscussionSeq(roomId) > message.seq) return 'cancel';
+    // Recorded discussion is durable proof even when the archive scan below
+    // would have to page; the scan covers anything not yet recorded.
+    if (room.heartbeat.activity_at !== undefined && room.heartbeat.observed_seq > message.seq) return 'cancel';
+    if (await this.firstDiscussionAfter(roomId, message.seq) !== undefined) return 'cancel';
     return 'send';
   }
 

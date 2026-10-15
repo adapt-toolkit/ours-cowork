@@ -807,6 +807,190 @@ test('real executable fails closed when the shared daemon is absent and creates 
   assert.equal(existsSync(join(coworkState, 'management.sock')), false);
 });
 
+test('SessionEnd follows watcher and packet quiescence and precedes owner release', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-terminal-drain-'));
+  const events = [];
+  let releaseWatch, releasePacket;
+  const watch = new Promise((resolve) => { releaseWatch = resolve; });
+  const packet = new Promise((resolve) => { releasePacket = resolve; });
+  const host = new FakeHost(events);
+  host.quiesce = async () => { events.push('watch.drain'); await watch; };
+  const registry = new FakeRegistry(events);
+  registry.quiesce = async () => { events.push('packet.drain'); await packet; };
+  const daemon = new CoworkDaemon({
+    config: { version: 1, stateDir: dir, rest: { enabled: false, port: 3010 } },
+    prepare: () => ({ socketPath: join(dir, 'management.sock') }),
+    lock: () => ({ release: () => events.push('lock.release') }),
+    host, registry, store: { async list() { return []; } },
+    service: new FakeService(events, []), transports: { async start() {}, async stop() {} },
+    writePid() {}, removePid() {},
+    beforeTerminalRelease: async () => { events.push('SessionEnd'); },
+  });
+  try {
+    await daemon.boot();
+    const stopped = daemon.shutdown();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(events.includes('SessionEnd'), false);
+    releaseWatch();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(events.includes('SessionEnd'), false);
+    releasePacket(); await stopped;
+    assert(events.indexOf('service.drain') < events.indexOf('watch.drain'));
+    assert(events.indexOf('packet.drain') < events.indexOf('SessionEnd'));
+    assert(events.indexOf('SessionEnd') < events.indexOf('packets.remove'));
+  } finally { releaseWatch(); releasePacket(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('terminal replay retains original event and selection until public SDK validates complete ACK', async () => {
+  const { OwnerCleanup } = await import('../src/owner-cleanup.ts');
+  const { createServer } = await import('node:http');
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-terminal-replay-'));
+  const instanceId = '11111111-2222-4333-8444-555555555555';
+  const tokenPath = join(dir, 'credential');
+  writeFileSync(tokenPath, 'fixture-current-token', { mode: 0o600 });
+  let complete = false;
+  const bodies = [];
+  const server = createServer(async (req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/selection') {
+      res.end(JSON.stringify({ schema: 1, instanceId, capabilities: ['external-sessions-v1'] }));
+      return;
+    }
+    assert.equal(req.url, '/api/v1/releaseLease');
+    assert.equal(req.headers['x-ours-api-token'], 'fixture-current-token');
+    let body = ''; for await (const chunk of req) body += chunk;
+    bodies.push(JSON.parse(body));
+    res.end(JSON.stringify({ released: [], closed: [], attempted: 1, notified: complete ? 1 : 0, failed: complete ? 0 : 1 }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const selection = { endpoint: `http://127.0.0.1:${server.address().port}`, expectedInstanceId: instanceId, credentialPath: tokenPath };
+  const markers = { pid: process.pid, bootId: 'cowork-supervisor:test', startId: 'cowork-worker:test', domain: 'cowork:authenticated-ipc' };
+  try {
+    const cleanup = new OwnerCleanup({ stateDir: dir, selection });
+    cleanup.publish(['owner-original'], 'process-exit', markers);
+    const files = realFs.readdirSync(cleanup.directory).filter((name) => name.endsWith('.json'));
+    assert.equal(files.length, 1);
+    const path = join(cleanup.directory, files[0]);
+    const original = readFileSync(path, 'utf8');
+    assert.equal(lstatSync(path).mode & 0o777, 0o600);
+    assert.equal(lstatSync(cleanup.directory).mode & 0o777, 0o700);
+    assert.equal(original.includes('fixture-current-token'), false);
+    cleanup.publish(['owner-original'], 'session-end', { ...markers, startId: 'later-marker' });
+    assert.equal(readFileSync(path, 'utf8'), original);
+    await assert.rejects(cleanup.replay(), /incomplete|acknowledgement/i);
+    assert.equal(readFileSync(path, 'utf8'), original);
+    complete = true;
+    // Restart under changed launch selection: the saved event retains its own target.
+    const replay = new OwnerCleanup({ stateDir: dir, selection: { ...selection, endpoint: 'http://127.0.0.1:1' } });
+    await Promise.all([replay.replay(), replay.replay()]);
+    assert.equal(existsSync(path), false);
+    assert.equal(bodies.length, 2, 'replay is serial and coalesces concurrent callers');
+    assert.deepEqual(bodies[0], bodies[1]);
+    assert.deepEqual(bodies[0].observation, JSON.parse(original).observation);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('supervisor authenticates owner registration and publishes only on exact child exit', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-terminal-supervisor-'));
+  const capability = 'ab'.repeat(32);
+  const sent = [];
+  const child = Object.assign(new EventEmitter(), {
+    pid: process.pid, connected: true, exitCode: null,
+    send(message) { sent.push(message); }, kill() {},
+  });
+  const supervisor = new DaemonSupervisor({
+    child, capability, signals: new EventEmitter(), shutdownTimeoutMs: 20,
+    ownerCleanup: { stateDir: dir, selection: {
+      endpoint: 'http://127.0.0.1:1', expectedInstanceId: '11111111-2222-4333-8444-555555555555',
+      credentialPath: join(dir, 'credential'),
+    } },
+  });
+  try {
+    supervisor.start();
+    const context = sent[0].ownerContext;
+    assert.equal(context.process.pid, child.pid);
+    assert.match(context.process.bootId, /^cowork-supervisor:/);
+    assert.match(context.process.startId, /^cowork-worker:/);
+    child.emit('message', { type: 'owner_register', ownerInstanceId: 'early', capability });
+    child.emit('message', { type: 'init_ack', capability });
+    child.emit('message', { type: 'owner_register', ownerInstanceId: 'forged', capability: 'cd'.repeat(32) });
+    assert.equal(sent.length, 1);
+    child.emit('message', { type: 'owner_register', ownerInstanceId: 'actual-owner', capability, endpoint: 'http://wrong' });
+    assert.equal(sent[1].accepted, true);
+    child.emit('error', new Error('IPC error is not terminal evidence'));
+    child.emit('disconnect');
+    assert.equal(existsSync(join(dir, 'owner-terminal')), false);
+    child.emit('message', { type: 'owner_register', ownerInstanceId: 'late', capability });
+    assert.equal(sent.at(-1).accepted, false);
+    child.emit('exit', null, 'SIGKILL');
+    const terminalDir = join(dir, 'owner-terminal');
+    const files = realFs.readdirSync(terminalDir).filter((name) => name.endsWith('.json'));
+    assert.equal(files.length, 1);
+    const path = join(terminalDir, files[0]);
+    const original = readFileSync(path, 'utf8');
+    const record = JSON.parse(original);
+    assert.equal(record.observation.ownerInstanceId, 'actual-owner');
+    assert.equal(record.observation.reason, 'process-exit');
+    assert.equal(record.selection.endpoint, 'http://127.0.0.1:1');
+    assert.equal(original.includes(capability), false);
+    child.emit('close', null, 'SIGKILL');
+    assert.equal(readFileSync(path, 'utf8'), original);
+    supervisor.requestShutdown('SIGTERM');
+    assert((await supervisor.done).error);
+    assert.equal(readFileSync(path, 'utf8'), original);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('actual worker shutdown or IPC loss cancels pending owner admission before HTTP attachment', async (t) => {
+  const { createServer } = await import('node:http');
+  for (const action of ['shutdown', 'disconnect']) {
+    const dir = mkdtempSync(join(tmpdir(), 'cowork-admission-cancel-'));
+    const requests = [];
+    const server = createServer((req, res) => { requests.push(req.url); res.writeHead(503).end(); });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const selection = {
+      endpoint: `http://127.0.0.1:${server.address().port}`,
+      expectedInstanceId: '11111111-2222-4333-8444-555555555555', credentialPath: join(dir, 'credential'),
+    };
+    writeFileSync(selection.credentialPath, 'fixture-unused-token', { mode: 0o600 });
+    const capability = 'bc'.repeat(32);
+    const child = spawn(process.execPath, [DAEMON_EXECUTABLE], {
+      env: { ...process.env, OURS_COWORK_DAEMON_WORKER: '1', OURS_COWORK_SUPERVISOR_PID: String(process.pid),
+        OURS_COWORK_STATE_DIR: dir, OURS_DAEMON_URL: selection.endpoint,
+        OURS_DAEMON_ID: selection.expectedInstanceId, OURS_DAEMON_CREDENTIAL_PATH: selection.credentialPath },
+      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+    });
+    let stderr = '', registrationSeen = false;
+    child.stderr.setEncoding('utf8'); child.stderr.on('data', (value) => { stderr += value; });
+    child.on('message', (message) => {
+      if (message.type !== 'owner_register') return;
+      registrationSeen = true;
+      if (action === 'disconnect') child.disconnect();
+      else child.send({ type: 'shutdown', signal: 'SIGTERM', capability });
+    });
+    t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
+    child.send({ type: 'init', capability, ownerContext: {
+      stateDir: dir, selection, process: { pid: child.pid, bootId: 'cowork-supervisor:fixture',
+        startId: 'cowork-worker:fixture', domain: 'cowork:authenticated-ipc' },
+    } });
+    try {
+      const outcome = await waitForChildExitOrKill(child, 3_000);
+      assert.equal(outcome.timedOut, false, stderr);
+      assert.equal(registrationSeen, true, stderr);
+      assert.equal(outcome.result.signal, null, stderr);
+      assert.deepEqual(requests, [], 'cancelled unacknowledged owner must never attach');
+      assert.equal(existsSync(join(dir, 'daemon.lock')), false);
+    } finally {
+      server.closeAllConnections(); await new Promise((resolve) => server.close(resolve));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
 
 test('startup resumes accepted lifecycle work before inbox and never restores closed deletion identity', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-daemon-lifecycle-'));

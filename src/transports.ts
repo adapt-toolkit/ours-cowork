@@ -101,9 +101,14 @@ export class RpcDispatcher {
 
 export interface TransportServerOptions {
   socketPath: string;
-  rest: { enabled: boolean; port: number };
+  rest: { enabled: boolean; host?: '127.0.0.1' | '0.0.0.0'; port: number };
   unixDispatcher: RpcDispatcher;
   restDispatcher: RpcDispatcher;
+  management?: {
+    dispatcher: RpcDispatcher;
+    authorize: (request: http.IncomingMessage) => Promise<boolean>;
+  };
+  publicOrigin?: string;
   staticHandler?: StaticWebHandler;
   fs?: typeof nodeFs;
   log?: (...parts: unknown[]) => void;
@@ -127,6 +132,10 @@ export class TransportServer {
   private protectedPrivateReplacement?: ProtectedPath;
 
   constructor(options: TransportServerOptions) {
+    if (options.publicOrigin !== undefined) {
+      const url = new URL(options.publicOrigin);
+      if (!['http:', 'https:'].includes(url.protocol) || url.origin !== options.publicOrigin) throw new Error('Cowork public origin must be an exact HTTP(S) origin');
+    }
     this.options = options;
     this.fs = options.fs ?? nodeFs;
     this.staticHandler = options.staticHandler ?? createStaticWebHandler(new Map());
@@ -148,7 +157,7 @@ export class TransportServer {
     await this.cleanupStalePrivateSockets();
     const unix = net.createServer((socket) => this.handleUnix(socket));
     this.unixServer = unix;
-    const privateSocketPath = `${this.options.socketPath}.private-${process.pid}-${randomBytes(6).toString('hex')}`;
+    const privateSocketPath = `${this.options.socketPath}.private-${randomBytes(6).toString('hex')}`;
     this.privateSocketPath = privateSocketPath;
     try {
       await listen(unix, privateSocketPath);
@@ -170,7 +179,7 @@ export class TransportServer {
           });
         });
         this.httpServer = rest;
-        await listen(rest, this.options.rest.port, '127.0.0.1');
+        await listen(rest, this.options.rest.port, this.options.rest.host ?? '127.0.0.1');
       }
     } catch (error) {
       const quarantined = this.quarantinePublicPath();
@@ -197,7 +206,7 @@ export class TransportServer {
   }
 
   private async stopUnlocked(): Promise<void> {
-    for (const dispatcher of new Set([this.options.unixDispatcher, this.options.restDispatcher])) {
+    for (const dispatcher of new Set([this.options.unixDispatcher, this.options.restDispatcher, ...(this.options.management ? [this.options.management.dispatcher] : [])])) {
       dispatcher.beginShutdown();
     }
     const httpServer = this.httpServer;
@@ -213,7 +222,7 @@ export class TransportServer {
     await this.drainRequests();
     httpServer?.closeAllConnections?.();
     for (const socket of this.httpSockets) socket.destroy();
-    for (const dispatcher of new Set([this.options.unixDispatcher, this.options.restDispatcher])) {
+    for (const dispatcher of new Set([this.options.unixDispatcher, this.options.restDispatcher, ...(this.options.management ? [this.options.management.dispatcher] : [])])) {
       await dispatcher.drain();
     }
     for (const socket of this.sockets) socket.destroy();
@@ -271,7 +280,15 @@ export class TransportServer {
       socket.setTimeout(0);
     };
     try {
-      if (request.url !== '/rpc') {
+      if (request.url === '/client-config' && request.method === 'GET') {
+        activateResponse();
+        response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        response.end(JSON.stringify({ authenticatedBrowser: !!this.options.management }));
+        return await responseFinished(response);
+      }
+      const browser = request.url === '/browser/rpc' && !!this.options.management;
+      const management = request.url === '/management/rpc' || browser ? this.options.management : undefined;
+      if (request.url !== '/rpc' && !management) {
         if (request.method === 'GET') {
           activateResponse();
           if (await serveApiDocs(request, response)) return;
@@ -294,7 +311,25 @@ export class TransportServer {
         request.resume();
         return await responseFinished(response);
       }
-      if (!this.safeRestOrigin(request)) {
+      if (management && !browser && (request.headers.origin !== undefined || request.headers['sec-fetch-site'] !== undefined)) {
+        activateResponse();
+        sendJson(response, 403, errorResponse(null, 'forbidden', 'browser requests cannot use machine management'));
+        request.resume();
+        return await responseFinished(response);
+      }
+      if (browser && !this.safeAuthenticatedBrowserOrigin(request)) {
+        activateResponse();
+        sendJson(response, 403, errorResponse(null, 'forbidden', 'forbidden request origin'));
+        request.resume();
+        return await responseFinished(response);
+      }
+      if (management && !await management.authorize(request)) {
+        activateResponse();
+        sendJson(response, 401, errorResponse(null, 'unauthorized', 'server credential required'));
+        request.resume();
+        return await responseFinished(response);
+      }
+      if (!management && !this.safeRestOrigin(request)) {
         activateResponse();
         sendJson(response, 403, errorResponse(null, 'forbidden', 'forbidden request origin'));
         request.resume();
@@ -314,7 +349,7 @@ export class TransportServer {
         return await responseFinished(response);
       }
       activateResponse();
-      const rpc = await this.dispatchBytes(this.options.restDispatcher, body.bytes);
+      const rpc = await this.dispatchBytes(!browser && management ? management.dispatcher : this.options.restDispatcher, body.bytes);
       const status = 'error' in rpc
         ? rpc.error.code === 'method_not_found' ? 404
           : rpc.error.code === 'internal' ? 500 : 400
@@ -332,6 +367,18 @@ export class TransportServer {
         socket.setTimeout(HTTP_KEEP_ALIVE_TIMEOUT_MS);
       }
     }
+  }
+
+  private safeAuthenticatedBrowserOrigin(request: http.IncomingMessage): boolean {
+    const site = request.headers['sec-fetch-site'];
+    if (site !== undefined && site !== 'same-origin' && site !== 'none') return false;
+    const origin = request.headers.origin;
+    if (origin === undefined) return true;
+    if (this.options.publicOrigin) return origin === this.options.publicOrigin;
+    try {
+      const url = new URL(origin);
+      return ['http:', 'https:'].includes(url.protocol) && url.origin === origin && url.host === request.headers.host;
+    } catch { return false; }
   }
 
   private safeRestOrigin(request: http.IncomingMessage): boolean {
@@ -570,7 +617,8 @@ function isJsonMediaType(value: string | undefined): boolean {
 /**
  * Serve the read-only OpenAPI document and its browser UI. These carry no room
  * state and no secrets, so they follow the static console's exposure rules:
- * loopback-only listener, `'self'`-only CSP, and no remote asset of any kind.
+ * host-loopback-only publication (a container may explicitly listen on
+ * `0.0.0.0`), `'self'`-only CSP, and no remote asset of any kind.
  */
 async function serveApiDocs(
   request: http.IncomingMessage,
@@ -660,7 +708,7 @@ function readBody(request: http.IncomingMessage, limit: number): Promise<{ ok: t
   });
 }
 
-function unixSocketIsLive(path: string): Promise<boolean> {
+export function unixSocketIsLive(path: string): Promise<boolean> {
   return new Promise((resolveProbe, rejectProbe) => {
     const socket = net.createConnection(path);
     const timer = setTimeout(() => {

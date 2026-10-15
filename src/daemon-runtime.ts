@@ -1,3 +1,4 @@
+import { createManagementAuthorizer } from './http-management.ts';
 // SDK-backed daemon runtime. The SDK-free daemon-worker bootstrap imports this
 // only after installing its IPC shutdown/disconnect handlers.
 
@@ -15,6 +16,7 @@ import {
 export { loadConfig } from './config.ts';
 import { createOursHost, type OursRuntimeClientFactory } from './ours-runtime.ts';
 import { PacketRegistry } from './packets.ts';
+import { RoomOwnerLedger } from './room-owners.ts';
 import { RoomService } from './service.ts';
 import { CoworkStore } from './storage.ts';
 import { createPrivateServiceRoutes, createServiceRoutes, RpcDispatcher, TransportServer } from './transports.ts';
@@ -49,6 +51,7 @@ export interface DaemonHost {
   boot(): Promise<void>;
   close(): void;
   shutdown?(): Promise<DaemonHostShutdownResult>;
+  quiesce?(): Promise<void>;
 }
 
 export interface DaemonStore {
@@ -57,6 +60,7 @@ export interface DaemonStore {
 
 export interface DaemonRegistry {
   unhostAll(): Promise<void>;
+  quiesce?(): Promise<void>;
   unhost?(roomId: string): Promise<void>;
 }
 
@@ -110,6 +114,8 @@ export interface CoworkDaemonOptions {
   log?: (...parts: unknown[]) => void;
   onStage?: (stage: DaemonStage) => void;
   control?: DaemonControl;
+  registerOwner?: (owner: string) => Promise<void>;
+  beforeTerminalRelease?: () => Promise<void>;
 }
 
 export interface DaemonControl {
@@ -189,7 +195,7 @@ export class CoworkDaemon {
     this.options.onStage?.('post-lock');
     this.checkpoint();
     try {
-      this.host = this.options.host ?? createOursHost(config, this.options.log);
+      this.host = this.options.host ?? createOursHost(config, this.options.log, this.options.registerOwner);
       this.store = this.options.store ?? new CoworkStore(config.stateDir);
 
       // The closure deliberately queues notifications until every recovery
@@ -201,6 +207,8 @@ export class CoworkDaemon {
         config.stateDir,
         {
           log: this.options.log,
+          // V1 external owners only; legacy local-PID leases end with their process.
+          ...(process.env.OURS_DAEMON_ID ? { owners: new RoomOwnerLedger(config.stateDir, process.env.OURS_DAEMON_ID) } : {}),
           onNotify: (roomId, event) => {
             if (isIntakeNotification(event)) {
               this.handleNotification(roomId, event, serviceRef);
@@ -281,6 +289,12 @@ export class CoworkDaemon {
         : { ...serviceRoutes, ...createPrivateServiceRoutes(realService) };
       const unixDispatcher = new RpcDispatcher(unixRoutes);
       const restDispatcher = new RpcDispatcher(serviceRoutes);
+      const authorizeManagement = createManagementAuthorizer(process.env);
+      // Deliberately omit createDaemonControlRoutes from the HTTP allowlist.
+      const management = authorizeManagement ? {
+        dispatcher: new RpcDispatcher({ ...serviceRoutes, ...createPrivateServiceRoutes(realService) }),
+        authorize: authorizeManagement,
+      } : undefined;
       const staticHandler = createStaticWebHandler(loadWebAssets(
         fileURLToPath(new URL('./web/', import.meta.url)),
       ));
@@ -289,6 +303,8 @@ export class CoworkDaemon {
         rest: config.rest,
         unixDispatcher,
         restDispatcher,
+        management,
+        publicOrigin: process.env.OURS_COWORK_PUBLIC_ORIGIN,
         staticHandler,
         log: this.options.log,
       });
@@ -352,17 +368,28 @@ export class CoworkDaemon {
       }
       this.pidWritten = false;
     } catch (error) { errors.push(error); }
-    try { await this.registry?.unhostAll(); } catch (error) { errors.push(error); }
-    if (this.hostStartAttempted || this.hostBooted) {
+    let terminalReady = true;
+    if (this.options.beforeTerminalRelease) {
       try {
-        if (this.host?.shutdown) {
-          const result = await this.host.shutdown();
-          requiresProcessExit ||= result?.requiresProcessExit === true;
+        await this.host?.quiesce?.();
+        await this.registry?.quiesce?.();
+        if (errors.length > 0) throw new Error('cannot attest SessionEnd before successful intake drain');
+        await this.options.beforeTerminalRelease();
+      } catch (error) { errors.push(error); terminalReady = false; }
+    }
+    if (terminalReady) {
+      try { await this.registry?.unhostAll(); } catch (error) { errors.push(error); }
+      if (this.hostStartAttempted || this.hostBooted) {
+        try {
+          if (this.host?.shutdown) {
+            const result = await this.host.shutdown();
+            requiresProcessExit ||= result?.requiresProcessExit === true;
+          }
+          else this.host?.close();
+        } catch (error) {
+          requiresProcessExit ||= requiresExitFrom(error);
+          errors.push(error);
         }
-        else this.host?.close();
-      } catch (error) {
-        requiresProcessExit ||= requiresExitFrom(error);
-        errors.push(error);
       }
     }
     this.hostBooted = false;

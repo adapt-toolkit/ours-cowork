@@ -15,11 +15,14 @@ export const CoworkConfigSchema = z.object({
   consumer_commands: ConsumerConfigurationSchema.optional(),
   rest: z.object({
     enabled: z.boolean(),
+    host: z.enum(['127.0.0.1', '0.0.0.0']).optional(),
     port: z.number().int().min(1).max(65_535),
   }).strict(),
 }).strict();
 
 export type CoworkConfig = z.infer<typeof CoworkConfigSchema>;
+
+export const MANAGEMENT_SOCKET_NAME = 'management.sock';
 
 export interface RuntimeState {
   socketPath: string;
@@ -96,6 +99,7 @@ export function loadConfig(
       ...(file.consumer_commands === undefined ? {} : { consumer_commands: file.consumer_commands }),
       rest: {
         enabled: restPort === undefined ? file.rest.enabled : true,
+        ...(file.rest.host === undefined ? {} : { host: file.rest.host }),
         port: restPort ?? file.rest.port,
       },
     });
@@ -114,7 +118,7 @@ function rejectRemovedEnvironment(env: ConfigEnvironment): void {
   if (removed.length === 0) return;
   throw new CoworkConfigError(
     `${removed.join(', ')} ${removed.length === 1 ? 'was' : 'were'} removed: ours-cowork now attaches only to the shared ours daemon. ` +
-    'Configure that daemon with @ours.network/cli and select it through the standard OURS_CONFIG, OURS_PORT, and OURS_STATE_DIR inputs.',
+    'Configure that daemon with @ours.network/daemon and select it through the standard OURS_CONFIG, OURS_PORT, and OURS_STATE_DIR inputs.',
   );
 }
 
@@ -124,7 +128,7 @@ function rejectRemovedConfig(value: unknown, path: string): void {
   if (removed.length === 0) return;
   throw new CoworkConfigError(
     `cowork config at ${path} contains removed ${removed.join(' and ')} ${removed.length === 1 ? 'key' : 'keys'}: ` +
-    'ours-cowork now attaches only to the shared ours daemon. Remove those keys and configure the daemon with @ours.network/cli.',
+    'ours-cowork now attaches only to the shared ours daemon. Remove those keys and configure the daemon with @ours.network/daemon.',
   );
 }
 
@@ -150,7 +154,7 @@ export function ensureRuntimeState(config: CoworkConfig, io: ConfigIo = {}): Run
   assertSecureDirectory(fs, roomsPath, 'rooms directory');
 
   return {
-    socketPath: join(stateDir, 'management.sock'),
+    socketPath: join(stateDir, MANAGEMENT_SOCKET_NAME),
     pidPath: join(stateDir, 'daemon.pid'),
     lockPath: join(stateDir, 'daemon.lock'),
   };

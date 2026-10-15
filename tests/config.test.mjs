@@ -11,6 +11,36 @@ test('default configuration enables the loopback web host on port 3052', () => {
   assert.equal('roomIdentity' in defaultConfig('/home/demo'), false);
 });
 
+test('protected configuration preserves only explicit supported REST hosts', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-config-rest-host-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  const base = {
+    version: 1,
+    stateDir: join(dir, 'state'),
+    rest: { enabled: true, port: 3052 },
+  };
+
+  writeFileSync(path, JSON.stringify(base), { mode: 0o600 });
+  assert.deepEqual(loadConfig({ OURS_COWORK_CONFIG: path }).rest, base.rest);
+
+  for (const host of ['127.0.0.1', '0.0.0.0']) {
+    writeFileSync(path, JSON.stringify({
+      ...base, rest: { ...base.rest, host },
+    }), { mode: 0o600 });
+    assert.deepEqual(loadConfig({ OURS_COWORK_CONFIG: path }).rest, {
+      ...base.rest, host,
+    });
+  }
+
+  for (const host of ['localhost', '192.168.1.20']) {
+    writeFileSync(path, JSON.stringify({
+      ...base, rest: { ...base.rest, host },
+    }), { mode: 0o600 });
+    assert.throws(() => loadConfig({ OURS_COWORK_CONFIG: path }), /invalid cowork config/i);
+  }
+});
+
 test('removed room identity naming configuration is rejected', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-config-room-identity-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

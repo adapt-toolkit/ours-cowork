@@ -136,6 +136,16 @@ describe('room DTO guards', () => {
     expect(isRoomDto(daemonRoom)).toBe(true);
     expect(isRoomListDto([daemonRoom])).toBe(true);
     expect(isParticipantListDto(daemonRoom.seats)).toBe(true);
+    const removedSeat = {
+      ...daemonRoom.seats[0]!, state: 'removed', removed_at: AT,
+      removed_epoch: 1, removal_reason: 'contact_absent',
+    };
+    const reconciledRoom = { ...daemonRoom, membership_epoch: 1, seats: [removedSeat] };
+    expect(isRoomDto(reconciledRoom)).toBe(true);
+    expect(isRoomListDto([reconciledRoom])).toBe(true);
+    expect(isParticipantListDto([removedSeat])).toBe(true);
+    expect(isParticipantListDto([{ ...removedSeat, removal_reason: 'unknown' }])).toBe(false);
+    expect(isParticipantListDto([{ ...daemonRoom.seats[0]!, removal_reason: 'contact_absent' }])).toBe(false);
     expect(isRoomDto({ ...daemonRoom, role_briefings: undefined })).toBe(false);
     // rest_roles is part of the v2 room the daemon returns, and the guard is
     // exact-key: an unlisted field is rejected, so a new one must be listed.

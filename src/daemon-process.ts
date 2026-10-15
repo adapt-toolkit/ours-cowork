@@ -4,12 +4,14 @@
 import { randomBytes } from 'node:crypto';
 
 import { runSupervisor } from './daemon.ts';
+import { OwnerCleanup, ownerSelection, type OwnerContext } from './owner-cleanup.ts';
 
 const WORKER_HANDSHAKE_TIMEOUT_MS = 5_000;
 
 interface WorkerInitMessage {
   type: 'init';
   capability: string;
+  ownerContext?: OwnerContext;
 }
 
 interface WorkerShutdownMessage {
@@ -41,12 +43,33 @@ async function runWorker(): Promise<number> {
   let shutdownWork: Promise<void> | undefined;
   let daemon: import('./daemon-runtime.ts').CoworkDaemon | undefined;
   let capability: string | undefined;
+  let ownerContext: OwnerContext | undefined;
+  const owners = new Set<string>();
+  const admissions = new Map<string, { resolve(): void; reject(error: Error): void }>();
+  const cancelAdmissions = (): void => {
+    for (const pending of admissions.values()) pending.reject(new Error('owner admission cancelled by worker shutdown'));
+    admissions.clear();
+  };
+  const registerOwner = async (ownerInstanceId: string): Promise<void> => {
+    if (shutdownRequested || disconnected || !capability || !ownerContext) throw new Error('owner admission unavailable');
+    const registered = new Promise<void>((resolve, reject) => { admissions.set(ownerInstanceId, { resolve, reject }); });
+    try {
+      // Attach cannot race ahead of the parent's in-memory registration ACK.
+      void sendIpc({ type: 'owner_register', ownerInstanceId, capability }).then((sent) => {
+        if (!sent) admissions.get(ownerInstanceId)?.reject(new Error('owner registration IPC unavailable'));
+      });
+      await withTimeout(registered, WORKER_HANDSHAKE_TIMEOUT_MS, 'owner registration timed out');
+      if (shutdownRequested || disconnected || process.connected === false) throw new Error('owner admission cancelled');
+      owners.add(ownerInstanceId);
+    } finally { admissions.delete(ownerInstanceId); }
+  };
   let resolveShutdown!: (code: number) => void;
   const shutdownComplete = new Promise<number>((resolve) => { resolveShutdown = resolve; });
 
   const acknowledge = async (): Promise<void> => {
     if (shutdownWork) return shutdownWork;
     shutdownRequested = true;
+    cancelAdmissions();
     shutdownWork = (async () => {
       let requiresProcessExit = false;
       let error: unknown;
@@ -80,8 +103,15 @@ async function runWorker(): Promise<number> {
   const handshake = new Promise<'ready' | 'shutdown'>((resolve) => { resolveHandshake = resolve; });
   process.on('message', (message: unknown) => {
     if (isWorkerInitMessage(message)) {
-      if (capability && capability !== message.capability) return;
+      if (capability) return;
       capability = message.capability;
+      ownerContext = message.ownerContext;
+      if (ownerContext && ownerContext.process.pid !== process.pid) {
+        shutdownRequested = true;
+        resolveHandshake('shutdown');
+        void acknowledge();
+        return;
+      }
       void sendIpc({ type: 'init_ack', capability }).then((sent) => {
         if (sent) resolveHandshake('ready');
         else {
@@ -91,6 +121,13 @@ async function runWorker(): Promise<number> {
           void acknowledge();
         }
       });
+      return;
+    }
+    if (isRecord(message) && message.type === 'owner_registered' && message.capability === capability
+      && typeof message.ownerInstanceId === 'string') {
+      const pending = admissions.get(message.ownerInstanceId);
+      if (message.accepted === true && !shutdownRequested && !disconnected) pending?.resolve();
+      else pending?.reject(new Error('owner registration refused by supervisor'));
       return;
     }
     if (isWorkerShutdownMessage(message) && (!capability || capability === message.capability)) {
@@ -125,7 +162,16 @@ async function runWorker(): Promise<number> {
     await acknowledge();
     return shutdownComplete;
   }
+  if (ownerSelection(process.env) && !ownerContext) throw new Error('V1 worker requires authenticated owner context');
+  const cleanup = ownerContext ? new OwnerCleanup(ownerContext) : undefined;
   daemon = new runtime.CoworkDaemon({
+    ...(ownerContext ? {
+      registerOwner,
+      beforeTerminalRelease: async () => {
+        cleanup!.publish(owners, 'session-end', ownerContext!.process);
+        await cleanup!.replay();
+      },
+    } : {}),
     config: runtime.loadConfig(),
     log: (...parts) => console.error(...parts),
     writePid: (stateDir) => runtime.writeDaemonPid(stateDir, undefined, supervisorPid),

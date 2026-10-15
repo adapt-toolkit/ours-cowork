@@ -1069,15 +1069,40 @@ test('an observed transport refusal appends a terminal send_failed result withou
   assert.equal('wire_id' in result, false);
 });
 
-test('non-seat and non-active messages are consumed but never archived or relayed', async () => {
-  for (const roomOverride of [{}, { state: 'provisioning', activated_at: undefined }]) {
-    const f = fixture({ room: roomOverride });
-    f.packet.inbox.push(incoming(roomOverride.state ? {} : { sender_id: 'cid-outsider' }));
-    await f.pump.pump(ROOM_ID);
-    assert.equal(f.packet.inbox.length, 0);
-    assert.deepEqual(await f.store.read(ROOM_ID), []);
-    assert.equal(f.packet.sendCalls.length, 0);
-  }
+test('non-seat messages are consumed but never archived or relayed', async () => {
+  const f = fixture();
+  f.packet.inbox.push(incoming({ sender_id: 'cid-outsider' }));
+  await f.pump.pump(ROOM_ID);
+  assert.equal(f.packet.inbox.length, 0);
+  assert.deepEqual(await f.store.read(ROOM_ID), []);
+  assert.equal(f.packet.sendCalls.length, 0);
+});
+
+test('provisioning preserves text, files and typed command intake until activation', async () => {
+  const f = fixture({ room: { state: 'provisioning', activated_at: undefined } });
+  f.packet.inbox.push(incoming());
+  f.packet.fileInbox.push(incomingFile());
+  await f.pump.notify(ROOM_ID);
+  await f.pump.resumePending(ROOM_ID);
+  assert.equal(f.packet.inbox.length, 1);
+  assert.equal(f.packet.fileInbox.length, 1);
+  assert.equal(f.packet.drainCalls, 0);
+  assert.deepEqual(f.packet.acknowledgeOrder, []);
+  assert.deepEqual(await f.store.read(ROOM_ID), []);
+
+  f.store.rooms.set(ROOM_ID, room());
+  await f.pump.pump(ROOM_ID);
+  await f.pump.pump(ROOM_ID);
+  const records = await f.store.read(ROOM_ID);
+  assert.equal(byKind(records, 'message').length, 1);
+  assert.equal(byKind(records, 'file').length, 1);
+  assert.equal(byKind(records, 'message')[0].source_wire_id, 'wire-in-7');
+  assert.equal(byKind(records, 'file')[0].source_wire_id, 'wire-file-in-9');
+  assert.equal(f.packet.sendCalls.length, 4, 'one text and one file metadata envelope per recipient');
+  assert.equal(f.packet.sendFileCalls.length, 2);
+  assert.deepEqual(f.packet.acknowledgeOrder, ['message:7', 'file:9']);
+  assert.equal(f.packet.inbox.length, 0);
+  assert.equal(f.packet.fileInbox.length, 0);
 });
 
 test('an older row promoted after listing takes the full intake path before the expected acknowledgement retries', async () => {
@@ -1135,11 +1160,11 @@ test('an empty acknowledgement response treats the durably archived expected row
 });
 
 test('intake bounds each history query and services files between message backlog batches', async () => {
-  const f = fixture({ room: { state: 'provisioning', activated_at: undefined } });
+  const f = fixture();
   for (let msgId = 1; msgId <= 40; msgId += 1) {
-    f.packet.inbox.push(incoming({ msg_id: msgId, wire_id: `wire-backlog-${msgId}` }));
+    f.packet.inbox.push(incoming({ msg_id: msgId, wire_id: `wire-backlog-${msgId}`, sender_id: 'cid-outsider' }));
   }
-  f.packet.fileInbox.push(incomingFile({ file_id: 41, wire_id: 'wire-backlog-file' }));
+  f.packet.fileInbox.push(incomingFile({ file_id: 41, wire_id: 'wire-backlog-file', sender_id: 'cid-outsider' }));
 
   await f.pump.pump(ROOM_ID);
 

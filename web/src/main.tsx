@@ -1,6 +1,6 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { CoworkApp } from './App';
+import { BrowserSession } from './BrowserSession';
 import './styles/theme.css';
 import './styles/app.css';
 
@@ -10,6 +10,6 @@ if (!root) throw new Error('missing root element');
 
 createRoot(root).render(
   <StrictMode>
-    <CoworkApp />
+    <BrowserSession />
   </StrictMode>,
 );

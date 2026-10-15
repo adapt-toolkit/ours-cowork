@@ -20,6 +20,7 @@ export interface OursRuntimeClientFactory {
 export interface OursRuntimeHost extends OursRuntimeClientFactory {
   boot(): Promise<void>;
   close(): void;
+  quiesce(): Promise<void>;
   shutdown(): Promise<{ requiresProcessExit: boolean }>;
 }
 
@@ -32,14 +33,15 @@ const attachSharedClient: AttachClient = async (options) => {
 
 /**
  * Cowork is always a client of the one shared ours daemon. The cowork config is
- * intentionally not a daemon selection surface: SDK 3 resolves the ordinary
- * ours configuration/environment and proves endpoint/state-root coherence.
+ * intentionally not a daemon selection surface. V1 selection adapts explicit
+ * daemon environment inputs to the official SDK; legacy selection stays there too.
  */
 export function createOursHost(
   config: CoworkConfig,
   log: (...parts: unknown[]) => void = () => {},
+  registerOwner?: (owner: string) => Promise<void>,
 ): OursRuntimeHost {
-  return new SharedOursHost(log, attachSharedClient, config.consumer_commands !== undefined);
+  return new SharedOursHost(log, attachSharedClient, process.env, registerOwner, config.consumer_commands !== undefined);
 }
 
 export class SharedOursHost implements OursRuntimeHost {
@@ -47,6 +49,9 @@ export class SharedOursHost implements OursRuntimeHost {
   private readonly attach: AttachClient;
   private readonly listeners = new Set<(identityName: string, event?: NotificationEvent) => void>();
   private readonly watchers = new Map<string, IdentityWatcher>();
+  private readonly watchWork = new Set<Promise<void>>();
+  private readonly environment: NodeJS.ProcessEnv;
+  private selection?: AttachOursClientOptions;
   private readonly watchLeaseToken = `cowork-watch-${randomBytes(16).toString('hex')}`;
   private watchClient?: OursClient;
   private resyncTimer?: ReturnType<typeof setInterval>;
@@ -55,35 +60,41 @@ export class SharedOursHost implements OursRuntimeHost {
   constructor(
     log: (...parts: unknown[]) => void = () => {},
     attach: AttachClient = attachSharedClient,
+    environment: NodeJS.ProcessEnv = process.env,
+    private readonly registerOwner?: (owner: string) => Promise<void>,
     private readonly requireDynamicCatalogs = false,
   ) {
     this.log = log;
     this.attach = attach;
+    this.environment = { ...environment };
   }
 
   async boot(): Promise<void> {
     if (this.watchClient) return;
     if (this.closed) throw new Error('shared ours daemon host cannot restart in the same process');
-    const client = await this.attach({ leaseToken: this.watchLeaseToken });
+    this.selection = sharedSelection(this.environment);
+    await this.registerOwner?.(this.watchLeaseToken);
+    const client = await this.attach({ ...this.selection, leaseToken: this.watchLeaseToken });
     try {
       if (this.requireDynamicCatalogs) {
         const { version } = await client.version();
-        const parts = /^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
-        const [major, minor, patch] = parts ? parts.slice(1).map(Number) : [0, 0, 0];
-        if (!(major! > 3 || (major === 3 && (minor! > 7 || (minor === 7 && patch! >= 2))))) {
+        const parts = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
+        const [major, minor, patch] = parts ? parts.slice(1, 4).map(Number) : [0, 0, 0];
+        if (!(major! > 3 || (major === 3 && (minor! > 7 || (minor === 7 && (patch! > 2 || (patch === 2 && !parts?.[4]))))))) {
           throw new Error('consumer commands require shared daemon SDK 3.7.2 or newer (ours CLI 2.7.2)');
         }
       }
       this.watchClient = client;
     } catch (error) {
-      await client.releaseLease();
+      try { await client.releaseLease(); } finally { await client.close(); }
       throw error;
     }
   }
 
   async createClient(leaseToken = `cowork-${randomBytes(16).toString('hex')}`): Promise<OursClient> {
     if (!this.watchClient) throw new Error('shared ours daemon host is not booted');
-    return this.attach({ leaseToken });
+    await this.registerOwner?.(leaseToken);
+    return this.attach({ ...this.selection, leaseToken });
   }
 
   async listIdentityNames(localNames: ReadonlySet<string>): Promise<Set<string>> {
@@ -104,6 +115,11 @@ export class SharedOursHost implements OursRuntimeHost {
     const controller = new AbortController();
     const watcher: IdentityWatcher = { controller, work: Promise.resolve() };
     watcher.work = this.follow(identityName, controller.signal);
+    this.watchWork.add(watcher.work);
+    void watcher.work.then(
+      () => this.watchWork.delete(watcher.work),
+      () => this.watchWork.delete(watcher.work),
+    );
     this.watchers.set(identityName, watcher);
     // SDK 3's structured notification log covers inbox work but not every
     // contact-state transition (notably contact_accepted). Reconcile once now
@@ -118,18 +134,28 @@ export class SharedOursHost implements OursRuntimeHost {
     // lifecycle contract without hiding asynchronous watcher teardown.
   }
 
-  async shutdown(): Promise<{ requiresProcessExit: boolean }> {
-    if (this.closed) return { requiresProcessExit: false };
-    this.closed = true;
+  async quiesce(): Promise<void> {
     this.listeners.clear();
     this.stopStateResync();
     const watchers = [...this.watchers.values()];
     this.watchers.clear();
     for (const watcher of watchers) watcher.controller.abort();
-    await Promise.allSettled(watchers.map((watcher) => watcher.work));
+    // untrack aborts a watcher before shutdown; retain its work until it settles.
+    await Promise.allSettled([...this.watchWork]);
+  }
+
+  async shutdown(): Promise<{ requiresProcessExit: boolean }> {
+    if (this.closed) return { requiresProcessExit: false };
+    this.closed = true;
+    await this.quiesce();
     const client = this.watchClient;
     this.watchClient = undefined;
-    if (client) await client.releaseLease();
+    if (client) {
+      try {
+        const result = await client.releaseLease();
+        if (result.failed > 0) throw new Error('shared watcher lease cleanup incomplete');
+      } finally { await client.close(); }
+    }
     // The shared daemon remains owned by its operator/CLI and keeps running.
     return { requiresProcessExit: false };
   }
@@ -203,6 +229,19 @@ export class SharedOursHost implements OursRuntimeHost {
       }
     }
   }
+}
+
+function sharedSelection(env: NodeJS.ProcessEnv): AttachOursClientOptions {
+  const endpoint = env.OURS_DAEMON_URL;
+  const expectedInstanceId = env.OURS_DAEMON_ID;
+  const credentialPath = env.OURS_DAEMON_CREDENTIAL_PATH;
+  if ([endpoint, expectedInstanceId, credentialPath].some(value => value !== undefined)) {
+    if (!endpoint || !expectedInstanceId || !credentialPath) {
+      throw new Error('V1 selection requires OURS_DAEMON_URL, OURS_DAEMON_ID and OURS_DAEMON_CREDENTIAL_PATH');
+    }
+    return { endpoint, expectedInstanceId, credentialPath, sessionMode: 'external', env };
+  }
+  return { env };
 }
 
 interface IdentityWatcher {

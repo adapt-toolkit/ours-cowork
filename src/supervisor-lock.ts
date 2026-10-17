@@ -99,6 +99,31 @@ export function acquireSupervisorLock(stateDir: string, options: SupervisorLockO
   throw new Error('supervisor lock changed repeatedly while acquiring it');
 }
 
+/** The current supervisor generation, if any; read-only. */
+export function currentSupervisorGeneration(stateDir: string, fs: typeof nodeFs = nodeFs): number | undefined {
+  return generations(fs, stateDir).at(-1);
+}
+
+/**
+ * Read-only: true once the supervisor that held `generation` can no longer
+ * exclude a replacement — it left its tombstone, it is positively dead, or a
+ * later generation superseded it (only possible after one of those). Anything
+ * uncertain, including an unreadable record, is still held.
+ */
+export function supervisorGenerationFinished(
+  stateDir: string,
+  generation: number,
+  options: Pick<SupervisorLockOptions, 'fs' | 'inspect'> = {},
+): boolean {
+  const fs = options.fs ?? nodeFs;
+  if ((generations(fs, stateDir).at(-1) ?? 0) > generation) return true;
+  let holder: ReturnType<typeof readHolder>;
+  try { holder = readHolder(fs, generationPath(stateDir, generation)); } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+  return holder.released === true || !holderAlive(holder, options.inspect ?? inspectProcess);
+}
+
 /** Exclusively create one complete generation record; false when it already exists. */
 function publish(fs: typeof nodeFs, stateDir: string, path: string, record: SupervisorIncarnation): boolean {
   const temporary = temporaryPath(stateDir);

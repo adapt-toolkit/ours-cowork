@@ -1,3 +1,4 @@
+import { CoworkResourceViews, ResourceBindingError } from './resource-views.ts';
 import { classifyServiceError } from './command-routes.ts';
 import { randomBytes } from 'node:crypto';
 import * as http from 'node:http';
@@ -108,6 +109,7 @@ export interface TransportServerOptions {
     dispatcher: RpcDispatcher;
     authorize: (request: http.IncomingMessage) => Promise<boolean>;
   };
+  resources?: CoworkResourceViews;
   publicOrigin?: string;
   staticHandler?: StaticWebHandler;
   fs?: typeof nodeFs;
@@ -206,6 +208,7 @@ export class TransportServer {
   }
 
   private async stopUnlocked(): Promise<void> {
+    this.options.resources?.close();
     for (const dispatcher of new Set([this.options.unixDispatcher, this.options.restDispatcher, ...(this.options.management ? [this.options.management.dispatcher] : [])])) {
       dispatcher.beginShutdown();
     }
@@ -280,6 +283,52 @@ export class TransportServer {
       socket.setTimeout(0);
     };
     try {
+      const resourceUrl = new URL(request.url ?? '/', 'http://cowork');
+      const resourceRoute = /^\/(browser|management)?\/?resources(?:\/(.*))?$/.exec(resourceUrl.pathname);
+      if (resourceRoute) {
+        activateResponse();
+        const mode = resourceRoute[1], management = this.options.management;
+        const forbidden = mode === 'management'
+          ? !management || request.headers.origin !== undefined || request.headers['sec-fetch-site'] !== undefined
+          : mode === 'browser' ? !management || !this.safeAuthenticatedBrowserOrigin(request)
+          : !!management || !this.safeRestOrigin(request);
+        if (forbidden) { sendJson(response,403,{error:'forbidden request origin'});request.resume();return; }
+        if (management && !await management.authorize(request)) { sendJson(response,401,{error:'server credential required'});request.resume();return; }
+        const resources = this.options.resources;
+        if (!resources) { sendJson(response,503,{error:'resource source unavailable'});request.resume();return; }
+        // The existing operator credential owns the connection; no new token or auth scheme.
+        const owner = mode ? `${mode}:${request.headers['x-ours-api-token']}` : 'local';
+        try {
+          const parts = (resourceRoute[2] ?? '').split('/').filter(Boolean);
+          if (request.method === 'GET' && !parts.length) {
+            response.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-store','x-accel-buffering':'no'});
+            const connection = resources.open(response,owner,async()=>!management || await management.authorize(request));
+            response.once('close',connection.close);
+            await responseFinished(response); return;
+          }
+          if (parts.length !== 3 || parts[1] !== 'views') {sendJson(response,404,{error:'not found'});request.resume();return;}
+          const [connectionId,,viewId] = parts;
+          if (request.method === 'POST') {
+            if (!isJsonMediaType(request.headers['content-type'])) {sendJson(response,415,{error:'application/json required'});request.resume();return;}
+            const body = await readBody(request,MAX_REQUEST_BYTES);
+            if (!body.ok) {sendJson(response,413,{error:'request too large'});return;}
+            const value = JSON.parse(Buffer.from(body.bytes).toString());
+            if (response.destroyed) return;
+            const binding = resources.register(owner,connectionId,viewId,value.subscriptionEpoch,value.descriptor);
+            const retireAbandoned = () => {
+              if (response.writableFinished) return;
+              try { resources.remove(owner,connectionId,viewId,binding.subscriptionEpoch); } catch { /* connection already closed */ }
+            };
+            response.once('close',retireAbandoned);
+            response.once('finish',() => response.off('close',retireAbandoned));
+            sendJson(response,200,binding);return;
+          }
+          const epoch = Number(resourceUrl.searchParams.get('epoch'));
+          if (request.method === 'DELETE') {resources.remove(owner,connectionId,viewId,epoch);sendJson(response,200,{});return;}
+          if (request.method === 'GET') {sendJson(response,200,await resources.bound(owner,connectionId,viewId,epoch,resourceUrl.searchParams.get('baselineId') ?? ''));return;}
+          sendJson(response,404,{error:'not found'});request.resume();return;
+        } catch (error) {sendJson(response,error instanceof ResourceBindingError ? error.status : 400,{error:error instanceof Error?error.message:'invalid request'});return;}
+      }
       if (request.url === '/client-config' && request.method === 'GET') {
         activateResponse();
         response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -641,7 +690,7 @@ async function serveApiDocs(
   return true;
 }
 
-function sendJson(response: http.ServerResponse, status: number, value: RpcResponse): void {
+function sendJson(response: http.ServerResponse, status: number, value: unknown): void {
   const body = Buffer.from(JSON.stringify(value), 'utf8');
   response.writeHead(status, {
     'content-type': 'application/json',

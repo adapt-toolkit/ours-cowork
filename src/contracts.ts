@@ -932,6 +932,7 @@ const CloseNoticeResultShape = {
 
 export const MessageRecordSchema = z.object({ ...RecordCommonShape, ...MessageShape }).strict();
 export const FileRecordSchema = z.object({ ...RecordCommonShape, ...FileShape }).strict();
+export const FileMetadataRecordSchema = FileRecordSchema.omit({ data_base64: true });
 export const RelayIntentRecordSchema = z.object({ ...RecordCommonShape, ...RelayIntentShape }).strict();
 export const RelayResultRecordSchema = z.object({ ...RecordCommonShape, ...RelayResultShape }).strict();
 export const IntakeRejectionRecordSchema = z.object({ ...RecordCommonShape, ...IntakeRejectionShape }).strict();
@@ -1212,3 +1213,5 @@ export type CommunicationRecord = z.infer<typeof CommunicationRecordSchema>;
 export type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 export type IntakeRejection = Extract<CommunicationRecord, { kind: 'intake_rejection' }>;
 export type AppendRecord = z.infer<typeof AppendRecordSchema>;
+
+export type CommunicationMetadataRecord = Exclude<CommunicationRecord, { kind: 'file' }> | z.infer<typeof FileMetadataRecordSchema>;

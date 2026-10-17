@@ -1,4 +1,5 @@
 import type { FileRow } from './state/roomModel';
+import { isHistoryDto } from './api/types';
 
 export const FILE_INTEGRITY_ERROR = 'File integrity check failed; download blocked.';
 export const DOWNLOAD_MIME = 'application/octet-stream';
@@ -18,6 +19,7 @@ export interface DownloadEnvironment {
 }
 
 export async function verifiedFileBytes(file: Pick<FileRow, 'dataBase64' | 'size' | 'sha256'>): Promise<Uint8Array> {
+  if (typeof file.dataBase64 !== 'string') throw new FileIntegrityError();
   const bytes = decodeCanonicalBase64(file.dataBase64);
   if (bytes.byteLength !== file.size) throw new FileIntegrityError();
 
@@ -45,8 +47,10 @@ export function safeDownloadName(filename: string): string {
 export async function downloadVerifiedFile(
   file: Pick<FileRow, 'dataBase64' | 'size' | 'sha256' | 'filename'>,
   environment: DownloadEnvironment = browserDownloadEnvironment(),
+  signal?: AbortSignal,
 ): Promise<void> {
   const bytes = await verifiedFileBytes(file);
+  signal?.throwIfAborted();
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   const url = environment.createObjectURL(new Blob([copy.buffer], { type: DOWNLOAD_MIME }));
@@ -82,4 +86,22 @@ function browserDownloadEnvironment(): DownloadEnvironment {
     createAnchor: () => document.createElement('a'),
     schedule: (callback) => setTimeout(callback, 0),
   };
+}
+
+/** Fetch exactly the selected immutable record through the existing authenticated RPC. */
+export async function loadFileContent(
+  file: FileRow,
+  call: (method: string, params: Record<string, unknown>, options: {signal: AbortSignal}) => Promise<unknown>,
+  signal: AbortSignal,
+): Promise<string> {
+  const roomId = file.recordId.split(':')[0]!;
+  const records = await call('room.history', {room_id: roomId, after: file.seq - 1, limit: 1}, {signal});
+  signal.throwIfAborted();
+  if (!isHistoryDto(records) || records.length !== 1) throw new FileIntegrityError();
+  const record = records[0]!;
+  if (record.kind !== 'file' || record.room_id !== roomId || record.record_id !== file.recordId
+    || record.seq !== file.seq || record.file_id !== file.fileId || record.sha256 !== file.sha256
+    || record.size !== file.size || record.filename !== file.filename || record.mime !== file.mime
+    || typeof record.data_base64 !== 'string') throw new FileIntegrityError();
+  return record.data_base64;
 }

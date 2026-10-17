@@ -68,3 +68,13 @@ describe('verified file download', () => {
     expect(safeDownloadName('folder/name')).toBe('folder_name');
   });
 });
+
+it('does not start a download after disposal during integrity verification', async () => {
+  const controller = new AbortController();
+  const createObjectURL = vi.fn(() => 'blob:unexpected');
+  const environment: DownloadEnvironment = {createObjectURL, revokeObjectURL: vi.fn(), createAnchor: () => document.createElement('a'), schedule: vi.fn()};
+  const pending = downloadVerifiedFile({filename: 'file', dataBase64: 'QQ==', size: 1, sha256: SHA_A}, environment, controller.signal);
+  controller.abort();
+  await expect(pending).rejects.toMatchObject({name: 'AbortError'});
+  expect(createObjectURL).not.toHaveBeenCalled();
+});

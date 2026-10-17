@@ -37,6 +37,9 @@ async function startFakeDaemon(t, options = {}) {
   const polls = [];
   const waiting = new Set();
   const events = [];
+  const resources = new Set();
+  let position = 0;
+  const resourceFrame = kind => `event: resource\ndata: ${JSON.stringify({protocolVersion:1,producerGeneration:INSTANCE_ID,position,kind})}\n\n`;
   const identityRows = options.identityRows ?? [
     { name: IDENTITY },
     { name: 'Human@laptop' },
@@ -73,11 +76,20 @@ async function startFakeDaemon(t, options = {}) {
       send(200, { identities: identityRows });
       return;
     }
+    if (request.method === 'GET' && /^\/identities\/[^/]+\/resource-events$/.test(url.pathname)) {
+      if (!authorized()) return;
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      resources.add(response); response.write(resourceFrame('ready'));
+      const heartbeat = setInterval(() => response.write(resourceFrame('coverage')), 2000);
+      response.once('close', () => { clearInterval(heartbeat); resources.delete(response); });
+      return;
+    }
     const notifications = /^\/identities\/([^/]+)\/notifications$/.exec(url.pathname);
     if (request.method === 'GET' && notifications) {
       if (!authorized()) return;
       const raw = url.searchParams.get('since');
       polls.push(raw);
+      if (raw === null || raw === 'tip') { send(200, { cursor: events.length, events: [] }); return; }
       const since = raw === null || raw === 'tip' ? events.length : Number(raw);
       const held = { since, send: (body) => send(200, body), response };
       waiting.add(held);
@@ -102,6 +114,7 @@ async function startFakeDaemon(t, options = {}) {
   t.after(async () => {
     for (const held of [...waiting]) held.send({ cursor: events.length, events: [] });
     waiting.clear();
+    for (const response of resources) response.destroy();
     await new Promise((closed) => server.close(closed));
     rmSync(stateDir, { recursive: true, force: true });
   });
@@ -112,6 +125,7 @@ async function startFakeDaemon(t, options = {}) {
     requests,
     polls,
     emit(event) { events.push(event); flush(); },
+    commit() { position++; for (const response of resources) response.write(resourceFrame('committed')); },
     dropWatchers() {
       for (const held of [...waiting]) {
         waiting.delete(held);
@@ -217,7 +231,8 @@ test('shared notification watch forwards events and releases without stopping th
   await waitFor(() => daemon.watching === 1, 'notification watch');
   await waitFor(() => seen.length >= 1, 'initial state resync');
   const afterInitial = seen.length;
-  await waitFor(() => seen.length > afterInitial, 'periodic state resync for unlogged contact transitions');
+  daemon.commit();
+  await waitFor(() => seen.length > afterInitial, 'committed resource wake for contact transitions');
   const beforeEvent = seen.length;
 
   daemon.emit({

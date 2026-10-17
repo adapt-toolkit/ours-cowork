@@ -111,7 +111,8 @@ export interface RoomPacket {
 export interface PacketRegistryOptions {
   fs?: typeof fs;
   log?: (...parts: unknown[]) => void;
-  onNotify?: (roomId: string, event: string) => void;
+  onNotify?: (roomId: string, event: string) => void | Promise<void>;
+  onResourceHealth?: (roomId: string, healthy: boolean) => void;
   rebindSleep?: (ms: number) => Promise<void>;
   rebindRandom?: () => number;
   /** Durable V1 owner IDs; absent for legacy local-PID daemon selection. */
@@ -161,7 +162,8 @@ export class PacketRegistry {
   private readonly stateDir: string;
   private readonly fs: typeof fs;
   private readonly log: (...parts: unknown[]) => void;
-  private readonly onNotify: (roomId: string, event: string) => void;
+  private readonly onNotify: (roomId: string, event: string) => void | Promise<void>;
+  private readonly onResourceHealth: (roomId: string, healthy: boolean) => void;
   private readonly rebindSleep: (ms: number) => Promise<void>;
   private readonly rebindRandom: () => number;
   private readonly owners?: RoomOwnerLedger;
@@ -173,6 +175,7 @@ export class PacketRegistry {
     this.fs = options.fs ?? fs;
     this.log = options.log ?? (() => {});
     this.onNotify = options.onNotify ?? (() => {});
+    this.onResourceHealth = options.onResourceHealth ?? (() => {});
     this.rebindSleep = options.rebindSleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.rebindRandom = options.rebindRandom ?? Math.random;
     this.owners = options.owners;
@@ -182,9 +185,9 @@ export class PacketRegistry {
       const [roomId, packet] = found;
       // A delayed event for a previous identity with the same name has no authority.
       if (event?.event === 'contact_removed' && event.identity_cid !== packet.cid) return;
-      void packet.refresh().then(
+      return packet.refresh().then(
         () => this.onNotify(roomId, event?.event === 'contact_removed' ? 'contact_removed' : 'message_received'),
-        (error) => this.log(`[${name}] failed to refresh SDK state after notification:`, error),
+        (error) => { this.log(`[${name}] failed to refresh SDK state after notification:`, error); throw error; },
       );
     });
   }
@@ -360,7 +363,20 @@ export class PacketRegistry {
 
   /** Begin the shared daemon notification watch for one locally known name. */
   private track(roomId: string, identityName: string): void {
-    this.trackers.set(roomId, this.host.trackIdentity(identityName));
+    // The registry already owns the exact mapping; identity names need not
+    // contain the room ID. Subscribe before the watcher reports startup health.
+    const unsubscribe = this.host.onResourceHealth?.((name, healthy) => {
+      if (name === identityName) this.onResourceHealth(roomId, healthy);
+    });
+    try {
+      const untrack = this.host.trackIdentity(identityName);
+      this.trackers.set(roomId, () => {
+        try { untrack(); }
+        finally { unsubscribe?.(); this.onResourceHealth(roomId, true); }
+      });
+    } catch (error) {
+      unsubscribe?.(); this.onResourceHealth(roomId, true); throw error;
+    }
   }
 
   private untrack(roomId: string): void {

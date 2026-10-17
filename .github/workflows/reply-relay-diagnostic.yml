@@ -1,0 +1,45 @@
+# Diagnostic only (not part of the product change): runs the single reply-relay E2E test on the exact product PR head
+# below and keeps its evidence (driver stdout/stderr, acceptance.json, the fixture Cowork daemon.log copied by the
+# test's own cleanup before it removes its scratch directory). Lives only on a draft branch whose PR targets the
+# product branch, so the ordinary pull_request trigger runs it; it is never merged.
+name: Reply-relay diagnostic
+on:
+  pull_request:
+    branches: [feat/complete-resource-sse-20261017]
+permissions:
+  contents: read
+env:
+  # exact product PR head under test (this diagnostic branch's own HEAD is NOT tested)
+  COWORK_SHA: 859fd30e41707e489356b864c4078ff2a383d4e4
+jobs:
+  reply-relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COWORK_CHROME_PATH: /usr/bin/google-chrome
+      COWORK_REPLY_EVIDENCE_DIR: ${{ github.workspace }}/evidence/reply-relay
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ env.COWORK_SHA }}', persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Verify the product head
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          got=$(git rev-parse HEAD)
+          { node --version; npm --version; echo "head $got tree $(git rev-parse 'HEAD^{tree}')"; } | tee evidence/head.txt
+          [ "$got" = "$COWORK_SHA" ] || { echo "HEAD MISMATCH $got != $COWORK_SHA"; exit 1; }
+      - run: npm ci
+      - run: npm run build
+      - name: Failing reply-relay test only (same runner flags as npm test)
+        run: |
+          set -o pipefail
+          node --import tsx --test --test-concurrency=1 tests/reply-relay-e2e.test.mjs 2>&1 \
+            | tee evidence/reply-relay-test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reply-relay-diagnostic-${{ env.COWORK_SHA }}
+          path: evidence/
+          retention-days: 7

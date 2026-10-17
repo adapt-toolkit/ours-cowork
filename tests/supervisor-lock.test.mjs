@@ -7,7 +7,9 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { acquireSupervisorLock, inspectProcess, SupervisorAlreadyRunningError } from '../src/supervisor-lock.ts';
+import {
+  acquireSupervisorLock, currentSupervisorGeneration, inspectProcess, SupervisorAlreadyRunningError, supervisorGenerationFinished,
+} from '../src/supervisor-lock.ts';
 
 function stateDir(t) {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-supervisor-lock-'));
@@ -36,6 +38,24 @@ test('a live supervisor excludes every replacement until it releases', (t) => {
   assert.deepEqual(readdirSync(dir), ['supervisor.lock.2'], 'the superseded generation is removed by its successor');
   assert.throws(() => acquireSupervisorLock(dir, { pid: 300, inspect: everyone }), SupervisorAlreadyRunningError);
   second.release();
+});
+
+test('a stopped supervisor generation is finished only once it can no longer exclude a replacement', (t) => {
+  const dir = stateDir(t);
+  assert.equal(currentSupervisorGeneration(dir), undefined);
+  const first = acquireSupervisorLock(dir, { pid: 100, inspect: everyone });
+  const generation = currentSupervisorGeneration(dir);
+  assert.equal(generation, 1);
+  assert.equal(supervisorGenerationFinished(dir, generation, { inspect: everyone }), false, 'a live holder is not finished');
+  assert.equal(supervisorGenerationFinished(dir, generation, { inspect: table({ 100: {} }) }), false,
+    'a holder without incarnation evidence is not finished');
+  assert.equal(supervisorGenerationFinished(dir, generation, { inspect: table({}) }), true, 'a dead holder is finished');
+  assert.deepEqual(readdirSync(dir), ['supervisor.lock.1'], 'observation never changes the lock');
+  first.release();
+  assert.equal(supervisorGenerationFinished(dir, generation, { inspect: everyone }), true, 'a tombstone is finished');
+  acquireSupervisorLock(dir, { pid: 200, inspect: everyone });
+  assert.equal(supervisorGenerationFinished(dir, generation, { inspect: everyone }), true, 'a superseded generation is finished');
+  assert.equal(supervisorGenerationFinished(dir, 2, { inspect: everyone }), false, 'its live successor is not');
 });
 
 test('only positive evidence of death supersedes a recorded supervisor', (t) => {

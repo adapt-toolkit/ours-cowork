@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 import { ensureRuntimeState, loadConfig, type CoworkConfig } from './config.ts';
 import { MAX_EXTERNAL_INVITE_BYTES, MAX_MANAGEMENT_RESPONSE_BYTES, RuntimeCommandGrantPatternSchema } from './contracts.ts';
+import { currentSupervisorGeneration, supervisorGenerationFinished } from './supervisor-lock.ts';
 
 const EXIT = {
   success: 0,
@@ -793,6 +794,9 @@ async function stopDaemon(config: CoworkConfig): Promise<{ stopped: boolean }> {
   if (initial.kind === 'occupied') {
     throw new CliError(EXIT.invalidState, 'invalid_state', 'management endpoint did not prove cowork supervisor control');
   }
+  // The supervisor answering this session holds the newest lock generation
+  // until its terminal delivery is finished, after its control socket closes.
+  const generation = currentSupervisorGeneration(config.stateDir);
   let response: unknown;
   try {
     response = await rpcCall(
@@ -816,7 +820,8 @@ async function stopDaemon(config: CoworkConfig): Promise<{ stopped: boolean }> {
       return { stopped: true };
     }
     if (observed.kind === 'absent'
-      && !await socketOpen(socketPath, Math.min(500, Math.max(1, deadline - Date.now())))) {
+      && !await socketOpen(socketPath, Math.min(500, Math.max(1, deadline - Date.now())))
+      && (generation === undefined || supervisorGenerationFinished(config.stateDir, generation))) {
       return { stopped: true };
     }
     await sleep(100);

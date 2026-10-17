@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { CoworkApp, type RpcClient } from '../web/src/App';
 import type { RoomDto } from '../web/src/api/types';
+import type { ResourceDelivery } from '../web/src/state/poller';
 
 const AT = '2026-08-03T00:00:00.000Z';
 const ROOM_ONE = '01jz6y7n8p9q0r1s2t3v4w5x70';
@@ -92,7 +93,7 @@ describe('CoworkApp room orchestration', () => {
   });
   afterEach(() => vi.useRealTimers());
 
-  it('groups rooms, hash-routes selection, and refreshes the list every five seconds', async () => {
+  it('groups rooms and hash-routes selection without periodic healthy reads', async () => {
     const release = { ...room(ROOM_ONE, 'Release coordination', 'active'), room_name: 'Launch bridge' };
     const archive = { ...room(ROOM_TWO, 'Finished migration', 'closed'), room_name: 'Migration archive' };
     const call = vi.fn(async (method: string, params: Record<string, unknown>) => {
@@ -119,7 +120,7 @@ describe('CoworkApp room orchestration', () => {
 
     const before = call.mock.calls.filter(([method]) => method === 'room.list').length;
     await act(() => vi.advanceTimersByTimeAsync(5_000));
-    expect(call.mock.calls.filter(([method]) => method === 'room.list')).toHaveLength(before + 1);
+    expect(call.mock.calls.filter(([method]) => method === 'room.list')).toHaveLength(before);
   });
 
   it('loads a host history page with scoped messages and keeps rejection and relay rows in the archive', async () => {
@@ -159,26 +160,27 @@ describe('CoworkApp room orchestration', () => {
     expect(screen.getAllByText(/skipped_reply_unavailable/).some(element => element.closest('[role="tabpanel"]'))).toBe(true);
   });
 
-  it('preserves loaded room data and disables mutations when list polling disconnects', async () => {
+  it('preserves loaded room data and disables mutations when resource delivery disconnects', async () => {
     const release = room(ROOM_ONE, 'Release coordination', 'active');
-    let listCalls = 0;
-    const call = vi.fn(async (method: string) => {
-      if (method === 'room.list') {
-        listCalls += 1;
-        if (listCalls > 1) throw new Error('offline');
-        return [release];
-      }
-      if (method === 'room.show') return release;
-      throw new Error(`unexpected ${method}`);
-    });
-
-    render(<CoworkApp rpc={{ call } as RpcClient} />);
+    let delivery!: ResourceDelivery;
+    const call = vi.fn();
+    const rpc = {
+      call,
+      resources(value: ResourceDelivery) {
+        delivery = value;
+        return {watchRoom() {}, unwatchRoom() {}, close() {}};
+      },
+    } as RpcClient;
+    render(<CoworkApp rpc={rpc} />);
+    await act(async () => { delivery.snapshot('rooms', undefined, [release]); delivery.health(true); });
     expect(await screen.findByText('Release coordination')).toBeVisible();
-    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(screen.getByRole('button', { name: 'Create room' })).toBeEnabled();
+    await act(async () => delivery.health(false, new Error('offline')));
 
     expect(screen.getByText('Release coordination')).toBeVisible();
     expect(screen.getByRole('status')).toHaveTextContent('Disconnected');
     expect(screen.getByRole('button', { name: 'Create room' })).toBeDisabled();
+    expect(call).not.toHaveBeenCalled();
   });
 
   it('ignores a previous room response that resolves after the current selection', async () => {

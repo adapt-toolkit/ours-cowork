@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { CoworkApp, type RpcClient } from './App';
 import { rpcCall } from './api/rpc';
+import { createResourceSession } from './state/poller';
 
 /** Credentials live only in this mounted browser session, never browser storage. */
 export function BrowserSession() {
@@ -21,6 +22,7 @@ export function BrowserSession() {
     return () => controller.abort();
   }, []);
   const rpc = useMemo<RpcClient>(() => ({
+    resources: delivery => createResourceSession({...delivery,authenticationRequired:()=>{setCredential(undefined);setError('Your server credential is no longer authorized. Connect again.');}},credential),
     call: (method, params, options) => rpcCall(method, params, { signal: options?.signal, browserCredential: credential }),
   }), [credential]);
   if (mode === 'local') return <CoworkApp />;

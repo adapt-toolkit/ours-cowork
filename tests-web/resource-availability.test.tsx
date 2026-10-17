@@ -1,0 +1,21 @@
+import React from 'react';
+import {act,render,screen} from '@testing-library/react';
+import {afterEach,expect,it,vi} from 'vitest';
+import {CoworkApp,type RpcClient} from '../web/src/App';
+import type {ResourceDelivery} from '../web/src/state/poller';
+const ID='01jz6y7n8p9q0r1s2t3v4w5x70';
+const room={version:1,room_id:ID,room_name:'Available sibling',identity_name:'cowork-room',identity_cid:'cid-room',mission:{goal:'Goal',briefing:'Brief'},state:'active',invites:[],seats:[],created_at:'2026-08-03T00:00:00.000Z'};
+afterEach(()=>{location.hash='';});
+it('canonical success enables independent commands before every selected resource is ready',async()=>{
+ let delivery!:ResourceDelivery;
+ const call=vi.fn(async()=>[]);
+ const rpc={call,resources(d:ResourceDelivery){delivery=d;return {watchRoom(){},unwatchRoom(){},close(){}};}} as RpcClient;
+ location.hash=`#/rooms/${ID}`;render(<CoworkApp rpc={rpc}/>);
+ await act(async()=>{delivery.snapshot('rooms',undefined,[room]);delivery.degraded?.(ID);});
+ expect(screen.getByRole('button',{name:'Create room'})).toBeEnabled();
+ expect(screen.getByText('Connected')).toBeInTheDocument();expect(call).not.toHaveBeenCalled();
+ await act(async()=>{delivery.health(false,Error('transport lost'));});
+ expect(screen.getByRole('button',{name:'Create room'})).toBeDisabled();
+ await act(async()=>{await delivery.recover?.(undefined,new AbortController().signal);});
+ expect(screen.getByRole('button',{name:'Create room'})).toBeEnabled();
+});

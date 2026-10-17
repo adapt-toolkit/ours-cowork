@@ -45,7 +45,7 @@ const HistoryParams = z.object({
   room_id: z.string(),
   after: z.number().optional(),
   limit: z.number().optional(),
-  view: z.enum(['operator', 'participant']).optional(),
+  view: z.enum(['operator', 'operator-metadata', 'participant']).optional(),
 }).strict();
 const RoleBriefingSetParams = z.object({
   room_id: z.string(), role: z.string(), text: z.string(),

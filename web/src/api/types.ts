@@ -189,7 +189,7 @@ export interface FileRecordDto extends RecordCommonDto {
   mime: string;
   size: number;
   sha256: string;
-  data_base64: string;
+  data_base64?: string;
   recipient_identities: string[];
   source_file_id: number;
   source_wire_id?: string;
@@ -505,6 +505,10 @@ function hasValidMessageThread(value: Record<string, unknown>): boolean {
 }
 
 export function isCommunicationRecordDto(value: unknown): value is CommunicationRecordDto {
+  return isRecordDto(value, false);
+}
+
+function isRecordDto(value: unknown, metadataOnly: boolean): value is CommunicationRecordDto {
   if (!hasRecordCommon(value)) return false;
   switch (value.kind) {
     case 'message':
@@ -545,8 +549,9 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
         && optionalString(value.wire_id)
         && optionalString(value.metadata_wire_id);
     case 'file': {
+      const metadata = metadataOnly && !Object.hasOwn(value, 'data_base64');
       const decodedSize = canonicalBase64DecodedSize(value.data_base64);
-      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'file_id', 'author', 'filename', 'mime', 'size', 'sha256', 'data_base64', 'recipient_identities', 'source_file_id'], ['author_alias', 'source_wire_id', 'source_reply_to'])
+      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'file_id', 'author', 'filename', 'mime', 'size', 'sha256', ...(metadata ? [] : ['data_base64']), 'recipient_identities', 'source_file_id'], ['author_alias', 'source_wire_id', 'source_reply_to'])
         && isLowerCrockfordUlid(value.file_id)
         && isAuthor(value.author)
         && (value.author_alias === undefined || isAuthorAlias(value.author_alias))
@@ -556,7 +561,7 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
         && value.size <= MAX_FILE_BYTES
         && typeof value.sha256 === 'string'
         && /^[0-9a-f]{64}$/.test(value.sha256)
-        && decodedSize === value.size
+        && (metadata || decodedSize === value.size)
         && isUniqueStringArray(value.recipient_identities)
         && isNonNegativeSafeInteger(value.source_file_id)
         && optionalString(value.source_wire_id)
@@ -601,6 +606,10 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
     default:
       return false;
   }
+}
+
+export function isResourceHistoryDto(value: unknown): value is CommunicationRecordDto[] {
+  return Array.isArray(value) && value.every(record => isRecordDto(record, true));
 }
 
 export function isHistoryDto(value: unknown): value is CommunicationRecordDto[] {

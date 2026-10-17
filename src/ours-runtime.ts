@@ -6,13 +6,13 @@ import type { CoworkConfig } from './config.ts';
 
 const WATCH_RETRY_MIN_MS = 500;
 const WATCH_RETRY_MAX_MS = 30_000;
-const STATE_RESYNC_INTERVAL_MS = 2_000;
 
 export interface OursRuntimeClientFactory {
   createClient(leaseToken?: string): Promise<OursClient>;
   /** Return only daemon identities whose names are in cowork's durable room set. */
   listIdentityNames(localNames: ReadonlySet<string>): Promise<Set<string>>;
-  onIdentityNotify(listener: (identityName: string, event?: NotificationEvent) => void): () => void;
+  onIdentityNotify(listener: (identityName: string, event?: NotificationEvent) => void | Promise<void>): () => void;
+  onResourceHealth?(listener: (identityName: string, healthy: boolean) => void): () => void;
   trackIdentity(identityName: string): () => void;
 }
 
@@ -47,14 +47,14 @@ export function createOursHost(
 export class SharedOursHost implements OursRuntimeHost {
   private readonly log: (...parts: unknown[]) => void;
   private readonly attach: AttachClient;
-  private readonly listeners = new Set<(identityName: string, event?: NotificationEvent) => void>();
+  private readonly listeners = new Set<(identityName: string, event?: NotificationEvent) => void | Promise<void>>();
   private readonly watchers = new Map<string, IdentityWatcher>();
   private readonly watchWork = new Set<Promise<void>>();
   private readonly environment: NodeJS.ProcessEnv;
   private selection?: AttachOursClientOptions;
   private readonly watchLeaseToken = `cowork-watch-${randomBytes(16).toString('hex')}`;
   private watchClient?: OursClient;
-  private resyncTimer?: ReturnType<typeof setInterval>;
+  private readonly healthListeners = new Set<(identityName: string, healthy: boolean) => void>();
   private closed = false;
 
   constructor(
@@ -103,7 +103,7 @@ export class SharedOursHost implements OursRuntimeHost {
     return new Set(rows.flatMap((row) => localNames.has(row.name) ? [row.name] : []));
   }
 
-  onIdentityNotify(listener: (identityName: string, event?: NotificationEvent) => void): () => void {
+  onIdentityNotify(listener: (identityName: string, event?: NotificationEvent) => void | Promise<void>): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
@@ -121,11 +121,6 @@ export class SharedOursHost implements OursRuntimeHost {
       () => this.watchWork.delete(watcher.work),
     );
     this.watchers.set(identityName, watcher);
-    // SDK 3's structured notification log covers inbox work but not every
-    // contact-state transition (notably contact_accepted). Reconcile once now
-    // and periodically while the long poll supplies the low-latency path.
-    this.announce(identityName);
-    this.ensureStateResync();
     return () => this.untrack(identityName, watcher);
   }
 
@@ -136,7 +131,7 @@ export class SharedOursHost implements OursRuntimeHost {
 
   async quiesce(): Promise<void> {
     this.listeners.clear();
-    this.stopStateResync();
+    this.healthListeners.clear();
     const watchers = [...this.watchers.values()];
     this.watchers.clear();
     for (const watcher of watchers) watcher.controller.abort();
@@ -164,68 +159,97 @@ export class SharedOursHost implements OursRuntimeHost {
     if (this.watchers.get(identityName) !== watcher) return;
     this.watchers.delete(identityName);
     watcher.controller.abort();
-    if (this.watchers.size === 0) this.stopStateResync();
+    this.health(identityName, true);
   }
 
-  private ensureStateResync(): void {
-    if (this.resyncTimer) return;
-    this.resyncTimer = setInterval(() => {
-      for (const identityName of this.watchers.keys()) this.announce(identityName);
-    }, STATE_RESYNC_INTERVAL_MS);
-    this.resyncTimer.unref();
+  onResourceHealth(listener: (identityName: string, healthy: boolean) => void): () => void {
+    this.healthListeners.add(listener); return () => this.healthListeners.delete(listener);
+  }
+  private health(identityName: string, healthy: boolean): void {
+    for (const listener of this.healthListeners) { try { listener(identityName, healthy); } catch {} }
   }
 
-  private stopStateResync(): void {
-    if (!this.resyncTimer) return;
-    clearInterval(this.resyncTimer);
-    this.resyncTimer = undefined;
-  }
-
-  /**
-   * Long-poll one identity forever, reconnecting with bounded backoff.
-   *
-   * A replacement stream primes at the daemon tip, so each reconnection also
-   * requests a full state resync. The periodic resync above covers the small
-   * request-prime race and daemon transitions that are not in the structured
-   * notification log; reconciliation is idempotent and self-coalescing.
-   */
+  /** Subscribe before canonical admission/intake drain. Cursor belongs to this
+   * watcher, not a recreated notification generator, including empty pages. */
   private async follow(identityName: string, signal: AbortSignal): Promise<void> {
     let backoffMs = WATCH_RETRY_MIN_MS;
-    let resyncPending = false;
+    let cursor: number | undefined;
     while (!signal.aborted) {
       const client = this.watchClient;
       if (!client) return;
-      try {
-        const stream = client.watchNotifications(identityName, { signal });
-        let step = stream.next();
-        if (resyncPending) {
-          resyncPending = false;
-          this.announce(identityName);
-        }
-        for (let settled = await step; !settled.done; settled = await step) {
+      const attempt = new AbortController();
+      const lifetime = AbortSignal.any([signal, attempt.signal]);
+      this.health(identityName, false);
+      let notificationWork: Promise<void> | undefined;
+      let rejectWork!: (error: unknown) => void;
+      const workFailure = new Promise<never>((_, reject) => { rejectWork = reject; });
+      void workFailure.catch(() => {});
+      let observation: Promise<void> | undefined;
+      let canonicalWork: Promise<void> | undefined;
+      let canonicalDirty = false;
+      const drain = async () => {
+        while (!lifetime.aborted) {
+          const page = await client.readNotificationPage(identityName, { since: cursor, signal: lifetime });
+          // Commit the explicit page position only after every callback succeeds.
+          for (const event of page.events) await this.announce(identityName, event as NotificationEvent);
+          cursor = page.cursor;
+          // Canonical reconciliation alone does not prove the drain recovered:
+          // a poison page/callback must retain the consecutive-failure backoff.
           backoffMs = WATCH_RETRY_MIN_MS;
-          this.announce(identityName, settled.value);
-          step = stream.next();
         }
-        if (!signal.aborted) {
-          resyncPending = true;
-          this.log(`[${identityName}] shared ours daemon notification watch ended; reconnecting`);
-        }
+      };
+      // Consume source coverage independently of slow admission/intake. Commits
+      // coalesce into one pending pass rather than retaining frames or callbacks.
+      const scheduleCanonical = () => {
+        canonicalDirty = true;
+        if (canonicalWork || lifetime.aborted) return;
+        canonicalWork = (async () => {
+          while (canonicalDirty && !lifetime.aborted) {
+            canonicalDirty = false;
+            // Capture tip before recovery; retain the admitted cursor on retries.
+            if (cursor === undefined) {
+              const tip = await client.readNotificationPage(identityName, { since: 'tip', signal: lifetime });
+              if (lifetime.aborted) return;
+              cursor = tip.cursor;
+            }
+            await this.announce(identityName);
+            if (lifetime.aborted) return;
+            if (!notificationWork) { notificationWork = drain(); void notificationWork.catch(rejectWork); }
+          }
+          if (lifetime.aborted) return;
+          this.health(identityName, true);
+        })();
+        void canonicalWork.then(() => {
+          canonicalWork = undefined;
+          if (canonicalDirty && !lifetime.aborted) scheduleCanonical();
+        }, rejectWork);
+      };
+      try {
+        const observe = async () => {
+          for await (const frame of client.resourceEvents(identityName, { signal: lifetime })) {
+            if (frame.kind === 'resync') throw Error('resource continuity lost');
+            if (frame.kind === 'ready' || frame.kind === 'committed') scheduleCanonical();
+          }
+          if (!lifetime.aborted) throw Error('resource observation ended');
+        };
+        observation = observe();
+        await Promise.race([observation, workFailure]);
       } catch (error) {
-        if (signal.aborted) return;
-        resyncPending = true;
-        this.log(`[${identityName}] shared ours daemon notification watch failed:`, error);
+        if (!signal.aborted) this.log(`[${identityName}] shared resource observation failed:`, error);
+      } finally {
+        if (!signal.aborted) this.health(identityName, false); attempt.abort();
+        await Promise.allSettled([...(notificationWork ? [notificationWork] : []), ...(observation ? [observation] : []), ...(canonicalWork ? [canonicalWork] : [])]);
       }
       if (signal.aborted) return;
-      await sleep(backoffMs, signal);
-      backoffMs = Math.min(backoffMs * 2, WATCH_RETRY_MAX_MS);
+      await sleep(backoffMs, signal); backoffMs = Math.min(backoffMs * 2, WATCH_RETRY_MAX_MS);
     }
   }
 
-  private announce(identityName: string, event?: NotificationEvent): void {
+  private async announce(identityName: string, event?: NotificationEvent): Promise<void> {
     for (const listener of this.listeners) {
-      try { listener(identityName, event); } catch (error) {
+      try { await listener(identityName, event); } catch (error) {
         this.log(`cowork SDK notification listener failed for ${identityName}:`, error);
+        throw error;
       }
     }
   }

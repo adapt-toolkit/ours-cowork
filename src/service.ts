@@ -33,6 +33,7 @@ import {
   RoomSchema,
   UpdateRoomInputSchema,
   type CommunicationRecord,
+  type CommunicationMetadataRecord,
   type InviteMode,
   type RelayStatus,
   type Room,
@@ -103,7 +104,7 @@ const CreateInviteInputSchema = z.object({
 const HistoryOptionsSchema = z.object({
   after: z.number().int().nonnegative().safe().optional(),
   limit: z.number().int().positive().safe().optional(),
-  view: z.enum(['operator', 'participant']).optional(),
+  view: z.enum(['operator', 'operator-metadata', 'participant']).optional(),
 }).strict();
 
 const JOURNAL_WORK_BATCH_SIZE = 64;
@@ -117,7 +118,7 @@ const RemoveParticipantInputSchema = z.object({
   notify: z.boolean().optional(),
 }).strict();
 
-type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | 'append' | 'read' | 'delete'>
+type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | 'append' | 'read' | 'readMetadata' | 'delete'>
   & Pick<CoworkStore, 'discardPendingProvisioning'>
   & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'briefingDeliveryTimes'>>;
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
@@ -1210,6 +1211,29 @@ export class RoomService {
     return this.intake.drain();
   }
 
+  /** Operator resource metadata keeps file bytes on the explicit history read path. */
+  async resourceRoom(roomId: string, historyAfter?: number): Promise<unknown> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    try {
+      return await this.store.mutex(id, async () => {
+        const room = await this.showRoom(id), participants = await this.participants(id);
+        const history: unknown[] = [];
+        let after = historyAfter ?? 0;
+        for (;;) {
+          const page = await this.store.readMetadata(id, { after, limit: 200 });
+          if (!page.length) break;
+          history.push(...page); after = page[page.length - 1]!.seq;
+        }
+        return { room, participants, history, ...(historyAfter === undefined ? {} : {historyAfter}) };
+      });
+    } catch (error) {
+      // Only an actually absent room is a tombstone; corruption stays a failure.
+      const rooms = await this.listRooms();
+      if (!rooms.some(room => room.room_id === id)) return null;
+      throw error;
+    }
+  }
+
   async listRooms(): Promise<Room[]> {
     return this.store.list();
   }
@@ -1441,9 +1465,12 @@ export class RoomService {
   async history(
     roomId: string,
     options: unknown = {},
-  ): Promise<CommunicationRecord[] | HostParticipantHistoryRecord[]> {
+  ): Promise<CommunicationMetadataRecord[] | HostParticipantHistoryRecord[]> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const { view, ...page } = HistoryOptionsSchema.parse(options);
+    if (view === 'operator-metadata') {
+      return byteBoundedHistoryPage(await this.store.readMetadata(id, page as ArchiveReadOptions));
+    }
     const records = view === 'participant'
       ? await queryStore(this.store, id, { kind: 'message', after: page.after, limit: page.limit })
       : await this.store.read(id, page as ArchiveReadOptions);

@@ -377,8 +377,8 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
       limit: { type: 'integer', minimum: 1, description: 'Maximum number of records to return.' },
       view: {
         type: 'string',
-        enum: ['operator', 'participant'],
-        description: 'History projection. Defaults to the operator view.',
+        enum: ['operator', 'operator-metadata', 'participant'],
+        description: 'History projection. Defaults to the byte-bearing operator view; operator-metadata omits file bytes for resource recovery.',
       },
     }, ['room_id']),
     result: 'An array of communication records, byte-bounded to one page.',

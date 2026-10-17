@@ -23,7 +23,7 @@ try {
     format: 'esm',
     target: 'node20',
     outfile: output,
-    external: ['playwright-core'],
+    external: ['playwright-core', 'better-sqlite3'],
     sourcemap: false,
     logLevel: 'silent',
     define: { __COWORK_BROWSER_TEST_ROOT__: JSON.stringify(ROOT) },

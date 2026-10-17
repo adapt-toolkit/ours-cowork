@@ -405,6 +405,6 @@ test('browser smoke wrapper is Node 22 JavaScript and explicitly bundles its Typ
   assert.match(wrapper, /browser-smoke-entry\.ts/);
   assert.match(wrapper, /node_modules['"],\s*['"]\.cache/);
   assert.match(wrapper, /target:\s*['"]node20['"]/);
-  assert.match(wrapper, /external:\s*\[['"]playwright-core['"]\]/);
+  assert.match(wrapper, /external:\s*\[[^\]]*['"]playwright-core['"][^\]]*\]/);
   assert.match(wrapper, /await import\(pathToFileURL\(output\)\.href\)/);
 });

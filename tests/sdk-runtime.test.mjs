@@ -949,7 +949,7 @@ test('room terminal cleanup rejects existing release result failures',async()=>{
 
 test('host shutdown waits for watchers already untracked by room teardown',async()=>{
   let finish;const gate=new Promise(resolve=>{finish=resolve;});let released=false;
-  const client={async *watchNotifications(){await gate;},async releaseLease(){released=true;return {failed:0};},async close(){}};
+  const client={async *resourceEvents(){await gate;},async releaseLease(){released=true;return {failed:0};},async close(){}};
   const host=new SharedOursHost(()=>{},async()=>client,{});
   await host.boot();const untrack=host.trackIdentity(IDENTITY);untrack();
   const shutdown=host.shutdown();
@@ -1143,15 +1143,25 @@ test('typed SDK contact removal routes by immutable room CID, reconciles every a
 
 test('shared host forwards typed lifecycle events and resyncs when a watch reconnects', async () => {
   const event = { event: 'contact_removed', identity_cid: CID, cid: 'C'.repeat(64), by: 'peer' };
-  let watches = 0;
+  let watches = 0, polls = 0;
+  const cursors = [];
   let resolveSeen;
   const seen = new Promise(resolve => { resolveSeen = resolve; });
   const observed = [];
   const host = new SharedOursHost(() => {}, async () => ({
-    async *watchNotifications() {
+    async *resourceEvents(_identity, {signal}) {
       watches++;
-      if (watches === 1) { yield event; throw new Error('disconnected'); }
-      yield event;
+      yield {kind:'ready'};
+      if (!signal.aborted) await new Promise(resolve=>signal.addEventListener('abort',resolve,{once:true}));
+    },
+    async readNotificationPage(_identity, {since,signal}) {
+      cursors.push(since); polls++;
+      if (polls===1) return {cursor:1,events:[]};
+      if (polls===2) return {cursor:2,events:[event]};
+      if (polls===3) throw new Error('disconnected');
+      if (polls===4) return {cursor:3,events:[event]};
+      if (!signal.aborted) await new Promise(resolve=>signal.addEventListener('abort',resolve,{once:true}));
+      throw new Error('aborted');
     },
     async releaseLease() { return { failed: 0 }; },
     async close() {},
@@ -1162,8 +1172,8 @@ test('shared host forwards typed lifecycle events and resyncs when a watch recon
     if (watches > 1 && value) resolveSeen();
   });
   host.trackIdentity(IDENTITY);
-  await seen;
-  await host.shutdown();
+  try { await seen; } finally { await host.shutdown(); }
+  assert.deepEqual(cursors.slice(0,4),['tip',1,2,2],'reconnect resumes the committed notification cursor');
   assert(observed.filter(([, value]) => value === undefined).length >= 2, 'startup and reconnect request authoritative resync');
   assert.equal(observed.filter(([, value]) => value === event).length, 2);
 });

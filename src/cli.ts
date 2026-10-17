@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 import { ensureRuntimeState, loadConfig, type CoworkConfig } from './config.ts';
 import { MAX_EXTERNAL_INVITE_BYTES, MAX_MANAGEMENT_RESPONSE_BYTES, RuntimeCommandGrantPatternSchema } from './contracts.ts';
+import { currentSupervisorGeneration, supervisorGenerationFinished } from './supervisor-lock.ts';
 
 const EXIT = {
   success: 0,
@@ -644,13 +645,43 @@ async function waitForOwnedDaemon(config: CoworkConfig, timeoutMs: number): Prom
 }
 
 async function startCoworkDaemon(config: CoworkConfig): Promise<{ started: boolean; alreadyRunning: boolean }> {
+  const deadline = Date.now() + START_TIMEOUT_MS;
+  const remaining = (): number => deadline - Date.now();
   const socketPath = join(config.stateDir, 'management.sock');
-  const existing = await probeDaemon(config);
-  if (existing.kind === 'running') return { started: false, alreadyRunning: true };
-  if (existing.kind === 'occupied' || await socketOpen(socketPath)) {
-    throw new CliError(EXIT.invalidState, 'invalid_state', 'management socket is occupied by an endpoint without cowork supervisor control');
-  }
+  const lockHeld = (): CliError => new CliError(EXIT.invalidState, 'invalid_state', 'another cowork supervisor still holds the supervisor lock');
+  const admit = async (): Promise<{ started: false; alreadyRunning: true } | undefined> => {
+    if (remaining() <= 0) throw lockHeld();
+    const probe = await probeDaemon(config, Math.min(RPC_TIMEOUT_MS, remaining()));
+    if (probe.kind === 'running') return { started: false, alreadyRunning: true };
+    if (probe.kind === 'occupied' || (remaining() > 0 && await socketOpen(socketPath, Math.min(500, remaining())))) {
+      throw new CliError(EXIT.invalidState, 'invalid_state', 'management socket is occupied by an endpoint without cowork supervisor control');
+    }
+    return undefined;
+  };
+  const existing = await admit();
+  if (existing) return existing;
   ensureRuntimeState(config);
+  // A stopped supervisor closes its control socket before it finishes terminal
+  // owner delivery and releases its lock, and a concurrently started one holds
+  // its lock before it opens a socket. Wait for either within the same start
+  // budget, re-reading the newest generation, rather than spawning a
+  // replacement the held lock would refuse. The lock still arbitrates any race
+  // after the last check.
+  let waited = false;
+  for (;;) {
+    const generation = currentSupervisorGeneration(config.stateDir);
+    if (generation === undefined || supervisorGenerationFinished(config.stateDir, generation)) break;
+    if (remaining() <= 0) throw lockHeld();
+    waited = true;
+    await sleep(Math.min(200, remaining()));
+    const running = await admit();
+    if (running) return running;
+  }
+  if (waited) {
+    const running = await admit();
+    if (running) return running;
+  }
+  if (remaining() <= 0) throw lockHeld();
   const logPath = join(config.stateDir, 'daemon.log');
   const logFd = fs.openSync(logPath, 'a', 0o600);
   let child;
@@ -665,7 +696,7 @@ async function startCoworkDaemon(config: CoworkConfig): Promise<{ started: boole
   }
   child.unref();
   if (!child.pid) throw new CliError(EXIT.internal, 'internal', 'failed to spawn cowork daemon');
-  const ready = await waitForOwnedDaemon(config, START_TIMEOUT_MS);
+  const ready = await waitForOwnedDaemon(config, remaining());
   if (ready === null) {
     throw new CliError(EXIT.internal, 'internal', `daemon did not become ready; inspect ${logPath}`);
   }

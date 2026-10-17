@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import * as nodeFs from 'node:fs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { basename, dirname, join } from 'node:path';
@@ -7,6 +7,8 @@ import Database from 'better-sqlite3';
 import {
   AppendRecordSchema,
   CommunicationRecordSchema,
+  FileMetadataRecordSchema,
+  type CommunicationMetadataRecord,
   LowerCrockfordUlidSchema,
   RoomSchema,
   RoomV1Schema,
@@ -109,6 +111,25 @@ export class CoworkStore {
   private readonly lockOwnership = new AsyncLocalStorage<ReadonlyMap<string, LockOwnership>>();
   private readonly reconciledBlobRooms = new Set<string>();
 
+  private readonly resourceGeneration = randomUUID();
+  private resourcePosition = 0;
+  private readonly resourceListeners = new Set<(event: { roomId?: string; kind: 'metadata' | 'history' | 'delete' | 'health' }) => void>();
+  private readonly failedSources = new Map<string, string | undefined>();
+  onResourceCommit(listener: (event: { roomId?: string; kind: 'metadata' | 'history' | 'delete' | 'health' }) => void): () => void {
+    this.resourceListeners.add(listener); return () => this.resourceListeners.delete(listener);
+  }
+  resourceState(roomId?: string) { return { protocolVersion: 1 as const, producerGeneration: this.resourceGeneration, position: this.resourcePosition, health: [...this.failedSources.values()].some(scope => scope === undefined || scope === roomId) ? 'failed' as const : 'healthy' as const }; }
+  setResourceHealth(source: string, healthy: boolean, roomId?: string): void {
+    const previous = this.failedSources.has(source);
+    if (healthy) this.failedSources.delete(source); else this.failedSources.set(source, roomId);
+    if (previous === !healthy) return;
+    this.publishResource({ kind: 'health', ...(roomId ? {roomId} : {}) });
+  }
+  private publishResource(event: { roomId?: string; kind: 'metadata' | 'history' | 'delete' | 'health' }): void {
+    this.resourcePosition++;
+    for (const listener of this.resourceListeners) { try { listener(event); } catch { /* committed persistence wins */ } }
+  }
+
   constructor(stateDir: string, options: CoworkStoreOptions = {}) {
     if (!stateDir) throw new CoworkStorageError('state directory is required');
     this.stateDir = stateDir;
@@ -170,6 +191,7 @@ export class CoworkStore {
         this.fsyncDirectory(roomDir); this.fsyncDirectory(this.roomsDirectory());
         this.withDatabase(room.room_id, () => undefined, true);
         this.atomicMetadataWrite(this.metadataPath(room.room_id), room);
+      this.publishResource({roomId: room.room_id, kind: 'metadata'});
         return room;
       } catch (error) {
         if (created) {
@@ -191,6 +213,7 @@ export class CoworkStore {
     return this.mutex(room.room_id, () => {
       this.assertRoomDirectory(room.room_id);
       this.atomicMetadataWrite(this.metadataPath(room.room_id), room);
+      this.publishResource({roomId: room.room_id, kind: 'metadata'});
       return room;
     });
   }
@@ -228,7 +251,7 @@ export class CoworkStore {
         storedDraft = withoutBytes;
       }
       try {
-        return this.withDatabase(id, (db) => {
+        const committed = this.withDatabase(id, (db) => {
           const transaction = db.transaction(() => {
             const next = (db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM records').get() as { next: number }).next;
             // AppendRecordSchema already validated the complete caller-controlled
@@ -271,6 +294,8 @@ export class CoworkStore {
           });
           return transaction.immediate();
         });
+        this.publishResource({roomId: id, kind: 'history'});
+        return committed;
       } catch (error) {
         if (blob?.created) this.removeUnreferencedBlob(id, blob.path);
         throw this.wrap(`failed to append room "${id}" archive`, error);
@@ -288,6 +313,18 @@ export class CoworkStore {
       return this.withDatabase(id, (db) => this.decodeRows(id, db.prepare(
         'SELECT seq,payload_json,blob_path FROM records WHERE seq > ? ORDER BY seq ASC LIMIT ?',
       ).all(after, limit) as RecordRow[]));
+    });
+  }
+
+  /** Resource projections expose immutable file metadata without opening blobs. */
+  async readMetadata(roomId: string, options: ArchiveReadOptions = {}): Promise<CommunicationMetadataRecord[]> {
+    const id = this.roomId(roomId), after = options.after ?? 0, limit = options.limit ?? Number.MAX_SAFE_INTEGER;
+    this.validatePage(after, limit);
+    return this.mutex(id, () => {
+      this.assertRoomDirectory(id);
+      return this.withDatabase(id, db => this.decodeRows(id, db.prepare(
+        'SELECT seq,payload_json,blob_path FROM records WHERE seq > ? ORDER BY seq ASC LIMIT ?',
+      ).all(after, limit) as RecordRow[], false));
     });
   }
 
@@ -463,6 +500,7 @@ export class CoworkStore {
       this.fsyncDirectory(roomDir);
       if (this.lstatIfPresent(metadata)) { this.assertRegularFile(metadata, 'room metadata'); this.fs.unlinkSync(metadata); }
       this.fsyncDirectory(roomDir); this.fs.rmdirSync(roomDir); this.fsyncDirectory(this.roomsDirectory());
+      this.publishResource({roomId: id, kind: 'delete'});
     });
   }
 
@@ -564,7 +602,9 @@ export class CoworkStore {
     };
   }
 
-  private decodeRows(roomId: string, rows: RecordRow[]): CommunicationRecord[] {
+  private decodeRows(roomId: string, rows: RecordRow[]): CommunicationRecord[];
+  private decodeRows(roomId: string, rows: RecordRow[], fileBytes: false): CommunicationMetadataRecord[];
+  private decodeRows(roomId: string, rows: RecordRow[], fileBytes = true): CommunicationMetadataRecord[] {
     return rows.map((row) => {
       let decoded: unknown;
       try { decoded = JSON.parse(row.payload_json); }
@@ -576,12 +616,15 @@ export class CoworkStore {
         if (expectedPath === undefined || row.blob_path !== expectedPath) {
           throw new CoworkStorageError(`invalid blob reference in room "${roomId}" archive at sequence ${row.seq}`);
         }
-        const bytes = this.readFileNoFollow(join(this.roomDirectory(roomId), expectedPath), 'room file blob');
-        decoded = { ...(decoded as object), data_base64: bytes.toString('base64') };
+        if (fileBytes) {
+          const bytes = this.readFileNoFollow(join(this.roomDirectory(roomId), expectedPath), 'room file blob');
+          decoded = { ...(decoded as object), data_base64: bytes.toString('base64') };
+        }
       }
       try {
-        const record = CommunicationRecordSchema.parse(decoded);
-        if (record.room_id !== roomId || record.seq !== row.seq) throw new Error('indexed identity mismatch');
+        const record = !fileBytes && (decoded as {kind?: unknown})?.kind === 'file'
+          ? FileMetadataRecordSchema.parse(decoded) : CommunicationRecordSchema.parse(decoded);
+        if (record.room_id !== roomId || record.seq !== row.seq || record.record_id !== `${roomId}:${row.seq}`) throw new Error('indexed identity mismatch');
         return record;
       } catch (error) { throw new CoworkStorageError(`invalid record in room "${roomId}" archive at sequence ${row.seq}`, { cause: error }); }
     });

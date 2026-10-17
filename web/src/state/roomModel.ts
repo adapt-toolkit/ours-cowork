@@ -21,7 +21,7 @@ export interface FileRow {
   mime: string;
   size: number;
   sha256: string;
-  dataBase64: string;
+  dataBase64?: string;
 }
 
 export interface FileVersion extends FileRow {

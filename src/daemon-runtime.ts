@@ -1,3 +1,4 @@
+import { CoworkResourceViews } from './resource-views.ts';
 import { createManagementAuthorizer } from './http-management.ts';
 // SDK-backed daemon runtime. The SDK-free daemon-worker bootstrap imports this
 // only after installing its IPC shutdown/disconnect handlers.
@@ -195,6 +196,7 @@ export class CoworkDaemon {
     try {
       this.host = this.options.host ?? createOursHost(config, this.options.log, this.options.registerOwner);
       this.store = this.options.store ?? new CoworkStore(config.stateDir);
+      if (this.store instanceof CoworkStore) this.store.setResourceHealth('process', false);
 
       // The closure deliberately queues notifications until every recovery
       // phase is complete. Restored identities may receive traffic as soon as
@@ -205,11 +207,14 @@ export class CoworkDaemon {
         config.stateDir,
         {
           log: this.options.log,
+          onResourceHealth: (roomId, healthy) => {
+            if (this.store instanceof CoworkStore) this.store.setResourceHealth(`room:${roomId}`, healthy, roomId);
+          },
           // V1 external owners only; legacy local-PID leases end with their process.
           ...(process.env.OURS_DAEMON_ID ? { owners: new RoomOwnerLedger(config.stateDir, process.env.OURS_DAEMON_ID) } : {}),
           onNotify: (roomId, event) => {
             if (isIntakeNotification(event)) {
-              this.handleNotification(roomId, event, serviceRef);
+              return this.handleNotification(roomId, event, serviceRef);
             }
           },
         },
@@ -302,6 +307,8 @@ export class CoworkDaemon {
         unixDispatcher,
         restDispatcher,
         management,
+        ...(this.store instanceof CoworkStore ? { resources: new CoworkResourceViews(this.store, async (descriptor, _signal, _owner, historyAfter) =>
+          descriptor.resource === 'rooms' ? realService.listRooms() : realService.resourceRoom(descriptor.roomId!, historyAfter)) } : {}),
         publicOrigin: process.env.OURS_COWORK_PUBLIC_ORIGIN,
         staticHandler,
         log: this.options.log,
@@ -313,6 +320,7 @@ export class CoworkDaemon {
 
       this.ready = true;
       await this.flushQueuedNotifications();
+      if (this.store instanceof CoworkStore) this.store.setResourceHealth('process', true);
       this.checkpoint();
       this.options.onStage?.('pre-pid');
       (this.options.writePid ?? writeDaemonPid)(config.stateDir);
@@ -348,6 +356,7 @@ export class CoworkDaemon {
   private async cleanupUnlocked(): Promise<DaemonShutdownResult> {
     this.stopping = true;
     this.ready = false;
+    if (this.store instanceof CoworkStore) this.store.setResourceHealth('process', false);
     const errors: unknown[] = [];
     let requiresProcessExit = false;
     try { this.service?.beginShutdown(); } catch (error) { errors.push(error); }
@@ -403,7 +412,7 @@ export class CoworkDaemon {
     if (this.cancelled) throw new DaemonBootCancelledError();
   }
 
-  private handleNotification(roomId: string, event = 'message_received', service = this.service): void {
+  private handleNotification(roomId: string, event = 'message_received', service = this.service): void | Promise<void> {
     if (this.stopping) return;
     if (!this.ready || !service?.notifyRoom) {
       this.queuedNotifications.add(roomId);
@@ -418,6 +427,7 @@ export class CoworkDaemon {
         this.options.log?.(`room notification failed for ${roomId}:`, error);
       },
     );
+    return work;
   }
 
   private async flushQueuedNotifications(): Promise<void> {

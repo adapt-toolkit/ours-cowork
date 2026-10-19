@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
-import { acquireDaemonLock, CoworkDaemon, isIntakeNotification } from '../src/daemon-runtime.ts';
+import { acquireDaemonLock, CoworkDaemon, isIntakeNotification, isTransportError } from '../src/daemon-runtime.ts';
+import { CoworkStore } from '../src/storage.ts';
 import { DAEMON_SHUTDOWN_TIMEOUT_MS, DaemonSupervisor } from '../src/daemon.ts';
 import {
   ensureRuntimeState,
@@ -646,6 +647,402 @@ test('one room reconciliation failure releases its lease while healthy rooms res
   assert(events.includes('transports.start'));
   await daemon.shutdown();
   rmSync(dir, { recursive: true, force: true });
+});
+
+async function until(condition, what, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    assert(Date.now() < deadline, `timed out waiting for ${what}`);
+    await new Promise((resolveTick) => setTimeout(resolveTick, 2));
+  }
+}
+
+/** What fetch rejects with when the daemon closes the connection. */
+const fetchFailed = (code = 'UND_ERR_SOCKET') => new TypeError('fetch failed', {
+  cause: Object.assign(new Error('other side closed'), { code }),
+});
+
+test('only connection failures count as transport errors', () => {
+  assert.equal(isTransportError(fetchFailed()), true);
+  assert.equal(isTransportError(fetchFailed('ECONNREFUSED')), true);
+  assert.equal(isTransportError(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })), true);
+  assert.equal(isTransportError(fetchFailed('UNABLE_TO_VERIFY_LEAF_SIGNATURE')), false, 'TLS is not transport');
+  assert.equal(isTransportError(new TypeError('fetch failed')), false, 'no cause, no classification');
+  assert.equal(isTransportError(new Error('restored room packet CID mismatch')), false);
+  assert.equal(isTransportError('fetch failed'), false);
+});
+
+/** A real store (for resource health) whose room list is fixed by the test. */
+class ListedStore extends CoworkStore {
+  rooms;
+  constructor(dir, rooms) { super(dir); this.rooms = rooms; }
+  async list() { return this.rooms; }
+  async load(roomId) {
+    const room = this.rooms.find((candidate) => candidate.room_id === roomId);
+    if (!room) throw new Error(`room "${roomId}" does not exist`);
+    return room;
+  }
+}
+
+const fanoutDaemon = (dir, events, logs, store, resumePending, drainPending, overrides = {}) => new CoworkDaemon({
+  config: { version: 1, stateDir: dir, rest: { enabled: false, port: 3010 } },
+  prepare: () => ({ socketPath: join(dir, 'management.sock') }),
+  lock: () => ({ release: () => events.push('lock.release') }),
+  host: new FakeHost(events),
+  store,
+  registry: new FakeRegistry(events),
+  service: Object.assign(new FakeService(events, []), { resumePending }, drainPending ? { drainPending } : {}),
+  transports: { async start() { events.push('transports.start'); }, async stop() { events.push('transports.stop'); } },
+  writePid: () => events.push('pid.write'), removePid: () => events.push('pid.remove'),
+  log: (line) => logs.push(line),
+  fanoutRetry: { initialMs: 5, maxMs: 20 },
+  ...overrides,
+});
+
+test('a failed startup fanout keeps the restored room hosted, unhealthy, and retries it until it succeeds', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-fanout-retry-'));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const events = [];
+  const logs = [];
+  const store = new ListedStore(dir, [{ room_id: roomId, state: 'active' }]);
+  let calls = 0;
+  let succeeded;
+  const success = new Promise((resolveSuccess) => { succeeded = resolveSuccess; });
+  const daemon = fanoutDaemon(dir, events, logs, store, async (id) => {
+    calls += 1;
+    events.push(`pending:${id}`);
+    if (calls === 1) throw fetchFailed();
+    succeeded();
+  });
+  try {
+    await daemon.boot();
+    assert.equal(events.includes(`unhost:${roomId}`), false, 'a fanout failure does not release the room');
+    assert(events.includes('transports.start'));
+    assert.equal(store.resourceState(roomId).health, 'failed', 'the room reports unhealthy until fanout succeeds');
+    const deferred = logs.map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .find((entry) => entry?.event === 'startup_room_fanout_deferred');
+    assert.equal(deferred?.room_id, roomId);
+    assert.equal(deferred?.error, 'fetch failed');
+    await success;
+    await until(() => store.resourceState(roomId).health === 'healthy', 'the room to report healthy after its retried fanout');
+    assert.equal(calls, 2);
+    assert(logs.some((line) => line.includes('"event":"startup_room_fanout_resumed"')));
+  } finally {
+    await daemon.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a deferred startup fanout backs off and stops retrying at shutdown', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-fanout-stop-'));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const events = [];
+  const logs = [];
+  const store = new ListedStore(dir, [{ room_id: roomId, state: 'active' }]);
+  const at = [];
+  let thirdCall;
+  const third = new Promise((resolveThird) => { thirdCall = resolveThird; });
+  const daemon = fanoutDaemon(dir, events, logs, store, async () => {
+    at.push(performance.now());
+    if (at.length === 3) thirdCall();
+    throw fetchFailed();
+  });
+  try {
+    await daemon.boot();
+    await third;
+    assert.equal(events.includes(`unhost:${roomId}`), false);
+    assert(at[2] - at[1] >= at[1] - at[0] - 1, 'each retry waits at least as long as the previous one');
+  } finally {
+    await daemon.shutdown();
+  }
+  const callsAtShutdown = at.length;
+  // Longer than the capped delay: a cancelled retry would have fired by now.
+  await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+  assert.equal(at.length, callsAtShutdown, 'no retry runs after shutdown');
+  assert.equal(store.resourceState(roomId).health, 'failed', 'shutdown does not report the room recovered');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+const fanoutLogs = (logs, event) => logs
+  .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+  .filter((entry) => entry?.event === event);
+
+test('a healthy resource observation does not clear a failed startup fanout', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-fanout-observer-'));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const events = [];
+  const logs = [];
+  const store = new ListedStore(dir, [{ room_id: roomId, state: 'active' }]);
+  const daemon = fanoutDaemon(dir, events, logs, store, async () => { throw fetchFailed(); });
+  try {
+    await daemon.boot();
+    // What the packet registry's observer reports for a live identity.
+    store.setResourceHealth(`room:${roomId}`, true, roomId);
+    assert.equal(store.resourceState(roomId).health, 'failed');
+  } finally {
+    await daemon.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a retried fanout reports healthy only after the pump it waits for has completed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-fanout-active-pump-'));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const events = [];
+  const logs = [];
+  const store = new ListedStore(dir, [{ room_id: roomId, state: 'active' }]);
+  // The first retry joins a pump already running for the room; that pump fails
+  // in transport. The next retry's pump completes.
+  const pumps = [];
+  let entered;
+  const joined = new Promise((resolveJoined) => { entered = resolveJoined; });
+  const daemon = fanoutDaemon(dir, events, logs, store, async () => { throw fetchFailed(); }, () => {
+    let settle;
+    const work = new Promise((resolveWork, rejectWork) => { settle = { resolveWork, rejectWork }; });
+    pumps.push(settle);
+    entered();
+    return work;
+  });
+  try {
+    await daemon.boot();
+    await joined;
+    assert.equal(store.resourceState(roomId).health, 'failed', 'a running pump is not a completed one');
+    pumps[0].rejectWork(fetchFailed());
+    await until(() => pumps.length === 2, 'the next retry after the joined pump failed');
+    assert.equal(store.resourceState(roomId).health, 'failed');
+    pumps[1].resolveWork();
+    await until(() => store.resourceState(roomId).health === 'healthy', 'healthy after the completed pump');
+    assert.equal(events.includes(`unhost:${roomId}`), false);
+  } finally {
+    await daemon.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fanout retries stop when the room starts closing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-fanout-close-'));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const events = [];
+  const logs = [];
+  const rooms = [{ room_id: roomId, state: 'active' }];
+  const store = new ListedStore(dir, rooms);
+  let calls = 0;
+  let secondCall;
+  const second = new Promise((resolveSecond) => { secondCall = resolveSecond; });
+  const daemon = fanoutDaemon(dir, events, logs, store, async () => {
+    calls += 1;
+    if (calls === 2) secondCall();
+    throw fetchFailed();
+  });
+  try {
+    await daemon.boot();
+    await second;
+    rooms[0] = { room_id: roomId, state: 'closing' };
+    const callsAtClose = calls;
+    await until(() => store.resourceState(roomId).health === 'healthy', 'the closing room to leave the fanout retry');
+    // Longer than the capped delay: another attempt would have run by now.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+    assert.equal(calls, callsAtClose, 'no fanout attempt for a closing room');
+  } finally {
+    await daemon.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a non-transport startup fanout failure is still quarantined', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-fanout-quarantine-'));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const events = [];
+  const logs = [];
+  const store = new ListedStore(dir, [{ room_id: roomId, state: 'active' }]);
+  const daemon = fanoutDaemon(dir, events, logs, store, async () => {
+    throw new Error('restored room packet CID mismatch');
+  });
+  try {
+    await daemon.boot();
+    assert(events.includes(`unhost:${roomId}`));
+    assert.equal(fanoutLogs(logs, 'startup_room_recovery_failed')[0]?.phase, 'fanout');
+    assert.equal(fanoutLogs(logs, 'startup_room_fanout_deferred').length, 0);
+  } finally {
+    await daemon.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a retried fanout that fails outside transport quarantines the room', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-fanout-retry-quarantine-'));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const events = [];
+  const logs = [];
+  const store = new ListedStore(dir, [{ room_id: roomId, state: 'active' }]);
+  let calls = 0;
+  const daemon = fanoutDaemon(dir, events, logs, store, async () => {
+    calls += 1;
+    if (calls === 1) throw fetchFailed();
+    throw new Error('storage returned the wrong relay result kind');
+  });
+  try {
+    await daemon.boot();
+    await until(() => events.includes(`unhost:${roomId}`), 'the room to be quarantined');
+    const failed = fanoutLogs(logs, 'startup_room_recovery_failed');
+    assert.equal(failed.length, 1);
+    assert.equal(failed[0].error, 'storage returned the wrong relay result kind');
+  } finally {
+    await daemon.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a fanout retry that cannot read its room quarantines that room only', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-fanout-lookup-'));
+  const broken = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const other = '01jz6y7n8p9q0r1s2t3v4w5x6z';
+  const events = [];
+  const logs = [];
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  const store = new ListedStore(dir, [{ room_id: broken, state: 'active' }, { room_id: other, state: 'active' }]);
+  let lookups = 0;
+  const load = store.load.bind(store);
+  store.load = async (roomId) => {
+    if (roomId !== broken) return load(roomId);
+    lookups += 1;
+    throw new Error('EIO: i/o error, read room.json');
+  };
+  let listings = 0;
+  store.list = async () => { listings += 1; return store.rooms; };
+  const calls = { [broken]: 0, [other]: 0 };
+  const daemon = fanoutDaemon(dir, events, logs, store, async (id) => {
+    calls[id] += 1;
+    if (calls[id] === 1) throw fetchFailed();
+  });
+  try {
+    await daemon.boot();
+    await until(() => events.includes(`unhost:${broken}`), 'the unreadable room to be quarantined');
+    const failed = fanoutLogs(logs, 'startup_room_recovery_failed');
+    assert.deepEqual(failed.map((entry) => [entry.room_id, entry.phase, entry.error]),
+      [[broken, 'fanout', 'EIO: i/o error, read room.json']]);
+    await until(() => fanoutLogs(logs, 'startup_room_fanout_resumed').some((entry) => entry.room_id === other),
+      'the other room to finish its retried fanout');
+    assert.equal(events.includes(`unhost:${other}`), false, 'the other room stays hosted');
+    const lookupsAtQuarantine = lookups;
+    // Longer than the capped delay: a still-scheduled retry would have run by now.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+    assert.equal(lookups, lookupsAtQuarantine, 'no retry after the room is quarantined');
+    assert.equal(calls[broken], 1, 'the unreadable room is not pumped');
+    assert.equal(listings, 1, 'only boot lists every room; retries look up their own');
+    assert.equal(store.resourceState(broken).health, 'failed');
+    assert.equal(store.resourceState(other).health, 'healthy');
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    await daemon.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a fanout retry reports a room it quarantined but could not unhost', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-fanout-unhost-'));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const events = [];
+  const logs = [];
+  const store = new ListedStore(dir, [{ room_id: roomId, state: 'active' }]);
+  let calls = 0;
+  const registry = Object.assign(new FakeRegistry(events), {
+    async unhost(id) { events.push(`unhost:${id}`); throw new Error('packet close timed out'); },
+  });
+  const daemon = fanoutDaemon(dir, events, logs, store, async () => {
+    calls += 1;
+    if (calls === 1) throw fetchFailed();
+    throw new Error('storage returned the wrong relay result kind');
+  }, undefined, { registry });
+  try {
+    await daemon.boot();
+    await until(() => fanoutLogs(logs, 'startup_room_recovery_failed').length === 1, 'the room to be quarantined');
+    assert.deepEqual(fanoutLogs(logs, 'startup_room_unhost_failed').map((entry) => [entry.room_id, entry.error]),
+      [[roomId, 'packet close timed out']]);
+    assert.equal(store.resourceState(roomId).health, 'failed', 'a quarantined room is not reported recovered');
+  } finally {
+    await daemon.shutdown().catch(() => undefined);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('shutdown waits for a fanout retry quarantine until its unhost has settled', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-fanout-held-unhost-'));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const events = [];
+  const logs = [];
+  const store = new ListedStore(dir, [{ room_id: roomId, state: 'active' }]);
+  let calls = 0;
+  let release;
+  let entered;
+  const unhosting = new Promise((resolveEntered) => { entered = resolveEntered; });
+  const registry = Object.assign(new FakeRegistry(events), {
+    unhost(id) {
+      events.push(`unhost:${id}`);
+      entered();
+      return new Promise((resolveUnhost) => { release = resolveUnhost; });
+    },
+  });
+  const daemon = fanoutDaemon(dir, events, logs, store, async () => {
+    calls += 1;
+    if (calls === 1) throw fetchFailed();
+    throw new Error('storage returned the wrong relay result kind');
+  }, undefined, { registry });
+  let stopped = false;
+  try {
+    await daemon.boot();
+    await unhosting;
+    const shutdown = daemon.shutdown().then(() => { stopped = true; });
+    // Longer than the capped delay: shutdown must still be waiting on the held unhost.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+    assert.equal(stopped, false, 'shutdown waits for the quarantine to finish unhosting');
+    assert.equal(events.includes('packets.remove'), false, 'unhostAll does not run before the quarantine settles');
+    release();
+    await shutdown;
+    assert.deepEqual(fanoutLogs(logs, 'startup_room_recovery_failed').map((entry) => entry.room_id), [roomId]);
+  } finally {
+    release?.();
+    await daemon.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('shutdown waits for an in-flight fanout retry and does not report the room recovered', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-fanout-inflight-'));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const events = [];
+  const logs = [];
+  const store = new ListedStore(dir, [{ room_id: roomId, state: 'active' }]);
+  let pumps = 0;
+  let release;
+  let entered;
+  const held = new Promise((resolveEntered) => { entered = resolveEntered; });
+  const daemon = fanoutDaemon(dir, events, logs, store, async () => { throw fetchFailed(); }, () => {
+    pumps += 1;
+    entered();
+    return new Promise((resolvePump) => { release = resolvePump; });
+  });
+  let stopped = false;
+  try {
+    await daemon.boot();
+    await held;
+    const shutdown = daemon.shutdown().then(() => { stopped = true; });
+    // Longer than the capped delay: shutdown must still be waiting on the held pump.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+    assert.equal(stopped, false, 'shutdown waits for the in-flight retry');
+    release();
+    await shutdown;
+    assert.equal(pumps, 1, 'no further retry is started');
+    assert.equal(store.resourceState(roomId).health, 'failed', 'a pump finishing during shutdown is not a recovery');
+    assert.equal(fanoutLogs(logs, 'startup_room_fanout_resumed').length, 0);
+  } finally {
+    release?.();
+    await daemon.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('runtime shutdown is idempotent and does not own process signal listeners', async () => {

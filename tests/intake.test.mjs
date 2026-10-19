@@ -1759,6 +1759,29 @@ test('concurrent pumps share one SDK reader and callback resume queues without d
   assert.equal(passes, 2);
 });
 
+test('a pump that joins a running pump fails with it', async () => {
+  const f = fixture();
+  let release;
+  let entered;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  let passes = 0;
+  f.packet.drainRuntimeCommands = async () => {
+    passes++;
+    if (passes === 1) {
+      entered();
+      await gate;
+      throw new TypeError('fetch failed');
+    }
+  };
+  const first = f.pump.pump(ROOM_ID);
+  await started;
+  const joined = f.pump.pump(ROOM_ID);
+  release();
+  await assert.rejects(first, /fetch failed/);
+  await assert.rejects(joined, /fetch failed/);
+});
+
 // Scoped intake must select its audience before a durable source or intent exists.
 async function threadFixture({ solo = false, anonymous = false, deferRelay = false } = {}) {
   const seats = room().seats.map((seat, i) => ({ ...seat, identity: ['A', 'B', 'C'][i].repeat(64),

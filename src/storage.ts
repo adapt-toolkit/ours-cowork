@@ -17,6 +17,7 @@ import {
   type CommunicationRecord,
   type Room,
 } from './contracts.ts';
+import type { OperationTrace } from './diagnostics.ts';
 import { generateUlid } from './ulid.ts';
 
 const DIRECTORY_MODE = 0o700;
@@ -47,6 +48,8 @@ export interface CoworkStoreOptions {
   fs?: CoworkFs;
   /** Test seam for an injected failure after row writes but before COMMIT. */
   beforeRecordCommit?: () => void;
+  /** Opt-in diagnostics: room mutex wait and hold spans; absent in normal operation. */
+  trace?: OperationTrace;
 }
 export interface ArchiveReadOptions { after?: number; limit?: number }
 
@@ -107,6 +110,7 @@ export class CoworkStore {
   readonly stateDir: string;
   private readonly fs: CoworkFs;
   private readonly beforeRecordCommit?: () => void;
+  private readonly trace?: OperationTrace;
   private readonly roomMutexes = new Map<string, RoomQueue>();
   private readonly lockOwnership = new AsyncLocalStorage<ReadonlyMap<string, LockOwnership>>();
   private readonly reconciledBlobRooms = new Set<string>();
@@ -135,6 +139,7 @@ export class CoworkStore {
     this.stateDir = stateDir;
     this.fs = options.fs ?? nodeFs;
     this.beforeRecordCommit = options.beforeRecordCommit;
+    this.trace = options.trace;
   }
 
   mutex(roomId: string): RoomMutex;
@@ -158,15 +163,27 @@ export class CoworkStore {
     }
     let queue = this.roomMutexes.get(roomId);
     if (!queue) { queue = new RoomQueue(); this.roomMutexes.set(roomId, queue); }
+    const trace = this.trace;
+    const wait = trace?.start('mutex_wait', 'room') ?? 0;
     return queue.runExclusive(async () => {
+      trace?.finish(wait);
+      // The hold ends once nested work admitted under this ownership has settled.
+      const hold = trace?.start('mutex_hold', 'room') ?? 0;
       const acquired: LockOwnership = { active: true, pending: new Set(), failures: [] };
       const context = new Map(inherited ?? []); context.set(roomId, acquired);
       let result!: T; let rootFailure: unknown; let rootFailed = false;
       try {
-        try { result = await this.lockOwnership.run(context, work); }
+        try {
+          result = await (trace
+            ? trace.within(hold, () => this.lockOwnership.run(context, work))
+            : this.lockOwnership.run(context, work));
+        }
         catch (error) { rootFailed = true; rootFailure = error; }
         while (acquired.pending.size > 0) await Promise.allSettled([...acquired.pending]);
-      } finally { acquired.active = false; }
+      } finally {
+        acquired.active = false;
+        trace?.finish(hold, rootFailed || acquired.failures.length > 0, rootFailed ? rootFailure : acquired.failures[0]);
+      }
       if (rootFailed) throw rootFailure;
       if (acquired.failures.length > 0) throw acquired.failures[0];
       return result;

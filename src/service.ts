@@ -45,6 +45,7 @@ import {
 } from './contracts.ts';
 import { ContactAlreadyAbsentError, unpackInvite, type RoomPacket } from './packets.ts';
 import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
+import type { OperationTrace } from './diagnostics.ts';
 import { IntakePump } from './intake.ts';
 import { createServiceRoutes, createPrivateServiceRoutes, classifyServiceError } from './command-routes.ts';
 import { ConsumerHandlers, ConsumerDefinitionSchema, type ConsumerConfiguration, type ConsumerDefinition, type StoredConsumerDefinition } from './consumer-commands.ts';
@@ -139,6 +140,8 @@ export interface RoomServiceOptions {
   roomId?: () => string;
   messageId?: () => string;
   provisioningCheckpoint?: (stage: 'metadata') => void;
+  /** Opt-in diagnostics for the intake pump; absent in normal operation. */
+  trace?: OperationTrace;
 }
 
 export interface InviteReceipt {
@@ -213,6 +216,7 @@ export class RoomService {
       messageId: this.nextMessageId,
       shouldPause: async (roomId) => (await this.store.load(roomId)).lifecycle_request?.state === 'pending',
       afterPump: async (roomId) => { await this.resumeLifecycleRequest(roomId); },
+      ...(options.trace ? { trace: options.trace } : {}),
     });
   }
 

@@ -8,6 +8,7 @@ import { basename, dirname, join } from 'node:path';
 
 import { z } from 'zod';
 
+import { traced, type OperationTrace } from './diagnostics.ts';
 import { apiDocsAsset } from './openapi.ts';
 export { createServiceRoutes, createPrivateServiceRoutes, type RoomServiceApi } from './command-routes.ts';
 import { CONTENT_SECURITY_POLICY, createStaticWebHandler, safePathname, type StaticWebHandler } from './web.ts';
@@ -56,8 +57,10 @@ export class RpcDispatcher {
   private readonly routes: AuthenticatedRouteTable;
   private readonly work = new Set<Promise<unknown>>();
   private accepting = true;
+  private readonly trace?: OperationTrace;
 
-  constructor(routes: AuthenticatedRouteTable) {
+  constructor(routes: AuthenticatedRouteTable, options: { trace?: OperationTrace } = {}) {
+    this.trace = options.trace;
     const owned = Object.create(null) as Record<string, AuthenticatedRoute>;
     for (const [method, route] of Object.entries(routes)) owned[method] = route;
     this.routes = Object.freeze(owned);
@@ -80,7 +83,7 @@ export class RpcDispatcher {
     if (!this.accepting) return Promise.resolve(errorResponse(request.id, 'shutting_down', 'daemon is shutting down'));
     const route = Object.hasOwn(this.routes, request.method) ? this.routes[request.method] : undefined;
     if (!route) return Promise.resolve(errorResponse(request.id, 'method_not_found', 'method not found'));
-    const operation = Promise.resolve().then(() => route.run(request.params)).then(
+    const operation = Promise.resolve().then(() => traced(this.trace, 'rpc', request.method, () => route.run(request.params))).then(
       (result): RpcResponse => ({ version: 1, id: request.id, result }),
       (error): RpcResponse => errorResponse(
         request.id,
@@ -113,6 +116,8 @@ export interface TransportServerOptions {
   publicOrigin?: string;
   staticHandler?: StaticWebHandler;
   fs?: typeof nodeFs;
+  /** Opt-in diagnostics for Unix management requests; absent in normal operation. */
+  trace?: OperationTrace;
   log?: (...parts: unknown[]) => void;
 }
 
@@ -262,8 +267,18 @@ export class TransportServer {
           socket.end(`${JSON.stringify(errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'))}\n`);
           return;
         }
-        const operation = this.dispatchBytes(this.options.unixDispatcher, line).then((response) => {
-          if (!socket.destroyed) socket.write(`${JSON.stringify(response)}\n`);
+        const trace = this.options.trace;
+        // Diagnostics only: a request span parents the method span and the
+        // response decision, so a reply skipped for a closed socket is visible.
+        const request = trace?.start('rpc_request', 'unix') ?? 0;
+        const dispatch = () => this.dispatchBytes(this.options.unixDispatcher, line);
+        const operation = (trace ? trace.within(request, dispatch) : dispatch()).then((response) => {
+          const destroyed = socket.destroyed;
+          if (!destroyed) socket.write(`${JSON.stringify(response)}\n`);
+          if (trace) {
+            trace.within(request, () => trace.mark('rpc_response', destroyed ? 'socket_destroyed' : 'write_issued'));
+            trace.finish(request);
+          }
         });
         this.track(operation);
       }

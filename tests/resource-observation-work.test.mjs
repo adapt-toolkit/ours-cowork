@@ -5,7 +5,7 @@ import { SharedOursHost } from '../src/ours-runtime.ts';
 
 const deferred = () => { let resolve; const promise = new Promise(done => {resolve=done;}); return {promise,resolve}; };
 function fixture() {
- const health=[], logs=[];let send, streams=0, canonical=0, active=0, maximum=0;
+ const health=[], pending=[], logs=[];let send, streams=0, canonical=0, active=0, maximum=0;
  const held=deferred(), entered=deferred(), reconciled=deferred();
  const client=new OursClient({url:'http://sdk.test',fetch:async(_url,{signal})=>{
   streams++;
@@ -23,15 +23,15 @@ function fixture() {
    throw Error('aborted');
   },async releaseLease(){return {failed:0};},async close(){},
  }));
- host.onResourceHealth((_identity,value)=>health.push(value));
+ host.onResourceHealth((_identity,value,workPending)=>{health.push(value);pending.push(workPending===true);});
  host.onIdentityNotify(async()=>{
   active++;maximum=Math.max(maximum,active);
   try {if(++canonical===2){entered.resolve();await held.promise;}if(canonical===3)reconciled.resolve();}
   finally {active--;}
  });
- return {host,health,logs,held,entered,reconciled,send:kind=>send(kind),get streams(){return streams;},get canonical(){return canonical;},get maximum(){return maximum;}};
+ return {host,health,pending,logs,held,entered,reconciled,send:kind=>send(kind),get streams(){return streams;},get canonical(){return canonical;},get maximum(){return maximum;}};
 }
-async function start(f){await f.host.boot();f.host.trackIdentity('room');while(!f.health.includes(true))await new Promise(resolve=>setImmediate(resolve));}
+async function start(f){await f.host.boot();f.host.trackIdentity('room');while(!f.health.includes(true)||f.pending.at(-1))await new Promise(resolve=>setImmediate(resolve));}
 
 test('canonical work longer than six seconds does not stop coverage draining and commits coalesce', {timeout:10000}, async t=>{
  const f=fixture();t.after(async()=>{f.held.resolve();await f.host.shutdown();});await start(f);
@@ -51,4 +51,15 @@ test('canonical completion after stream failure cannot restore attempt health', 
  assert.equal(f.health.at(-1),false,'source loss is observed while canonical work remains pending');
  const before=f.health.length;f.held.resolve();await new Promise(resolve=>setTimeout(resolve,20));
  assert.equal(f.health.slice(before).includes(true),false);
+});
+
+
+test('SDK coverage cannot certify held canonical intake and successful completion clears pending', {timeout:3000}, async t=>{
+ const f=fixture();t.after(async()=>{f.held.resolve();await f.host.shutdown();});await start(f);
+ f.send('committed');await f.entered.promise;
+ assert.equal(f.pending.at(-1),true,'pending canonical intake excludes affected room from health certification');
+ for(let i=0;i<5;i++)f.send('coverage');await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(f.pending.at(-1),true,'SDK liveness alone cannot clear canonical intake pending');
+ f.held.resolve();await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(f.pending.at(-1),false);assert.equal(f.health.at(-1),true);
 });

@@ -90,11 +90,11 @@ test('separate UI consumes full snapshots without healthy content GETs and repla
  const session=createResourceSession({snapshot:(...args)=>{if(args[0]==='room')received.push(args);},health:state=>health.push(state)},'in-memory',fakeFetch);t.after(()=>session.close());session.watchRoom(ID);
  send('event: resource-connection\ndata: '+JSON.stringify({protocolVersion:1,connectionId:'connection',producerGeneration:'generation'})+'\n\n');await new Promise(r=>setTimeout(r,10));
  // Health requires both owned baselines, including the room list.
- for(const [index,[kind,payload]] of [['snapshot',[{room_id:ID}]],['ready',{baselineId:'rooms-baseline'}]].entries()) {
+ for(const [index,[kind,payload]] of [['snapshot',[{room_id:ID}]],['ready',{baselineId:'rooms-baseline',source:{protocolVersion:1,producerGeneration:'store',position:1,health:'healthy'}}]].entries()) {
   send('event: resource\ndata: '+JSON.stringify({protocolVersion:1,producerGeneration:'generation',viewId:'rooms',subscriptionEpoch:1,baselineId:'rooms-baseline',revision:1,sequence:index+1,kind,payload})+'\n\n');
  }
  let sequence=0;const frame=(kind,payload)=>send('event: resource\ndata: '+JSON.stringify({protocolVersion:1,producerGeneration:'generation',viewId:`room_${ID}`,subscriptionEpoch:1,baselineId:'baseline',revision:1,sequence:++sequence,kind,payload})+'\n\n');
- frame('snapshot',{history:[{seq:1},{seq:2}]});frame('ready',{baselineId:'baseline'});frame('snapshot',{history:[]});frame('coverage',{});
+ frame('snapshot',{history:[{seq:1},{seq:2}]});frame('ready',{baselineId:'baseline',source:{protocolVersion:1,producerGeneration:'store',position:1,health:'healthy'}});frame('snapshot',{history:[]});frame('coverage',{source:{protocolVersion:1,producerGeneration:'store',position:1,health:'healthy'}});
  await new Promise(r=>setTimeout(r,25));assert.equal(received.length,2);assert.deepEqual(received.at(-1)[2].history,[]);assert.deepEqual(health,[true]);
  assert.equal(requests.length,3);assert.ok(requests.every(r=>!r.url.includes('rpc')));assert.ok(requests.every(r=>r.options.headers['x-ours-api-token']==='in-memory'));
  session.close();
@@ -195,4 +195,18 @@ test('resource projections keep file bytes on demand while public history still 
  assert.deepEqual(await route.run({room_id:ID,after:record.seq,limit:1,view:'operator-metadata'}),[]);
  assert.deepEqual(await service.history(ID,{view:'participant'}),[]);
  assert.deepEqual(await service.history(ID,{after:record.seq-1,limit:1}),[record],'existing explicit authenticated history read retains exact bytes');assert.ok(blobReads>0);
+});
+
+test('idle views share sparse batches and complete changed snapshots certify their captured source',async t=>{
+ const {CoworkResourceViews}=await import('../src/resource-views.ts');const store=fixture(t);const out=output();let reads=0;
+ t.mock.timers.enable({apis:['setInterval','Date'],now:1000});
+ const views=new CoworkResourceViews(store,async d=>{reads++;return d.resource==='rooms'?store.list():{room:await store.load(ID),history:[]};});t.after(()=>views.close());
+ await store.create(room);const c=views.open(out.response,'owner',async()=>true);
+ for(const descriptor of [{viewId:'list',resource:'rooms'},{viewId:'room',resource:'room',roomId:ID}]){const b=views.register('owner',c.connectionId,descriptor.viewId,1,descriptor);await views.bound('owner',c.connectionId,descriptor.viewId,1,b.baselineId);}
+ await new Promise(resolve=>setImmediate(resolve));const settled=reads;out.frames.length=0;
+ for(let i=0;i<4;i++){t.mock.timers.tick(15000);await new Promise(resolve=>setImmediate(resolve));}
+ const health=out.frames.filter(frame=>frame.startsWith('event: resource-coverage\n')).map(frame=>JSON.parse(frame.split('data: ')[1]));
+ assert.equal(health.length,4);assert.ok(health.every(frame=>frame.views.length===2));assert.equal(reads,settled);assert.deepEqual(out.resources(),[]);
+ await store.save({...room,room_name:'Changed'});await new Promise(resolve=>setImmediate(resolve));
+ const changed=out.resources().filter(frame=>frame.kind==='snapshot');assert.equal(changed.length,2);assert.ok(changed.every(frame=>frame.source?.position===store.resourceState().position));
 });

@@ -177,7 +177,7 @@ export function createResourceSession(delivery: ResourceDelivery, credential?: s
       activeAttempt=attempt;
       const openingDeadline=Date.now()+10_000;
       let established=false,byteDeadline=Number.POSITIVE_INFINITY;
-      const views = new Map<string, { resource: 'rooms' | 'room'; roomId?: string; epoch: number; sequence: number; revision: number; baselineId?: string; pending?: unknown; ready: boolean; failures: number; failed?: boolean; retry?: ReturnType<typeof setTimeout>; expires: number; registration?: Promise<unknown> }>();
+      const views = new Map<string, { resource: 'rooms' | 'room'; roomId?: string; epoch: number; sequence: number; revision: number; completedRevision?: number; baselineId?: string; pending?: unknown; ready: boolean; source?: {protocolVersion:1;producerGeneration:string;position:number;health:'healthy'}; failures: number; failed?: boolean; retry?: ReturnType<typeof setTimeout>; expires: number; registration?: Promise<unknown> }>();
       let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
       let timer: ReturnType<typeof setTimeout> | undefined;
       const cancelRead = () => { void reader?.cancel().catch(()=>{}); };
@@ -221,6 +221,12 @@ export function createResourceSession(delivery: ResourceDelivery, credential?: s
             const next=[...degraded.keys()].find(room=>rooms.has(room));if(next)register('room',next);
           }).catch(error=>{if(!terminal(error))attempt.abort(error);});
         };
+        const source = (view: {source?: {producerGeneration:string;position:number};expires:number}, evidence: any, commit = true) => {
+          if(evidence?.protocolVersion!==1 || typeof evidence.producerGeneration!=='string' || !evidence.producerGeneration
+            || !Number.isSafeInteger(evidence.position) || evidence.position<0 || evidence.health!=='healthy'
+            || (view.source && (view.source.producerGeneration!==evidence.producerGeneration || view.source.position>evidence.position))) throw Error('Invalid resource source');
+          if(commit){view.source=evidence;view.expires=Date.now()+45_000;}
+        };
         const apply = (value: Record<string,unknown>) => {
           check();
           const view = views.get(String(value.viewId));
@@ -229,8 +235,10 @@ export function createResourceSession(delivery: ResourceDelivery, credential?: s
           if (value.protocolVersion!==1 || value.producerGeneration!==generation || value.subscriptionEpoch!==view.epoch
             || value.sequence!==view.sequence+1 || !Number.isSafeInteger(value.revision) || Number(value.revision)<view.revision
             || typeof value.baselineId!=='string' || (view.baselineId!==undefined && view.baselineId!==value.baselineId)) throw Error('Resource binding lost');
+          const newer=Number(value.revision)>(view.completedRevision??0);
           view.sequence=Number(value.sequence);view.revision=Number(value.revision);view.baselineId=value.baselineId;
           if (value.kind==='snapshot') {
+            if(newer && value.source!==undefined && (value.payload as {historyComplete?:boolean}|null)?.historyComplete!==false)source(view,value.source,false);
             view.pending=value.payload;
             if(view.resource==='rooms' && Array.isArray(value.payload)) {
               const available=new Set(value.payload.map(row=>String(row.room_id)));
@@ -251,22 +259,23 @@ export function createResourceSession(delivery: ResourceDelivery, credential?: s
                 for(const record of page.records)if(record.seq!==++seq)throw Error('Invalid history sequence');
               }
               pending.history.push(...page.records);
+              if(page.complete && newer && value.source!==undefined)source(view,value.source,false);
               if(page.complete){delete pending.historyComplete;delete pending.historyAfter;if(view.ready)delivery.snapshot(view.resource,view.roomId,pending);}
             }
-            if(view.ready)view.expires=Date.now()+6000;arm();
+            arm();
           } else if(value.kind==='ready') {
             if(view.pending===undefined || !value.payload || (value.payload as {baselineId?:unknown}).baselineId!==view.baselineId) throw Error('Invalid resource baseline');
             if((view.pending as {historyComplete?:boolean}|null)?.historyComplete===false)throw Error('Incomplete resource history');
-            view.ready=true;view.expires=Date.now()+6000;
+            source(view,(value.payload as {source?:unknown}).source);view.ready=true;view.completedRevision=view.revision;
             const key=view.roomId??'';degraded.get(key)?.stop();degraded.delete(key);
             delivery.snapshot(view.resource,view.roomId,view.pending);
-            if([...views.values()].every(v=>v.ready||v.failed)){established=true;byteDeadline=Date.now()+10_000;failures=0;if([...views.values()].every(v=>v.ready&&!v.failed))delivery.health(true);}
+            if([...views.values()].every(v=>v.ready||v.failed)){established=true;byteDeadline=Date.now()+45_000;failures=0;if([...views.values()].every(v=>v.ready&&!v.failed))delivery.health(true);}
             arm();
-          } else if(value.kind==='coverage') { if(!view.ready) throw Error('Resource baseline missing');view.expires=Date.now()+6000;arm(); }
+          } else if(value.kind==='coverage') { if(!view.ready) throw Error('Resource baseline missing');source(view,(value.payload as {source?:unknown})?.source);arm(); }
           else if(value.kind==='health' && (value.payload as {reason?:string})?.reason==='auth_required') {terminal(new ResourceHttpError(401));}
           else if(value.kind==='resync' && ['capacity','projection_unavailable'].includes((value.payload as {reason?:string})?.reason??'')) {
             view.failed=true;view.expires=Number.POSITIVE_INFINITY;recover(view.roomId);
-            if([...views.values()].every(v=>v.ready||v.failed)){established=true;byteDeadline=Date.now()+10_000;}
+            if([...views.values()].every(v=>v.ready||v.failed)){established=true;byteDeadline=Date.now()+45_000;}
             // Only a witnessed failed capture probes again. Healthy sibling
             // bindings keep their stream and never enter content polling.
             if((value.payload as {reason:string}).reason==='projection_unavailable')view.retry=setTimeout(()=>{
@@ -276,10 +285,16 @@ export function createResourceSession(delivery: ResourceDelivery, credential?: s
             arm();
           }
           else throw Error('Resource recovery required');
+          // Paged history is one logical record; incomplete units cannot certify it.
+          if((value.kind==='snapshot' || value.kind==='upsert')
+            && (view.pending as {historyComplete?:boolean}|null)?.historyComplete!==false) {
+            if(view.ready && newer && value.source!==undefined){source(view,value.source);arm();}
+            view.completedRevision=view.revision;
+          }
         };
         for (;;) {
           const step = await reader.read();check();if(step.done)throw Error('Resource transport ended');
-          if(established && step.value.length)byteDeadline=Date.now()+10_000;arm();
+          if(established && step.value.length)byteDeadline=Date.now()+45_000;arm();
           buffer += decoder.decode(step.value,{stream:true});
           if(new TextEncoder().encode(buffer).length>8*1024*1024)throw Error('Resource input capacity');
           let end: number;
@@ -296,6 +311,13 @@ export function createResourceSession(delivery: ResourceDelivery, credential?: s
               connection=value.connectionId;generation=value.producerGeneration;
               register('rooms');registerRoom=id=>register('room',id);for(const id of rooms)if(!degraded.has(id))registerRoom(id);
             } else if(event==='resource') {if(assembly)throw Error('Interleaved resource assembly');apply(value);}
+            else if(event==='resource-coverage') {
+              if(assembly || value.protocolVersion!==1 || value.producerGeneration!==generation || !Array.isArray(value.views))throw Error('Invalid resource coverage');
+              for(const entry of value.views) {
+                if(!entry || typeof entry!=='object')throw Error('Invalid resource coverage entry');
+                apply({...entry,protocolVersion:value.protocolVersion,producerGeneration:value.producerGeneration,kind:'coverage',payload:{source:entry.source}});
+              }
+            }
             else if(event==='resource-chunk') {
               if(value.type==='start') {
                 if(assembly || !Number.isSafeInteger(value.totalBytes) || Number(value.totalBytes)<=0 || Number(value.totalBytes)>16*1024*1024 || !Number.isSafeInteger(value.parts) || Number(value.parts)<=0 || Number(value.parts)>64)throw Error('Resource assembly capacity');

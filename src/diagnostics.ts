@@ -170,10 +170,11 @@ function isPlainNativePromise(value: unknown): value is Promise<unknown> {
 /** Whether a value may be a thenable, decided without running a getter or trap. */
 function mayBeThenable(value: unknown): boolean {
   if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
-  if (types.isProxy(value)) return true;
   try {
     let target: unknown = value;
     for (let depth = 0; depth < 32 && target !== null; depth += 1) {
+      // Any proxy on the chain, the value itself or an ancestor, would run its traps.
+      if (types.isProxy(target)) return true;
       const descriptor = Object.getOwnPropertyDescriptor(target, 'then');
       if (descriptor) return 'get' in descriptor || typeof descriptor.value === 'function';
       target = Object.getPrototypeOf(target);

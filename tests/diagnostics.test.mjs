@@ -532,6 +532,31 @@ test('other promises and thenables are returned untouched, run no application co
   assert.equal(await foreign, 3);
 });
 
+test('a proxy anywhere on the prototype chain is never trapped and leaves the step unobserved', async () => {
+  const trace = new OperationTrace();
+  const traps = { getOwnPropertyDescriptor: 0, getPrototypeOf: 0, get: 0, has: 0 };
+  const proxyAncestor = new Proxy({}, {
+    getOwnPropertyDescriptor(target, key) { traps.getOwnPropertyDescriptor += 1; return Reflect.getOwnPropertyDescriptor(target, key); },
+    getPrototypeOf(target) { traps.getPrototypeOf += 1; return Reflect.getPrototypeOf(target); },
+    get(target, key, receiver) { traps.get += 1; return Reflect.get(target, key, receiver); },
+    has(target, key) { traps.has += 1; return Reflect.has(target, key); },
+  });
+  const child = Object.create(proxyAncestor);
+  const grandchild = Object.create(Object.create(proxyAncestor));
+  const promise = Promise.resolve(5);
+  Object.setPrototypeOf(promise, Object.create(proxyAncestor));
+
+  let calls = 0;
+  for (const value of [child, grandchild, promise]) {
+    assert.equal(traced(trace, 'sdk', 'get_messages', () => { calls += 1; return value; }), value);
+  }
+  assert.equal(calls, 3);
+  assert.deepEqual(traps, { getOwnPropertyDescriptor: 0, getPrototypeOf: 0, get: 0, has: 0 });
+  const snapshot = trace.snapshot();
+  assert.deepEqual(snapshot.records.map((record) => record.outcome), ['unobserved', 'unobserved', 'unobserved']);
+  assert.deepEqual([snapshot.unobserved, snapshot.observer_failures, snapshot.complete], [3, 0, false]);
+});
+
 test('a registration failure inside native then is isolated from the returned promise', async () => {
   const trace = new OperationTrace();
   const original = Object.getOwnPropertyDescriptor(Promise.prototype, 'constructor');

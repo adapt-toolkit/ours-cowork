@@ -177,7 +177,7 @@ test('browser newly registered view keeps ten-second ready budget after connecti
 
 test('held canonical intake expires through the browser owner despite live sibling batches',async t=>{
  t.mock.timers.enable({apis:['Date','setTimeout','setInterval'],now:100000});
- const f=await consumerFixture(t,false),dir=mkdtempSync('/private/tmp/cowork-held-browser-');t.after(()=>rmSync(dir,{recursive:true,force:true}));
+ const f=await consumerFixture(t,false),dir=mkdtempSync(join(tmpdir(),'cowork-held-browser-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));
  const store=new CoworkStore(dir);await store.create(room);
  const response=Object.assign(new (await import('node:events')).EventEmitter(),{destroyed:false,writableEnded:false,write(wire){f.sendRaw(wire);return true;},end(){this.writableEnded=true;this.emit('close');}});
  const views=new CoworkResourceViews(store,async descriptor=>descriptor.resource==='rooms'?store.list():{room:await store.load(ID),history:[]});t.after(()=>views.close());

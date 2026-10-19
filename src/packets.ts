@@ -118,7 +118,7 @@ export interface PacketRegistryOptions {
   fs?: typeof fs;
   log?: (...parts: unknown[]) => void;
   onNotify?: (roomId: string, event: string) => void | Promise<void>;
-  onResourceHealth?: (roomId: string, healthy: boolean) => void;
+  onResourceHealth?: (roomId: string, healthy: boolean, pending?: boolean) => void;
   rebindSleep?: (ms: number) => Promise<void>;
   rebindRandom?: () => number;
   /** Durable V1 owner IDs; absent for legacy local-PID daemon selection. */
@@ -171,7 +171,7 @@ export class PacketRegistry {
   private readonly fs: typeof fs;
   private readonly log: (...parts: unknown[]) => void;
   private readonly onNotify: (roomId: string, event: string) => void | Promise<void>;
-  private readonly onResourceHealth: (roomId: string, healthy: boolean) => void;
+  private readonly onResourceHealth: (roomId: string, healthy: boolean, pending?: boolean) => void;
   private readonly rebindSleep: (ms: number) => Promise<void>;
   private readonly rebindRandom: () => number;
   private readonly owners?: RoomOwnerLedger;
@@ -376,8 +376,8 @@ export class PacketRegistry {
   private track(roomId: string, identityName: string): void {
     // The registry already owns the exact mapping; identity names need not
     // contain the room ID. Subscribe before the watcher reports startup health.
-    const unsubscribe = this.host.onResourceHealth?.((name, healthy) => {
-      if (name === identityName) this.onResourceHealth(roomId, healthy);
+    const unsubscribe = this.host.onResourceHealth?.((name, healthy, pending) => {
+      if (name === identityName) this.onResourceHealth(roomId, healthy, pending);
     });
     try {
       const untrack = this.host.trackIdentity(identityName);

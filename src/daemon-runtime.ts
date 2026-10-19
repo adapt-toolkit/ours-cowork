@@ -248,8 +248,8 @@ export class CoworkDaemon {
         {
           log: this.options.log,
           ...(this.options.trace ? { trace: this.options.trace } : {}),
-          onResourceHealth: (roomId, healthy) => {
-            if (this.store instanceof CoworkStore) this.store.setResourceHealth(`room:${roomId}`, healthy, roomId);
+          onResourceHealth: (roomId, healthy, pending) => {
+            if (this.store instanceof CoworkStore) this.store.setResourceHealth(`room:${roomId}`, healthy, roomId, pending);
           },
           // V1 external owners only; legacy local-PID leases end with their process.
           ...(process.env.OURS_DAEMON_ID ? { owners: new RoomOwnerLedger(config.stateDir, process.env.OURS_DAEMON_ID) } : {}),

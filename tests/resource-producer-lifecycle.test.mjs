@@ -86,3 +86,19 @@ test('notification startup primes at tip before reconciliation and reconnect ret
   assert.deepEqual(cursors.slice(0, 4), ['tip', 100, 200, 200]);
   assert.deepEqual(reconciliations, [true, true], 'tip is captured before canonical recovery, including startup');
 });
+
+test('shared health waits behind complete chunks and disposal rejects blocked output',async()=>{
+ const {ResourceOutput}=await import('../src/resource-views.ts');
+ const response=output();let blocked=true;response.write=wire=>{response.frames.push(wire);return !blocked;};
+ const controller=new AbortController(),failures=[],writer=new ResourceOutput(response,controller.signal,error=>failures.push(error));
+ const binding={protocolVersion:1,producerGeneration:'service',viewId:'rooms',subscriptionEpoch:1,baselineId:'baseline',sequence:1,revision:1};
+ const data=writer.send({...binding,kind:'snapshot',payload:'x'.repeat(9*1024*1024)});
+ const batch=writer.send({protocolVersion:1,producerGeneration:'service',views:[{...binding,sequence:2,source:{protocolVersion:1,producerGeneration:'store',position:1,health:'healthy'}}]});
+ assert.equal(response.frames.length,1,'backpressure retains one bounded active chunk assembly');
+ blocked=false;response.emit('drain');await Promise.all([data,batch]);
+ assert.ok(response.frames.at(-2).includes('"type":"commit"'));assert.ok(response.frames.at(-1).startsWith('event: resource-coverage\n'));assert.deepEqual(failures,[]);
+ controller.abort();assert.equal(response.listenerCount('drain'),0);
+ const held=output();held.write=wire=>{held.frames.push(wire);return false;};const abort=new AbortController(),pendingWriter=new ResourceOutput(held,abort.signal,()=>{});
+ const first=pendingWriter.send({...binding,kind:'snapshot',payload:{}}),next=pendingWriter.send({protocolVersion:1,producerGeneration:'service',views:[]});
+ abort.abort();assert.deepEqual((await Promise.allSettled([first,next])).map(result=>result.status),['rejected','rejected']);assert.equal(held.listenerCount('drain'),0);
+});

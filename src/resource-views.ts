@@ -24,7 +24,7 @@ export interface ResourceFrameBinding {
   readonly baselineId?: string;
 }
 export type ResourceHealthReason = 'auth_required' | 'unsupported' | 'upstream_unavailable';
-export type ResourceEnvelope = ResourceFrameBinding & (
+export type ResourceEnvelope = ResourceFrameBinding & {readonly source?: CoworkResourceState} & (
   | { readonly kind: 'snapshot'; readonly payload: unknown }
   | { readonly kind: 'upsert'; readonly payload: unknown }
   | { readonly kind: 'delete'; readonly payload: { readonly id: string; readonly revision: number } }
@@ -33,7 +33,8 @@ export type ResourceEnvelope = ResourceFrameBinding & (
   | { readonly kind: 'resync'; readonly payload: { readonly reason: 'capacity' | 'projection_unavailable' } }
   | { readonly kind: 'health'; readonly payload: { readonly healthy: false; readonly reason: ResourceHealthReason } }
 );
-export interface ResourceWireFrame { event: 'resource' | 'resource-chunk'; data: Record<string, unknown> }
+export interface ResourceCoverage { readonly protocolVersion: 1; readonly producerGeneration: string; readonly views: readonly (ResourceFrameBinding & {readonly source: CoworkResourceState})[] }
+export interface ResourceWireFrame { event: 'resource' | 'resource-chunk' | 'resource-coverage'; data: Record<string, unknown> }
 export const RESOURCE_FRAME_BYTES = 512 * 1024;
 export const RESOURCE_PENDING_BYTES = 8 * 1024 * 1024;
 export const RESOURCE_ASSEMBLY_BYTES = 16 * 1024 * 1024;
@@ -60,7 +61,7 @@ export function* resourceFrames(envelope: ResourceEnvelope): Generator<ResourceW
 }
 
 interface PendingOutput {
-  envelope: ResourceEnvelope;
+  envelope: ResourceEnvelope | ResourceCoverage;
   bytes: number;
   resolve: () => void;
   reject: (error: Error) => void;
@@ -87,13 +88,14 @@ export class ResourceOutput {
     }
   }
 
-  send(envelope: ResourceEnvelope): Promise<void> {
+  send(envelope: ResourceEnvelope | ResourceCoverage, admitted: () => void = () => {}): Promise<void> {
     if (this.#closed) return Promise.reject(new Error('resource output closed'));
     const bytes = Buffer.byteLength(JSON.stringify(envelope));
     if (bytes > RESOURCE_ASSEMBLY_BYTES) return this.#fail(new Error('resource assembly limit exceeded'));
     if (this.#active && this.#pendingBytes + bytes > RESOURCE_PENDING_BYTES) {
       return this.#fail(new Error('resource pending limit exceeded'));
     }
+    admitted();
     return new Promise<void>((resolve, reject) => {
       const item = { envelope, bytes, resolve, reject };
       if (!this.#active) {
@@ -128,7 +130,7 @@ export class ResourceOutput {
     try {
       while (this.#active && !this.#closed) {
         const item = this.#active;
-        for (const frame of resourceFrames(item.envelope)) {
+        for (const frame of ('views' in item.envelope ? [{event:'resource-coverage' as const,data:item.envelope as unknown as Record<string,unknown>}] : resourceFrames(item.envelope))) {
           if (this.#closed) break;
           const writable = this.response.write(`event: ${frame.event}\ndata: ${JSON.stringify(frame.data)}\n\n`);
           if (!writable) await this.#drain();
@@ -173,7 +175,7 @@ interface View {
   descriptor: ResourceDescriptor; epoch: number; baselineId: string; controller: AbortController;
   revision: number; sequence: number; dirty: boolean; running: boolean; failed: boolean;
   initial: Promise<BoundProjection>; resolveInitial(value: BoundProjection): void; rejectInitial(error: Error): void;
-  payload?: unknown; covered?: CoworkResourceState; baselineReady: boolean; commits: number; historyAfter?: number;
+  payload?: unknown; covered?: CoworkResourceState; baselineReady: boolean; commits: number; historyAfter?: number; qualifiedAt?: number;
 }
 interface BoundProjection {
   payload: unknown; source: CoworkResourceState; producerGeneration: string; revision: number; baselineId: string; descriptor: ResourceDescriptor;
@@ -219,6 +221,10 @@ export class CoworkResourceViews {
             view.failed=true; this.retire(view);
             void this.emit(connection,view,'resync',{reason:'projection_unavailable'}).catch(close);
           }
+        } else if (this.store.resourcePending?.(view.descriptor.roomId)) {
+          // Canonical intake remains owned by its existing callback. Its pending
+          // state excludes certification without declaring an explicit failure.
+          view.commits++;
         } else if ((event.kind === 'health' && !event.roomId) || (view.descriptor.resource === 'rooms' ? event.kind !== 'history' && event.kind !== 'health' : event.roomId === view.descriptor.roomId)) { view.commits++; this.schedule(connection, view); }
         else if (view.covered && !view.running && !view.dirty) view.covered = observer.snapshot();
       }
@@ -230,14 +236,8 @@ export class CoworkResourceViews {
       response.write(`event: resource-service-health\ndata: ${JSON.stringify({protocolVersion:1,healthy:false,reason:'upstream_unavailable'})}\n\n`); close();
     } else {
       timer = setInterval(() => {
-        for (const view of connection!.views.values()) {
-          if (view.baselineReady && !view.failed && view.covered && connection!.observer.snapshot(view.descriptor.roomId).health === 'healthy'
-            && view.covered.position === connection!.observer.snapshot().position) {
-            void this.emit(connection!, view, 'coverage', { source: view.covered }).catch(close);
-          }
-        }
-        if (!connection!.views.size) response.write(': keepalive\n\n');
-      }, 2000); timer.unref();
+        void this.coverage(connection!).catch(close);
+      }, 15_000); timer.unref();
     }
     return { connectionId:id, close };
   }
@@ -279,7 +279,7 @@ export class CoworkResourceViews {
   }
   private current(connection:Connection,view:View) {return !connection.controller.signal.aborted && !view.controller.signal.aborted && connection.views.get(view.descriptor.viewId)===view;}
   private retire(view:View) {view.controller.abort();view.rejectInitial(new ResourceBindingError(409,'resource binding retired'));}
-  private async emit(connection:Connection,view:View,kind:ResourceEnvelope['kind'],payload:unknown) {
+  private async emit(connection:Connection,view:View,kind:ResourceEnvelope['kind'],payload:unknown,source?:CoworkResourceState) {
     if (kind === 'snapshot' || kind === 'upsert') {
       if (!await connection.authorized()) {
         await this.emit(connection,view,'health',{healthy:false,reason:'auth_required'});
@@ -287,10 +287,24 @@ export class CoworkResourceViews {
       }
       if (!this.current(connection,view)) throw Error('resource binding retired');
     }
-    const envelope = {protocolVersion:1,producerGeneration:this.producerGeneration,viewId:view.descriptor.viewId,subscriptionEpoch:view.epoch,baselineId:view.baselineId,sequence:view.sequence+1,revision:view.revision,kind,payload} as ResourceEnvelope;
+    if (this.store.resourcePending?.(view.descriptor.roomId)) source=undefined;
+    const envelope = {protocolVersion:1,producerGeneration:this.producerGeneration,viewId:view.descriptor.viewId,subscriptionEpoch:view.epoch,baselineId:view.baselineId,sequence:view.sequence+1,revision:view.revision,kind,payload,...(source?{source}:{})} as ResourceEnvelope;
     if (Buffer.byteLength(JSON.stringify(envelope)) > RESOURCE_ASSEMBLY_BYTES) throw new ResourceCapacityError('resource assembly capacity');
-    view.sequence++;
-    return connection.output.send(envelope);
+    return connection.output.send(envelope,()=>{view.sequence++;if(source||kind==='ready')view.qualifiedAt=Date.now();});
+  }
+  private coverage(connection:Connection):Promise<void> {
+    const now=Date.now();
+    const eligible=[...connection.views.values()].filter(view=>this.current(connection,view)&&view.baselineReady&&!view.failed
+      &&!view.running&&!view.dirty&&view.covered&&!this.store.resourcePending?.(view.descriptor.roomId)
+      &&connection.observer.snapshot(view.descriptor.roomId).health==='healthy'
+      &&view.covered.position===connection.observer.snapshot().position&&now-(view.qualifiedAt??0)>=15_000);
+    if(!eligible.length)return Promise.resolve();
+    const views=eligible.map(view=>({protocolVersion:1 as const,producerGeneration:this.producerGeneration,
+      viewId:view.descriptor.viewId,subscriptionEpoch:view.epoch,baselineId:view.baselineId,sequence:view.sequence+1,
+      revision:view.revision,source:view.covered!}));
+    return connection.output.send({protocolVersion:1,producerGeneration:this.producerGeneration,views},()=>{
+      for(const view of eligible){view.sequence++;view.qualifiedAt=now;}
+    });
   }
   private schedule(connection:Connection,view:View) {
     if(!this.current(connection,view)||view.failed)return;
@@ -302,6 +316,7 @@ export class CoworkResourceViews {
     try {
       if(!view.dirty||!this.current(connection,view))return;
       view.dirty=false;
+      if(this.store.resourcePending?.(view.descriptor.roomId))return;
       let payload:unknown,source:CoworkResourceState|undefined;
       for(let attempt=0;attempt<3;attempt++) {
         view.controller.signal.throwIfAborted();
@@ -313,6 +328,7 @@ export class CoworkResourceViews {
         if(after.health!=='healthy')throw Error('resource observation unavailable');
         if(before===view.commits) {source=after;view.dirty=false;break;}
       }
+      if(this.store.resourcePending?.(view.descriptor.roomId))return;
       if (!source) throw Error('stable resource projection unavailable');
       if(!this.current(connection,view))return;
       const first=view.payload===undefined;
@@ -339,9 +355,9 @@ export class CoworkResourceViews {
             }
             records.push(record);bytes += size;
           }
-          await this.emit(connection,view,'upsert',{type:'history-page',records,complete:true});
-        } else await this.emit(connection,view,'snapshot',payload);
-        if(!this.current(connection,view))return;
+          await this.emit(connection,view,'upsert',{type:'history-page',records,complete:true},source);
+        } else await this.emit(connection,view,'snapshot',payload,source);
+        if(!this.current(connection,view)||this.store.resourcePending?.(view.descriptor.roomId))return;
         view.payload=comparison;
         if (view.descriptor.resource === 'room' && room && Array.isArray(room.history)) {
           view.historyAfter = room.history.at(-1)?.seq ?? (incremental ? view.historyAfter : 0);
@@ -355,7 +371,7 @@ export class CoworkResourceViews {
         await this.emit(connection,view,'ready',{baselineId:view.baselineId,source:view.covered});
         if (this.current(connection,view)) view.baselineReady = true;
         if(this.current(connection,view))view.resolveInitial({payload,source:view.covered,producerGeneration:this.producerGeneration,revision:view.revision,baselineId:view.baselineId,descriptor:view.descriptor});
-      } else await this.emit(connection,view,'coverage',{source:view.covered});
+      }
     } catch(error) {
       if(!this.current(connection,view))return;view.failed=true;
       view.rejectInitial(error instanceof Error?error:Error('projection failed'));

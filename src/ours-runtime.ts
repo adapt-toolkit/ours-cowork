@@ -12,7 +12,7 @@ export interface OursRuntimeClientFactory {
   /** Return only daemon identities whose names are in cowork's durable room set. */
   listIdentityNames(localNames: ReadonlySet<string>): Promise<Set<string>>;
   onIdentityNotify(listener: (identityName: string, event?: NotificationEvent) => void | Promise<void>): () => void;
-  onResourceHealth?(listener: (identityName: string, healthy: boolean) => void): () => void;
+  onResourceHealth?(listener: (identityName: string, healthy: boolean, pending?: boolean) => void): () => void;
   trackIdentity(identityName: string): () => void;
 }
 
@@ -54,7 +54,7 @@ export class SharedOursHost implements OursRuntimeHost {
   private selection?: AttachOursClientOptions;
   private readonly watchLeaseToken = `cowork-watch-${randomBytes(16).toString('hex')}`;
   private watchClient?: OursClient;
-  private readonly healthListeners = new Set<(identityName: string, healthy: boolean) => void>();
+  private readonly healthListeners = new Set<(identityName: string, healthy: boolean, pending?: boolean) => void>();
   private closed = false;
 
   constructor(
@@ -162,11 +162,11 @@ export class SharedOursHost implements OursRuntimeHost {
     this.health(identityName, true);
   }
 
-  onResourceHealth(listener: (identityName: string, healthy: boolean) => void): () => void {
+  onResourceHealth(listener: (identityName: string, healthy: boolean, pending?: boolean) => void): () => void {
     this.healthListeners.add(listener); return () => this.healthListeners.delete(listener);
   }
-  private health(identityName: string, healthy: boolean): void {
-    for (const listener of this.healthListeners) { try { listener(identityName, healthy); } catch {} }
+  private health(identityName: string, healthy: boolean, pending = false): void {
+    for (const listener of this.healthListeners) { try { listener(identityName, healthy, pending); } catch {} }
   }
 
   /** Subscribe before canonical admission/intake drain. Cursor belongs to this
@@ -187,11 +187,20 @@ export class SharedOursHost implements OursRuntimeHost {
       let observation: Promise<void> | undefined;
       let canonicalWork: Promise<void> | undefined;
       let canonicalDirty = false;
+      let intakePending = false;
+      const publish = () => {
+        if (!lifetime.aborted) this.health(identityName, true, canonicalDirty || canonicalWork !== undefined || intakePending);
+      };
       const drain = async () => {
         while (!lifetime.aborted) {
           const page = await client.readNotificationPage(identityName, { since: cursor, signal: lifetime });
           // Commit the explicit page position only after every callback succeeds.
-          for (const event of page.events) await this.announce(identityName, event as NotificationEvent);
+          if (page.events.length) {
+            intakePending = true; publish();
+            for (const event of page.events) await this.announce(identityName, event as NotificationEvent);
+            if (lifetime.aborted) return;
+            intakePending = false; publish();
+          }
           cursor = page.cursor;
           // Canonical reconciliation alone does not prove the drain recovered:
           // a poison page/callback must retain the consecutive-failure backoff.
@@ -202,6 +211,7 @@ export class SharedOursHost implements OursRuntimeHost {
       // coalesce into one pending pass rather than retaining frames or callbacks.
       const scheduleCanonical = () => {
         canonicalDirty = true;
+        publish();
         if (canonicalWork || lifetime.aborted) return;
         canonicalWork = (async () => {
           while (canonicalDirty && !lifetime.aborted) {
@@ -217,10 +227,11 @@ export class SharedOursHost implements OursRuntimeHost {
             if (!notificationWork) { notificationWork = drain(); void notificationWork.catch(rejectWork); }
           }
           if (lifetime.aborted) return;
-          this.health(identityName, true);
+          // Only successful canonical intake clears pending certification.
         })();
         void canonicalWork.then(() => {
           canonicalWork = undefined;
+          publish();
           if (canonicalDirty && !lifetime.aborted) scheduleCanonical();
         }, rejectWork);
       };

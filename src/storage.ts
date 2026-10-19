@@ -118,15 +118,20 @@ export class CoworkStore {
   private readonly resourceGeneration = randomUUID();
   private resourcePosition = 0;
   private readonly resourceListeners = new Set<(event: { roomId?: string; kind: 'metadata' | 'history' | 'delete' | 'health' }) => void>();
+  private readonly pendingSources = new Map<string, string | undefined>();
   private readonly failedSources = new Map<string, string | undefined>();
   onResourceCommit(listener: (event: { roomId?: string; kind: 'metadata' | 'history' | 'delete' | 'health' }) => void): () => void {
     this.resourceListeners.add(listener); return () => this.resourceListeners.delete(listener);
   }
   resourceState(roomId?: string) { return { protocolVersion: 1 as const, producerGeneration: this.resourceGeneration, position: this.resourcePosition, health: [...this.failedSources.values()].some(scope => scope === undefined || scope === roomId) ? 'failed' as const : 'healthy' as const }; }
-  setResourceHealth(source: string, healthy: boolean, roomId?: string): void {
-    const previous = this.failedSources.has(source);
+  resourcePending(roomId?: string): boolean {
+    return [...this.pendingSources.values()].some(scope => scope === undefined || scope === roomId);
+  }
+  setResourceHealth(source: string, healthy: boolean, roomId?: string, pending = false): void {
+    const previous = this.failedSources.has(source), wasPending = this.pendingSources.has(source);
     if (healthy) this.failedSources.delete(source); else this.failedSources.set(source, roomId);
-    if (previous === !healthy) return;
+    if (healthy && pending) this.pendingSources.set(source, roomId); else this.pendingSources.delete(source);
+    if (previous === !healthy && wasPending === (healthy && pending)) return;
     this.publishResource({ kind: 'health', ...(roomId ? {roomId} : {}) });
   }
   private publishResource(event: { roomId?: string; kind: 'metadata' | 'history' | 'delete' | 'health' }): void {

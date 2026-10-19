@@ -969,6 +969,47 @@ test('a fanout retry reports a room it quarantined but could not unhost', async 
   }
 });
 
+test('shutdown waits for a fanout retry quarantine until its unhost has settled', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-fanout-held-unhost-'));
+  const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';
+  const events = [];
+  const logs = [];
+  const store = new ListedStore(dir, [{ room_id: roomId, state: 'active' }]);
+  let calls = 0;
+  let release;
+  let entered;
+  const unhosting = new Promise((resolveEntered) => { entered = resolveEntered; });
+  const registry = Object.assign(new FakeRegistry(events), {
+    unhost(id) {
+      events.push(`unhost:${id}`);
+      entered();
+      return new Promise((resolveUnhost) => { release = resolveUnhost; });
+    },
+  });
+  const daemon = fanoutDaemon(dir, events, logs, store, async () => {
+    calls += 1;
+    if (calls === 1) throw fetchFailed();
+    throw new Error('storage returned the wrong relay result kind');
+  }, undefined, { registry });
+  let stopped = false;
+  try {
+    await daemon.boot();
+    await unhosting;
+    const shutdown = daemon.shutdown().then(() => { stopped = true; });
+    // Longer than the capped delay: shutdown must still be waiting on the held unhost.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+    assert.equal(stopped, false, 'shutdown waits for the quarantine to finish unhosting');
+    assert.equal(events.includes('packets.remove'), false, 'unhostAll does not run before the quarantine settles');
+    release();
+    await shutdown;
+    assert.deepEqual(fanoutLogs(logs, 'startup_room_recovery_failed').map((entry) => entry.room_id), [roomId]);
+  } finally {
+    release?.();
+    await daemon.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('shutdown waits for an in-flight fanout retry and does not report the room recovered', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-fanout-inflight-'));
   const roomId = '01jz6y7n8p9q0r1s2t3v4w5x6y';

@@ -145,7 +145,6 @@ export function isTransportError(error: unknown): boolean {
 interface FanoutRetry {
   delayMs: number;
   timer?: ReturnType<typeof setTimeout>;
-  work?: Promise<void>;
 }
 
 export interface DaemonControl {
@@ -208,6 +207,8 @@ export class CoworkDaemon {
   private readonly queuedNotifications = new Set<string>();
   private readonly notificationWork = new Set<Promise<void>>();
   private readonly fanoutRetries = new Map<string, FanoutRetry>();
+  /** Every started retry attempt until it settles, including a quarantine's unhost. */
+  private readonly fanoutWork = new Set<Promise<void>>();
 
   constructor(options: CoworkDaemonOptions) {
     this.options = options;
@@ -478,13 +479,14 @@ export class CoworkDaemon {
     const schedule = () => {
       retry.timer = setTimeout(() => {
         retry.timer = undefined;
-        retry.work = attempt()
+        const work: Promise<void> = attempt()
           .catch((failure) => {
             // Last resort, e.g. a throwing logger: the retry ends, the room stays unhealthy.
             finish();
             try { this.logFanout('startup_room_recovery_failed', roomId, failure); } catch { /* nothing left to report to */ }
           })
-          .finally(() => { retry.work = undefined; });
+          .finally(() => { this.fanoutWork.delete(work); });
+        this.fanoutWork.add(work);
       }, retry.delayMs);
     };
     const finish = () => {
@@ -544,14 +546,12 @@ export class CoworkDaemon {
   }
 
   private cancelFanoutRetries(): Promise<void>[] {
-    const work: Promise<void>[] = [];
     for (const retry of this.fanoutRetries.values()) {
       if (retry.timer) clearTimeout(retry.timer);
       retry.timer = undefined;
-      if (retry.work) work.push(retry.work);
     }
     this.fanoutRetries.clear();
-    return work;
+    return [...this.fanoutWork];
   }
 
   private setFanoutHealth(roomId: string, healthy: boolean): void {

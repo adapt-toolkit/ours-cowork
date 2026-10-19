@@ -14,7 +14,7 @@ const ID='01jz6y7n8p9q0r1s2t3v4w5x6y';
 const room={version:2,room_id:ID,room_name:'Live committed room',identity_name:`cowork-room-${ID}`,identity_cid:'cid',mission:{goal:'Goal',briefing:'Brief',briefing_version:1},role_briefings:{},rest_roles:[],command_grants:[],role_command_grants:[],anonymous:false,quiet_membership:false,membership_epoch:0,state:'provisioning',invites:[],seats:[],created_at:'2026-08-02T10:11:12.345Z'};
 
 test('committed separate-writer room, participant and loaded history changes render without event or periodic reads', {timeout:120000,skip:process.env.FULL_RESOURCE_QUALIFY!=='1'}, async t=>{
- const dir=mkdtempSync(join(tmpdir(),'cowork-delivery-'));
+ const dir=mkdtempSync(join(tmpdir(),'cw-'));
  const retainState=process.env.KEEP_RESOURCE_TEST_STATE==='1';
  if(retainState)console.log(`Retaining resource test state: ${dir}`);
  const store=new CoworkStore(dir), service=new RoomService(store,{});
@@ -25,7 +25,7 @@ test('committed separate-writer room, participant and loaded history changes ren
  const frameBytes=[],healthWire=[];let chunks=0,roomUpdates=0;const open=views.open.bind(views);views.open=(response,...args)=>{const write=response.write.bind(response);response.write=(chunk,...rest)=>{frameBytes.push(Buffer.byteLength(chunk));if(String(chunk).startsWith('event: resource-coverage\n')){const batch=JSON.parse(String(chunk).split('data: ')[1]);healthWire.push({at:Date.now(),bytes:Buffer.byteLength(chunk),entries:batch.views.length});}if(String(chunk).startsWith('event: resource-chunk'))chunks++;if(String(chunk).includes('"type":"room-update"'))roomUpdates++;return write(chunk,...rest);};return open(response,...args);};
  const dispatcher=new RpcDispatcher(createServiceRoutes(service));
  let allowed=true,authCalls=0;
- const transport=new TransportServer({socketPath:join(dir,'control.sock'),rest:{enabled:true,port:0},unixDispatcher:dispatcher,restDispatcher:dispatcher,management:{dispatcher,authorize:async req=>{authCalls++;return allowed&&req.headers['x-ours-api-token']==='operator';}},resources:views,staticHandler:createStaticWebHandler(loadWebAssets('dist/web'))});
+ const transport=new TransportServer({socketPath:join(dir,'c'),rest:{enabled:true,port:0},unixDispatcher:dispatcher,restDispatcher:dispatcher,management:{dispatcher,authorize:async req=>{authCalls++;return allowed&&req.headers['x-ours-api-token']==='operator';}},resources:views,staticHandler:createStaticWebHandler(loadWebAssets('dist/web'))});
  let browser;
  t.after(async()=>{await browser?.close();await transport.stop();if(!retainState)rmSync(dir,{recursive:true,force:true});});
  await transport.start();

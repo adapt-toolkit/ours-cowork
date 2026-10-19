@@ -55,6 +55,8 @@ export interface DaemonHost {
 
 export interface DaemonStore {
   list(): Promise<Array<{ room_id: string; state: string }>>;
+  /** One room's metadata; fanout retries use it instead of listing every room. */
+  load?(roomId: string): Promise<{ room_id: string; state: string }>;
 }
 
 export interface DaemonRegistry {
@@ -69,6 +71,8 @@ export interface DaemonService {
   reconcileRoom(roomId: string): Promise<unknown>;
   closeRoom(roomId: string): Promise<unknown>;
   resumePending(roomId: string): Promise<void>;
+  /** Drain and relay now, awaiting any pump already running for the room. */
+  drainPending?(roomId: string): Promise<void>;
   notifyRoom?(roomId: string, event?: string): Promise<void>;
   beginShutdown(): void;
   drain(): Promise<void>;
@@ -115,6 +119,33 @@ export interface CoworkDaemonOptions {
   control?: DaemonControl;
   registerOwner?: (owner: string) => Promise<void>;
   beforeTerminalRelease?: () => Promise<void>;
+  /** Delays for retrying a startup fanout that failed in transport; see deferFanout. */
+  fanoutRetry?: { initialMs: number; maxMs: number };
+}
+
+const FANOUT_RETRY_INITIAL_MS = 5_000;
+const FANOUT_RETRY_MAX_MS = 300_000;
+const TRANSPORT_ERROR_CODES = new Set([
+  'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+  'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT',
+]);
+
+/**
+ * A request to the OURS daemon that failed on the connection, as opposed to a
+ * storage, identity, authorization or TLS error. Decided by the error code of
+ * the error or its cause only: fetch reports every failure, including TLS and
+ * other non-transport causes, as `TypeError: fetch failed`.
+ */
+export function isTransportError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const code = (error as { code?: unknown }).code ?? (error.cause as { code?: unknown } | undefined)?.code;
+  return typeof code === 'string' && TRANSPORT_ERROR_CODES.has(code);
+}
+
+interface FanoutRetry {
+  delayMs: number;
+  timer?: ReturnType<typeof setTimeout>;
+  work?: Promise<void>;
 }
 
 export interface DaemonControl {
@@ -176,6 +207,7 @@ export class CoworkDaemon {
   private cancelled = false;
   private readonly queuedNotifications = new Set<string>();
   private readonly notificationWork = new Set<Promise<void>>();
+  private readonly fanoutRetries = new Map<string, FanoutRetry>();
 
   constructor(options: CoworkDaemonOptions) {
     this.options = options;
@@ -281,8 +313,20 @@ export class CoworkDaemon {
       }
       // resumePending itself performs inbox snapshot -> complete all
       // intents -> atomic consume -> pending sends, in that exact order.
+      // A restored, reconciled room whose fanout fails in transport stays
+      // hosted: its unread external history is durable and its pump can be
+      // retried. Any other fanout failure is quarantined like earlier phases.
+      const deferred: Array<{ roomId: string; error: unknown }> = [];
       for (const room of recoverable.filter((candidate) => candidate.state !== 'closing')) {
-        await recoverPhase(room.room_id, 'fanout', () => this.service!.resumePending(room.room_id));
+        await recoverPhase(room.room_id, 'fanout', async () => {
+          try {
+            await this.service!.resumePending(room.room_id);
+          } catch (error) {
+            if (!isTransportError(error)) throw error;
+            this.setFanoutHealth(room.room_id, false);
+            deferred.push({ roomId: room.room_id, error });
+          }
+        });
       }
 
       const realService = this.service as RoomService;
@@ -319,6 +363,7 @@ export class CoworkDaemon {
       this.checkpoint();
 
       this.ready = true;
+      for (const { roomId, error } of deferred) this.deferFanout(roomId, error);
       await this.flushQueuedNotifications();
       if (this.store instanceof CoworkStore) this.store.setResourceHealth('process', true);
       this.checkpoint();
@@ -359,6 +404,7 @@ export class CoworkDaemon {
     if (this.store instanceof CoworkStore) this.store.setResourceHealth('process', false);
     const errors: unknown[] = [];
     let requiresProcessExit = false;
+    const fanoutWork = this.cancelFanoutRetries();
     try { this.service?.beginShutdown(); } catch (error) { errors.push(error); }
     if (this.transportStartAttempted || this.transportsStarted || this.transports) {
       try { await this.transports?.stop(); } catch (error) { errors.push(error); }
@@ -366,7 +412,7 @@ export class CoworkDaemon {
       this.transportStartAttempted = false;
     }
     try {
-      await Promise.allSettled([...this.notificationWork]);
+      await Promise.allSettled([...this.notificationWork, ...fanoutWork]);
       await this.service?.drain();
     } catch (error) { errors.push(error); }
     try {
@@ -410,6 +456,115 @@ export class CoworkDaemon {
 
   private checkpoint(): void {
     if (this.cancelled) throw new DaemonBootCancelledError();
+  }
+
+  /**
+   * Retry a room's startup fanout that failed in transport. The room stays
+   * hosted and reports unhealthy under its own `fanout:` source, so a healthy
+   * resource observation cannot hide it. Attempts are unbounded in number but
+   * bounded in rate (doubling from initialMs to maxMs), one per room at a time;
+   * they stop on success, when the room is closing, closed or gone, at
+   * shutdown, or on a non-transport error, which quarantines the room as a
+   * failed startup phase would have. A failure to read the room's metadata is
+   * such an error: it quarantines this room only and never escapes the timer.
+   */
+  private deferFanout(roomId: string, error: unknown): void {
+    if (this.stopping || this.fanoutRetries.has(roomId)) return;
+    const { initialMs, maxMs } = this.options.fanoutRetry ?? { initialMs: FANOUT_RETRY_INITIAL_MS, maxMs: FANOUT_RETRY_MAX_MS };
+    const retry: FanoutRetry = { delayMs: initialMs };
+    this.fanoutRetries.set(roomId, retry);
+    this.setFanoutHealth(roomId, false);
+    this.logFanout('startup_room_fanout_deferred', roomId, error, retry.delayMs);
+    const schedule = () => {
+      retry.timer = setTimeout(() => {
+        retry.timer = undefined;
+        retry.work = attempt()
+          .catch((failure) => {
+            // Last resort, e.g. a throwing logger: the retry ends, the room stays unhealthy.
+            finish();
+            try { this.logFanout('startup_room_recovery_failed', roomId, failure); } catch { /* nothing left to report to */ }
+          })
+          .finally(() => { retry.work = undefined; });
+      }, retry.delayMs);
+    };
+    const finish = () => {
+      if (this.fanoutRetries.get(roomId) === retry) this.fanoutRetries.delete(roomId);
+    };
+    const quarantine = async (failure: unknown): Promise<void> => {
+      finish();
+      const unhost = this.registry?.unhost;
+      if (unhost) {
+        await unhost.call(this.registry, roomId).catch((unhostError) => {
+          this.options.log?.(JSON.stringify({
+            event: 'startup_room_unhost_failed', room_id: roomId,
+            error: unhostError instanceof Error ? unhostError.message : String(unhostError),
+          }));
+        });
+      }
+      this.logFanout('startup_room_recovery_failed', roomId, failure);
+    };
+    const attempt = async (): Promise<void> => {
+      if (this.stopping) return;
+      const store = this.store;
+      let room: { room_id: string; state: string } | undefined;
+      try {
+        room = store?.load
+          ? await store.load(roomId)
+          : (await store?.list())?.find((candidate) => candidate.room_id === roomId);
+      } catch (failure) {
+        if (!this.stopping) await quarantine(failure);
+        return;
+      }
+      if (this.stopping) return;
+      if (!room || room.state === 'closing' || room.state === 'closed') {
+        finish();
+        this.setFanoutHealth(roomId, true);
+        return;
+      }
+      const service = this.service;
+      try {
+        await (service?.drainPending ?? service?.resumePending)?.call(service, roomId);
+      } catch (failure) {
+        if (this.stopping) return;
+        if (isTransportError(failure)) {
+          retry.delayMs = Math.min(retry.delayMs * 2, maxMs);
+          this.logFanout('startup_room_fanout_deferred', roomId, failure, retry.delayMs);
+          schedule();
+          return;
+        }
+        await quarantine(failure);
+        return;
+      }
+      if (this.stopping) return;
+      finish();
+      this.setFanoutHealth(roomId, true);
+      this.logFanout('startup_room_fanout_resumed', roomId);
+    };
+    schedule();
+  }
+
+  private cancelFanoutRetries(): Promise<void>[] {
+    const work: Promise<void>[] = [];
+    for (const retry of this.fanoutRetries.values()) {
+      if (retry.timer) clearTimeout(retry.timer);
+      retry.timer = undefined;
+      if (retry.work) work.push(retry.work);
+    }
+    this.fanoutRetries.clear();
+    return work;
+  }
+
+  private setFanoutHealth(roomId: string, healthy: boolean): void {
+    if (this.store instanceof CoworkStore) this.store.setResourceHealth(`fanout:${roomId}`, healthy, roomId);
+  }
+
+  private logFanout(event: string, roomId: string, error?: unknown, retryInMs?: number): void {
+    this.options.log?.(JSON.stringify({
+      event,
+      room_id: roomId,
+      ...(error === undefined ? {} : { phase: 'fanout', error: error instanceof Error ? error.message : String(error) }),
+      ...(retryInMs === undefined ? {} : { retry_in_ms: retryInMs }),
+    }));
   }
 
   private handleNotification(roomId: string, event = 'message_received', service = this.service): void | Promise<void> {

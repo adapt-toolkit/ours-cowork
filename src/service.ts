@@ -1203,6 +1203,11 @@ export class RoomService {
     return this.intake.resumePending(roomId);
   }
 
+  /** Drain and relay now; unlike resumePending, waits for a pump already running. */
+  drainPending(roomId: string): Promise<void> {
+    return this.intake.pump(roomId);
+  }
+
   beginShutdown(): void {
     this.intake.beginShutdown();
   }

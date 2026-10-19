@@ -5,9 +5,10 @@ import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { runInNewContext } from 'node:vm';
 
 import { createServiceRoutes } from '../src/command-routes.ts';
-import { OperationTrace, traced } from '../src/diagnostics.ts';
+import { DEFAULT_TRACE_LIMITS, OperationTrace, traced } from '../src/diagnostics.ts';
 import { PacketRegistry } from '../src/packets.ts';
 import { RoomService } from '../src/service.ts';
 import { CoworkStore } from '../src/storage.ts';
@@ -362,38 +363,192 @@ test('a management reply skipped for a closed Unix socket is recorded while the 
   assert.equal(response.parent, request.id);
 });
 
-test('trace records are finite and capped, and a full or failing observer never changes the operation', async () => {
-  const capped = new OperationTrace({ maxRecords: 2, maxActive: 1 });
+test('records hold only finite labels and allowlisted codes, never error text', async () => {
+  const trace = new OperationTrace();
   const error = Object.assign(new Error('secret body text /private/path'), {
     code: 'SOME_UNLISTED_CODE', cause: Object.assign(new Error('inner'), { code: 'ECONNRESET' }),
   });
-  const outer = traced(capped, 'sdk', 'not-a-listed-operation', () => traced(capped, 'sdk', 'get_messages', async () => { throw error; }));
-  await assert.rejects(outer, (thrown) => thrown === error);
-  await traced(capped, 'sdk', 'list_contacts', async () => 'ok');
-  const snapshot = capped.snapshot();
+  await assert.rejects(traced(trace, 'sdk', 'not-a-listed-operation', async () => { throw error; }), (thrown) => thrown === error);
+  const getter = { get name() { throw new Error('observer must not run getters'); } };
+  await assert.rejects(traced(trace, 'sdk', 'get_messages', async () => { throw getter; }), (thrown) => thrown === getter);
+  const snapshot = trace.snapshot();
   assert.deepEqual(snapshot.records.map((record) => [record.label, record.error_name, record.error_code, record.cause_code]), [
     ['other', 'Error', 'other', 'ECONNRESET'],
-    ['list_contacts', null, null, null],
+    ['get_messages', 'none', 'none', 'none'],
   ]);
-  assert.equal(snapshot.dropped_active, 1);
-  assert.equal(snapshot.omitted, 0);
-  assert.equal(snapshot.complete, false);
-  assert.equal(JSON.stringify(snapshot).includes('secret'), false);
-  assert.equal(JSON.stringify(snapshot).includes('/private'), false);
+  assert.equal(snapshot.complete, true);
+  assert.equal(/secret|private|inner/.test(JSON.stringify(snapshot)), false);
+});
 
-  const full = new OperationTrace({ maxRecords: 1 });
-  assert.equal(await traced(full, 'sdk', 'get_messages', async () => 1), 1);
-  assert.equal(await traced(full, 'sdk', 'get_messages', async () => 2), 2);
-  assert.equal(full.snapshot().omitted, 1);
+test('limits are validated once, capped at frozen hard maxima, and actually enforced', () => {
+  assert.equal(Object.isFrozen(DEFAULT_TRACE_LIMITS), true);
+  assert.throws(() => { DEFAULT_TRACE_LIMITS.maxRecords = 1e9; }, TypeError);
+  assert.deepEqual({ ...DEFAULT_TRACE_LIMITS }, { maxRecords: 2048, maxActive: 256 });
 
-  let ticks = 0;
-  const broken = new OperationTrace({}, () => { if (ticks++ > 0) throw new Error('clock failure'); return 0; });
+  for (const bad of [NaN, Infinity, -Infinity, -1, 0, 1.5, '3', null]) {
+    assert.throws(() => new OperationTrace({ maxRecords: bad }), RangeError, `maxRecords ${String(bad)}`);
+    assert.throws(() => new OperationTrace({ maxActive: bad }), RangeError, `maxActive ${String(bad)}`);
+  }
+
+  const requested = { maxRecords: 1e9, maxActive: 1e9 };
+  const clamped = new OperationTrace(requested);
+  requested.maxRecords = 1;
+  requested.maxActive = 1;
+  assert.deepEqual({ ...clamped.limits }, { maxRecords: 2048, maxActive: 256 });
+  assert.equal(Object.isFrozen(clamped.limits), true);
+  assert.throws(() => { clamped.limits.maxRecords = 1e9; }, TypeError);
+  assert.throws(() => { clamped.limits = { maxRecords: 1e9, maxActive: 1e9 }; }, TypeError);
+
+  // Over-maximum input is enforced at the hard maxima, not the requested values.
+  const open = [];
+  for (let index = 0; index < 257; index += 1) open.push(clamped.start('sdk', 'get_messages'));
+  assert.equal(open.filter((id) => id === 0).length, 1);
+  for (const id of open) clamped.finish(id);
+  for (let index = 0; index < 2048; index += 1) clamped.finish(clamped.start('sdk', 'get_messages'));
+  let snapshot = clamped.snapshot();
+  assert.equal(snapshot.records.length, 2048);
+  assert.deepEqual([snapshot.dropped_active, snapshot.omitted, snapshot.complete], [1, 257 - 1 + 2048 - 2048, false]);
+
+  const small = new OperationTrace({ maxRecords: 2, maxActive: 1 });
+  const outer = small.start('sdk', 'get_messages');
+  assert.equal(small.start('sdk', 'get_files'), 0);
+  small.finish(outer);
+  small.finish(small.start('sdk', 'get_files'));
+  small.finish(small.start('sdk', 'list_contacts'));
+  snapshot = small.snapshot();
+  assert.deepEqual([snapshot.records.length, snapshot.dropped_active, snapshot.omitted, snapshot.complete], [2, 1, 1, false]);
+  assert.deepEqual({ ...snapshot.limits }, { maxRecords: 2, maxActive: 1 });
+});
+
+/** A clock that returns the given readings in turn; a function entry is called instead (e.g. to throw). */
+function scriptedClock(readings) {
+  let index = 0;
+  return () => {
+    const reading = readings[Math.min(index, readings.length - 1)];
+    index += 1;
+    return typeof reading === 'function' ? reading() : reading;
+  };
+}
+const brokenReading = () => { throw new Error('clock failure'); };
+
+test('a failing or invalid clock keeps the work and its result but marks the evidence incomplete', async () => {
+  // Start reading fails: the span is still recorded, at the last valid time.
+  let calls = 0;
   const value = {};
-  assert.equal(await traced(broken, 'sdk', 'get_messages', async () => value), value);
-  await assert.rejects(traced(broken, 'sdk', 'get_messages', async () => { throw error; }), (thrown) => thrown === error);
+  const atStart = new OperationTrace({}, scriptedClock([0, brokenReading, 4]));
+  assert.equal(await traced(atStart, 'sdk', 'get_messages', async () => { calls += 1; return value; }), value);
+  assert.equal(calls, 1);
+  let snapshot = atStart.snapshot();
+  assert.deepEqual([snapshot.observer_failures, snapshot.complete], [1, false]);
+  assert.deepEqual(snapshot.records.map((record) => [record.outcome, record.start_ms, record.end_ms]), [['ok', 0, 4]]);
 
-  const getter = { get name() { throw new Error('observer must not run getters'); } };
-  const odd = new OperationTrace();
-  await assert.rejects(traced(odd, 'sdk', 'get_messages', async () => { throw getter; }), (thrown) => thrown === getter);
-  assert.equal(odd.snapshot().records[0].error_name, 'none');
+  // Finish reading fails: the span is still closed, with its error, and the failure counted.
+  const error = new TypeError('fetch failed');
+  const atFinish = new OperationTrace({}, scriptedClock([0, 2, brokenReading]));
+  await assert.rejects(traced(atFinish, 'sdk', 'get_messages', async () => { throw error; }), (thrown) => thrown === error);
+  snapshot = atFinish.snapshot();
+  assert.deepEqual([snapshot.observer_failures, snapshot.open, snapshot.complete], [1, 0, false]);
+  assert.deepEqual(snapshot.records.map((record) => [record.outcome, record.error_name, record.end_ms]), [['error', 'TypeError', 2]]);
+
+  // Every reading fails, including at creation: nothing is lost silently.
+  const dead = new OperationTrace({}, brokenReading);
+  assert.equal(await traced(dead, 'sdk', 'get_messages', async () => 7), 7);
+  snapshot = dead.snapshot();
+  assert.equal(snapshot.complete, false);
+  assert.equal(snapshot.observer_failures, 3);
+
+  // Non-finite and backward readings are counted and replaced by the last valid one.
+  const odd = new OperationTrace({}, scriptedClock([0, 5, NaN, 3, Infinity, 9]));
+  for (let index = 0; index < 2; index += 1) await traced(odd, 'sdk', 'get_messages', async () => index);
+  await traced(odd, 'sdk', 'get_messages', async () => 2).catch(() => {});
+  snapshot = odd.snapshot();
+  assert.equal(snapshot.invalid_times, 3);
+  assert.equal(snapshot.complete, false);
+  const times = snapshot.records.flatMap((record) => [record.start_ms, record.end_ms]);
+  assert(times.every((time) => Number.isFinite(time)), 'every recorded time is finite');
+  assert.deepEqual(times, [...times].sort((left, right) => left - right), 'recorded times never decrease');
+});
+
+test('a plain native promise is returned as is and followed without a derived unhandled rejection', async (t) => {
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.off('unhandledRejection', onUnhandled));
+  const trace = new OperationTrace();
+
+  let calls = 0;
+  const fulfilled = Promise.resolve('value');
+  assert.equal(traced(trace, 'sdk', 'get_messages', () => { calls += 1; return fulfilled; }), fulfilled);
+  assert.equal(await fulfilled, 'value');
+
+  const error = new Error('rejected');
+  const rejected = Promise.reject(error);
+  assert.equal(traced(trace, 'sdk', 'get_files', () => { calls += 1; return rejected; }), rejected);
+  await assert.rejects(rejected, (thrown) => thrown === error);
+
+  const synchronous = new Error('thrown');
+  assert.throws(() => traced(trace, 'sdk', 'list_contacts', () => { calls += 1; throw synchronous; }), (thrown) => thrown === synchronous);
+  const plain = { result: true };
+  assert.equal(traced(trace, 'rpc', 'room.status', () => { calls += 1; return plain; }), plain);
+
+  await new Promise((resolveTick) => setImmediate(resolveTick));
+  assert.equal(calls, 4, 'each step ran exactly once');
+  const snapshot = trace.snapshot();
+  assert.deepEqual(snapshot.records.map((record) => record.outcome), ['ok', 'error', 'error', 'ok']);
+  assert.equal(snapshot.complete, true);
+  assert.deepEqual(unhandled, []);
+});
+
+test('other promises and thenables are returned untouched, run no application code, and stay unobserved', async () => {
+  const trace = new OperationTrace();
+  let speciesReads = 0;
+  class Throwing extends Promise {
+    static get [Symbol.species]() { speciesReads += 1; throw new Error('species'); }
+  }
+  const subclass = Throwing.resolve(1);
+  let constructorReads = 0;
+  const ownConstructor = Promise.resolve(2);
+  Object.defineProperty(ownConstructor, 'constructor', { get() { constructorReads += 1; throw new Error('constructor'); } });
+  let thenCalls = 0;
+  const thenable = { then() { thenCalls += 1; } };
+  const foreign = runInNewContext('Promise.resolve(3)');
+  let traps = 0;
+  const proxied = new Proxy(Promise.resolve(4), {
+    get(target, key) { traps += 1; return Reflect.get(target, key); },
+    getPrototypeOf(target) { traps += 1; return Reflect.getPrototypeOf(target); },
+    getOwnPropertyDescriptor(target, key) { traps += 1; return Reflect.getOwnPropertyDescriptor(target, key); },
+  });
+
+  let calls = 0;
+  for (const value of [subclass, ownConstructor, thenable, foreign, proxied]) {
+    assert.equal(traced(trace, 'sdk', 'get_messages', () => { calls += 1; return value; }), value);
+  }
+  assert.equal(calls, 5);
+  assert.deepEqual([speciesReads, constructorReads, thenCalls, traps], [0, 0, 0, 0]);
+  const snapshot = trace.snapshot();
+  assert.deepEqual(snapshot.records.map((record) => record.outcome), Array(5).fill('unobserved'));
+  assert.deepEqual([snapshot.unobserved, snapshot.open, snapshot.complete], [5, 0, false]);
+  // Awaiting the subclass would run its throwing species: that is the caller's code, not the trace's.
+  assert.equal(await foreign, 3);
+});
+
+test('a registration failure inside native then is isolated from the returned promise', async () => {
+  const trace = new OperationTrace();
+  const original = Object.getOwnPropertyDescriptor(Promise.prototype, 'constructor');
+  let calls = 0;
+  const value = Promise.resolve('kept');
+  // A tampered global makes the intrinsic then throw while resolving the species.
+  Object.defineProperty(Promise.prototype, 'constructor', { configurable: true, get() { throw new Error('species lookup'); } });
+  let returned;
+  try {
+    returned = traced(trace, 'sdk', 'get_messages', () => { calls += 1; return value; });
+  } finally {
+    Object.defineProperty(Promise.prototype, 'constructor', original);
+  }
+  assert.equal(returned, value);
+  assert.equal(calls, 1);
+  assert.equal(await returned, 'kept');
+  const snapshot = trace.snapshot();
+  assert.deepEqual([snapshot.records[0].outcome, snapshot.observer_failures, snapshot.unobserved, snapshot.complete],
+    ['unobserved', 1, 1, false]);
 });

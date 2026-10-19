@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { performance } from 'node:perf_hooks';
+import { types } from 'node:util';
 
 import { PRIVATE_ROOM_RPC_METHODS, ROOM_RPC_METHODS } from './openapi.ts';
 
@@ -9,13 +10,18 @@ import { PRIVATE_ROOM_RPC_METHODS, ROOM_RPC_METHODS } from './openapi.ts';
  * intake stage, and the concrete SDK call beneath it.
  *
  * Absent by default. Every hook is `trace?.…` or `traced(undefined, …)`, which
- * runs the original code. A trace adds no I/O, await, timer, retry or lock; it
- * returns the traced promise itself and never replaces its result or error.
+ * runs the original code. A trace adds no I/O, await, timer, retry or lock.
+ * The traced step runs exactly once and the caller receives its own value,
+ * promise or thrown error; observation runs separately, never throws, and
+ * follows only plain native promises of this realm to settlement. Anything
+ * else is left untouched and recorded as unobserved.
+ *
  * Records hold only finite labels, local integer IDs, monotonic milliseconds
  * and allowlisted error names and codes, never arguments, results, bodies,
- * identities, room or wire IDs, paths, messages or stacks. When a cap is
- * reached the trace drops records and counts them; the evidence is then
- * incomplete, the operation is unaffected.
+ * identities, room or wire IDs, paths, messages or stacks. Limits are
+ * validated once and capped at hard maxima. A cap, an internal failure, a bad
+ * clock reading or an unobserved step makes the snapshot incomplete; the
+ * operation itself is unaffected.
  */
 
 export type SpanKind =
@@ -74,15 +80,17 @@ export interface TraceRecord {
   attempt: number;
   start_ms: number;
   end_ms: number | null;
-  outcome: 'ok' | 'error' | 'open';
+  /** `unobserved`: the step returned something other than a plain native promise; its settlement is unknown. */
+  outcome: 'ok' | 'error' | 'open' | 'unobserved';
   error_name: string | null;
   error_code: string | null;
   cause_code: string | null;
 }
 
-export interface TraceLimits { maxRecords: number; maxActive: number }
+export interface TraceLimits { readonly maxRecords: number; readonly maxActive: number }
 
 export interface TraceSnapshot {
+  /** The limits actually enforced. */
   limits: TraceLimits;
   records: TraceRecord[];
   /** Spans not recorded because maxRecords was reached. */
@@ -91,10 +99,32 @@ export interface TraceSnapshot {
   dropped_active: number;
   /** Recorded spans still open when the snapshot was taken. */
   open: number;
+  /** Recorded spans whose settlement the trace could not observe. */
+  unobserved: number;
+  /** Internal trace failures, e.g. a throwing clock; each may have lost or damaged a record. */
+  observer_failures: number;
+  /** Clock readings that were not finite or ran backwards; the previous reading was used instead. */
+  invalid_times: number;
+  /** True only when every started span was recorded, settled and observed without a failure. */
   complete: boolean;
 }
 
-export const DEFAULT_TRACE_LIMITS: TraceLimits = { maxRecords: 2048, maxActive: 256 };
+/** Hard maxima. A trace may be configured lower, never higher. */
+export const DEFAULT_TRACE_LIMITS: TraceLimits = Object.freeze({ maxRecords: 2048, maxActive: 256 });
+
+/**
+ * One validated limit: absent means the hard maximum, an integer above it is
+ * clamped to it, and anything else (fractional, below 1, NaN, infinite or not
+ * a number) is rejected when the trace is created.
+ */
+function validLimit(value: unknown, name: keyof TraceLimits): number {
+  const hard = DEFAULT_TRACE_LIMITS[name];
+  if (value === undefined) return hard;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(`trace ${name} must be an integer of at least 1`);
+  }
+  return Math.min(value, hard);
+}
 
 /** A finite label for a value from a fixed set, never the value itself. */
 function finite(allowed: ReadonlySet<string>, value: unknown): string | null {
@@ -108,6 +138,7 @@ function own(value: unknown, key: 'name' | 'code' | 'cause'): unknown {
     let target: unknown = value;
     for (let depth = 0; depth < 8; depth += 1) {
       if (target === null || (typeof target !== 'object' && typeof target !== 'function')) return undefined;
+      if (types.isProxy(target)) return undefined;
       const descriptor = Object.getOwnPropertyDescriptor(target, key);
       if (descriptor) return 'value' in descriptor ? descriptor.value : undefined;
       if (key !== 'name') return undefined;
@@ -117,8 +148,42 @@ function own(value: unknown, key: 'name' | 'code' | 'cause'): unknown {
   } catch { return undefined; }
 }
 
+// Captured once, so later changes to the global Promise cannot redirect observation.
+const nativeThen = Promise.prototype.then;
+const nativePrototype = Promise.prototype;
+
+/**
+ * The supported boundary: a promise of this realm whose prototype is exactly
+ * Promise.prototype, with no own `constructor` or `then`, and not a proxy.
+ * Checked through internal slots and descriptors only, so no application
+ * getter or trap runs. Subclasses, promises of another realm, proxies and
+ * other thenables are left untouched and reported as unobserved.
+ */
+function isPlainNativePromise(value: unknown): value is Promise<unknown> {
+  return types.isPromise(value)
+    && !types.isProxy(value)
+    && Object.getPrototypeOf(value) === nativePrototype
+    && !Object.hasOwn(value, 'constructor')
+    && !Object.hasOwn(value, 'then');
+}
+
+/** Whether a value may be a thenable, decided without running a getter or trap. */
+function mayBeThenable(value: unknown): boolean {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
+  if (types.isProxy(value)) return true;
+  try {
+    let target: unknown = value;
+    for (let depth = 0; depth < 32 && target !== null; depth += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(target, 'then');
+      if (descriptor) return 'get' in descriptor || typeof descriptor.value === 'function';
+      target = Object.getPrototypeOf(target);
+    }
+    return target !== null;
+  } catch { return true; }
+}
+
 export class OperationTrace {
-  readonly limits: TraceLimits;
+  private readonly enforced: TraceLimits;
   private readonly now: () => number;
   private readonly origin: number;
   private readonly current = new AsyncLocalStorage<number>();
@@ -127,20 +192,38 @@ export class OperationTrace {
   private nextId = 1;
   private omitted = 0;
   private droppedActive = 0;
+  private unobservedCount = 0;
+  private observerFailures = 0;
+  private invalidTimes = 0;
+  private last = 0;
 
-  constructor(limits: Partial<TraceLimits> = {}, now: () => number = () => performance.now()) {
-    this.limits = { ...DEFAULT_TRACE_LIMITS, ...limits };
+  constructor(limits: { maxRecords?: number; maxActive?: number } = {}, now: () => number = () => performance.now()) {
+    // Each field is read exactly once; later changes to the argument have no effect.
+    const maxRecords = limits.maxRecords;
+    const maxActive = limits.maxActive;
+    this.enforced = Object.freeze({
+      maxRecords: validLimit(maxRecords, 'maxRecords'),
+      maxActive: validLimit(maxActive, 'maxActive'),
+    });
     this.now = now;
-    this.origin = now();
+    let origin = 0;
+    try {
+      const reading = now();
+      if (Number.isFinite(reading)) origin = reading; else this.invalidTimes += 1;
+    } catch { this.observerFailures += 1; }
+    this.origin = origin;
   }
 
-  /** Open a span under the current one; 0 when a cap dropped it. Never throws. */
+  /** The limits this trace enforces, frozen. */
+  get limits(): TraceLimits { return this.enforced; }
+
+  /** Open a span under the current one; 0 when a cap or a failure dropped it. Never throws. */
   start(kind: SpanKind, label: string, attempt = 1): number {
     try {
-      if (this.records.length >= this.limits.maxRecords) { this.omitted += 1; return 0; }
-      if (this.active.size >= this.limits.maxActive) { this.droppedActive += 1; return 0; }
+      if (this.records.length >= this.enforced.maxRecords) { this.omitted += 1; return 0; }
+      if (this.active.size >= this.enforced.maxActive) { this.droppedActive += 1; return 0; }
       const record: TraceRecord = {
-        id: this.nextId++,
+        id: this.nextId,
         parent: this.current.getStore() ?? 0,
         kind,
         label: finite(LABELS[kind], label) ?? 'other',
@@ -152,10 +235,14 @@ export class OperationTrace {
         error_code: null,
         cause_code: null,
       };
+      this.nextId += 1;
       this.records.push(record);
       this.active.set(record.id, record);
       return record.id;
-    } catch { return 0; }
+    } catch {
+      this.observerFailures += 1;
+      return 0;
+    }
   }
 
   /** Close a span; `failed` with the error it settled with. Never throws. */
@@ -163,15 +250,18 @@ export class OperationTrace {
     try {
       const record = this.active.get(id);
       if (!record) return;
-      this.active.delete(id);
-      record.end_ms = this.elapsed();
-      record.outcome = failed ? 'error' : 'ok';
+      const end = this.elapsed();
       if (failed) {
         record.error_name = finite(ERROR_NAMES, own(error, 'name')) ?? 'none';
         record.error_code = finite(ERROR_CODES, own(error, 'code')) ?? 'none';
         record.cause_code = finite(ERROR_CODES, own(own(error, 'cause'), 'code')) ?? 'none';
       }
-    } catch { /* the observer never affects the operation */ }
+      record.end_ms = end;
+      record.outcome = failed ? 'error' : 'ok';
+      this.active.delete(id);
+    } catch {
+      this.observerFailures += 1;
+    }
   }
 
   /** A completed zero-length span, for decisions such as a coalesced pump. */
@@ -184,28 +274,70 @@ export class OperationTrace {
     return id === 0 ? work() : this.current.run(id, work);
   }
 
+  /**
+   * Close span `id` when `result` settles, without touching anything but a
+   * plain native promise. Never throws and never changes `result`.
+   */
+  observe(id: number, result: unknown): void {
+    if (id === 0) return;
+    try {
+      if (isPlainNativePromise(result)) {
+        // Handlers cannot throw, so the derived promise always fulfils.
+        Reflect.apply(nativeThen, result, [() => this.finish(id), (error: unknown) => this.finish(id, true, error)]);
+      } else if (mayBeThenable(result)) {
+        this.unobserved(id);
+      } else {
+        this.finish(id);
+      }
+    } catch {
+      this.observerFailures += 1;
+      this.unobserved(id);
+    }
+  }
+
   snapshot(): TraceSnapshot {
     const records = this.records.map((record) => ({ ...record }));
     const open = records.filter((record) => record.outcome === 'open').length;
     return {
-      limits: { ...this.limits },
+      limits: this.enforced,
       records,
       omitted: this.omitted,
       dropped_active: this.droppedActive,
       open,
-      complete: this.omitted === 0 && this.droppedActive === 0 && open === 0,
+      unobserved: this.unobservedCount,
+      observer_failures: this.observerFailures,
+      invalid_times: this.invalidTimes,
+      complete: this.omitted === 0 && this.droppedActive === 0 && open === 0 && this.unobservedCount === 0
+        && this.observerFailures === 0 && this.invalidTimes === 0,
     };
   }
 
+  private unobserved(id: number): void {
+    try {
+      const record = this.active.get(id);
+      if (!record) return;
+      record.outcome = 'unobserved';
+      this.active.delete(id);
+      this.unobservedCount += 1;
+    } catch { this.observerFailures += 1; }
+  }
+
+  /** Milliseconds since creation, finite and never decreasing; a bad reading is counted and replaced. */
   private elapsed(): number {
-    return Math.round((this.now() - this.origin) * 1000) / 1000;
+    let reading: number;
+    try { reading = this.now(); } catch { this.observerFailures += 1; return this.last; }
+    const value = Math.round((reading - this.origin) * 1000) / 1000;
+    if (!Number.isFinite(value) || value < this.last) { this.invalidTimes += 1; return this.last; }
+    this.last = value;
+    return value;
   }
 }
 
 /**
- * Trace one step. Without a trace this is exactly `work()`. With one, the
- * same value or promise is returned; a promise's span is closed by a handler
- * that cannot reject, so tracing adds no unhandled rejection.
+ * Trace one step. Without a trace this is exactly `work()`. With one, `work`
+ * runs exactly once and its own value, promise or thrown error is what the
+ * caller gets; observation is separate and cannot throw. Only a plain native
+ * promise is followed to settlement; see `isPlainNativePromise`.
  */
 export function traced<T>(
   trace: OperationTrace | undefined,
@@ -223,12 +355,6 @@ export function traced<T>(
     trace.finish(id, true, error);
     throw error;
   }
-  if (id !== 0) {
-    if (result instanceof Promise) {
-      Promise.prototype.then.call(result, () => trace.finish(id), (error: unknown) => trace.finish(id, true, error));
-    } else {
-      trace.finish(id);
-    }
-  }
+  trace.observe(id, result);
   return result;
 }

@@ -14,6 +14,7 @@ import {
   type CommunicationRecord,
   type Room,
 } from './contracts.ts';
+import { traced, type OperationTrace } from './diagnostics.ts';
 import type { FileInboxItem, InboxItem, RoomPacket } from './packets.ts';
 import type { CoworkStore, RoomMutex } from './storage.ts';
 import { generateUlid } from './ulid.ts';
@@ -36,6 +37,8 @@ export interface IntakePumpOptions {
   messageId?: () => string;
   shouldPause?: (roomId: string) => Promise<boolean>;
   afterPump?: (roomId: string) => Promise<void>;
+  /** Opt-in diagnostics; absent in normal operation. */
+  trace?: OperationTrace;
 }
 
 interface NotificationState {
@@ -140,12 +143,15 @@ export class IntakePump {
     if (existing) {
       existing.dirty = true;
       const current = this.processing.getStore();
-      if (current?.active && current.roomId === id) return;
-      return existing.work;
+      if (current?.active && current.roomId === id) {
+        this.options.trace?.mark('pump', 'pump_reentrant');
+        return;
+      }
+      return traced(this.options.trace, 'pump', 'pump_joined', () => existing.work);
     }
     const state: NotificationState = { dirty: true, work: Promise.resolve() };
     this.pumps.set(id, state);
-    state.work = this.runPump(id, state);
+    state.work = traced(this.options.trace, 'pump', 'pump_run', () => this.runPump(id, state));
     return state.work;
   }
 
@@ -153,7 +159,11 @@ export class IntakePump {
   async resumePending(roomId: string): Promise<void> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const active = this.pumps.get(id);
-    if (active) { active.dirty = true; return; }
+    if (active) {
+      active.dirty = true;
+      this.options.trace?.mark('pump', 'resume_coalesced');
+      return;
+    }
     await this.pump(id);
   }
 
@@ -228,32 +238,36 @@ export class IntakePump {
   }
 
   private async drainAndRelay(roomId: string, packet: RoomPacket): Promise<void> {
+    const trace = this.options.trace;
     for (;;) {
       if (await this.shouldPause(roomId)) break;
-      await packet.drainRuntimeCommands?.(
+      await traced(trace, 'intake_stage', 'drain_commands', () => packet.drainRuntimeCommands?.(
         (item) => this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false)),
-      );
+      ));
       if (await this.shouldPause(roomId)) break;
-      const messages = await packet.listUnreadMessages(INTAKE_BATCH_SIZE);
-      const files = await packet.listUnreadFiles(INTAKE_BATCH_SIZE);
+      const messages = await traced(trace, 'intake_stage', 'list_messages', () => packet.listUnreadMessages(INTAKE_BATCH_SIZE));
+      const files = await traced(trace, 'intake_stage', 'list_files', () => packet.listUnreadFiles(INTAKE_BATCH_SIZE));
       if (messages.length === 0 && files.length === 0) break;
       for (const item of messages) {
         if (await this.shouldPause(roomId)) break;
-        await this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false));
+        await traced(trace, 'intake_stage', 'persist_message',
+          () => this.lock(roomId, () => this.processInboxItem(roomId, packet, item, false)));
         // SDK acknowledgement can dispatch a newly promoted typed command.
-        await packet.acknowledgeMessage(item,
-          (unexpected) => this.lock(roomId, () => this.processInboxItem(roomId, packet, unexpected, false)));
+        await traced(trace, 'intake_stage', 'ack_message', () => packet.acknowledgeMessage(item,
+          (unexpected) => this.lock(roomId, () => this.processInboxItem(roomId, packet, unexpected, false))));
       }
       for (const item of files) {
         if (await this.shouldPause(roomId)) break;
-        await this.lock(roomId, () => this.processFileInboxItem(roomId, packet, item));
+        // Persists, then acknowledges the file inside the same room lock.
+        await traced(trace, 'intake_stage', 'persist_file',
+          () => this.lock(roomId, () => this.processFileInboxItem(roomId, packet, item)));
       }
     }
     if (await this.shouldPause(roomId)) return;
-    await this.lock(roomId, async () => {
+    await traced(trace, 'intake_stage', 'relay', () => this.lock(roomId, async () => {
       await this.completeSnapshotIntents(roomId);
       await this.relayPendingUnlocked(roomId, packet);
-    });
+    }));
   }
 
   private async processFileInboxItem(

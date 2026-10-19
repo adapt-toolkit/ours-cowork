@@ -15,6 +15,7 @@ import {
 } from './config.ts';
 export { loadConfig } from './config.ts';
 import { createOursHost, type OursRuntimeClientFactory } from './ours-runtime.ts';
+import { traced, type OperationTrace } from './diagnostics.ts';
 import { PacketRegistry } from './packets.ts';
 import { RoomOwnerLedger } from './room-owners.ts';
 import { RoomService } from './service.ts';
@@ -121,6 +122,12 @@ export interface CoworkDaemonOptions {
   beforeTerminalRelease?: () => Promise<void>;
   /** Delays for retrying a startup fanout that failed in transport; see deferFanout. */
   fanoutRetry?: { initialMs: number; maxMs: number };
+  /**
+   * Opt-in diagnostics passed to the components this daemon builds and to its
+   * startup recovery phases. Absent in normal operation; nothing enables it
+   * from configuration or environment.
+   */
+  trace?: OperationTrace;
 }
 
 const FANOUT_RETRY_INITIAL_MS = 5_000;
@@ -228,7 +235,7 @@ export class CoworkDaemon {
     this.checkpoint();
     try {
       this.host = this.options.host ?? createOursHost(config, this.options.log, this.options.registerOwner);
-      this.store = this.options.store ?? new CoworkStore(config.stateDir);
+      this.store = this.options.store ?? new CoworkStore(config.stateDir, this.options.trace ? { trace: this.options.trace } : {});
       if (this.store instanceof CoworkStore) this.store.setResourceHealth('process', false);
 
       // The closure deliberately queues notifications until every recovery
@@ -240,6 +247,7 @@ export class CoworkDaemon {
         config.stateDir,
         {
           log: this.options.log,
+          ...(this.options.trace ? { trace: this.options.trace } : {}),
           onResourceHealth: (roomId, healthy) => {
             if (this.store instanceof CoworkStore) this.store.setResourceHealth(`room:${roomId}`, healthy, roomId);
           },
@@ -255,7 +263,7 @@ export class CoworkDaemon {
       this.service = this.options.service ?? new RoomService(
         this.store as CoworkStore,
         this.registry as PacketRegistry,
-        { consumerCommands: config.consumer_commands },
+        { consumerCommands: config.consumer_commands, ...(this.options.trace ? { trace: this.options.trace } : {}) },
       );
       serviceRef = this.service;
 
@@ -273,7 +281,7 @@ export class CoworkDaemon {
       const recoverPhase = async (roomId: string, phase: string, work: () => Promise<unknown>): Promise<void> => {
         if (!healthy.has(roomId)) return;
         try {
-          await work();
+          await traced(this.options.trace, 'phase', phase, work);
           this.checkpoint();
         } catch (error) {
           healthy.delete(roomId);
@@ -335,7 +343,7 @@ export class CoworkDaemon {
       const unixRoutes = this.options.control
         ? { ...serviceRoutes, ...createPrivateServiceRoutes(realService), ...createDaemonControlRoutes(this.options.control) }
         : { ...serviceRoutes, ...createPrivateServiceRoutes(realService) };
-      const unixDispatcher = new RpcDispatcher(unixRoutes);
+      const unixDispatcher = new RpcDispatcher(unixRoutes, this.options.trace ? { trace: this.options.trace } : {});
       const restDispatcher = new RpcDispatcher(serviceRoutes);
       const authorizeManagement = createManagementAuthorizer(process.env);
       // Deliberately omit createDaemonControlRoutes from the HTTP allowlist.
@@ -357,6 +365,7 @@ export class CoworkDaemon {
         publicOrigin: process.env.OURS_COWORK_PUBLIC_ORIGIN,
         staticHandler,
         log: this.options.log,
+        ...(this.options.trace ? { trace: this.options.trace } : {}),
       });
       this.transportStartAttempted = true;
       await this.transports.start();
@@ -525,7 +534,8 @@ export class CoworkDaemon {
       }
       const service = this.service;
       try {
-        await (service?.drainPending ?? service?.resumePending)?.call(service, roomId);
+        await traced(this.options.trace, 'phase', 'fanout_retry',
+          () => (service?.drainPending ?? service?.resumePending)?.call(service, roomId));
       } catch (failure) {
         if (this.stopping) return;
         if (isTransportError(failure)) {

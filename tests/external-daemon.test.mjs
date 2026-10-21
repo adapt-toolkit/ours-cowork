@@ -10,10 +10,11 @@ import { createOursHost, SharedOursHost } from '../src/ours-runtime.ts';
 
 const ROOM_ID = '01jz6y7n8p9q0r1s2t3v4w5x6y';
 const IDENTITY = `ours-cowork-${ROOM_ID}`;
+const INSTANCE_ID = '11111111-1111-4111-8111-111111111111';
 const CID = 'AB'.repeat(32);
 const SDK_ENVIRONMENT = [
   'OURS_CONFIG', 'OURS_STATE_DIR', 'OURS_PORT', 'OURS_API_TOKEN', 'OURS_INSTANCE',
-  'OURS_BROKER_URL', 'OURS_API_VISIBILITY',
+  'OURS_BROKER_URL', 'OURS_API_VISIBILITY', 'OURS_DAEMON_URL', 'OURS_DAEMON_ID', 'OURS_DAEMON_CREDENTIAL_PATH',
 ];
 
 function pinSdkEnvironment(t) {
@@ -29,13 +30,16 @@ function pinSdkEnvironment(t) {
 
 async function startFakeDaemon(t, options = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'cowork-shared-daemon-'));
-  const reportedStateDir = options.reportedStateDir ?? stateDir;
+  const reportedInstanceId = options.reportedInstanceId ?? INSTANCE_ID;
   const token = 'shared-daemon-token';
   writeFileSync(join(stateDir, 'daemon-token'), `${token}\n`, { mode: 0o600 });
   const requests = [];
   const polls = [];
   const waiting = new Set();
   const events = [];
+  const resources = new Set();
+  let position = 0;
+  const resourceFrame = kind => `event: resource\ndata: ${JSON.stringify({protocolVersion:1,producerGeneration:INSTANCE_ID,position,kind})}\n\n`;
   const identityRows = options.identityRows ?? [
     { name: IDENTITY },
     { name: 'Human@laptop' },
@@ -63,8 +67,8 @@ async function startFakeDaemon(t, options = {}) {
       send(401, { error: 'unauthorized' });
       return false;
     };
-    if (request.method === 'GET' && url.pathname === '/state-dir') {
-      send(200, { stateDir: reportedStateDir, version: '2.0.1', compat: 1 });
+    if (request.method === 'GET' && url.pathname === '/selection') {
+      send(200, { schema: 1, instanceId: reportedInstanceId, capabilities: ['external-sessions-v1'] });
       return;
     }
     if (request.method === 'GET' && url.pathname === '/identities') {
@@ -72,11 +76,20 @@ async function startFakeDaemon(t, options = {}) {
       send(200, { identities: identityRows });
       return;
     }
+    if (request.method === 'GET' && /^\/identities\/[^/]+\/resource-events$/.test(url.pathname)) {
+      if (!authorized()) return;
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      resources.add(response); response.write(resourceFrame('ready'));
+      const heartbeat = setInterval(() => response.write(resourceFrame('coverage')), 2000);
+      response.once('close', () => { clearInterval(heartbeat); resources.delete(response); });
+      return;
+    }
     const notifications = /^\/identities\/([^/]+)\/notifications$/.exec(url.pathname);
     if (request.method === 'GET' && notifications) {
       if (!authorized()) return;
       const raw = url.searchParams.get('since');
       polls.push(raw);
+      if (raw === null || raw === 'tip') { send(200, { cursor: events.length, events: [] }); return; }
       const since = raw === null || raw === 'tip' ? events.length : Number(raw);
       const held = { since, send: (body) => send(200, body), response };
       waiting.add(held);
@@ -101,6 +114,7 @@ async function startFakeDaemon(t, options = {}) {
   t.after(async () => {
     for (const held of [...waiting]) held.send({ cursor: events.length, events: [] });
     waiting.clear();
+    for (const response of resources) response.destroy();
     await new Promise((closed) => server.close(closed));
     rmSync(stateDir, { recursive: true, force: true });
   });
@@ -111,6 +125,7 @@ async function startFakeDaemon(t, options = {}) {
     requests,
     polls,
     emit(event) { events.push(event); flush(); },
+    commit() { position++; for (const response of resources) response.write(resourceFrame('committed')); },
     dropWatchers() {
       for (const held of [...waiting]) {
         waiting.delete(held);
@@ -122,8 +137,9 @@ async function startFakeDaemon(t, options = {}) {
 }
 
 function selectDaemon(daemon) {
-  process.env.OURS_PORT = String(daemon.port);
-  process.env.OURS_STATE_DIR = daemon.stateDir;
+  process.env.OURS_DAEMON_URL = `http://127.0.0.1:${daemon.port}`;
+  process.env.OURS_DAEMON_ID = INSTANCE_ID;
+  process.env.OURS_DAEMON_CREDENTIAL_PATH = join(daemon.stateDir, 'daemon-token');
 }
 
 test('cowork configuration is app-local and removed daemon/broker keys fail with migration guidance', (t) => {
@@ -154,7 +170,7 @@ test('cowork configuration is app-local and removed daemon/broker keys fail with
     }), { mode: 0o600 });
     assert.throws(
       () => loadConfig({ OURS_COWORK_CONFIG: path }),
-      /removed.*shared ours daemon.*@ours\.network\/cli/i,
+      /removed.*shared ours daemon.*@ours\.network\/daemon/i,
     );
   }
   for (const name of [
@@ -176,7 +192,7 @@ test('the host factory has exactly one shared-daemon mode', () => {
   assert(createOursHost(defaultConfig('/home/demo')) instanceof SharedOursHost);
 });
 
-test('shared boot proves the state root before credentials and filters global identities locally', async (t) => {
+test('shared boot proves the daemon identity before credentials and filters global identities locally', async (t) => {
   pinSdkEnvironment(t);
   const daemon = await startFakeDaemon(t);
   selectDaemon(daemon);
@@ -187,18 +203,18 @@ test('shared boot proves the state root before credentials and filters global id
     await host.listIdentityNames(new Set([IDENTITY, 'not-present'])),
     new Set([IDENTITY]),
   );
-  assert.deepEqual(daemon.requests[0], { method: 'GET', path: '/state-dir', token: null });
+  assert.deepEqual(daemon.requests[0], { method: 'GET', path: '/selection', token: null });
   assert(daemon.requests.some((entry) => entry.path === '/identities' && entry.token === daemon.token));
   assert.deepEqual(await host.shutdown(), { requiresProcessExit: false });
 });
 
 test('a mismatched shared daemon fails before cowork offers its credential', async (t) => {
   pinSdkEnvironment(t);
-  const daemon = await startFakeDaemon(t, { reportedStateDir: join(tmpdir(), 'wrong-ours-state') });
+  const daemon = await startFakeDaemon(t, { reportedInstanceId: '22222222-2222-4222-8222-222222222222' });
   selectDaemon(daemon);
   const host = new SharedOursHost();
 
-  await assert.rejects(host.boot(), /owns state directory|selection expects/);
+  await assert.rejects(host.boot(), /instance selection.*mismatched/);
   assert.deepEqual(daemon.requests.map((entry) => entry.token), [null]);
   await assert.rejects(host.createClient(), /not booted/);
 });
@@ -215,7 +231,8 @@ test('shared notification watch forwards events and releases without stopping th
   await waitFor(() => daemon.watching === 1, 'notification watch');
   await waitFor(() => seen.length >= 1, 'initial state resync');
   const afterInitial = seen.length;
-  await waitFor(() => seen.length > afterInitial, 'periodic state resync for unlogged contact transitions');
+  daemon.commit();
+  await waitFor(() => seen.length > afterInitial, 'committed resource wake for contact transitions');
   const beforeEvent = seen.length;
 
   daemon.emit({

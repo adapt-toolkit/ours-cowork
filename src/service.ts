@@ -9,7 +9,6 @@ import {
   ContainerIdSchema,
   roomIdentityName,
   CreateRoomInputSchema,
-  FileNameSchema, FileMimeSchema, MAX_FILE_BYTES,
   DEFAULT_ROLE,
   defaultRoomName,
   InviteModeSchema,
@@ -34,6 +33,7 @@ import {
   RoomSchema,
   UpdateRoomInputSchema,
   type CommunicationRecord,
+  type CommunicationMetadataRecord,
   type InviteMode,
   type RelayStatus,
   type Room,
@@ -45,6 +45,7 @@ import {
 } from './contracts.ts';
 import { ContactAlreadyAbsentError, unpackInvite, type RoomPacket } from './packets.ts';
 import type { ArchiveReadOptions, CoworkStore, RoomMutex } from './storage.ts';
+import type { OperationTrace } from './diagnostics.ts';
 import { IntakePump } from './intake.ts';
 import { createServiceRoutes, createPrivateServiceRoutes, classifyServiceError } from './command-routes.ts';
 import { ConsumerHandlers, ConsumerDefinitionSchema, type ConsumerConfiguration, type ConsumerDefinition, type StoredConsumerDefinition } from './consumer-commands.ts';
@@ -104,7 +105,7 @@ const CreateInviteInputSchema = z.object({
 const HistoryOptionsSchema = z.object({
   after: z.number().int().nonnegative().safe().optional(),
   limit: z.number().int().positive().safe().optional(),
-  view: z.enum(['operator', 'participant']).optional(),
+  view: z.enum(['operator', 'operator-metadata', 'participant']).optional(),
 }).strict();
 
 const JOURNAL_WORK_BATCH_SIZE = 64;
@@ -118,9 +119,9 @@ const RemoveParticipantInputSchema = z.object({
   notify: z.boolean().optional(),
 }).strict();
 
-type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | 'append' | 'read' | 'delete'>
+type Store = Pick<CoworkStore, 'mutex' | 'create' | 'load' | 'save' | 'list' | 'append' | 'read' | 'readMetadata' | 'delete'>
   & Pick<CoworkStore, 'discardPendingProvisioning'>
-  & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'briefingDeliveryTimes' | 'subscribeArchive' | 'wakeArchiveReaders'>>;
+  & Partial<Pick<CoworkStore, 'query' | 'recordsNeedingRelayIntents' | 'briefingDeliveryTimes'>>;
 type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 type CloseNoticeIntentRecord = Extract<CommunicationRecord, { kind: 'close_notice_intent' }>;
 
@@ -139,6 +140,8 @@ export interface RoomServiceOptions {
   roomId?: () => string;
   messageId?: () => string;
   provisioningCheckpoint?: (stage: 'metadata') => void;
+  /** Opt-in diagnostics for the intake pump; absent in normal operation. */
+  trace?: OperationTrace;
 }
 
 export interface InviteReceipt {
@@ -198,7 +201,6 @@ export class RoomService {
   private readonly nextMessageId: () => string;
   private readonly intake: IntakePump;
   private readonly provisioningCheckpoint: NonNullable<RoomServiceOptions['provisioningCheckpoint']>;
-  private eventsStopping = false;
   private readonly identityNameTails = new Map<string, Promise<void>>();
 
   constructor(store: Store, packets: RoomPacketRegistry, options: RoomServiceOptions = {}) {
@@ -214,6 +216,7 @@ export class RoomService {
       messageId: this.nextMessageId,
       shouldPause: async (roomId) => (await this.store.load(roomId)).lifecycle_request?.state === 'pending',
       afterPump: async (roomId) => { await this.resumeLifecycleRequest(roomId); },
+      ...(options.trace ? { trace: options.trace } : {}),
     });
   }
 
@@ -242,6 +245,9 @@ export class RoomService {
         quiet_membership: settings.quiet_membership ?? false,
         membership_epoch: 0,
         state: 'provisioning',
+        ...(settings.activation_requirements === undefined ? {} : {
+          activation_requirements: settings.activation_requirements,
+        }),
         status: 'packet_pending',
         invites: [],
         seats: [],
@@ -270,7 +276,7 @@ export class RoomService {
       }
       this.provisioningCheckpoint('metadata');
       const { status: _packetPending, ...created } = provisional;
-      const room = await this.store.save(RoomSchema.parse({ ...created, identity_cid: packet.cid, ...(settings.activate_empty ? {state:'active',activated_at:this.now()} : {}) }));
+      const room = await this.store.save(RoomSchema.parse({ ...created, identity_cid: packet.cid }));
       await this.registerRuntimeCommands(roomId, packet);
       return room;
     }));
@@ -382,7 +388,10 @@ export class RoomService {
     const registered = await this.store.load(roomId);
     this.publishedConsumerRevisions.delete(roomId);
     await packet.registerRuntimeCommands?.({
-      shouldPause: async () => (await this.store.load(roomId)).lifecycle_request?.state === 'pending',
+      shouldPause: async () => {
+        const room = await this.store.load(roomId);
+        return room.state === 'provisioning' || room.lifecycle_request?.state === 'pending';
+      },
       consumerCommands: (registered.consumer_commands ?? []).map((definition) => ({
         name: definition.name, description: definition.description,
         input_schema: definition.input_schema as Record<string, JsonValue>,
@@ -1198,14 +1207,40 @@ export class RoomService {
     return this.intake.resumePending(roomId);
   }
 
+  /** Drain and relay now; unlike resumePending, waits for a pump already running. */
+  drainPending(roomId: string): Promise<void> {
+    return this.intake.pump(roomId);
+  }
+
   beginShutdown(): void {
-    this.eventsStopping = true;
-    this.store.wakeArchiveReaders?.();
     this.intake.beginShutdown();
   }
 
   drain(): Promise<void> {
     return this.intake.drain();
+  }
+
+  /** Operator resource metadata keeps file bytes on the explicit history read path. */
+  async resourceRoom(roomId: string, historyAfter?: number): Promise<unknown> {
+    const id = LowerCrockfordUlidSchema.parse(roomId);
+    try {
+      return await this.store.mutex(id, async () => {
+        const room = await this.showRoom(id), participants = await this.participants(id);
+        const history: unknown[] = [];
+        let after = historyAfter ?? 0;
+        for (;;) {
+          const page = await this.store.readMetadata(id, { after, limit: 200 });
+          if (!page.length) break;
+          history.push(...page); after = page[page.length - 1]!.seq;
+        }
+        return { room, participants, history, ...(historyAfter === undefined ? {} : {historyAfter}) };
+      });
+    } catch (error) {
+      // Only an actually absent room is a tombstone; corruption stays a failure.
+      const rooms = await this.listRooms();
+      if (!rooms.some(room => room.room_id === id)) return null;
+      throw error;
+    }
   }
 
   async listRooms(): Promise<Room[]> {
@@ -1436,63 +1471,15 @@ export class RoomService {
     });
   }
 
-  /** Authenticated operator long-poll. Subscribe before reading to avoid lost wakes.
-   * Cursor is durable archive sequence; delivery can repeat and consumers deduplicate. */
-  async events(roomId: string, input: unknown) {
-    const id = LowerCrockfordUlidSchema.parse(roomId);
-    const options = z.object({after:z.number().int().nonnegative().safe(),limit:z.number().int().min(1).max(100).default(50),wait_ms:z.number().int().min(0).max(20000).default(20000)}).strict().parse(input);
-    let wake!: () => void;
-    const changed = new Promise<void>(resolve => { wake = resolve; });
-    const unsubscribe = this.store.subscribeArchive?.(id, wake);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      let records = await this.history(id, {after:options.after,limit:options.limit,view:'operator'});
-      if (!records.length && options.wait_ms > 0 && !this.eventsStopping) {
-        timer = setTimeout(wake, options.wait_ms);
-        await changed;
-        records = await this.history(id, {after:options.after,limit:options.limit,view:'operator'});
-      }
-      return {room_id:id,records,next_after:records.length ? records[records.length-1]!.seq : options.after};
-    } finally { if (timer) clearTimeout(timer); unsubscribe?.(); }
-  }
-
-  /** Archive and enqueue a room-authored file without an infrastructure seat.
-   * upload_id is an idempotency key scoped to this room, never a native wire ID. */
-  async sendFile(roomId: string, input: unknown) {
-    const id = LowerCrockfordUlidSchema.parse(roomId);
-    const request = z.object({upload_id:z.string().uuid(),role:RoleSchema,filename:FileNameSchema,mime:FileMimeSchema,data_base64:z.string().max(4*Math.ceil(MAX_FILE_BYTES/3))}).strict().parse(input);
-    const bytes = Buffer.from(request.data_base64,'base64');
-    if (bytes.toString('base64') !== request.data_base64 || bytes.length > MAX_FILE_BYTES) throw new RoomServiceError('invalid file bytes');
-    const sha256 = createHash('sha256').update(bytes).digest('hex');
-    const record = await this.lock(id, async () => {
-      const room = await this.store.load(id);
-      this.assertPostable(id,room);
-      if (!room.rest_roles.includes(request.role)) throw new RoomServiceError('file role is not registered for REST authorship');
-      const [previous] = await queryStore(this.store, id, {kind:'file',uploadId:request.upload_id,limit:1});
-      if (previous?.kind === 'file') {
-        if (previous.sha256 !== sha256 || previous.filename !== request.filename || previous.mime !== request.mime || previous.author.role !== request.role) throw new RoomServiceError('upload idempotency conflict');
-        return previous;
-      }
-      return this.store.append(id,{
-        version:1,kind:'file',room_id:id,at:this.now(),file_id:generateUlid(),upload_id:request.upload_id,
-        author:{identity:room.identity_cid,display_name:request.role,role:request.role},
-        filename:request.filename,mime:request.mime,size:bytes.length,sha256,data_base64:request.data_base64,
-        recipient_identities:uniqueIdentities(activeSeats(room).map(seat=>seat.identity)),
-      });
-    });
-    // The archive commit already includes durable relay work; a later pump can
-    // resume it. A failed delivery must not invalidate the accepted upload.
-    void this.intake.resumePending(id).catch(() => {});
-    if (record.kind !== 'file') throw new RoomServiceError('unexpected upload record');
-    return {room_id:id,file_id:record.file_id,upload_id:request.upload_id,seq:record.seq,filename:record.filename,mime:record.mime,size:record.size,sha256:record.sha256,state:'archived' as const};
-  }
-
   async history(
     roomId: string,
     options: unknown = {},
-  ): Promise<CommunicationRecord[] | HostParticipantHistoryRecord[]> {
+  ): Promise<CommunicationMetadataRecord[] | HostParticipantHistoryRecord[]> {
     const id = LowerCrockfordUlidSchema.parse(roomId);
     const { view, ...page } = HistoryOptionsSchema.parse(options);
+    if (view === 'operator-metadata') {
+      return byteBoundedHistoryPage(await this.store.readMetadata(id, page as ArchiveReadOptions));
+    }
     const records = view === 'participant'
       ? await queryStore(this.store, id, { kind: 'message', after: page.after, limit: page.limit })
       : await this.store.read(id, page as ArchiveReadOptions);
@@ -1854,7 +1841,9 @@ export class RoomService {
       .filter((invite) => invite.state !== 'revoked')
       .every((invite) => invite.accepted_cids.length >= invite.min_accepts);
     const admitted = [...activatedPending, ...newSeats];
-    if (next.state === 'provisioning' && activeSeats(next).length > 0 && requirementsMet) {
+    const plannedRolesMet = (next.activation_requirements ?? []).every(requirement =>
+      activeSeats(next).filter(seat => seat.role === requirement.role).length >= requirement.count);
+    if (next.state === 'provisioning' && activeSeats(next).length > 0 && requirementsMet && plannedRolesMet) {
       const activationAt = await this.ensureActivationBriefing(next, activeSeats(next));
       next = RoomSchema.parse({ ...next, state: 'active', activated_at: activationAt });
     } else if (next.state === 'active' && admitted.length > 0) {
@@ -2199,7 +2188,6 @@ async function queryStore(
       && (options.after === undefined || record.seq > options.after)
       && (options.messageId === undefined || value.message_id === options.messageId)
       && (options.fileId === undefined || value.file_id === options.fileId)
-      && (options.uploadId === undefined || value.upload_id === options.uploadId)
       && (options.intentRecordId === undefined || value.intent_record_id === options.intentRecordId)
       && (options.recipientIdentity === undefined || value.recipient_identity === options.recipientIdentity)
       && (options.category === undefined || value.category === options.category)

@@ -8,7 +8,7 @@ ours-cowork web
 
 The command safely starts the cowork daemon only when it is absent, waits for `GET /` readiness, then opens `http://127.0.0.1:3052/`. The shared ours daemon must already be running; this command never starts it. `ours-cowork --json web` performs the same readiness checks but returns `{ "url": "http://127.0.0.1:3052/", "opened": false }` inside the standard JSON result without opening a browser.
 
-The console and HTTP room RPC have no authentication. They bind only to `127.0.0.1`; both the `127.0.0.1` and `localhost` browser URLs are accepted. Do not use port forwarding, a reverse proxy, or another mechanism to expose this listener to other hosts.
+The console and HTTP room RPC have no authentication. They bind to `127.0.0.1` by default; both the `127.0.0.1` and `localhost` browser URLs are accepted. In a container, the protected cowork configuration may set `rest.host` to `0.0.0.0` only so a host-loopback-only published port can reach the listener through the container interface. Bind that publication to host `127.0.0.1`, never a wildcard host or LAN address, and use the same host and container port because Host and Origin validation requires the actual REST port. Do not use port forwarding, a reverse proxy, or another mechanism to expose this listener to other hosts.
 
 ## API description
 
@@ -40,8 +40,16 @@ Files lists every validated file already loaded from the selected room's paged h
 
 Files never preview or interpret content. Download decodes the archive's canonical base64, verifies the declared size and SHA-256 in the browser, and only then downloads a short-lived `application/octet-stream` Blob. An integrity mismatch is blocked. The reported MIME is shown as metadata only, and unsafe control/format characters or trailing spaces/dots are replaced in the derived download name without changing the displayed or grouped filename. Loaded files remain readable and downloadable when a room is closed or the daemon is disconnected; deleting the room removes its entire local archive and UI, with no per-file deletion.
 
-Room list and connection health poll every five seconds. The selected room, participants, and new history poll every two seconds. Polling pauses while the page is hidden, coalesces overlapping cycles, and refreshes after confirmed mutations. Version one does not use push updates.
+Healthy room lists, selected room state, participants and loaded history arrive through complete resource streams. Transiently degraded delivery uses the existing five-second room-list and two-second selected-room recovery readers. Recovery disposes its readers while hidden, stays single-flight and stops at complete ready. Transient stream failures allow three fast retries, followed by ten, twenty and capped thirty-second probes; probes fence the prior recovery reader, and terminal authentication failures stop automated recovery. A matching resource-capable daemon remains required; confirmed mutations keep their existing command authority.
 
 Close requires the room title or exact ID and leaves the plaintext local archive. Delete is available only after close, requires the exact room ID, and removes local state only as described in the limitations topic.
 
 Every operation remains available through `ours-cowork room ...` when no browser is available. Use `ours-cowork docs rooms`, `ours-cowork docs invites`, and `ours-cowork docs messaging` for the CLI workflows.
+
+## Complete resource delivery qualification
+
+The list and selected room own their resource views; changing selection unregisters and discards the old room's delivery cache. Complete room snapshots include participants and the complete loaded history, with bounded history units for large archives. Commands remain RPC/HTTP, file bytes stay on demand, and resource observation never acknowledges a notification. Idle coverage does not repeat operator authorization reads; binding and content publication preserve existing authorization. Terminal authorization failure returns the browser to its existing in-memory credential entry.
+
+`FULL_RESOURCE_QUALIFY=1 COWORK_CHROME_PATH=/absolute/chrome RESOURCE_QUALIFY_IDLE_MS=60000 node --import tsx tests/browser-resource-delivery.test.mjs` exercises actual committed storage/service changes through the existing HTTP transport into the shipped UI. Build first. It measures healthy idle content RPC and indirect authorization calls separately from initial credential admission and subscription control. It does not prove live-daemon contact acceptance, external-worker scheduling or every deployed gateway. The matching App integration can compose this fixture with the other service source qualifications.
+
+The consumer requires a matching daemon that exposes the committed resource stream. A source qualification against an older pinned published daemon returned resource HTTP 404; the same unchanged integration passed with the matching already-built SDK daemon selected through `COWORK_OURS_CLI_PATH`. Publish/install the capable daemon before deploying this consumer. No native compilation or compatibility polling shim is part of browser qualification.

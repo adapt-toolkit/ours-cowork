@@ -440,11 +440,24 @@ function refineRoomLineage(room: RoomLineageView, context: z.RefinementCtx): voi
   }
 }
 
+const ActivationRequirementsSchema = z.array(z.object({
+  role: RoleSchema,
+  count: z.number().int().min(1).max(1000),
+}).strict()).max(1000).superRefine((requirements, context) => {
+  const seen = new Set<string>();
+  for (const [index, requirement] of requirements.entries()) {
+    if (seen.has(requirement.role)) context.addIssue({ code: z.ZodIssueCode.custom,
+      path: [index, 'role'], message: 'activation roles must be unique' });
+    seen.add(requirement.role);
+  }
+});
+
 const RoomCommonShape = {
   room_id: LowerCrockfordUlidSchema,
   identity_name: NonEmptyStringSchema,
   identity_cid: z.string(),
   state: RoomStateSchema,
+  activation_requirements: ActivationRequirementsSchema.optional(),
   status: NonEmptyStringSchema.optional(),
   invites: z.array(RoomInviteSchema),
   created_at: Rfc3339Schema,
@@ -655,12 +668,12 @@ export function migrateRoomV1(
 
 /** Caller-controlled room creation fields. Identity and authorship are host-owned. */
 export const CreateRoomInputSchema = z.object({
-  activate_empty: z.boolean().optional(),
   name: RoomNameSchema.optional(),
   goal: MissionTextSchema,
   briefing: MissionTextSchema,
   anonymous: z.boolean().optional(),
   quiet_membership: z.boolean().optional(),
+  activation_requirements: ActivationRequirementsSchema.optional(),
 }).strict();
 
 export const UpdateRoomInputSchema = z.object({
@@ -860,8 +873,7 @@ const FileShape = {
       seen.add(identity);
     }
   }),
-  source_file_id: z.number().int().nonnegative().safe().optional(),
-  upload_id: z.string().uuid().optional(),
+  source_file_id: z.number().int().nonnegative().safe(),
   source_wire_id: NonEmptyStringSchema.optional(),
   source_reply_to: ReplyReferenceSchema.optional(),
 } as const;
@@ -920,6 +932,7 @@ const CloseNoticeResultShape = {
 
 export const MessageRecordSchema = z.object({ ...RecordCommonShape, ...MessageShape }).strict();
 export const FileRecordSchema = z.object({ ...RecordCommonShape, ...FileShape }).strict();
+export const FileMetadataRecordSchema = FileRecordSchema.omit({ data_base64: true });
 export const RelayIntentRecordSchema = z.object({ ...RecordCommonShape, ...RelayIntentShape }).strict();
 export const RelayResultRecordSchema = z.object({ ...RecordCommonShape, ...RelayResultShape }).strict();
 export const IntakeRejectionRecordSchema = z.object({ ...RecordCommonShape, ...IntakeRejectionShape }).strict();
@@ -992,13 +1005,10 @@ function refineIntakeRejection(
 }
 
 function refineFileRecord(
-  record: { kind: string; data_base64?: string; size?: number; sha256?: string; source_file_id?: number; upload_id?: string; source_wire_id?: string; source_reply_to?: unknown },
+  record: { kind: string; data_base64?: string; size?: number; sha256?: string },
   context: z.RefinementCtx,
 ): void {
   if (record.kind !== 'file' || record.data_base64 === undefined) return;
-  if ((record.source_file_id === undefined) === (record.upload_id === undefined) || (record.upload_id !== undefined && (record.source_wire_id !== undefined || record.source_reply_to !== undefined))) {
-    context.addIssue({code:z.ZodIssueCode.custom,message:'file requires either native source or operator upload provenance'});
-  }
   const bytes = Buffer.from(record.data_base64, 'base64');
   if (bytes.toString('base64') !== record.data_base64) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ['data_base64'], message: 'file bytes must use canonical base64' });
@@ -1203,3 +1213,5 @@ export type CommunicationRecord = z.infer<typeof CommunicationRecordSchema>;
 export type MessageRecord = Extract<CommunicationRecord, { kind: 'message' }>;
 export type IntakeRejection = Extract<CommunicationRecord, { kind: 'intake_rejection' }>;
 export type AppendRecord = z.infer<typeof AppendRecordSchema>;
+
+export type CommunicationMetadataRecord = Exclude<CommunicationRecord, { kind: 'file' }> | z.infer<typeof FileMetadataRecordSchema>;

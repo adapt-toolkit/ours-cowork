@@ -1,7 +1,10 @@
-import { useState } from 'react';
+import { createContext, useContext, useEffect, useRef, useState } from 'react';
 
 import { downloadVerifiedFile, FILE_INTEGRITY_ERROR, FileIntegrityError } from '../fileDownload';
 import type { FileRow } from '../state/roomModel';
+
+export type FileContentLoader = (file: FileRow, signal: AbortSignal) => Promise<string>;
+export const FileContentContext = createContext<FileContentLoader | undefined>(undefined);
 
 export function FileAttachment({ file }: { file: FileRow }) {
   return (
@@ -17,19 +20,31 @@ export function FileAttachment({ file }: { file: FileRow }) {
 }
 
 export function FileDownloadButton({ file }: { file: FileRow }) {
+  const loadContent = useContext(FileContentContext);
+  const request = useRef<AbortController>();
   const [pending, setPending] = useState(false);
   const [status, setStatus] = useState('');
+  useEffect(() => {
+    setPending(false);
+    setStatus('');
+    return () => request.current?.abort();
+  }, [file.recordId, loadContent]);
 
   async function download() {
     if (pending) return;
     setPending(true);
     setStatus('');
+    const controller = new AbortController();
+    request.current = controller;
     try {
-      await downloadVerifiedFile(file);
+      const dataBase64 = file.dataBase64 ?? await loadContent?.(file, controller.signal);
+      controller.signal.throwIfAborted();
+      await downloadVerifiedFile({...file, dataBase64}, undefined, controller.signal);
     } catch (error) {
+      if (controller.signal.aborted) return;
       setStatus(error instanceof FileIntegrityError ? FILE_INTEGRITY_ERROR : 'Download failed.');
     } finally {
-      setPending(false);
+      if (!controller.signal.aborted) setPending(false);
     }
   }
 

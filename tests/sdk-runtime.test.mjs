@@ -165,6 +165,7 @@ class FakeClient {
   }
 
   async removeIdentity(input) { this.calls.push(['removeIdentity', structuredClone(input)]); }
+  async close() {}
   async releaseLease() { this.calls.push(['releaseLease']); return { released: [IDENTITY] }; }
 }
 
@@ -870,6 +871,7 @@ test('shared host attaches through SDK 3, filters daemon-global names, and relea
       return [{ name: IDENTITY }, { name: 'unrelated-human' }, { name: 'other-app-room' }];
     },
     async releaseLease() { calls.push(['releaseLease', 'watch']); return { released: [] }; },
+    async close() {},
     async *watchNotifications() { /* no events */ },
   };
   const room = blankClient();
@@ -901,23 +903,114 @@ test('shared host exposes attach failure and never falls back to another runtime
 });
 
 
+test('V1 shared host passes one verified selection to distinct external room owners', async () => {
+  const calls=[];
+  const fake={async releaseLease(){return {failed:0};},async close(){}};
+  const env={OURS_DAEMON_URL:'http://127.0.0.1:3050',OURS_DAEMON_ID:'12345678-1234-1234-1234-123456789abc',OURS_DAEMON_CREDENTIAL_PATH:'/run/ours/current'};
+  const host=new SharedOursHost(()=>{},async options=>{calls.push(options);return fake;},env);
+  try {
+    await host.boot(); await host.createClient(); await host.createClient();
+    assert.equal(new Set(calls.map(c=>c.leaseToken)).size,3);
+    for(const call of calls) {
+      assert.equal(call.endpoint,env.OURS_DAEMON_URL);
+      assert.equal(call.expectedInstanceId,env.OURS_DAEMON_ID);
+      assert.equal(call.credentialPath,env.OURS_DAEMON_CREDENTIAL_PATH);
+      assert.equal(call.sessionMode,'external');
+      assert.equal(call.token,undefined);
+    }
+    await host.createClient('same-owner-after-transport-retry');
+    assert.equal(calls.at(-1).leaseToken,'same-owner-after-transport-retry');
+  } finally {await host.shutdown();}
+});
+
+test('partial V1 selection refuses before attachment with no legacy fallback', async()=>{
+  let calls=0;
+  const host=new SharedOursHost(()=>{},async()=>{calls++;return {};},{OURS_DAEMON_ID:'12345678-1234-1234-1234-123456789abc'});
+  await assert.rejects(host.boot(),/requires.*OURS_DAEMON_URL.*OURS_DAEMON_ID.*OURS_DAEMON_CREDENTIAL_PATH/);
+  assert.equal(calls,0);
+});
+
+test('room terminal release waits for an already-running notification refresh',async()=>{
+  let finish; const gate=new Promise(resolve=>{finish=resolve;});
+  const client=blankClient();
+  client.listContacts=async()=>{await gate;return {contacts:[],pending:[],roots:{},degraded:[],renames:{}};};
+  const packet=new SdkRoomPacket(IDENTITY,CID,client);
+  const refresh=packet.refresh(); const close=packet.close();
+  try {
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(client.calls.some(([name])=>name==='releaseLease'),false,'release cannot race active refresh');
+  } finally {finish();await Promise.allSettled([refresh,close]);}
+});
+
+test('room terminal cleanup rejects existing release result failures',async()=>{
+  const client=blankClient();client.releaseLease=async()=>({failed:1});
+  await assert.rejects(new SdkRoomPacket(IDENTITY,CID,client).close(),/cleanup incomplete/);
+});
+
+test('host shutdown waits for watchers already untracked by room teardown',async()=>{
+  let finish;const gate=new Promise(resolve=>{finish=resolve;});let released=false;
+  const client={async *resourceEvents(){await gate;},async releaseLease(){released=true;return {failed:0};},async close(){}};
+  const host=new SharedOursHost(()=>{},async()=>client,{});
+  await host.boot();const untrack=host.trackIdentity(IDENTITY);untrack();
+  const shutdown=host.shutdown();
+  try {
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(released,false,'terminal release waits for aborted iterator completion');
+  } finally {finish();await shutdown;}
+});
+
+test('owner registration completes before watcher and room SDK admission', async () => {
+  const admitted = [];
+  const registrations = [];
+  let allow;
+  const host = new SharedOursHost(() => {}, async (options) => {
+    admitted.push(options.leaseToken);
+    return { releaseLease: async () => ({ failed: 0 }), close: async () => {} };
+  }, {}, async (owner) => {
+    registrations.push(owner);
+    await new Promise((resolve) => { allow = resolve; });
+  });
+  const boot = host.boot();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(admitted.length, 0, 'watcher attached before owner registration ACK');
+  assert.equal(registrations.length, 1);
+  allow(); await boot;
+  const room = host.createClient('room-exact-owner');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(admitted.length, 1, 'room attached before owner registration ACK');
+  assert.equal(registrations[1], 'room-exact-owner');
+  allow(); await room;
+  assert.deepEqual(admitted, registrations);
+  await host.shutdown();
+});
+
+test('cancelled owner registration prevents SDK admission', async () => {
+  let attaches = 0;
+  const host = new SharedOursHost(() => {}, async () => { attaches++; }, {},
+    async () => { throw new Error('owner admission cancelled'); });
+  await assert.rejects(host.boot(), /owner admission cancelled/);
+  assert.equal(attaches, 0);
+});
+
 test('consumer configuration checks the daemon SDK release, not its control protocol', async () => {
-  for (const version of ['3.7.0', '3.7.1', '3.6.99', '3.7.2-rc.1', 'unknown']) {
+  for (const version of ['3.7.0', '3.7.1', '3.6.99', '3.7.2-rc.1', '3.7.2-nightly.1', '3.8.1-', 'unknown']) {
     let releases = 0;
     const host = new SharedOursHost(() => {}, async () => ({
       version: async () => ({ version, protocol: 2 }),
-      releaseLease: async () => { releases++; },
-    }), true);
+      releaseLease: async () => { releases++; return { failed: 0 }; },
+      close: async () => {},
+    }), {}, undefined, true);
     await assert.rejects(host.boot(), /SDK 3.7.2/);
     assert.equal(releases, 1);
     await host.shutdown();
   }
-  for (const version of ['3.7.2', '3.7.3', '3.8.0', '4.0.0']) {
+  for (const version of ['3.7.2', '3.7.2+build.1', '3.7.3', '3.7.3-rc.1', '3.8.0', '3.8.1-nightly.3', '4.0.0']) {
     let releases = 0;
     const host = new SharedOursHost(() => {}, async () => ({
       version: async () => ({ version, protocol: 2 }),
-      releaseLease: async () => { releases++; },
-    }), true);
+      releaseLease: async () => { releases++; return { failed: 0 }; },
+      close: async () => {},
+    }), {}, undefined, true);
     await host.boot();
     await host.shutdown();
     assert.equal(releases, 1);
@@ -937,7 +1030,7 @@ test('real SDK command results persist only authenticated viewer history across 
  const { OursClient }=await import('@ours.network/sdk/client');
  const { CoworkStore }=await import('../src/storage.ts');
  const { RoomService }=await import('../src/service.ts');
- const sdkHistory=await import(new URL('./history.js',import.meta.resolve('@ours.network/sdk')));
+ const sdkHistory=await import(new URL('../node_modules/@ours.network/daemon/dist/runtime/history.js', import.meta.url));
  const dir=mkdtempSync(join(tmpdir(),'cowork-history-command-'));
  const identity={dir:join(dir,'sdk-identity')};
  t.after(()=>{sdkHistory.closeHistory(identity);rmSync(dir,{recursive:true,force:true});});
@@ -1050,17 +1143,28 @@ test('typed SDK contact removal routes by immutable room CID, reconciles every a
 
 test('shared host forwards typed lifecycle events and resyncs when a watch reconnects', async () => {
   const event = { event: 'contact_removed', identity_cid: CID, cid: 'C'.repeat(64), by: 'peer' };
-  let watches = 0;
+  let watches = 0, polls = 0;
+  const cursors = [];
   let resolveSeen;
   const seen = new Promise(resolve => { resolveSeen = resolve; });
   const observed = [];
   const host = new SharedOursHost(() => {}, async () => ({
-    async *watchNotifications() {
+    async *resourceEvents(_identity, {signal}) {
       watches++;
-      if (watches === 1) { yield event; throw new Error('disconnected'); }
-      yield event;
+      yield {kind:'ready'};
+      if (!signal.aborted) await new Promise(resolve=>signal.addEventListener('abort',resolve,{once:true}));
     },
-    async releaseLease() {},
+    async readNotificationPage(_identity, {since,signal}) {
+      cursors.push(since); polls++;
+      if (polls===1) return {cursor:1,events:[]};
+      if (polls===2) return {cursor:2,events:[event]};
+      if (polls===3) throw new Error('disconnected');
+      if (polls===4) return {cursor:3,events:[event]};
+      if (!signal.aborted) await new Promise(resolve=>signal.addEventListener('abort',resolve,{once:true}));
+      throw new Error('aborted');
+    },
+    async releaseLease() { return { failed: 0 }; },
+    async close() {},
   }));
   await host.boot();
   host.onIdentityNotify((name, value) => {
@@ -1068,35 +1172,8 @@ test('shared host forwards typed lifecycle events and resyncs when a watch recon
     if (watches > 1 && value) resolveSeen();
   });
   host.trackIdentity(IDENTITY);
-  await seen;
-  await host.shutdown();
+  try { await seen; } finally { await host.shutdown(); }
+  assert.deepEqual(cursors.slice(0,4),['tip',1,2,2],'reconnect resumes the committed notification cursor');
   assert(observed.filter(([, value]) => value === undefined).length >= 2, 'startup and reconnect request authoritative resync');
   assert.equal(observed.filter(([, value]) => value === event).length, 2);
-});
-
-
-test('mintInvite waits for stale in-flight snapshot then refreshes the generated invite', async () => {
-  const client = new FakeClient();
-  let releaseContacts;
-  let contactsEntered;
-  const entered = new Promise(resolve => { contactsEntered = resolve; });
-  const paused = new Promise(resolve => { releaseContacts = resolve; });
-  let first = true;
-  client.listContacts = async () => {
-    if (first) { first = false; contactsEntered(); await paused; }
-    return {contacts:[]};
-  };
-  client.generateInvite = async () => {
-    client.invites = [{invite_id:'new-invite',mode:'one_time'}];
-    return {blob:'opaque-test-blob',inviteId:'new-invite'};
-  };
-  const packet = new SdkRoomPacket(IDENTITY, CID, client);
-  const staleRefresh = packet.refresh();
-  await entered;
-  const minted = packet.mintInvite('one_time');
-  await new Promise(resolve => setImmediate(resolve));
-  releaseContacts();
-  await staleRefresh;
-  await minted;
-  assert.deepEqual(packet.listInvites(), [{invite_id:'new-invite',mode:'one_time'}]);
 });

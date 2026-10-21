@@ -1,3 +1,4 @@
+import { CoworkResourceViews, ResourceBindingError } from './resource-views.ts';
 import { classifyServiceError } from './command-routes.ts';
 import { randomBytes } from 'node:crypto';
 import * as http from 'node:http';
@@ -7,11 +8,12 @@ import { basename, dirname, join } from 'node:path';
 
 import { z } from 'zod';
 
+import { traced, type OperationTrace } from './diagnostics.ts';
 import { apiDocsAsset } from './openapi.ts';
 export { createServiceRoutes, createPrivateServiceRoutes, type RoomServiceApi } from './command-routes.ts';
 import { CONTENT_SECURITY_POLICY, createStaticWebHandler, safePathname, type StaticWebHandler } from './web.ts';
 
-export const MAX_REQUEST_BYTES = 3 * 1024 * 1024; // 2 MiB file encoded as base64 plus bounded metadata.
+export const MAX_REQUEST_BYTES = 1024 * 1024;
 export const HTTP_HEADERS_TIMEOUT_MS = 5_000;
 export const HTTP_REQUEST_TIMEOUT_MS = 10_000;
 export const HTTP_BODY_IDLE_TIMEOUT_MS = 5_000;
@@ -55,8 +57,10 @@ export class RpcDispatcher {
   private readonly routes: AuthenticatedRouteTable;
   private readonly work = new Set<Promise<unknown>>();
   private accepting = true;
+  private readonly trace?: OperationTrace;
 
-  constructor(routes: AuthenticatedRouteTable) {
+  constructor(routes: AuthenticatedRouteTable, options: { trace?: OperationTrace } = {}) {
+    this.trace = options.trace;
     const owned = Object.create(null) as Record<string, AuthenticatedRoute>;
     for (const [method, route] of Object.entries(routes)) owned[method] = route;
     this.routes = Object.freeze(owned);
@@ -79,7 +83,7 @@ export class RpcDispatcher {
     if (!this.accepting) return Promise.resolve(errorResponse(request.id, 'shutting_down', 'daemon is shutting down'));
     const route = Object.hasOwn(this.routes, request.method) ? this.routes[request.method] : undefined;
     if (!route) return Promise.resolve(errorResponse(request.id, 'method_not_found', 'method not found'));
-    const operation = Promise.resolve().then(() => route.run(request.params)).then(
+    const operation = Promise.resolve().then(() => traced(this.trace, 'rpc', request.method, () => route.run(request.params))).then(
       (result): RpcResponse => ({ version: 1, id: request.id, result }),
       (error): RpcResponse => errorResponse(
         request.id,
@@ -101,11 +105,19 @@ export class RpcDispatcher {
 
 export interface TransportServerOptions {
   socketPath: string;
-  rest: { enabled: boolean; port: number };
+  rest: { enabled: boolean; host?: '127.0.0.1' | '0.0.0.0'; port: number };
   unixDispatcher: RpcDispatcher;
   restDispatcher: RpcDispatcher;
+  management?: {
+    dispatcher: RpcDispatcher;
+    authorize: (request: http.IncomingMessage) => Promise<boolean>;
+  };
+  resources?: CoworkResourceViews;
+  publicOrigin?: string;
   staticHandler?: StaticWebHandler;
   fs?: typeof nodeFs;
+  /** Opt-in diagnostics for Unix management requests; absent in normal operation. */
+  trace?: OperationTrace;
   log?: (...parts: unknown[]) => void;
 }
 
@@ -127,6 +139,10 @@ export class TransportServer {
   private protectedPrivateReplacement?: ProtectedPath;
 
   constructor(options: TransportServerOptions) {
+    if (options.publicOrigin !== undefined) {
+      const url = new URL(options.publicOrigin);
+      if (!['http:', 'https:'].includes(url.protocol) || url.origin !== options.publicOrigin) throw new Error('Cowork public origin must be an exact HTTP(S) origin');
+    }
     this.options = options;
     this.fs = options.fs ?? nodeFs;
     this.staticHandler = options.staticHandler ?? createStaticWebHandler(new Map());
@@ -148,7 +164,7 @@ export class TransportServer {
     await this.cleanupStalePrivateSockets();
     const unix = net.createServer((socket) => this.handleUnix(socket));
     this.unixServer = unix;
-    const privateSocketPath = `${this.options.socketPath}.private-${process.pid}-${randomBytes(6).toString('hex')}`;
+    const privateSocketPath = `${this.options.socketPath}.private-${randomBytes(6).toString('hex')}`;
     this.privateSocketPath = privateSocketPath;
     try {
       await listen(unix, privateSocketPath);
@@ -170,7 +186,7 @@ export class TransportServer {
           });
         });
         this.httpServer = rest;
-        await listen(rest, this.options.rest.port, '127.0.0.1');
+        await listen(rest, this.options.rest.port, this.options.rest.host ?? '127.0.0.1');
       }
     } catch (error) {
       const quarantined = this.quarantinePublicPath();
@@ -197,7 +213,8 @@ export class TransportServer {
   }
 
   private async stopUnlocked(): Promise<void> {
-    for (const dispatcher of new Set([this.options.unixDispatcher, this.options.restDispatcher])) {
+    this.options.resources?.close();
+    for (const dispatcher of new Set([this.options.unixDispatcher, this.options.restDispatcher, ...(this.options.management ? [this.options.management.dispatcher] : [])])) {
       dispatcher.beginShutdown();
     }
     const httpServer = this.httpServer;
@@ -213,7 +230,7 @@ export class TransportServer {
     await this.drainRequests();
     httpServer?.closeAllConnections?.();
     for (const socket of this.httpSockets) socket.destroy();
-    for (const dispatcher of new Set([this.options.unixDispatcher, this.options.restDispatcher])) {
+    for (const dispatcher of new Set([this.options.unixDispatcher, this.options.restDispatcher, ...(this.options.management ? [this.options.management.dispatcher] : [])])) {
       await dispatcher.drain();
     }
     for (const socket of this.sockets) socket.destroy();
@@ -237,7 +254,7 @@ export class TransportServer {
       buffered = Buffer.concat([buffered, chunk]);
       if (buffered.length > MAX_REQUEST_BYTES && buffered.indexOf(0x0a) < 0) {
         rejected = true;
-        socket.end(`${JSON.stringify(errorResponse(null, 'request_too_large', `request exceeds ${MAX_REQUEST_BYTES} bytes`))}\n`);
+        socket.end(`${JSON.stringify(errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'))}\n`);
         return;
       }
       for (;;) {
@@ -247,11 +264,21 @@ export class TransportServer {
         buffered = buffered.subarray(newline + 1);
         if (line.length > MAX_REQUEST_BYTES) {
           rejected = true;
-          socket.end(`${JSON.stringify(errorResponse(null, 'request_too_large', `request exceeds ${MAX_REQUEST_BYTES} bytes`))}\n`);
+          socket.end(`${JSON.stringify(errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'))}\n`);
           return;
         }
-        const operation = this.dispatchBytes(this.options.unixDispatcher, line).then((response) => {
-          if (!socket.destroyed) socket.write(`${JSON.stringify(response)}\n`);
+        const trace = this.options.trace;
+        // Diagnostics only: a request span parents the method span and the
+        // response decision, so a reply skipped for a closed socket is visible.
+        const request = trace?.start('rpc_request', 'unix') ?? 0;
+        const dispatch = () => this.dispatchBytes(this.options.unixDispatcher, line);
+        const operation = (trace ? trace.within(request, dispatch) : dispatch()).then((response) => {
+          const destroyed = socket.destroyed;
+          if (!destroyed) socket.write(`${JSON.stringify(response)}\n`);
+          if (trace) {
+            trace.within(request, () => trace.mark('rpc_response', destroyed ? 'socket_destroyed' : 'write_issued'));
+            trace.finish(request);
+          }
         });
         this.track(operation);
       }
@@ -271,7 +298,61 @@ export class TransportServer {
       socket.setTimeout(0);
     };
     try {
-      if (request.url !== '/rpc') {
+      const resourceUrl = new URL(request.url ?? '/', 'http://cowork');
+      const resourceRoute = /^\/(browser|management)?\/?resources(?:\/(.*))?$/.exec(resourceUrl.pathname);
+      if (resourceRoute) {
+        activateResponse();
+        const mode = resourceRoute[1], management = this.options.management;
+        const forbidden = mode === 'management'
+          ? !management || request.headers.origin !== undefined || request.headers['sec-fetch-site'] !== undefined
+          : mode === 'browser' ? !management || !this.safeAuthenticatedBrowserOrigin(request)
+          : !!management || !this.safeRestOrigin(request);
+        if (forbidden) { sendJson(response,403,{error:'forbidden request origin'});request.resume();return; }
+        if (management && !await management.authorize(request)) { sendJson(response,401,{error:'server credential required'});request.resume();return; }
+        const resources = this.options.resources;
+        if (!resources) { sendJson(response,503,{error:'resource source unavailable'});request.resume();return; }
+        // The existing operator credential owns the connection; no new token or auth scheme.
+        const owner = mode ? `${mode}:${request.headers['x-ours-api-token']}` : 'local';
+        try {
+          const parts = (resourceRoute[2] ?? '').split('/').filter(Boolean);
+          if (request.method === 'GET' && !parts.length) {
+            response.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-store','x-accel-buffering':'no'});
+            const connection = resources.open(response,owner,async()=>!management || await management.authorize(request));
+            response.once('close',connection.close);
+            await responseFinished(response); return;
+          }
+          if (parts.length !== 3 || parts[1] !== 'views') {sendJson(response,404,{error:'not found'});request.resume();return;}
+          const [connectionId,,viewId] = parts;
+          if (request.method === 'POST') {
+            if (!isJsonMediaType(request.headers['content-type'])) {sendJson(response,415,{error:'application/json required'});request.resume();return;}
+            const body = await readBody(request,MAX_REQUEST_BYTES);
+            if (!body.ok) {sendJson(response,413,{error:'request too large'});return;}
+            const value = JSON.parse(Buffer.from(body.bytes).toString());
+            if (response.destroyed) return;
+            const binding = resources.register(owner,connectionId,viewId,value.subscriptionEpoch,value.descriptor);
+            const retireAbandoned = () => {
+              if (response.writableFinished) return;
+              try { resources.remove(owner,connectionId,viewId,binding.subscriptionEpoch); } catch { /* connection already closed */ }
+            };
+            response.once('close',retireAbandoned);
+            response.once('finish',() => response.off('close',retireAbandoned));
+            sendJson(response,200,binding);return;
+          }
+          const epoch = Number(resourceUrl.searchParams.get('epoch'));
+          if (request.method === 'DELETE') {resources.remove(owner,connectionId,viewId,epoch);sendJson(response,200,{});return;}
+          if (request.method === 'GET') {sendJson(response,200,await resources.bound(owner,connectionId,viewId,epoch,resourceUrl.searchParams.get('baselineId') ?? ''));return;}
+          sendJson(response,404,{error:'not found'});request.resume();return;
+        } catch (error) {sendJson(response,error instanceof ResourceBindingError ? error.status : 400,{error:error instanceof Error?error.message:'invalid request'});return;}
+      }
+      if (request.url === '/client-config' && request.method === 'GET') {
+        activateResponse();
+        response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        response.end(JSON.stringify({ authenticatedBrowser: !!this.options.management }));
+        return await responseFinished(response);
+      }
+      const browser = request.url === '/browser/rpc' && !!this.options.management;
+      const management = request.url === '/management/rpc' || browser ? this.options.management : undefined;
+      if (request.url !== '/rpc' && !management) {
         if (request.method === 'GET') {
           activateResponse();
           if (await serveApiDocs(request, response)) return;
@@ -294,7 +375,25 @@ export class TransportServer {
         request.resume();
         return await responseFinished(response);
       }
-      if (!this.safeRestOrigin(request)) {
+      if (management && !browser && (request.headers.origin !== undefined || request.headers['sec-fetch-site'] !== undefined)) {
+        activateResponse();
+        sendJson(response, 403, errorResponse(null, 'forbidden', 'browser requests cannot use machine management'));
+        request.resume();
+        return await responseFinished(response);
+      }
+      if (browser && !this.safeAuthenticatedBrowserOrigin(request)) {
+        activateResponse();
+        sendJson(response, 403, errorResponse(null, 'forbidden', 'forbidden request origin'));
+        request.resume();
+        return await responseFinished(response);
+      }
+      if (management && !await management.authorize(request)) {
+        activateResponse();
+        sendJson(response, 401, errorResponse(null, 'unauthorized', 'server credential required'));
+        request.resume();
+        return await responseFinished(response);
+      }
+      if (!management && !this.safeRestOrigin(request)) {
         activateResponse();
         sendJson(response, 403, errorResponse(null, 'forbidden', 'forbidden request origin'));
         request.resume();
@@ -303,18 +402,18 @@ export class TransportServer {
       const declared = request.headers['content-length'];
       if (declared !== undefined && (!/^[0-9]+$/.test(declared) || Number(declared) > MAX_REQUEST_BYTES)) {
         activateResponse();
-        sendJson(response, 413, errorResponse(null, 'request_too_large', `request exceeds ${MAX_REQUEST_BYTES} bytes`));
+        sendJson(response, 413, errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'));
         request.resume();
         return await responseFinished(response);
       }
       const body = await readBody(request, MAX_REQUEST_BYTES);
       if (!body.ok) {
         activateResponse();
-        sendJson(response, 413, errorResponse(null, 'request_too_large', `request exceeds ${MAX_REQUEST_BYTES} bytes`));
+        sendJson(response, 413, errorResponse(null, 'request_too_large', 'request exceeds 1 MiB'));
         return await responseFinished(response);
       }
       activateResponse();
-      const rpc = await this.dispatchBytes(this.options.restDispatcher, body.bytes);
+      const rpc = await this.dispatchBytes(!browser && management ? management.dispatcher : this.options.restDispatcher, body.bytes);
       const status = 'error' in rpc
         ? rpc.error.code === 'method_not_found' ? 404
           : rpc.error.code === 'internal' ? 500 : 400
@@ -332,6 +431,18 @@ export class TransportServer {
         socket.setTimeout(HTTP_KEEP_ALIVE_TIMEOUT_MS);
       }
     }
+  }
+
+  private safeAuthenticatedBrowserOrigin(request: http.IncomingMessage): boolean {
+    const site = request.headers['sec-fetch-site'];
+    if (site !== undefined && site !== 'same-origin' && site !== 'none') return false;
+    const origin = request.headers.origin;
+    if (origin === undefined) return true;
+    if (this.options.publicOrigin) return origin === this.options.publicOrigin;
+    try {
+      const url = new URL(origin);
+      return ['http:', 'https:'].includes(url.protocol) && url.origin === origin && url.host === request.headers.host;
+    } catch { return false; }
   }
 
   private safeRestOrigin(request: http.IncomingMessage): boolean {
@@ -570,7 +681,8 @@ function isJsonMediaType(value: string | undefined): boolean {
 /**
  * Serve the read-only OpenAPI document and its browser UI. These carry no room
  * state and no secrets, so they follow the static console's exposure rules:
- * loopback-only listener, `'self'`-only CSP, and no remote asset of any kind.
+ * host-loopback-only publication (a container may explicitly listen on
+ * `0.0.0.0`), `'self'`-only CSP, and no remote asset of any kind.
  */
 async function serveApiDocs(
   request: http.IncomingMessage,
@@ -593,7 +705,7 @@ async function serveApiDocs(
   return true;
 }
 
-function sendJson(response: http.ServerResponse, status: number, value: RpcResponse): void {
+function sendJson(response: http.ServerResponse, status: number, value: unknown): void {
   const body = Buffer.from(JSON.stringify(value), 'utf8');
   response.writeHead(status, {
     'content-type': 'application/json',
@@ -660,7 +772,7 @@ function readBody(request: http.IncomingMessage, limit: number): Promise<{ ok: t
   });
 }
 
-function unixSocketIsLive(path: string): Promise<boolean> {
+export function unixSocketIsLive(path: string): Promise<boolean> {
   return new Promise((resolveProbe, rejectProbe) => {
     const socket = net.createConnection(path);
     const timer = setTimeout(() => {

@@ -146,7 +146,6 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
       + 'in the provisioning state until its invitation requirements are satisfied.',
     params: params({
       name: roomNameProperty,
-      activate_empty: {type:'boolean',description:'Activate after identity provisioning without requiring an infrastructure participant.'},
       goal: missionTextProperty('Mission goal'),
       briefing: missionTextProperty('Mission briefing'),
       anonymous: {
@@ -363,18 +362,6 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
     example: { room_id: EXAMPLE_ROOM_ID, caller_cid: 'A'.repeat(64), command: 'remove-member' },
   },
   {
-    method:'room.events', summary:'Wait for durable room events',
-    description:'Authenticated operator long poll. Wakes after an archive commit; resume with next_after after reconnect. Records may repeat; clients advance their durable cursor after ingestion.',
-    params:params({room_id:roomIdProperty,after:{type:'integer',minimum:0},limit:{type:'integer',minimum:1,maximum:100},wait_ms:{type:'integer',minimum:0,maximum:20000}},['room_id','after']),
-    result:'room_id, byte-bounded archive records, and next_after.',example:{room_id:EXAMPLE_ROOM_ID,after:0,wait_ms:20000},
-  },
-  {
-    method:'room.file.send', summary:'Archive and send a room-authored file',
-    description:'Uploads up to 2 MiB under a registered REST role, archives it and enqueues durable fanout. Reuse upload_id with identical content after uncertain responses. The archived receipt does not claim recipient delivery.',
-    params:params({room_id:roomIdProperty,upload_id:{type:'string',format:'uuid'},role:roleProperty,filename:{type:'string',maxLength:255},mime:{type:'string'},data_base64:{type:'string',description:'Canonical base64, at most 2 MiB decoded.'}},['room_id','upload_id','role','filename','mime','data_base64']),
-    result:'room_id,file_id,upload_id,seq,filename,mime,size,sha256,state=archived.',example:{room_id:EXAMPLE_ROOM_ID,upload_id:'00000000-0000-4000-8000-000000000001',role:'Web',filename:'example.txt',mime:'text/plain',data_base64:'aGVsbG8='},
-  },
-  {
     method: 'room.history',
     summary: 'Read room history',
     description: 'Reads one page of the room\'s ordered communication archive. The operator view '
@@ -390,8 +377,8 @@ export const ROOM_RPC_METHODS: readonly RpcMethodDocumentation[] = [
       limit: { type: 'integer', minimum: 1, description: 'Maximum number of records to return.' },
       view: {
         type: 'string',
-        enum: ['operator', 'participant'],
-        description: 'History projection. Defaults to the operator view.',
+        enum: ['operator', 'operator-metadata', 'participant'],
+        description: 'History projection. Defaults to the byte-bearing operator view; operator-metadata omits file bytes for resource recovery.',
       },
     }, ['room_id']),
     result: 'An array of communication records, byte-bounded to one page.',

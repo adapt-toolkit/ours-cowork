@@ -28,8 +28,6 @@ export interface RoomServiceApi {
   grantRuntimeCommand(roomId: string, input: unknown): Promise<unknown>;
   revokeRuntimeCommand(roomId: string, input: unknown): Promise<unknown>;
   history(roomId: string, options: unknown): Promise<unknown>;
-  events(roomId: string, options: unknown): Promise<unknown>;
-  sendFile(roomId: string, input: unknown): Promise<unknown>;
   postMessage(roomId: string, input: unknown): Promise<unknown>;
   postAsRole(roomId: string, input: unknown): Promise<unknown>;
   addRestRole(roomId: string, input: unknown): Promise<unknown>;
@@ -47,7 +45,7 @@ const HistoryParams = z.object({
   room_id: z.string(),
   after: z.number().optional(),
   limit: z.number().optional(),
-  view: z.enum(['operator', 'participant']).optional(),
+  view: z.enum(['operator', 'operator-metadata', 'participant']).optional(),
 }).strict();
 const RoleBriefingSetParams = z.object({
   room_id: z.string(), role: z.string(), text: z.string(),
@@ -149,8 +147,6 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
       const { room_id, ...input } = RuntimeCommandGrantParams.parse(params);
       return service.revokeRuntimeCommand(room_id, input);
     } },
-    'room.events': { auth: true, run: (params) => { const {room_id,...input}=z.object({room_id:z.string(),after:z.unknown(),limit:z.unknown().optional(),wait_ms:z.unknown().optional()}).strict().parse(params);return service.events(room_id,input); } },
-    'room.file.send': { auth: true, run: (params) => { const {room_id,...input}=z.object({room_id:z.string(),upload_id:z.unknown(),role:z.unknown(),filename:z.unknown(),mime:z.unknown(),data_base64:z.unknown()}).strict().parse(params);return service.sendFile(room_id,input); } },
     'room.history': { auth: true, run: (params) => {
       const { room_id, ...options } = HistoryParams.parse(params);
       return service.history(room_id, options);
@@ -183,7 +179,7 @@ export function createServiceRoutes(service: RoomServiceApi): AuthenticatedRoute
   } satisfies AuthenticatedRouteTable;
 }
 
-/** Secret-bearing mutation routes are deliberately available only to the Unix dispatcher. */
+/** Secret-bearing routes require a private socket or explicitly authenticated HTTP management. */
 export function createPrivateServiceRoutes(service: RoomServiceApi): AuthenticatedRouteTable {
   return {
     'room.accept': { auth: true, run: (params) => {

@@ -95,7 +95,7 @@ test('the exhaustive service route table marks every route auth:true', () => {
     'room.briefing.role.delete', 'room.briefing.role.set',
     'room.close', 'room.command.grant', 'room.command.grants', 'room.command.revoke',
     'room.command.role.grants', 'room.command.role.set',
-    'room.create', 'room.delete', 'room.events', 'room.file.send', 'room.history', 'room.invite', 'room.list',
+    'room.create', 'room.delete', 'room.history', 'room.invite', 'room.list',
     'room.message', 'room.participant.remove', 'room.participants',
     'room.rebind', 'room.recover', 'room.recover.confirm', 'room.revoke',
     'room.role.rest.add', 'room.role.rest.remove', 'room.say',
@@ -240,6 +240,17 @@ test('role-authorship verbs are reachable over REST with strict params and no ne
   }
 });
 
+test('private Unix listener preserves paths near the portable socket length limit', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-long-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const socketPath = join(dir, 's'.repeat(81 - Buffer.byteLength(dir)));
+  assert.equal(Buffer.byteLength(socketPath), 82);
+  const dispatcher = new RpcDispatcher({ echo: { auth: true, run: async () => ({ ok: true }) } });
+  const server = new TransportServer({ socketPath, rest: { enabled: false, port: 1 }, ...dispatchers(dispatcher) });
+  await server.start(); t.after(() => server.stop());
+  assert.equal(lstatSync(socketPath).mode & 0o777, 0o600);
+});
+
 test('REST is unauthenticated, loopback-only, emits no CORS, and excludes daemon control routes', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'cowork-transport-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -284,6 +295,40 @@ test('REST is unauthenticated, loopback-only, emits no CORS, and excludes daemon
       ? { running: true }
       : method === 'room.accept' ? { state: 'pending' } : { accepted: true });
   }
+});
+
+test('REST explicitly binds 0.0.0.0 without relaxing loopback request checks', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cowork-rest-container-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  let calls = 0;
+  const dispatcher = new RpcDispatcher({
+    ping: { auth: true, run: async () => { calls += 1; return { pong: true }; } },
+  });
+  const server = new TransportServer({
+    socketPath: join(dir, 'management.sock'),
+    rest: { enabled: true, port: 0, host: '0.0.0.0' },
+    ...dispatchers(dispatcher),
+  });
+  await server.start();
+  t.after(() => server.stop());
+  assert.equal(server.restAddress.address, '0.0.0.0');
+  const port = server.restAddress.port;
+  const body = JSON.stringify({ version: 1, id: 1, method: 'ping', params: {} });
+
+  const accepted = await request(port, { body });
+  assert.equal(accepted.statusCode, 200);
+  assert.deepEqual(accepted.json.result, { pong: true });
+
+  for (const options of [
+    { host: `cowork:${port}` },
+    { headers: { 'content-type': 'application/json', origin: `http://localhost:${port}` } },
+    { headers: { 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' } },
+  ]) {
+    const rejected = await request(port, { body, ...options });
+    assert.equal(rejected.statusCode, 403);
+    assert.equal(rejected.json.error.code, 'forbidden');
+  }
+  assert.equal(calls, 1);
 });
 
 test('REST preserves correlated service errors over their actual non-2xx statuses', async (t) => {
@@ -945,3 +990,35 @@ for (const kind of ['regular file', 'symlink', 'socket']) {
     }
   });
 }
+
+test('opt-in HTTP management requires authorization and excludes daemon control at the application boundary', async t => {
+  const dir=mkdtempSync(join(tmpdir(),'cowork-http-management-'));
+  t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  let calls=0;
+  const ordinary={'room.list':{auth:true,run:()=>[]}};
+  const management={...ordinary,'room.accept':{auth:true,run:()=>{calls++;return {state:'pending'};}}};
+  const server=new TransportServer({socketPath:join(dir,'management.sock'),rest:{enabled:true,port:0},
+    unixDispatcher:new RpcDispatcher({...management,'daemon.shutdown':{auth:true,run:()=>({})}}),
+    restDispatcher:new RpcDispatcher(ordinary),
+    management:{dispatcher:new RpcDispatcher(management),authorize:async request=>request.headers['x-ours-api-token']==='issued-test-token'},
+  });
+  await server.start();t.after(()=>server.stop());
+  const envelope=method=>JSON.stringify({version:1,id:'request',method,params:{}});
+  const invoke=(method,headers={})=>request(server.restAddress.port,{path:'/management/rpc',host:'server.example',body:envelope(method),headers:{'content-type':'application/json',...headers}});
+  assert.equal((await invoke('room.accept')).statusCode,401);
+  assert.equal((await invoke('room.accept',{'x-ours-api-token':'wrong'})).statusCode,401);
+  assert.equal(calls,0);
+  assert.equal((await invoke('room.accept',{'x-ours-api-token':'issued-test-token'})).statusCode,200);
+  assert.equal(calls,1);
+  for(const method of ['daemon.shutdown','daemon.status','unknown'])assert.equal((await invoke(method,{'x-ours-api-token':'issued-test-token'})).statusCode,404);
+  assert.equal((await invoke('room.accept',{'x-ours-api-token':'issued-test-token',origin:'https://server.example'})).statusCode,403);
+  assert.equal(calls,1);
+  const browser=(method,headers={})=>request(server.restAddress.port,{path:'/browser/rpc',host:'server.example',body:envelope(method),headers:{'content-type':'application/json',...headers}});
+  assert.equal((await browser('room.list')).statusCode,401);
+  assert.equal((await browser('room.list',{'x-ours-api-token':'issued-test-token',origin:'https://server.example','sec-fetch-site':'same-origin'})).statusCode,200);
+  assert.equal((await browser('room.list',{'x-ours-api-token':'issued-test-token',origin:'https://evil.example'})).statusCode,403);
+  assert.equal((await browser('room.list',{'x-ours-api-token':'issued-test-token','sec-fetch-site':'cross-site'})).statusCode,403);
+  assert.equal((await browser('room.accept',{'x-ours-api-token':'issued-test-token'})).statusCode,404);
+  assert.equal((await browser('daemon.shutdown',{'x-ours-api-token':'issued-test-token'})).statusCode,404);
+  assert.deepEqual((await request(server.restAddress.port,{path:'/client-config',method:'GET'})).json,{authenticatedBrowser:true});
+});

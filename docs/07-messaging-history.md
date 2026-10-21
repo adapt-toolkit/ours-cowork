@@ -39,6 +39,8 @@ ours-cowork room history <room-id> --after 40 --limit 20
 
 The host management API, web archive, and default CLI history retain complete records and global archive sequence numbers, including scoped thread records and intake rejection results. The host-only `--view participant` option remains a legacy alias-redacted message view with global cursors; it has no viewer identity and may include every thread's messages. Its explicit allowlist omits internal thread scope, retry keys, source references, and recipient identities.
 
+Authenticated host `room.history` also accepts `view: "operator-metadata"` for resource recovery. It uses the same archive cursors, limits and byte-bounded paging, but file records contain metadata without opening or returning file blobs. Cold recovery reads from `after: 0`; later recovery reads the append-only tail after the last accepted sequence and refreshes room and participant metadata, publishing the completed capture atomically in the client. Default operator history and explicit file downloads still return file bytes.
+
 Runtime `room.history` is a separate authenticated participant API. It returns messages only, hides private roots and descendants from excluded or removed/re-added seats, and exposes only public thread metadata to eligible selected seats. Its `after` cursor and record IDs count that viewer's visible messages, so hidden activity creates no gaps or counts. The default limit is 200. Continue from the last returned `seq`; `view` may only be `participant`, and callers cannot choose another viewer. Old runtime callers must discard global archive cursors when switching to this API. Host archive cursors and participant cursors are not interchangeable.
 
 Daemon history responses are capped at 3 MiB of JSON so one 2 MiB file record (about 2.8 MiB after base64 expansion) remains retrievable without allowing an unbounded management response. A page may therefore contain fewer records than `--limit` even when more records exist. Continue from the last returned `seq` with `--after`; only an empty page means end of history. The CLI follows these byte-short pages automatically and still prints up to the requested record limit.
@@ -73,32 +75,3 @@ Reply translation changes transport metadata only. Incoming sentence references 
 The web console projects participant and room-authored messages plus the briefing into Communication. Relay, file, recovery, close, and failure records are excluded from chat and shown in Events; Archive retains the complete ordered record stream, including archived file bytes. Messages appear only after the authoritative history refresh observes them.
 
 Version one polls rather than receiving pushed updates: the room list refreshes every five seconds, while the selected room, participants, and history refresh every two seconds. Polling pauses in a hidden tab, coalesces overlap, and refreshes after confirmed mutations. CLI history remains the fallback when a browser is unavailable.
-
-
-## Operator file uploads and archive events
-
-Authenticated REST and Unix RPC clients can create a room with `activate_empty: true`
-to make its provisioned identity active before participants join. The default remains
-activation on admission. Register a REST role with `room.role.rest.add`, then call
-`room.file.send` with `room_id`, `role`, a UUID `upload_id`, `filename`, `mime`, and
-canonical `data_base64`. Files are limited to 2 MiB decoded; RPC requests to 3 MiB.
-
-The file is authored by the room identity under the registered role. The archive
-stores an `upload_id` instead of inventing native `source_file_id` or wire metadata.
-Its commit also persists relay work for the current active seats. The returned
-`state: "archived"` confirms durable acceptance, not recipient delivery. Repeating
-an upload ID with identical role, bytes and metadata returns the same file; a
-conflicting reuse fails. Persist the upload ID before sending so ambiguous failures
-can be retried safely. No bridge participant is required.
-
-`room.events` accepts `room_id`, the last processed archive sequence as `after`,
-`limit` (1–100, default 50), and `wait_ms` (0–20000, default 20000). It returns ordered
-operator archive `records` and `next_after`; an empty timeout leaves the cursor
-unchanged. An append wakes a waiting call after the archive transaction commits.
-Save the cursor only after processing records, reconnect using it, and deduplicate
-by room and sequence. The archive is durable across restarts; the wake notification
-itself is transient. Responses obey the existing history byte budget.
-
-This is an operator API: events include private archive metadata and file bytes.
-Applications must enforce their own audience rules before projecting events to
-users. Neither endpoint is exposed as a participant command.

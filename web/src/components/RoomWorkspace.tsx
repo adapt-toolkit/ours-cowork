@@ -1,3 +1,4 @@
+import { FileContentContext, type FileContentLoader } from './FileAttachment';
 import { useRef, useState } from 'react';
 
 import type { CommunicationRecordDto, RoomDto } from '../api/types';
@@ -11,7 +12,7 @@ import { roomTitle } from './RoomRail';
 const WORKSPACE_TABS = ['communication', 'files', 'events', 'archive'] as const;
 type WorkspaceTab = typeof WORKSPACE_TABS[number];
 
-export function RoomWorkspace({ room, records = [], historyReady = false, connected, visible = true, composerState, onComposerDraft, onOpenRooms, onOpenContext, onSettings, onSendMessage = unavailable }: {
+export function RoomWorkspace({ room, records = [], historyReady = false, connected, visible = true, composerState, onComposerDraft, onOpenRooms, onOpenContext, onSettings, onSendMessage = unavailable, loadFileContent }: {
   room?: RoomDto;
   records?: readonly CommunicationRecordDto[];
   historyReady?: boolean;
@@ -23,6 +24,7 @@ export function RoomWorkspace({ room, records = [], historyReady = false, connec
   onOpenContext(): void;
   onSettings(trigger: HTMLButtonElement): void;
   onSendMessage?(text: string): Promise<void>;
+  loadFileContent?: FileContentLoader;
 }) {
   const [tab, setTab] = useState<WorkspaceTab>('communication');
   const tabRefs = useRef<Partial<Record<WorkspaceTab, HTMLButtonElement>>>({});
@@ -43,7 +45,7 @@ export function RoomWorkspace({ room, records = [], historyReady = false, connec
 
   const capabilities = roomCapabilities(room.state, connected);
   return (
-    <main className="workspace">
+    <FileContentContext.Provider value={loadFileContent}><main className="workspace">
       <header className="workspace-header">
         <button className="icon-button mobile-rooms" type="button" onClick={onOpenRooms} aria-label="Open rooms">☰</button>
         <div className="workspace-identity">
@@ -96,7 +98,7 @@ export function RoomWorkspace({ room, records = [], historyReady = false, connec
         {tab === 'events' && <ArchiveView records={records} mode="events" />}
         {tab === 'archive' && <ArchiveView records={records} mode="archive" />}
       </section>
-    </main>
+    </main></FileContentContext.Provider>
   );
 }
 

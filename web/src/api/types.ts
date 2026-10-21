@@ -24,6 +24,7 @@ export interface ParticipantDto {
   alias?: string;
   removed_at?: string;
   removed_epoch?: number;
+  removal_reason?: 'contact_absent';
   bounced_at?: string;
 }
 
@@ -188,7 +189,7 @@ export interface FileRecordDto extends RecordCommonDto {
   mime: string;
   size: number;
   sha256: string;
-  data_base64: string;
+  data_base64?: string;
   recipient_identities: string[];
   source_file_id: number;
   source_wire_id?: string;
@@ -504,6 +505,10 @@ function hasValidMessageThread(value: Record<string, unknown>): boolean {
 }
 
 export function isCommunicationRecordDto(value: unknown): value is CommunicationRecordDto {
+  return isRecordDto(value, false);
+}
+
+function isRecordDto(value: unknown, metadataOnly: boolean): value is CommunicationRecordDto {
   if (!hasRecordCommon(value)) return false;
   switch (value.kind) {
     case 'message':
@@ -544,8 +549,9 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
         && optionalString(value.wire_id)
         && optionalString(value.metadata_wire_id);
     case 'file': {
+      const metadata = metadataOnly && !Object.hasOwn(value, 'data_base64');
       const decodedSize = canonicalBase64DecodedSize(value.data_base64);
-      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'file_id', 'author', 'filename', 'mime', 'size', 'sha256', 'data_base64', 'recipient_identities', 'source_file_id'], ['author_alias', 'source_wire_id', 'source_reply_to'])
+      return hasExactKeys(value, [...RECORD_COMMON_KEYS, 'file_id', 'author', 'filename', 'mime', 'size', 'sha256', ...(metadata ? [] : ['data_base64']), 'recipient_identities', 'source_file_id'], ['author_alias', 'source_wire_id', 'source_reply_to'])
         && isLowerCrockfordUlid(value.file_id)
         && isAuthor(value.author)
         && (value.author_alias === undefined || isAuthorAlias(value.author_alias))
@@ -555,7 +561,7 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
         && value.size <= MAX_FILE_BYTES
         && typeof value.sha256 === 'string'
         && /^[0-9a-f]{64}$/.test(value.sha256)
-        && decodedSize === value.size
+        && (metadata || decodedSize === value.size)
         && isUniqueStringArray(value.recipient_identities)
         && isNonNegativeSafeInteger(value.source_file_id)
         && optionalString(value.source_wire_id)
@@ -602,6 +608,10 @@ export function isCommunicationRecordDto(value: unknown): value is Communication
   }
 }
 
+export function isResourceHistoryDto(value: unknown): value is CommunicationRecordDto[] {
+  return Array.isArray(value) && value.every(record => isRecordDto(record, true));
+}
+
 export function isHistoryDto(value: unknown): value is CommunicationRecordDto[] {
   return Array.isArray(value) && value.every(isCommunicationRecordDto);
 }
@@ -631,7 +641,7 @@ function isParticipant(value: unknown, requireV2?: boolean): value is Participan
     v2
       ? ['identity', 'display_name', 'role', 'invite_id', 'participant_id', 'state']
       : ['identity', 'display_name', 'role', 'invite_id', 'accepted_at'],
-    v2 ? ['accepted_at', 'requested_at', 'invite_sha256', 'alias', 'removed_at', 'removed_epoch', 'bounced_at'] : [],
+    v2 ? ['accepted_at', 'requested_at', 'invite_sha256', 'alias', 'removed_at', 'removed_epoch', 'removal_reason', 'bounced_at'] : [],
   )) return false;
   if (!isString(value.identity)
     || !isString(value.display_name)
@@ -646,6 +656,7 @@ function isParticipant(value: unknown, requireV2?: boolean): value is Participan
       && optionalString(value.alias)
       && optionalStrictRfc3339(value.removed_at)
       && (value.removed_epoch === undefined || isNonNegativeSafeInteger(value.removed_epoch))
+      && (value.removal_reason === undefined || (value.state === 'removed' && value.removal_reason === 'contact_absent'))
       && optionalStrictRfc3339(value.bounced_at))) return false;
   if ((value.requested_at === undefined) !== (value.invite_sha256 === undefined)) return false;
   if (value.state === 'pending') {

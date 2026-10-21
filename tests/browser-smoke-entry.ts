@@ -9,6 +9,9 @@ import { chromium } from 'playwright-core';
 
 import { createServiceRoutes, RpcDispatcher, TransportServer } from '../src/transports.ts';
 import { createStaticWebHandler, loadWebAssets } from '../src/web.ts';
+import { CoworkStore } from '../src/storage.ts';
+import { CoworkResourceViews } from '../src/resource-views.ts';
+import { migrateRoomV1 } from '../src/contracts.ts';
 
 declare const __COWORK_BROWSER_TEST_ROOT__: string;
 
@@ -161,12 +164,33 @@ test('shipped web console creates, selects, invites, and sends through the real 
   const chrome = resolveChromeExecutable();
   const stateDir = mkdtempSync(join(tmpdir(), 'cowork-browser-smoke-'));
   const service = fakeService();
+  const store = new CoworkStore(stateDir);
+  for (const room of service.rooms) await store.create(migrateRoomV1(room));
+  // Existing scripted command boundary, now with the resource delivery seam it owns.
+  for (const method of ['createRoom', 'updateRoom', 'createInvite', 'postMessage'] as const) {
+    const command = service[method].bind(service);
+    (service as any)[method] = async (...args: any[]) => {
+      const result = await (command as any)(...args);
+      const persisted = await store.list();
+      for (const room of service.rooms) {
+        const existing = persisted.find(row => row.room_id === room.room_id);
+        const canonical = existing ?? migrateRoomV1({...room, invites: [], seats: []});
+        if (existing) await store.save(canonical);
+        else await store.create(canonical);
+      }
+      return result;
+    };
+  }
+  const resources = new CoworkResourceViews(store, async descriptor => descriptor.resource === 'rooms'
+    ? service.listRooms()
+    : { room: await service.showRoom(descriptor.roomId!), participants: await service.participants(descriptor.roomId!), history: await service.history(descriptor.roomId!, {after:0,limit:200}) });
   const restDispatcher = new RpcDispatcher(createServiceRoutes(service));
   const transport = new TransportServer({
     socketPath: join(stateDir, 'management.sock'),
     rest: { enabled: true, port: 0 },
     unixDispatcher: new RpcDispatcher({}),
     restDispatcher,
+    resources,
     staticHandler: createStaticWebHandler(loadWebAssets(join(ROOT, 'dist', 'web'))),
   });
   let browser;

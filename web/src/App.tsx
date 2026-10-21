@@ -1,28 +1,32 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { RpcError, rpcCall } from './api/rpc';
-import { isCommunicationRecordDto, isDeleteRoomReceiptDto, isHistoryDto, isParticipantListDto, isRoomDto, isRoomListDto, validateConfirmedRecoveryInvite, validateCreatedInviteReceipt, validateRecoveryInviteReceipts, type CommunicationRecordDto, type InviteMode, type InviteReceiptDto, type ParticipantDto, type RoomDto } from './api/types';
+import { isCommunicationRecordDto, isDeleteRoomReceiptDto, isHistoryDto, isResourceHistoryDto, isParticipantListDto, isRoomDto, isRoomListDto, validateConfirmedRecoveryInvite, validateCreatedInviteReceipt, validateRecoveryInviteReceipts, type CommunicationRecordDto, type InviteMode, type InviteReceiptDto, type ParticipantDto, type RoomDto } from './api/types';
 import { InviteReceiptDialog, type InviteReceiptVault } from './components/InviteManager';
 import { CloseRoomDialog, CreateRoomDialog, DeleteRoomDialog, SettingsDialog } from './components/RoomDialogs';
 import { RoomContext, type ContextTab } from './components/RoomContext';
 import type { RoomComposerState } from './components/RoomComposer';
 import { RoomRail } from './components/RoomRail';
 import { RoomWorkspace } from './components/RoomWorkspace';
-import { createPoller, type PollClock, type Poller } from './state/poller';
-import { mergeRecords, roomCapabilities } from './state/roomModel';
+import { createPoller, createResourceSession, type ResourceSession, type ResourceDelivery, type PollClock, type Poller } from './state/poller';
+import { mergeRecords, roomCapabilities, type FileRow } from './state/roomModel';
+import { loadFileContent } from './fileDownload';
 
 export interface RpcClient {
+  resources?(delivery: ResourceDelivery): ResourceSession;
   call<T = unknown>(method: string, params: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<T>;
 }
 
 export type AppClock = PollClock;
 
 const browserRpc: RpcClient = {
+  resources: delivery => createResourceSession(delivery),
   call: <T,>(method: string, params: Record<string, unknown>, options?: { signal?: AbortSignal }) =>
     rpcCall<T>(method, params, { signal: options?.signal }),
 };
 
 export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?: AppClock }) {
+  const fetchFileContent = useCallback((file: FileRow, signal: AbortSignal) => loadFileContent(file, (method, params, options) => rpc.call(method, params, options), signal), [rpc]);
   const [rooms, setRooms] = useState<RoomDto[]>([]);
   const [selectedRoomId, setSelectedRoomId] = useState<string | undefined>(() => roomIdFromHash(location.hash));
   const [selectedRoom, setSelectedRoom] = useState<RoomDto>();
@@ -43,6 +47,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   const [contextOpen, setContextOpen] = useState(false);
   const contextDrawer = useMediaQuery('(max-width: 999px)');
   const roomSheet = useMediaQuery('(max-width: 759px)');
+  const resourceSession = useRef<ResourceSession>();
   const listPoller = useRef<Poller>();
   const selectedPoller = useRef<Poller>();
   const selectionGeneration = useRef(0);
@@ -126,8 +131,90 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   }, [rpc]);
 
   useEffect(() => {
+    if (!rpc.resources) return;
+    let disposed = false;
+    const delivery: ResourceDelivery = {
+      degraded(roomId) {setBanner(`${roomId ? `Room ${roomId}` : 'Room list'} uses paginated recovery while live delivery is unavailable.`);},
+      async recover(roomId,signal) {
+        if(!roomId){const rows=await rpc.call('room.list',{},{signal});if(!disposed&&!signal.aborted)delivery.snapshot('rooms',undefined,rows);return;}
+        const accepted = historyByRoomRef.current[roomId];
+        const current = () => !disposed && !signal.aborted
+          && !deletedRoomIdsRef.current.has(roomId)
+          && roomsRef.current.some(room => room.room_id === roomId)
+          && historyByRoomRef.current[roomId] === accepted;
+        if (!current()) return;
+        const [room, participants] = await Promise.all([
+          rpc.call('room.show', {room_id: roomId}, {signal}),
+          rpc.call('room.participants', {room_id: roomId}, {signal}),
+        ]);
+        const history = [...(accepted ?? [])];
+        let after = history.at(-1)?.seq ?? 0;
+        while (current()) {
+          const page = await rpc.call('room.history', {room_id: roomId, after, limit: 200, view: 'operator-metadata'}, {signal});
+          if (!current()) return;
+          if (!isResourceHistoryDto(page) || page.some((record, index) =>
+            record.room_id !== roomId || record.seq <= (index ? page[index - 1].seq : after))) {
+            throw Error('Invalid recovery history');
+          }
+          if (!page.length) {
+            // Publish all pages together; only an accepted capture advances the tail.
+            delivery.snapshot('room', roomId, {room, participants, history});
+            return;
+          }
+          history.push(...page);
+          after = page[page.length - 1].seq;
+        }
+      },
+      health(healthy, error) {
+        updateConnected(healthy);
+        setBanner(healthy ? undefined : `Disconnected: ${error instanceof Error ? error.message : 'Resource source unavailable'}. Loaded room data is preserved.`);
+      },
+      snapshot(resource, roomId, payload) {
+        if (resource === 'rooms') {
+          if (!isRoomListDto(payload)) throw Error('Invalid room list snapshot');
+          const ids = new Set(payload.map(room => room.room_id));
+          // Canonical window removal also invalidates cached histories of visited rooms.
+          for (const id of Object.keys(historyByRoomRef.current)) if (!ids.has(id)) {delete historyByRoomRef.current[id];resourceSession.current?.unwatchRoom(id);}
+          setHistoryByRoom({...historyByRoomRef.current});
+          replaceRooms(payload);
+          const selected = selectedRoomIdRef.current;
+          if (selected && !ids.has(selected)) {
+            selectedRoomIdRef.current=undefined;setSelectedRoomId(undefined);updateSelectedRoom(undefined);setParticipants([]);
+            history.replaceState(null,'',`${location.pathname}${location.search}#/`);
+          }
+        } else if (roomId) {
+          if (payload === null) {
+            deletedRoomIdsRef.current.add(roomId);
+            resourceSession.current?.unwatchRoom(roomId);
+            delete historyByRoomRef.current[roomId];setHistoryByRoom({...historyByRoomRef.current});
+            if(selectedRoomIdRef.current===roomId){updateSelectedRoom(undefined);setParticipants([]);}
+            return;
+          }
+          const value=payload as {room:unknown;participants:unknown;history:unknown};
+          if(!value || !isRoomDto(value.room) || value.room.room_id!==roomId || !isParticipantListDto(value.participants) || !isResourceHistoryDto(value.history)
+            || value.history.some((record,index)=>record.room_id!==roomId || record.seq!==(index? (value.history as CommunicationRecordDto[])[index-1].seq+1:1)))throw Error('Invalid room snapshot');
+          if(deletedRoomIdsRef.current.has(roomId))return;
+          historyByRoomRef.current={...historyByRoomRef.current,[roomId]:value.history};setHistoryByRoom(historyByRoomRef.current);
+          setHistoryReadyByRoom(current=>({...current,[roomId]:true}));
+          // Detail snapshots must never resurrect list membership after deletion.
+          if(roomsRef.current.some(room=>room.room_id===roomId))replaceRoom(value.room);
+          if(selectedRoomIdRef.current===roomId){updateSelectedRoom(value.room);setParticipants(value.participants);}
+        }
+        // Canonical success establishes daemon availability independently of
+        // whether every selected resource has completed its SSE baseline.
+        updateConnected(true);
+      },
+    };
+    const session=rpc.resources(delivery);
+    resourceSession.current=session;
+    if(selectedRoomIdRef.current)session.watchRoom(selectedRoomIdRef.current);
+    return ()=>{disposed=true;resourceSession.current=undefined;session.close();};
+  }, [rpc,replaceRooms,replaceRoom,updateConnected,updateSelectedRoom]);
+
+  useEffect(() => {
+    if (rpc.resources) return;
     const poller = createPoller({
-      intervalMs: 5_000,
+      intervalMs: undefined,
       visible,
       clock,
       run: async (signal) => {
@@ -184,6 +271,23 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
 
   useEffect(() => {
     const generation = ++selectionGeneration.current;
+    if (rpc.resources) {
+      if(selectedRoomId) {
+        const cached=roomsRef.current.find(room=>room.room_id===selectedRoomId);
+        if(cached){updateSelectedRoom(cached);setParticipants(cached.seats);}
+        resourceSession.current?.watchRoom(selectedRoomId);
+        return () => {
+          resourceSession.current?.unwatchRoom(selectedRoomId);
+          // Only the selected workspace owns loaded history. Leaving unloads its
+          // canonical rows while the independent composer/draft cache survives.
+          delete historyByRoomRef.current[selectedRoomId];
+          setHistoryByRoom({...historyByRoomRef.current});
+          setHistoryReadyByRoom(current=>{const next={...current};delete next[selectedRoomId];return next;});
+        };
+      }
+      else {updateSelectedRoom(undefined);setParticipants([]);}
+      return;
+    }
     if (!selectedRoomId) { updateSelectedRoom(undefined); setParticipants([]); return; }
     if (deletedRoomIdsRef.current.has(selectedRoomId)) {
       selectedRoomIdRef.current = undefined;
@@ -197,7 +301,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
     if (cached) updateSelectedRoom(cached);
 
     const poller = createPoller({
-      intervalMs: 2_000,
+      intervalMs: undefined,
       visible,
       clock,
       run: async (signal) => {
@@ -437,7 +541,7 @@ export function CoworkApp({ rpc = browserRpc, clock }: { rpc?: RpcClient; clock?
   return (
     <div className="cowork-app">
       <RoomRail rooms={rooms} selectedRoomId={selectedRoomId} connected={connected} open={railOpen} sheet={roomSheet} onClose={() => setRailOpen(false)} onCreate={(trigger) => { createTrigger.current = trigger; setCreateOpen(true); }} onSelect={selectRoom} />
-      <RoomWorkspace room={activeRoom} records={activeRoom ? historyByRoom[activeRoom.room_id] ?? [] : []} historyReady={Boolean(activeRoom && historyReadyByRoom[activeRoom.room_id])} connected={connected === true} visible={!document.hidden} composerState={activeRoom ? composerByRoom[activeRoom.room_id] ?? EMPTY_COMPOSER : EMPTY_COMPOSER} onComposerDraft={activeRoom ? (draft) => updateComposer(activeRoom.room_id, (current) => ({ ...current, draft })) : undefined} onOpenRooms={() => setRailOpen(true)} onOpenContext={() => setContextOpen(true)} onSettings={(trigger) => { settingsTrigger.current = trigger; setSettingsOpen(true); }} onSendMessage={activeRoom ? (text) => sendMessage(activeRoom.room_id, text) : undefined} />
+      <RoomWorkspace loadFileContent={fetchFileContent} room={activeRoom} records={activeRoom ? historyByRoom[activeRoom.room_id] ?? [] : []} historyReady={Boolean(activeRoom && historyReadyByRoom[activeRoom.room_id])} connected={connected === true} visible={!document.hidden} composerState={activeRoom ? composerByRoom[activeRoom.room_id] ?? EMPTY_COMPOSER : EMPTY_COMPOSER} onComposerDraft={activeRoom ? (draft) => updateComposer(activeRoom.room_id, (current) => ({ ...current, draft })) : undefined} onOpenRooms={() => setRailOpen(true)} onOpenContext={() => setContextOpen(true)} onSettings={(trigger) => { settingsTrigger.current = trigger; setSettingsOpen(true); }} onSendMessage={activeRoom ? (text) => sendMessage(activeRoom.room_id, text) : undefined} />
       <RoomContext room={activeRoom} participants={participants} archiveCount={activeRoom ? historyByRoom[activeRoom.room_id]?.length ?? 0 : 0} connected={connected === true} tab={contextTab} open={contextOpen} drawer={contextDrawer} panelRef={contextPanel} onTab={setContextTab} onClose={() => setContextOpen(false)} onCreateInvite={activeRoom ? (input) => createInvite(activeRoom.room_id, input) : undefined} onRevokeInvite={activeRoom ? (inviteId) => revokeInvite(activeRoom.room_id, inviteId) : undefined} onRecoverInvites={activeRoom ? () => recoverInvites(activeRoom.room_id) : undefined} onRequestClose={(trigger) => { closeTrigger.current = trigger; setCloseOpen(true); }} onRequestDelete={(trigger) => { deleteTrigger.current = trigger; setDeleteOpen(true); }} />
       {((roomSheet && railOpen) || (contextDrawer && contextOpen)) && <button className="responsive-scrim" type="button" aria-label="Close open panel" onClick={() => { setRailOpen(false); setContextOpen(false); }} />}
 

@@ -28,7 +28,7 @@
     "test:v1-restart-delivery": "node tests/v1-restart-delivery.integration.mjs"
   },
   "dependencies": {
-    "@ours.network/sdk": "5.0.1",
+    "@ours.network/sdk": "5.1.0",
     "ajv": "8.20.0",
     "better-sqlite3": "13.0.3",
     "react": "18.3.1",
